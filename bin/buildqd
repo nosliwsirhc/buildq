@@ -321,7 +321,7 @@ class Lane:
         if not isinstance(group, str) or not group:
             raise ValueError(f"lanes.{name}.workspace_group must be a name")
         self.workspace_group = group
-        self.group_given = "workspace_group" in raw
+        self.group_given = "workspace_group" in raw and group != name  # (naming itself is the default)
         # RUST_TEST_THREADS and NEXTEST_TEST_THREADS win over a project's own settings (a suite
         # pinned to one thread for a shared database, say), so they are set only where asked.
         self.test_threads = boolean(raw.get("test_threads", False), f"lanes.{name}.test_threads")
@@ -395,17 +395,18 @@ class Config:
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
-        # (a lane whose group names another lane is checked first: its error says what to write)
-        for lane in sorted(self.lanes.values(), key=lambda l: l.workspace_group not in self.lanes):
+        for lane in self.lanes.values():  # a group that names a lane must be that lane's group
+            named = self.lanes.get(lane.workspace_group)
+            if lane.group_given and named is not None and named is not lane and named.workspace_group != lane.workspace_group:
+                raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r}: lane {named.name}'s "
+                                 f"group is {named.workspace_group!r}: use that")
+        for lane in self.lanes.values():
             if not lane.group_given:
                 continue
             others = [o for o in self.lanes.values() if o is not lane and o.workspace_group == lane.workspace_group]
             if not others:
-                named = self.lanes.get(lane.workspace_group)
-                hint = (f"lane {named.name}'s group is {named.workspace_group!r}: use that" if named is not None
-                        else "to join a lane's group, name that lane's group")
                 raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r} is shared with no other "
-                                 f"lane ({hint})")
+                                 "lane (to join a lane's group, name that lane or its group)")
             if any(not o.exclusive for o in [lane, *others]):
                 raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r}: every lane in a group "
                                  "must be exclusive")
@@ -2469,7 +2470,9 @@ class Ticket:
         self.dedupe = None  # same source, command, directory, lane and environment: the same build
         self.caller = None  # the unit its client ran in: a session, a CI runner
         self.from_ci = False  # submitted from a GitHub Actions job, which reports its own result
-        self.workspace_group: str | None = None  # its lane's workspace_group when it started (kept across reloads)
+        # Its lane's workspace_group when it started, kept across reloads: "" for a non-exclusive
+        # lane (no group); None when unknown (saved before groups were recorded).
+        self.workspace_group: str | None = None
         self.waited_by: dict[str, float] = {}  # seconds queued, by the reason it waited
         self.wait_mark: float | None = None  # when that was last added up
         self.peak_at = 0.0  # seconds into this attempt when it reached mem_peak (time paused not counted)
@@ -3880,7 +3883,7 @@ class Daemon:
         for t in running:
             if not t.workspace:
                 continue
-            groups = {t.workspace_group} if isinstance(t.workspace_group, str) else set()
+            groups = {t.workspace_group} if isinstance(t.workspace_group, str) and t.workspace_group else set()
             if t.lane in cfg.lanes and cfg.lanes[t.lane].exclusive:  # (a lane removed since: its group at start)
                 groups.add(cfg.lanes[t.lane].workspace_group)
             for group in groups:
@@ -4020,7 +4023,7 @@ class Daemon:
         t.oom_base = 0
         t.reason = t.reason_cat = ""
         t.granted = t.max_granted = granted
-        t.workspace_group = lane.workspace_group if lane.exclusive else None
+        t.workspace_group = lane.workspace_group if lane.exclusive else ""
         env_path = os.path.join(t.dir, "env.json")
         try:
             env = read_json(env_path)
@@ -4582,6 +4585,9 @@ class Daemon:
                 self.submissions[str(other)] = t.id
             if t.state in FINISHED:
                 continue
+            if t.state in ("starting", "running") and t.workspace_group is None and t.lane in self.cfg.lanes:
+                lane = self.cfg.lanes[t.lane]  # saved before groups were recorded: its group, while its lane is known
+                t.workspace_group = lane.workspace_group if lane.exclusive else ""
             if t.lane not in self.cfg.lanes:
                 t.lane = self.cfg.default_lane
             if t.state == "queued":
@@ -4601,8 +4607,6 @@ class Daemon:
                     t.js = None
             t.cpu_usec_base = None  # count CPU from here; the cgroup's counter started before
             t.observed_gap = True  # it ran unwatched for a while: its peak and after may have been missed
-            if t.workspace_group is None and t.lane in self.cfg.lanes and self.cfg.lanes[t.lane].exclusive:
-                t.workspace_group = self.cfg.lanes[t.lane].workspace_group  # (saved before groups were recorded)
             t.release_stood_at_load = t.release_at is not None and not t.release_revoked
             t.release_open_at_gap = t.release_open_at_gap or t.release_stood_at_load
             if isinstance(t.freeze_asked, list) and len(t.freeze_asked) >= 2 and t.cg:

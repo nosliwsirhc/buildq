@@ -387,6 +387,11 @@ class Admission(DaemonCase):
         grouped = BASE_CONFIG.replace("[lanes.heavy]\n", '[lanes.heavy]\nworkspace_group = "cargo"\n')
         with self.assertRaisesRegex(ValueError, "lane heavy's group is 'cargo'"):
             config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
+        with self.assertRaisesRegex(ValueError, "lane heavy's group is 'cargo'"):  # even with a third lane beside it
+            config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n'
+                   '[lanes.test]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
+        self.assertEqual(config('[lanes.check]\ncores = 2\nworkspace_group = "check"\n').lanes["check"].workspace_group,
+                         "check")  # naming itself: the default, said out loud
 
     def test_a_build_held_for_waiting_longest_holds_its_workspace(self):
         self.with_check_lane()
@@ -401,6 +406,9 @@ class Admission(DaemonCase):
         self.daemon.schedule(self.now + 1)
         self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
         self.assertIn("waited longest", check.reason)
+        self.daemon.cfg.lanes["check"].may_pass_held = True  # even a lane that may pass held room
+        self.daemon.schedule(self.now + 2)
+        self.assertEqual(check.reason_cat, "workspace")
 
     def test_a_regroup_while_builds_run_keeps_the_running_ones_apart(self):
         self.with_check_lane()
@@ -420,7 +428,7 @@ class Admission(DaemonCase):
     def test_a_non_exclusive_lane_blocks_nothing(self):
         tree = self.workdir("tree")
         web = self.submit(("pnpm", "build"), lane="web", cwd=tree)
-        self.assertEqual(web.workspace_group, None)
+        self.assertEqual(web.workspace_group, "")
         test = self.submit(("cargo", "test"), cwd=tree)
         self.assertEqual(self.states(web, test), ["running", "running"])
 

@@ -212,7 +212,8 @@ order and starts every build that fits:
 | Workspace | in an exclusive lane, no other build of that lane or of its `workspace_group` runs in its workspace (its `CARGO_TARGET_DIR`, or its git worktree), and none that has waited longest is held for it; they would only fight over the build directory |
 
 **Order.** A build that has waited `starve_seconds`, or was stopped once to free memory, goes
-first, and the room it needs is held for it, so later builds can't keep passing it (lanes with
+first, and the room it needs, its workspace included, is held for it, so later builds can't keep
+passing it (the workspace binds every lane in its group; for the rest, lanes with
 `may_pass_held` still may). After that, the higher priority first (the lane's plus the ticket's
 own); within a priority, the build whose caller has the fewest builds running (a fair share: one
 session's burst of builds doesn't keep the others waiting), then the build expected to finish
