@@ -9,6 +9,10 @@
   buildq wait   TICKET [--timeout DURATION]        block until it finishes; exit with its exit code
   buildq logs   TICKET [--follow] [--tail N]       its output
   buildq cancel TICKET...                          take it out of the queue, or stop it
+  buildq pause [REASON] | resume                   start nothing new (running builds carry on), or go on
+  buildq report [--since 7d] [--by command|lane|caller] [--json]
+                                                   time, memory and kills per command, from history
+  buildq help agents                               how a coding agent uses the queue
   buildq ping                                      check that the daemon answers
 
 A ticket is a UUID; any unique prefix of four or more characters works in its place.
@@ -23,6 +27,18 @@ Options for submit and run:
   --name TEXT          a name to show in place of the command
   --notify COMMAND     a shell command to run when it finishes (BUILDQ_TICKET, BUILDQ_STATE,
                        BUILDQ_EXIT, BUILDQ_LOG, ... are set)
+  --again              run it even if the same command on the same source is queued, running, or
+                       passed a moment ago
+  --reuse              take an earlier pass of the same command on the same source as this one's
+                       result, even for a command that isn't a plain check
+  --restartable        it is safe to stop and start over from the beginning (it only builds and
+                       tests): if the machine runs short of memory it is queued again, not failed
+
+buildq records the source a build is of: the commit, and a fingerprint of the changes on top. The
+same command on the same source, in the same directory, environment and settings, joins a build of
+it that is queued or running. A plain check (cargo check, clippy or test, dotnet test, tsc --noEmit,
+eslint, vitest run) that passed on the same source within the daemon's reuse_window, with the source
+unchanged while it ran, isn't run again: its earlier result answers (--again runs it anyway).
 
 The build runs in the background with the environment and working directory of the command that
 submitted it, and no stdin. `buildq run` streams its output to stdout and exits with its exit
@@ -51,13 +67,17 @@ from __future__ import annotations
 import argparse
 import collections
 import glob
+import hashlib
 import json
 import os
+import re
 import select
 import shlex
 import signal
 import socket
+import stat
 import struct
+import subprocess
 import sys
 import time
 import uuid
@@ -287,6 +307,17 @@ def print_ticket(row: dict) -> None:
         print(f"  name      {row['name']}")
     print(f"  command   {row['label']}")
     print(f"  in        {short_path(row['cwd'])}")
+    src = row.get("source")
+    if src:
+        print(f"  source    commit {src['commit'][:10]}{' + uncommitted changes' if src.get('dirty') else ''}"
+              f" (fingerprint {src['fingerprint'][:12]})")
+    if row.get("caller"):
+        print(f"  from      {row['caller']}")
+    if row.get("frozen"):
+        print("  paused    to give the machine its memory back; it goes on once there is room")
+    if row.get("requeues"):
+        print(f"  requeued  {row['requeues']} time{'s' if row['requeues'] != 1 else ''}: stopped to free memory, "
+              "then started over")
     if row["state"] in ("starting", "running") and row.get("measured"):
         print(f"  using     {row['cores_now']:.1f} cores, {fmt_size(row['mem_now'])} now; "
               f"peak {fmt_size(row['mem_peak'])}, {row['peak_cores']:.1f} cores")
@@ -314,6 +345,10 @@ def print_overview(s: dict) -> None:
     if b:
         print(f"room for new builds: {max(b['free_cores'], 0):.1f} cores, {fmt_size(max(b['free_mem'], 0))} "
               f"(after {fmt_size(b['growth_reserved'])} held for running builds to grow into)")
+    if s.get("paused"):
+        p = s["paused"]
+        print(f"PAUSED for {fmt_age(s['now'] - (p.get('since') or s['now']))}"
+              f"{': ' + p['reason'] if p.get('reason') else ''}. Nothing new starts until `buildq resume`.")
     print()
     running, queued, recent = s["running"], s["queued"], s.get("recent") or []
     print(f"running {len(running)} of at most {c['max_jobs']}")
@@ -324,7 +359,7 @@ def print_overview(s: dict) -> None:
         else:
             cores = f"{r['cores_now']:.1f}/{r['granted'] or r['est_cores']:g} cores" if r["measured"] else f"~{r['est_cores']:g} cores"
             memory = f"{fmt_size(r['mem_now'])}/{fmt_size(r['est_mem'])}" if r["measured"] else f"~{fmt_size(r['est_mem'])}"
-            use, tag = f"{cores} {memory}", ""
+            use, tag = f"{cores} {memory}", "  [paused: memory is short]" if r.get("frozen") else ""
         print(f"  {r['short']:<9} {r['lane']:<6} {fmt_age(r['elapsed']):>6}  {use:<22} {title(r)}{tag}")
     print(f"queued {len(queued)}")
     for r in queued:
@@ -413,6 +448,7 @@ class Follower:
         self.signals: list[int] = []
         self.last_category = None
         self.hinted = False  # said once that a long wait is better dropped off
+        self.owner = None  # the submission that made the build, when this client made it
         self.last_note = 0.0
         self.daemon_lost_at = None
 
@@ -469,8 +505,14 @@ class Follower:
                          "a cut-off cancels the build; drop a long wait off instead: "
                          f"`{command_for('submit', '<command>')}` prints a ticket to wait on.")
         elif kind == "ticket":
-            previous = self.row["state"]
+            previous, was_frozen = self.row["state"], self.row.get("frozen")
             self.row = message
+            if not self.quiet and message.get("frozen") != was_frozen and message["state"] == "running":
+                note("paused: the machine is short of memory; it goes on where it was once there is room."
+                     if message.get("frozen") else "going on: there is memory again.")
+            if not self.quiet and previous in ("starting", "running") and message["state"] == "queued":
+                note("stopped to free memory, and queued again at the front: it starts from the beginning "
+                     "once there is room. Keep waiting.")
             if previous == "queued" and message["state"] in ("starting", "running") and not self.quiet \
                     and (message.get("waited") or 0) >= 2:
                 note(f"starting after {fmt_age(message['waited'])} in the queue.")
@@ -480,7 +522,7 @@ class Follower:
         if self.channel is None:
             return
         try:
-            self.channel.send({"op": "watch", "ticket": self.row["id"]})
+            self.channel.send({"op": "watch", "ticket": self.row["id"], "submission": self.owner})
         except Lost:
             self.channel.close()
             self.channel = None
@@ -497,8 +539,12 @@ class Follower:
                     return reraise(self.signals[0])
                 if cancel_sent is None:
                     cancel_sent = time.monotonic()
-                    if request({"op": "cancel", "ticket": self.row["id"]}) is None:
+                    reply = request({"op": "cancel", "ticket": self.row["id"], "submission": self.owner})
+                    if reply is None:
                         note(f"couldn't reach the daemon to cancel {self.row['short']}; it may still run")
+                        return reraise(self.signals[0])
+                    if reply.get("kept"):
+                        note(f"{self.row['short']} carries on: other submissions of the same build wait for it")
                         return reraise(self.signals[0])
                     if not self.quiet:
                         note(f"cancelling {self.row['short']}")
@@ -572,6 +618,305 @@ def current_umask() -> int:
     return mask
 
 
+GITHUB_REMOTE = re.compile(r"(?:git@github\.com:|https://(?:[^@/]+@)?github\.com/|ssh://git@github\.com/)"
+                           r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+
+
+SOURCE_BYTES = 64 << 20  # tracked changes plus untracked contents hashed at most; past it, no record
+SOURCE_FILES = 20000  # untracked or ignored files looked at, at most
+
+
+def _find_prctl():
+    try:
+        import ctypes
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except (ImportError, OSError, AttributeError):  # a Python without ctypes, a libc without prctl
+        return None
+
+
+PRCTL = _find_prctl()  # looked up once, here, not in each child
+
+
+def die_with(parent: int):
+    """For a child about to exec: be killed if `parent` dies (PR_SET_PDEATHSIG), so a git started for
+    a fingerprint never outlives a helper killed for taking too long; and if it died already, between
+    the fork and here, go at once."""
+    def setup() -> None:
+        if PRCTL is not None:
+            try:
+                PRCTL(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+            except Exception:
+                pass
+        if os.getppid() != parent:
+            os._exit(1)
+    return setup
+
+
+class GitReader:
+    """Runs git under one deadline: output is read as it comes (select, then os.read), and a git
+    that overruns, or that the reader stops, is killed with its whole process group."""
+
+    BASE = ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]
+
+    def __init__(self, limit: float):
+        self.deadline = time.monotonic() + limit
+        self.env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"}
+
+    def left(self) -> float:
+        return self.deadline - time.monotonic()
+
+    def stream(self, where: str, args: list[str], on_chunk) -> bool:
+        """Feed git's output to on_chunk as it arrives; False on an error, at the deadline, or when
+        on_chunk returns False."""
+        if self.left() <= 0:
+            return False
+        try:
+            proc = subprocess.Popen([*self.BASE, "-C", where, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, env=self.env, start_new_session=True,
+                                    preexec_fn=die_with(os.getpid()))
+        except (OSError, subprocess.SubprocessError):
+            return False
+        fd, ok = proc.stdout.fileno(), True
+        try:
+            while True:
+                left = self.left()
+                if left <= 0 or not select.select([fd], [], [], left)[0]:
+                    ok = False
+                    break
+                chunk = os.read(fd, 1 << 16)
+                if not chunk:
+                    break
+                if on_chunk(chunk) is False:
+                    ok = False
+                    break
+        except OSError:
+            ok = False
+        finally:
+            proc.stdout.close()
+            if not ok:
+                self.kill(proc)
+            try:
+                proc.wait(max(0.1, self.left()))
+            except subprocess.TimeoutExpired:
+                self.kill(proc)
+                proc.wait()
+                ok = False
+        return ok and proc.returncode == 0
+
+    @staticmethod
+    def kill(proc) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    def output(self, where: str, args: list[str], limit: int = 1 << 20) -> bytes | None:
+        parts, size = [], [0]
+
+        def take(chunk):
+            size[0] += len(chunk)
+            parts.append(chunk)
+            return size[0] <= limit
+        return b"".join(parts) if self.stream(where, args, take) else None
+
+    def names(self, where: str, args: list[str], cap: int = SOURCE_FILES) -> list[bytes] | None:
+        """NUL-separated names from `git ls-files -z ...`, giving up past `cap` of them."""
+        names, rest = [], [b""]
+
+        def take(chunk):
+            items = (rest[0] + chunk).split(b"\0")
+            rest[0] = items.pop()
+            names.extend(i for i in items if i)
+            return len(names) <= cap
+        if not self.stream(where, ["ls-files", "-z", *args], take):
+            return None
+        if rest[0]:
+            names.append(rest[0])
+        return names if len(names) <= cap else None
+
+
+def source_of(cwd: str, limit: float = 5.0) -> dict | None:
+    """The source a build is of, as far as git can see it: the commit checked out, and a fingerprint
+    of that commit plus everything on top of it: the diff of tracked files, the contents, modes and
+    link targets of untracked files, and the names, sizes, modes and times of ignored `.env*` files
+    (other ignored files are build output and caches, which a build rewrites). It writes nothing
+    into the repository and runs no content filter.
+
+    None (so nothing is matched against it) outside a git worktree; in a repository at / or the home
+    directory; where an attributes file sets a content filter (LFS, git-crypt, nbstripout, which
+    `git diff` would run); with files marked skip-worktree or assume-unchanged (whose changes git
+    doesn't show); with a submodule, or a repository or worktree inside that isn't ignored;
+    past SOURCE_BYTES or SOURCE_FILES; or past `limit` seconds. BUILDQ_SOURCE=off skips it."""
+    if os.environ.get("BUILDQ_SOURCE", "").lower() in ("0", "off", "no", "false"):
+        return None
+    git = GitReader(limit)
+    top = git.output(cwd, ["rev-parse", "--show-toplevel"])
+    if not top:
+        return None
+    top = top.decode(errors="surrogateescape").strip()
+    if top in ("/", os.path.expanduser("~")):  # a dotfiles repository isn't a project's source
+        return None
+    head = git.output(top, ["rev-parse", "--verify", "-q", "HEAD"])
+    if not head:
+        return None
+    commit = head.decode().strip()
+    root = top.encode(errors="surrogateescape")
+    untracked = git.names(top, ["--others", "--exclude-standard"])
+    ignored = git.names(top, ["--others", "--ignored", "--exclude-standard", "--directory"])
+    if untracked is None or ignored is None:
+        return None
+    # Every tracked file, as it streams ("H 100644 sha 0<TAB>path"), keeping only the directories they
+    # are in. No record with a file git hides the changes of (a lowercase tag is assume-unchanged, S
+    # is skip-worktree), with a submodule (mode 160000: git would run a status, and its filters,
+    # inside it), or with a tracked .gitattributes missing from the tree (git then reads the index's).
+    folders, attributes, rest, refused = {b""}, [], [b""], [False]
+
+    def take_tags(chunk):
+        records = (rest[0] + chunk).split(b"\0")
+        rest[0] = records.pop()
+        for record in records:
+            head, _, path = record.partition(b"\t")
+            if re.match(rb"([a-z]|S) ", head) or head[2:8] == b"160000":
+                refused[0] = True
+                return False
+            folders.add(os.path.dirname(path))
+            if os.path.basename(path) == b".gitattributes":
+                attributes.append(path)
+        return True
+    if not git.stream(top, ["ls-files", "-z", "-v", "-s"], take_tags) or refused[0]:
+        return None
+    if any(not os.path.lexists(os.path.join(root, a)) for a in attributes):
+        return None
+    if filters_in_use(git, top, root, folders):
+        return None
+    digest = hashlib.sha256(commit.encode() + b"\0")
+    budget, changed = [SOURCE_BYTES], [False]
+
+    def take_diff(chunk):
+        budget[0] -= len(chunk)
+        if budget[0] < 0:
+            return False  # too big
+        changed[0] = True
+        digest.update(chunk)
+        return True
+    if not git.stream(top, ["diff", "HEAD", "--binary", "--no-ext-diff", "--no-textconv", "--no-color"], take_diff):
+        return None
+    loose = False  # untracked files of this tree's own (nested repositories aren't)
+    for name in untracked:
+        if git.left() <= 0:
+            return None
+        path = os.path.join(root, name)
+        if name.endswith(b"/"):
+            # A repository or worktree inside this one, which git lists as one entry: a check run
+            # here may read it (eslint ., vitest), and its changes wouldn't be in this record.
+            # (Checking each one's status costs seconds; ignore it in .git/info/exclude instead.)
+            return None
+        loose = True
+        try:
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                content = os.readlink(path)
+            elif stat.S_ISREG(st.st_mode):
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    while block := f.read(1 << 20):
+                        budget[0] -= len(block)
+                        if budget[0] < 0 or git.left() <= 0:
+                            return None
+                        h.update(block)
+                content = h.digest()
+            else:
+                content = b""  # a pipe or a device: its mode is all there is to know
+            digest.update(b"u\0" + name + b"\0" + oct(st.st_mode).encode() + b"\0" + content + b"\0")
+        except OSError:
+            digest.update(b"u\0" + name + b"\0gone\0")
+    untracked_changes = loose
+    for name in ignored:  # .env files, by name, size, mode and time; ignored directories are build output
+        if name.endswith(b"/") or not os.path.basename(name).startswith(b".env"):
+            continue
+        try:
+            st = os.lstat(os.path.join(root, name))
+            digest.update(b"i\0" + name + b"\0" + f"{st.st_size}:{st.st_mode:o}:{st.st_mtime_ns}".encode() + b"\0")
+        except OSError:
+            digest.update(b"i\0" + name + b"\0gone\0")
+    remote = None
+    url = git.output(top, ["remote", "get-url", "origin"])
+    if url:
+        match = GITHUB_REMOTE.match(url.decode(errors="replace").strip())
+        remote = match.group(1) if match else None
+    return {"repo": top, "commit": commit, "dirty": bool(changed[0] or untracked_changes),
+            "fingerprint": digest.hexdigest()[:32], "remote": remote}
+
+
+def filters_in_use(git: GitReader, top: str, root: bytes, folders: set[bytes]) -> bool:
+    """Whether an attributes file git reads for the tracked files sets a content filter (filter=...),
+    which `git diff` would run on every changed file (and LFS's writes into .git): a .gitattributes in
+    any directory holding tracked files or above it, tracked or not, ignored or not;
+    .git/info/attributes; the global one; the system one. Not knowing counts as yes, and so does an
+    attributes file that isn't a plain file (a pipe would block)."""
+    if os.environ.get("GIT_ATTR_SOURCE") or git.output(top, ["config", "--get", "attr.tree"]):
+        return True  # attributes read from a tree: more than the files here
+    info = git.output(top, ["rev-parse", "--git-path", "info/attributes"])
+    if info is None:
+        return True
+    dirs = set()
+    for folder in folders:  # and every directory above each
+        while True:
+            dirs.add(folder)
+            if not folder:
+                break
+            folder = os.path.dirname(folder)
+    in_tree = {os.path.join(root, d, b".gitattributes") for d in dirs}
+    paths = sorted(in_tree) + [os.path.join(root, info.strip())]
+    configured = git.output(top, ["config", "--path", "--get", "core.attributesFile"])  # ~ expanded
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    if configured is None:  # not set: the default global file
+        paths.append(os.path.join(home, "git", "attributes"))
+    elif configured.strip():  # (set empty, there is none)
+        paths.append(os.path.join(root, configured.strip()))  # relative to the top
+    if os.environ.get("GIT_ATTR_NOSYSTEM", "").lower() not in ("1", "true", "yes", "on"):
+        paths.append("/etc/gitattributes")
+    for path in paths:
+        if git.left() <= 0:
+            return True
+        try:  # in the tree, a symlink isn't followed (git doesn't, and reads the index's copy instead)
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | (os.O_NOFOLLOW if path in in_tree else 0))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return True
+            if re.search(rb"(^|\s)filter=", os.read(fd, 1 << 20), re.M):
+                return True
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
+    return False
+
+
+def caller() -> str | None:
+    """Who is submitting, for fair shares: BUILDQ_CALLER if set, else the agent session (Claude
+    Code's session, a Codex or T3 thread), else the unit this client runs in (a CI runner's
+    service, a terminal's scope). Agents that share a terminal or tmux server and set none of these
+    can set BUILDQ_CALLER apart."""
+    for name in ("BUILDQ_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "T3CODE_THREAD_ID"):
+        named = os.environ.get(name, "").strip()
+        if named:
+            return named[:200]
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    leaf = line[3:].strip().rsplit("/", 1)[-1]
+                    return leaf or None
+    except OSError:
+        pass
+    return None
+
+
 def submit_message(args, command: list[str], watch: bool, submission: str) -> dict:
     try:
         cwd = os.getcwd()
@@ -581,7 +926,35 @@ def submit_message(args, command: list[str], watch: bool, submission: str) -> di
     return {"op": "submit", "submission": submission, "argv": command, "cwd": cwd, "env": dict(os.environ),
             "lane": args.lane, "attach": watch, "rlimits": rlimits(), "umask": current_umask(),
             "cores": args.cores, "mem": args.mem, "priority": args.priority, "timeout": args.timeout,
-            "name": args.name, "notify": args.notify, "watch": watch}
+            "name": args.name, "notify": args.notify, "watch": watch, "caller": caller(),
+            "source": source_of(cwd), "again": bool(args.again), "reuse": True if args.reuse else None,
+            "restartable": bool(args.restartable)}
+
+
+def again_hint() -> str:
+    wrapper = os.environ.get("BUILDQ_AS", "").strip()
+    return f"{wrapper} --again <command>" if wrapper else "buildq run --again -- <command>"
+
+
+def reuse_hint() -> str:
+    wrapper = os.environ.get("BUILDQ_AS", "").strip()
+    return f"{wrapper} --reuse <command>" if wrapper else "buildq run --reuse -- <command>"
+
+
+def explain_outcome(reply: dict) -> None:
+    """Say how the daemon answered a submission that matched an earlier build of the same source."""
+    if reply.get("joined"):
+        note(f"the same command on the same source is already {reply['state']} as ticket {reply['short']}: "
+             f"this is that build (`{again_hint()}` starts a separate one).")
+    elif reply.get("reused"):
+        ago = fmt_age(time.time() - (reply.get("ended") or time.time()))
+        note(f"this exact source passed this command {ago} ago (ticket {reply['short']}); that result answers "
+             f"this one, and nothing runs. `{again_hint()}` runs it anyway.")
+    elif reply.get("passed_before"):
+        before = reply["passed_before"]
+        ago = fmt_age(time.time() - (before.get("ended") or time.time()))
+        note(f"this exact source passed this command {ago} ago (ticket {before.get('short')}); it runs again "
+             f"because it isn't a plain build or test. `{reuse_hint()}` would take that result instead.")
 
 
 def the_command(args) -> list[str] | None:
@@ -622,7 +995,7 @@ def inside_a_build() -> bool:
         return False
     try:
         with open("/proc/self/cgroup") as f:
-            if f"/buildq-{job}.service" in f.read():
+            if re.search(rf"/buildq-{re.escape(job)}(-r\d+)?\.service(/|$)", f.read(), re.M):
                 return True
     except OSError:
         pass
@@ -661,6 +1034,9 @@ def cmd_submit(args) -> int:
     print(reply["id"])
     detail = f": {reply['reason']}" if reply["state"] == "queued" and reply.get("reason") else ""
     note(f"ticket {reply['id']} [{reply['lane']}] {state_text(reply)}{detail}")
+    explain_outcome(reply)
+    if reply["state"] in FINISHED:
+        return 0
     waiting_for = reply.get("waiting_for")
     if waiting_for == "too-big":
         note(f"it can't fit on this machine as it is: cancel it (`{command_for('cancel', reply['short'])}`) "
@@ -726,14 +1102,33 @@ def cmd_run(args) -> int:
         channel.close()
         note(reply.get("error", "the daemon refused the build"))
         return 2
-    note(f"ticket {reply['id']} [{reply['lane']}]; Ctrl-C cancels it, "
+    explain_outcome(reply)
+    if reply.get("reused"):
+        channel.close()
+        offsets = reply.get("attempt_offsets") or {}
+        for name, out in (("stdout.log", sys.stdout.buffer), ("stderr.log", sys.stderr.buffer)):
+            try:
+                with open(os.path.join(reply["dir"], name), "rb") as f:
+                    f.seek(int(offsets.get(name) or 0))  # the attempt that passed, not one stopped for memory
+                    while chunk := f.read(1 << 20):
+                        out.write(chunk)
+                out.flush()
+            except OSError:
+                pass
+        note(summary_line(reply))
+        return reply["exit"] if isinstance(reply.get("exit"), int) else 0
+    shared = reply.get("joined") or (reply.get("joiners") or 0) > 0
+    note(f"ticket {reply['id']} [{reply['lane']}]; Ctrl-C "
+         f"{'stops following it (others wait for it too)' if shared else 'cancels it'}, "
          f"`{command_for('status', reply['short'])}` shows it from anywhere.")
     if (reply.get("expected") or 0) >= LONG_RUN:
         note(f"this command usually takes {fmt_age(reply['expected'])}. If what runs it has a shorter time "
              "limit (a tool call), it is cut off and the build cancelled; drop a long build off instead: "
              f"`{command_for('submit', '<command>')}` prints a ticket, then "
              f"`{command_for('wait', '<ticket> --timeout 9m')}`.")
+    # Ctrl-C tells the daemon this submission has gone; it stops the build only if nobody else waits.
     follower = Follower(reply, channel, stream=True, cancel_on_signal=True)
+    follower.owner = submission
     follower.split = True  # the build's stdout to stdout, its stderr to stderr
     follower.signals = pending  # an interrupt that already came cancels it straight away
     return follower.run()
@@ -766,7 +1161,27 @@ def cmd_wait(args) -> int:
     channel, row, failed = open_watch(args.ticket)
     if failed is not None:
         return failed
-    return Follower(row, channel, stream=False, cancel_on_signal=False, quiet=args.quiet).run(args.timeout)
+    follower = Follower(row, channel, stream=False, cancel_on_signal=False, quiet=args.quiet)
+    code = follower.run(args.timeout)
+    final = follower.row
+    if not args.quiet and final.get("state") in ("failed", "lost") and final.get("log"):
+        show_tail(final["log"], 20, final["short"])
+    return code
+
+
+def show_tail(path: str, lines: int, short: str) -> None:
+    """The end of a failed build's output, so the error is here without asking for the log."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(tail_offset(path, lines))
+            data = f.read()
+    except OSError:
+        return
+    if not data.strip():
+        return
+    note(f"the last {lines} lines of its output (`{command_for('logs', short)}` has all of it):")
+    sys.stderr.buffer.write(data if data.endswith(b"\n") else data + b"\n")
+    sys.stderr.flush()
 
 
 def cmd_logs(args) -> int:
@@ -822,7 +1237,7 @@ def tail_offset(path: str, lines: int) -> int:
 def cmd_cancel(args) -> int:
     status = 0
     for ref in args.tickets:
-        reply = request({"op": "cancel", "ticket": ref})
+        reply = request({"op": "cancel", "ticket": ref, "all": bool(args.all)})
         if reply is None:
             return unreachable()
         if reply.get("type") != "ticket":
@@ -871,6 +1286,132 @@ def cmd_list(args) -> int:
     return 0
 
 
+def cmd_pause(args) -> int:
+    reply = request({"op": "pause", "reason": " ".join(args.reason) or None})
+    if reply is None:
+        return unreachable()
+    print("paused: running builds carry on, nothing new starts until `buildq resume`")
+    return 0
+
+
+def cmd_resume(_args) -> int:
+    reply = request({"op": "resume"})
+    if reply is None:
+        return unreachable()
+    print("resumed: queued builds start as there is room")
+    return 0
+
+
+def median(values: list[float]) -> float | None:
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def cmd_report(args) -> int:
+    """What the queue's record of finished builds says, per command (or lane, or caller): how often
+    it ran and failed, how long it took and waited, its peak memory, how often it went over its
+    MemoryHigh, how long it waited on memory, and how often it was killed or stopped for memory."""
+    since = time.time() - args.since
+    groups: dict[str, list[dict]] = collections.defaultdict(list)
+    base = os.path.join(state_dir(), "outcomes.jsonl")
+    for path in (base + ".1", base):
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                r = json.loads(line)
+                if not isinstance(r, dict) or float(r.get("t") or 0) < since:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            key = str(r.get("key") or "?")
+            if args.by == "command":
+                repo, _, rest = key.partition("|")
+                name = f"{rest.partition('|')[2] or key}  ({repo})" if repo else key
+            else:
+                name = r.get(args.by)
+            groups[str(name or "(unknown)")].append(r)
+
+    def num(runs, field):
+        out = []
+        for r in runs:
+            try:
+                if r.get(field) is not None and not isinstance(r.get(field), bool):
+                    out.append(float(r[field]))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    rows = []
+    for name, runs in groups.items():
+        walls = num(runs, "wall")
+        rows.append({
+            "name": name, "runs": len(runs), "failed": sum(1 for r in runs if r.get("state") != "succeeded"),
+            "killed_for_memory": sum(1 for r in runs if r.get("oom") or r.get("stopped_for_memory")),
+            "requeues": int(sum(num(runs, "requeues"))),
+            "over_memory_high": sum(1 for r in runs if r.get("mem_high_all", r.get("mem_high"))),
+            "median_seconds": median(walls), "total_seconds": sum(walls),
+            "median_wait_seconds": median(num(runs, "waited")), "peak_memory": max(num(runs, "peak_mem"), default=0),
+            "memory_wait_seconds": sum(num(runs, "mem_wait_some")),
+            "core_hours": sum(num(runs, "cpu_seconds")) / 3600,
+        })
+    rows.sort(key=lambda r: r["total_seconds"], reverse=True)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print(f"no finished builds recorded in the last {fmt_age(args.since)}")
+        return 0
+    print(f"the last {fmt_age(args.since)}, by {args.by}, most time first")
+    print(f"{'RUNS':>5} {'FAILED':>6} {'MEDIAN':>7} {'WAITED':>7} {'PEAK':>6} {'HIGH':>5} {'MEMWAIT':>8} "
+          f"{'KILLED':>6} {'AGAIN':>5}  {args.by.upper()}")
+    for r in rows[: args.top]:
+        waited = fmt_age(r["median_wait_seconds"]) if r["median_wait_seconds"] is not None else "-"
+        print(f"{r['runs']:>5} {r['failed']:>6} {fmt_age(r['median_seconds']):>7} {waited:>7} "
+              f"{fmt_size(r['peak_memory']):>6} {r['over_memory_high']:>5} {fmt_age(r['memory_wait_seconds']):>8} "
+              f"{r['killed_for_memory']:>6} {r['requeues']:>5}  {r['name']}")
+    print("FAILED: didn't succeed (failed, cancelled, timed out or lost). HIGH: went over its MemoryHigh, where the "
+          "kernel slows it. MEMWAIT: time spent waiting on memory in all. KILLED: killed for memory, or stopped to "
+          "free it. AGAIN: times stopped for memory and started over.")
+    return 0
+
+
+def skill_file() -> str | None:
+    """The agents' page: the installed skill (with this machine's notes), or the one beside this program."""
+    data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(data, "buildq", "skill", "buildq", "SKILL.md"),
+                 os.path.join(here, "..", "skills", "buildq", "SKILL.md")):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def cmd_help(args) -> int:
+    if args.topic != "agents":
+        note("the help topic is `agents`; `buildq --help` has the rest")
+        return 2
+    path = skill_file()
+    if path is None:
+        note("the agents' page isn't installed; it is skills/buildq/SKILL.md in the buildq repository")
+        return 1
+    with open(path) as f:
+        sys.stdout.write(f.read())
+    return 0
+
+
+def cmd_source(args) -> int:
+    """For the daemon: the source record of a directory, as JSON (null if there is none)."""
+    print(json.dumps(source_of(args.directory)))
+    return 0
+
+
 def cmd_ping(_args) -> int:
     reply = request({"op": "ping"})
     if reply is None or reply.get("type") != "pong":
@@ -892,6 +1433,13 @@ def main(argv=None) -> int:
         p.add_argument("--timeout", type=parse_duration, help="stop the build after this long (for example 45m)")
         p.add_argument("--name", help="a name to show in place of the command")
         p.add_argument("--notify", metavar="COMMAND", help="a shell command to run when the build finishes")
+        again = p.add_mutually_exclusive_group()
+        again.add_argument("--again", action="store_true",
+                           help="run it even if the same command on the same source ran or is running")
+        again.add_argument("--reuse", action="store_true",
+                           help="take an earlier pass on the same source as the result, for any command")
+        p.add_argument("--restartable", action="store_true",
+                       help="safe to stop and start over from the beginning if the machine runs short of memory")
         p.add_argument("command", nargs=argparse.REMAINDER, help="the command and its arguments")
 
     build_options(sub.add_parser("submit", help="queue a build; prints its ticket"))
@@ -912,10 +1460,25 @@ def main(argv=None) -> int:
     logs.add_argument("--tail", "-n", type=int, help="start with the last N lines")
     cancel = sub.add_parser("cancel", help="take builds out of the queue, or stop them")
     cancel.add_argument("tickets", nargs="+")
+    cancel.add_argument("--all", action="store_true",
+                        help="stop a build even though other submissions of the same build wait for it")
+    pause = sub.add_parser("pause", help="start nothing new until `buildq resume`; running builds carry on")
+    pause.add_argument("reason", nargs="*", help="why, for everyone who sees the queue waiting")
+    sub.add_parser("resume", help="start queued builds again")
+    report = sub.add_parser("report", help="time, memory and kills per command, from the history")
+    report.add_argument("--since", type=parse_duration, default=7 * 86400, help="how far back (default 7d)")
+    report.add_argument("--by", choices=("command", "lane", "caller"), default="command")
+    report.add_argument("--top", type=int, default=25, help="show this many (default 25)")
+    report.add_argument("--json", action="store_true")
+    helper = sub.add_parser("help", help="`buildq help agents`: how a coding agent uses the queue")
+    helper.add_argument("topic", nargs="?", default="agents")
     sub.add_parser("ping", help="check that the daemon answers")
+    source = sub.add_parser("source", help=argparse.SUPPRESS)
+    source.add_argument("directory")
     args = parser.parse_args(argv)
     handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
-                "logs": cmd_logs, "cancel": cmd_cancel, "ping": cmd_ping}
+                "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
+                "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source}
     return handlers[args.cmd](args)
 
 

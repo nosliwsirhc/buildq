@@ -37,6 +37,35 @@ your tool call's time limit.
   to the caller. After a timeout, wait on the ticket. Never start the same build again.
 - Commands run inside a build (a script the build runs) go straight through: they share the
   build's turn. `buildq submit` refuses there.
+- A script that only builds and runs tests can be marked `--restartable`. If the machine runs
+  short of memory, it is then started over instead of failed.
+- When a dropped-off build fails, `buildq wait` ends with its last 20 lines of output: the error
+  is usually there, with no need to ask for the log.
+
+## The same source builds once
+
+The queue records the commit you build from, and a fingerprint of your changes on top
+(`buildq status <ticket>` shows "commit 4f1c2a0 + uncommitted changes"). Send the same command on
+the same source again, from the same directory, with the same environment and options, and:
+
+- **It is queued or running already:** you get its ticket and follow that build. That is the
+  build to wait on. With `run`, Ctrl-C then stops your following; the build goes on for whoever else
+  waits for it. `buildq cancel` won't stop a shared build unless you add `--all`: only do that if
+  you know nobody else needs it.
+- **A check passed on it in the last two hours** (cargo check, clippy or test, dotnet test,
+  `tsc --noEmit`, eslint, `vitest run`): you get that result and its output at once, and nothing
+  runs. Change the source, and it runs.
+- **A build that makes files, or a script, passed on it** (cargo build, a bundle, `run-tests.sh`):
+  it runs again, and the queue says it passed before. Its output may have changed since, and a
+  script might do anything.
+
+To run it anyway (a flaky test you are checking, a database that changed), add `--again`. To take
+an earlier pass of a script on the same source, add `--reuse`. Don't add `--again` by habit:
+running the same suite twice on the same source is exactly what this saves.
+
+The fingerprint covers what git sees in the repository. It doesn't cover path dependencies
+outside it, your toolchain, or ignored files other than `.env*`. After changing one of those, use
+`--again`.
 
 ## Don't
 
@@ -67,6 +96,12 @@ your tool call's time limit.
 | `waited on memory …s …; it went over its MemoryHigh` | It ran, but was slowed at its memory limit. | Nothing. Mention it to the owner if a command keeps doing it. |
 | `buildq: refusing to compile <crate> outside the build queue` | cargo ran outside a queued build, here where Rust compiles must be queued. | Run the same cargo command through the queue. |
 | `the queue daemon isn't answering …` | The daemon is down. A `run` waits for it. | Check `systemctl --user status buildq`. Tell the owner if it stays down. |
+| `the queue is paused (…)` | The owner paused it (a reboot, maintenance). Running builds carry on. | Wait, or drop the build off and check back later. Don't resume it yourself. |
+| `paused: the machine is short of memory` | Other work took the memory. Your build is frozen where it was. | Wait. It goes on by itself. |
+| `stopped to free memory, and queued again at the front` | The machine ran very short. Your build was stopped, and starts over from the beginning once there is room. | Keep waiting on the same ticket. Don't submit it again. |
+| `stopped to free memory … It isn't started again by itself` | The machine ran very short. It was a script or a push, and starting it over might repeat what it did. | Check what it had done, then run it again. If it only builds and tests, submit it with `--restartable` next time. |
+| `the same command on the same source is already running as ticket …` | Someone (maybe you, before a timeout) started this exact build. | Wait on that ticket. |
+| `this exact source passed this command … ago` | It already passed on this source. | Nothing to do. `--again` only if you have a reason. |
 
 ## Exit codes
 
@@ -83,6 +118,7 @@ build may be queued already.
 - `buildq status`: the machine's load, what runs, what waits and why, recent results.
 - `buildq list`: every ticket.
 - `buildq status <ticket>`: one ticket. A short prefix of the ticket works.
+- `buildq help agents`: this page, for an agent without skills.
 
 The command decides its lane: front-end tools, Rust, .NET and so on, as this machine's
 configuration says. A lane sets a build's priority, cores and memory cap.

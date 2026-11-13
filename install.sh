@@ -16,7 +16,8 @@
 #   ./install.sh --skill         also give coding agents (Claude Code, Codex, and agents that read
 #                                ~/.agents/skills) a "buildq" skill on using the queue, with this
 #                                machine's own notes from ~/.config/buildq/agents.md added at its end;
-#                                run it again after changing those notes
+#                                run it again after changing those notes. (The page itself is always
+#                                installed: `buildq help agents` prints it.)
 #   ./install.sh --uninstall     stop and remove it all (keeps ~/.config/buildq and ~/.local/state/buildq)
 #
 # PREFIX (default ~/.local) sets where the programs go.
@@ -51,9 +52,8 @@ our_link() {
   [[ -r "$skill_list" ]] && grep -qxF "$link"$'\t'"$target" "$skill_list"
 }
 
-# The skill for coding agents, with this machine's notes at its end, linked where agents look.
-install_skill() {
-  local home link
+# The skill for coding agents, with this machine's notes at its end (`buildq help agents` prints it).
+write_skill() {
   mkdir -p "$skilldir"
   {
     cat "$src/skills/buildq/SKILL.md"
@@ -63,6 +63,12 @@ install_skill() {
     fi
   } >"$skilldir/SKILL.md.new.$$"
   mv -f "$skilldir/SKILL.md.new.$$" "$skilldir/SKILL.md"
+}
+
+# ... and linked where agents look for skills.
+install_skill() {
+  local home link
+  write_skill
   for home in "${skill_homes[@]}"; do
     [[ -d "$home" ]] || continue
     link=$home/skills/buildq
@@ -191,9 +197,11 @@ fi
 for option in "$@"; do
   case $option in --shims | --skill | --rustc-guard | --rustc-guard=*) ;; *) say "unknown option $option"; exit 2 ;; esac
 done
+skill_linked=no
 for option in "$@"; do
-  if [[ $option == --skill ]]; then install_skill; fi
+  if [[ $option == --skill ]]; then install_skill; skill_linked=yes; fi
 done
+[[ $skill_linked == yes ]] || write_skill
 if ! have_systemd; then
   say "no systemd user session here. Start the daemon yourself ($bindir/buildqd &), then run install.sh again with any options."
   exit 0
