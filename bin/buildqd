@@ -272,7 +272,7 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 class Lane:
     KEYS = {"cores", "min_cores", "max_cores", "mem", "min_mem", "properties", "may_pass_held", "jobserver",
             "exclusive", "timeout", "priority", "extra_jobs", "test_threads", "waits_for_cpu",
-            "release_after_peak"}
+            "release_after_peak", "workspace_group"}
 
     def __init__(self, name: str, raw, mem_total: int, ncpu: int):
         if not isinstance(raw, dict):
@@ -315,6 +315,13 @@ class Lane:
             raise ValueError(f"lanes.{name}.jobserver must be true, false or \"tools\"")
         self.jobserver = modes[mode]  # "tools": only for cargo, make and ninja, which are known to speak it
         self.exclusive = boolean(raw.get("exclusive", True), f"lanes.{name}.exclusive")
+        # Exclusive lanes with the same group run one build per workspace between them (a cargo
+        # check and a cargo test sharing a target folder would only wait on cargo's lock).
+        group = raw.get("workspace_group", name)
+        if not isinstance(group, str) or not group:
+            raise ValueError(f"lanes.{name}.workspace_group must be a name")
+        self.workspace_group = group
+        self.group_given = "workspace_group" in raw and group != name  # (naming itself is the default)
         # RUST_TEST_THREADS and NEXTEST_TEST_THREADS win over a project's own settings (a suite
         # pinned to one thread for a shared database, say), so they are set only where asked.
         self.test_threads = boolean(raw.get("test_threads", False), f"lanes.{name}.test_threads")
@@ -332,7 +339,7 @@ class Lane:
                 "min_mem": self.min_mem, "properties": self.properties, "may_pass_held": self.may_pass_held,
                 "jobserver": self.jobserver, "exclusive": self.exclusive, "timeout": self.timeout,
                 "priority": self.priority, "extra_jobs": self.extra_jobs, "waits_for_cpu": self.waits_for_cpu,
-                "release_after_peak": self.release_after_peak}
+                "release_after_peak": self.release_after_peak, "workspace_group": self.workspace_group}
 
 
 class Config:
@@ -388,6 +395,21 @@ class Config:
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
+        for lane in self.lanes.values():  # a group that names a lane must be that lane's group
+            named = self.lanes.get(lane.workspace_group)
+            if lane.group_given and named is not None and named is not lane and named.workspace_group != lane.workspace_group:
+                raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r}: lane {named.name}'s "
+                                 f"group is {named.workspace_group!r}: use that")
+        for lane in self.lanes.values():
+            if not lane.group_given:
+                continue
+            others = [o for o in self.lanes.values() if o is not lane and o.workspace_group == lane.workspace_group]
+            if not others:
+                raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r} is shared with no other "
+                                 "lane (to join a lane's group, name that lane or its group)")
+            if any(not o.exclusive for o in [lane, *others]):
+                raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r}: every lane in a group "
+                                 "must be exclusive")
         self.default_lane = str(d["default_lane"])
         if self.default_lane not in self.lanes:
             raise ValueError(f"default_lane {self.default_lane!r} is not in lanes {sorted(self.lanes)}")
@@ -2376,7 +2398,7 @@ class Ticket:
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
-               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci",
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group", "group_lane",
                "waited_by", "wait_mark", "peak_at", "tail", "released", "release_at", "release_hold",
                "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
                "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
@@ -2448,6 +2470,10 @@ class Ticket:
         self.dedupe = None  # same source, command, directory, lane and environment: the same build
         self.caller = None  # the unit its client ran in: a session, a CI runner
         self.from_ci = False  # submitted from a GitHub Actions job, which reports its own result
+        # Its lane's workspace_group when it started, kept across reloads: "" for a non-exclusive
+        # lane (no group); None when unknown (saved before groups were recorded).
+        self.workspace_group: str | None = None
+        self.group_lane: str | None = None  # the lane it started in: it also holds that lane's group as it is now
         self.waited_by: dict[str, float] = {}  # seconds queued, by the reason it waited
         self.wait_mark: float | None = None  # when that was last added up
         self.peak_at = 0.0  # seconds into this attempt when it reached mem_peak (time paused not counted)
@@ -2561,6 +2587,8 @@ class Ticket:
         t.release_revoked = t.release_revoked is True
         t.release_breach = t.release_breach is True
         t.release_open_at_gap = t.release_open_at_gap is True
+        t.group_lane = t.group_lane if isinstance(t.group_lane, str) else None
+        t.workspace_group = t.workspace_group if isinstance(t.workspace_group, str) else None
         t.observed_gap = t.observed_gap is True
         t.write_dirs = [r for r in (within_home(d) for d in t.write_dirs if isinstance(d, str))
                         if r][:4] if isinstance(t.write_dirs, list) else []
@@ -3854,7 +3882,17 @@ class Daemon:
         count = len(running)
         per_lane = collections.Counter(t.lane for t in running)
         held_mem = held_cpu = 0.0
-        busy_workspaces = {(t.lane, t.workspace) for t in running if t.workspace}
+        busy_workspaces: dict[tuple[str, str], Ticket] = {}
+        for t in running:
+            if not t.workspace:
+                continue
+            # Under the group it started with, and the group the lane it started in has now (a reload
+            # may have regrouped it); a lane removed since holds only the group it started with.
+            groups = {t.workspace_group} if isinstance(t.workspace_group, str) and t.workspace_group else set()
+            if t.group_lane in cfg.lanes and cfg.lanes[t.group_lane].exclusive:
+                groups.add(cfg.lanes[t.group_lane].workspace_group)
+            for group in groups:
+                busy_workspaces[(group, t.workspace)] = t
         if self.paused is not None:
             why = self.paused.get("reason") or "no reason given"
             for t in self.queue(now):
@@ -3884,8 +3922,12 @@ class Daemon:
                         if floor > cfg.disk_floor else fmt_size(floor))
                 reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
                                          f"(disk_floor is {said})"), False
-            elif lane.exclusive and (t.lane, t.workspace) in busy_workspaces:
-                reason, holds = ("workspace", "another build in the same workspace is running; they would "
+            elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces:
+                holder = busy_workspaces[(lane.workspace_group, t.workspace)]
+                what = "is running" if holder.state != "queued" else "has waited longest and is held"
+                reason, holds = ("workspace", f"another build in the same workspace {what} ({holder.label[:60]}, "
+                                              f"{(holder.group_lane or holder.lane) if holder.state != 'queued' else self.lane(holder.lane).name} "
+                                              f"lane, {holder.id[:8]}); they would "
                                               "fight over its build directory"), False
             elif m.psi_mem > cfg.mem_psi_block:
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
@@ -3935,13 +3977,16 @@ class Daemon:
                 shrinkable = max(0, shrinkable - taken_from_others)
                 count += 1
                 per_lane[t.lane] += 1
-                busy_workspaces.add((t.lane, t.workspace))
+                if lane.exclusive and t.workspace:
+                    busy_workspaces[(lane.workspace_group, t.workspace)] = t
                 continue
             t.reason_cat, t.reason = reason
             if holds and not passes and self.starving(t, now):
                 t.held = True
                 held_mem += t.est_mem
                 held_cpu += t.need if lane.waits_for_cpu else 0  # it would start without that room
+                if lane.exclusive and t.workspace:  # and its workspace: a quicker lane mustn't keep taking it
+                    busy_workspaces.setdefault((lane.workspace_group, t.workspace), t)
         self.budget.update(held_mem=held_mem, held_cores=held_cpu)
 
     def build_env(self, t: Ticket) -> dict:
@@ -3984,6 +4029,8 @@ class Daemon:
         t.oom_base = 0
         t.reason = t.reason_cat = ""
         t.granted = t.max_granted = granted
+        t.workspace_group = lane.workspace_group if lane.exclusive else ""
+        t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
         env_path = os.path.join(t.dir, "env.json")
         try:
             env = read_json(env_path)
@@ -4545,6 +4592,14 @@ class Daemon:
                 self.submissions[str(other)] = t.id
             if t.state in FINISHED:
                 continue
+            if t.state in ("starting", "running") and t.group_lane is None:
+                # Saved before groups were recorded: it started in this lane, under this lane's group
+                # (or, the lane being gone, the lane's own name, which is what the old daemon held).
+                t.group_lane = t.lane
+                if t.workspace_group is None:
+                    lane = self.cfg.lanes.get(t.lane)
+                    t.workspace_group = (lane.workspace_group if lane.exclusive else "") if lane else t.lane
+                self.save(t)  # at once: a crash before the next save mustn't lose it
             if t.lane not in self.cfg.lanes:
                 t.lane = self.cfg.default_lane
             if t.state == "queued":

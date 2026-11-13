@@ -131,6 +131,8 @@ default_lane = "default"
 #                       needs, passing cores held for long-waiting builds, and take them back from
 #                       resizable builds (memory still decides)
 #   exclusive = true    one build at a time per workspace (CARGO_TARGET_DIR, or the git worktree)
+#   workspace_group = <the lane's name>   exclusive lanes with one group run one build per workspace
+#                       between them; name another lane (or its group) to join it
 #   jobserver = "tools" give builds a jobserver of their own, resized as the machine's load changes:
 #                       "tools" when the command is cargo, make or ninja; true for every build
 #                       (scripts that call them too; needs make 4.4+ inside); false for none
@@ -201,6 +203,23 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # mem = "16G"
 # min_mem = "16G"
 # release_after_peak = false   # its memory is dockerd's: the build's own trace says nothing about it
+#
+# cargo check and clippy: lighter than a full build, ahead of it. workspace_group = "heavy" joins the
+# heavy lane's group (a lane's group is its own name unless it says otherwise), so a check and a
+# cargo test in one target folder never start together: they would only wait on cargo's lock.
+#
+# [lanes.check]
+# cores = 2
+# min_cores = 2
+# max_cores = 4
+# mem = "12G"
+# priority = 40
+# workspace_group = "heavy"
+# properties = { MemoryHigh = "16G", MemoryMax = "20G", CPUWeight = 150, IOWeight = 150 }
+#
+# [[lane_rules]]
+# match = "^cargo (check|clippy)\\b"
+# lane = "check"
 #
 # [[lane_rules]]
 # match = "^(docker|podman) (build|buildx|compose)"
