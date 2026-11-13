@@ -47,6 +47,7 @@ import argparse
 import asyncio
 import collections
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import itertools
@@ -257,6 +258,8 @@ DEFAULTS = {
     "shed_memory": True,
     "reuse_window": "2h",
     "github_status": False,
+    "metrics": True,
+    "release_after_peak": "shadow",
     "env": {},
     "lanes": {"default": {"cores": 4, "mem": "4G", "properties": {"MemoryHigh": "40%", "MemoryMax": "50%"}}},
     "lane_rules": [],
@@ -268,7 +271,8 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class Lane:
     KEYS = {"cores", "min_cores", "max_cores", "mem", "min_mem", "properties", "may_pass_held", "jobserver",
-            "exclusive", "timeout", "priority", "extra_jobs", "test_threads", "waits_for_cpu"}
+            "exclusive", "timeout", "priority", "extra_jobs", "test_threads", "waits_for_cpu",
+            "release_after_peak"}
 
     def __init__(self, name: str, raw, mem_total: int, ncpu: int):
         if not isinstance(raw, dict):
@@ -303,6 +307,8 @@ class Lane:
         # false: its builds start even when the CPU is at cpu_target, on the cores they need, and
         # the rebalancer takes the difference back from resizable builds. Memory still decides.
         self.waits_for_cpu = boolean(raw.get("waits_for_cpu", True), f"lanes.{name}.waits_for_cpu")
+        # Off for builds whose memory is used outside their cgroup (docker build: dockerd does the work).
+        self.release_after_peak = boolean(raw.get("release_after_peak", True), f"lanes.{name}.release_after_peak")
         mode = raw.get("jobserver", "tools")
         modes = {True: "all", "all": "all", "tools": "tools", False: "off", "off": "off"}
         if mode not in modes:
@@ -325,7 +331,8 @@ class Lane:
         return {"cores": self.cores, "min_cores": self.min_cores, "max_cores": self.max_cores, "mem": self.mem,
                 "min_mem": self.min_mem, "properties": self.properties, "may_pass_held": self.may_pass_held,
                 "jobserver": self.jobserver, "exclusive": self.exclusive, "timeout": self.timeout,
-                "priority": self.priority, "extra_jobs": self.extra_jobs, "waits_for_cpu": self.waits_for_cpu}
+                "priority": self.priority, "extra_jobs": self.extra_jobs, "waits_for_cpu": self.waits_for_cpu,
+                "release_after_peak": self.release_after_peak}
 
 
 class Config:
@@ -365,6 +372,9 @@ class Config:
         self.shed_memory = boolean(d["shed_memory"], "shed_memory")
         self.reuse_window = parse_duration(d["reuse_window"]) if d["reuse_window"] not in (0, "0", "", None) else 0.0
         self.github_status = boolean(d["github_status"], "github_status")
+        self.metrics = boolean(d["metrics"], "metrics")
+        rap = d["release_after_peak"]
+        self.release_after_peak = "shadow" if rap == "shadow" else boolean(rap, "release_after_peak")
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
@@ -417,7 +427,8 @@ class Config:
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
             "max_log": self.max_log, "shed_memory": self.shed_memory, "reuse_window": self.reuse_window,
-            "github_status": self.github_status,
+            "github_status": self.github_status, "metrics": self.metrics,
+            "release_after_peak": self.release_after_peak,
             "lanes": {name: lane.summary() for name, lane in self.lanes.items()},
             "lane_rules": [[rule.pattern, lane] for rule, lane in self.lane_rules],
             "env": self.env,
@@ -645,6 +656,15 @@ def cgroup_held(path: str) -> tuple[int, int] | None:
     except (OSError, ValueError):
         pass
     return unreclaimable(stat), swap
+
+
+def cgroup_swap(path: str) -> int:
+    """Bytes of a cgroup's memory in swap now (0 if unknown)."""
+    try:
+        with open(os.path.join(path, "memory.swap.current")) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 0
 
 
 class WalkBudget:
@@ -1472,7 +1492,7 @@ class History:
             r["peak_mem"] = int(r["peak_mem"])
             r["peak_cores"] = float(r["peak_cores"])
             r["t"] = float(r.get("t", 0))
-            for name in ("wall", "granted", "avg_cores", "mem_cores"):
+            for name in ("wall", "granted", "avg_cores", "mem_cores", "peak_at", "tail", "peak_cpu"):
                 if r.get(name) is not None:
                     r[name] = float(r[name])
                     if not math.isfinite(r[name]) or r[name] < 0:
@@ -1523,6 +1543,39 @@ class History:
                     f.write(json.dumps(record, separators=(",", ":")) + "\n")
         os.replace(tmp, self.path)
         self.lines = sum(len(self._retained(k)) for k in self.by_key)
+
+    @staticmethod
+    def shaped(r: dict) -> bool:
+        """A run that says when it peaked and what it used after: it succeeded, wasn't killed for
+        memory, ran a minute or more, and its peak came before its last minute and last tenth."""
+        return (r.get("exit") == 0 and not r.get("oom") and not r.get("mem_high") and r.get("peak_at") is not None
+                and r.get("tail") is not None and r.get("peak_cpu") is not None and (r.get("wall") or 0) >= 60
+                and r["wall"] - r["peak_at"] >= max(60.0, 0.1 * r["wall"]))
+
+    def after_peak(self, key: str, cfg: Config, now: float, need: int = 3) -> tuple[float, float, int, int, float] | None:
+        """For "past the peak": from the same runs the estimate reads (the last history_runs, and
+        the biggest within history_days), the latest any of them peaked (seconds in), the most any
+        used after its peak, the peak behind the estimate, and the cores that peak was measured
+        with, and the most CPU-seconds any had used by its peak. None unless the run behind the
+        estimate and `need` recent runs are `shaped`, no recent successful run peaked at its end
+        (such a command's runs say nothing about after a peak), and no run in the window was killed
+        for memory (the clearest sign that a later phase can be bigger). Failed runs teach nothing
+        here either: a failure may have skipped a later, bigger phase."""
+        cutoff = now - cfg.history_days * 86400
+        recent = [r for r in self.by_key.get(key, ()) if r["t"] >= cutoff][-cfg.history_runs:]
+        window = [r for r in self._retained(key) if r["t"] >= cutoff] or recent
+        if not window:
+            return None
+        top = max(window, key=lambda r: r["peak_mem"])
+        known = [r for r in recent if self.shaped(r)]
+        ended_at_peak = [r for r in recent if r.get("exit") == 0 and not r.get("oom") and not self.shaped(r)
+                         and r.get("peak_at") is not None and (r.get("wall") or 0) >= 60]
+        if len(known) < need or not self.shaped(top) or ended_at_peak or any(r.get("oom") for r in window):
+            return None
+        runs = known + ([top] if all(r is not top for r in known) else [])
+        cores = int(top.get("mem_cores") or top.get("granted") or 0)
+        return (max(r["peak_at"] for r in runs), max(r["tail"] for r in runs), int(top["peak_mem"]), cores,
+                max(r["peak_cpu"] for r in runs))
 
     def estimate(self, key: str, lane: Lane, cfg: Config, ncpu: int, cap_enforced: bool, cold: bool,
                  now: float) -> Estimate:
@@ -1588,6 +1641,423 @@ class History:
             want = min(max(lane.min_cores, math.ceil(want)), lane.max_cores)
             need = lane.min_cores
         return Estimate(want, need, mem, source, rigid, wall, max(1, mem_cores))
+
+
+# --------------------------------------------------------------------------------------------
+# Analytics: a small SQLite file of how the machine and the queue were doing, kept bounded
+
+
+# The `minute` and `hour` tables share these columns: (name, SQL type, how a period rolls up).
+# AVG is weighted by `sampled` (the seconds the daemon saw); WAVG:<column> is weighted by that
+# column instead; SUM, MAX and MIN are what they say. wait_* are the builds waiting, by reason, on
+# average, so wait_memory × sampled / 60 is build-minutes.
+METRIC_COLUMNS = [
+    ("sampled", "REAL", "SUM"),
+    ("cores", "INTEGER", "MAX"), ("cpu_target", "REAL", "AVG"),
+    ("cpu_busy", "REAL", "AVG"), ("cpu_busy_max", "REAL", "MAX"),
+    ("mem_total", "INTEGER", "MAX"), ("mem_floor", "INTEGER", "AVG"),
+    ("mem_available", "INTEGER", "AVG"), ("mem_available_min", "INTEGER", "MIN"),
+    ("swap_used", "INTEGER", "AVG"), ("psi_cpu", "REAL", "AVG"), ("psi_mem", "REAL", "AVG"),
+    ("running", "REAL", "AVG"), ("running_max", "INTEGER", "MAX"),
+    ("queued", "REAL", "AVG"), ("queued_max", "INTEGER", "MAX"),
+    ("reserved", "INTEGER", "AVG"),  # the running builds' expected peaks, together
+    ("growth", "INTEGER", "AVG"),  # what is held for them to grow into
+    ("free_mem", "INTEGER", "AVG"), ("free_mem_min", "INTEGER", "MIN"),  # room for new builds
+    ("free_cpu", "REAL", "AVG"),
+    ("wait_memory", "REAL", "AVG"), ("wait_cpu", "REAL", "AVG"), ("wait_held", "REAL", "AVG"),
+    ("wait_turn", "REAL", "AVG"), ("wait_workspace", "REAL", "AVG"), ("wait_other", "REAL", "AVG"),
+    # While at least one build waited on memory: for how long, and what sat idle or held meanwhile.
+    ("mem_wait_seconds", "REAL", "SUM"),
+    ("idle_cores_mem_wait", "REAL", "WAVG:mem_wait_seconds"),  # cores under the CPU target
+    ("free_mem_mem_wait", "INTEGER", "WAVG:mem_wait_seconds"),  # memory above the floor
+    ("growth_mem_wait", "INTEGER", "WAVG:mem_wait_seconds"),  # held for running builds to grow into
+    # Who used the machine: buildq's builds, CI runners, containers, the user's apps (sessions,
+    # editors; CI runners in app.slice not counted twice), and the rest. Cores are averages.
+    ("builds_cores", "REAL", "AVG"), ("builds_mem", "INTEGER", "AVG"),
+    ("ci_cores", "REAL", "AVG"), ("ci_mem", "INTEGER", "AVG"),
+    ("containers_cores", "REAL", "AVG"), ("containers_mem", "INTEGER", "AVG"),
+    ("apps_cores", "REAL", "AVG"), ("apps_mem", "INTEGER", "AVG"),
+    ("other_cores", "REAL", "AVG"),
+]
+WAIT_COLUMN = {"memory": "wait_memory", "memory-pressure": "wait_memory",
+               "cpu": "wait_cpu", "cpu-pressure": "wait_cpu", "held": "wait_held", "max-jobs": "wait_turn",
+               "workspace": "wait_workspace"}  # anything else (too big, disk, paused, new): wait_other
+WAIT_COLUMNS = ("wait_memory", "wait_cpu", "wait_held", "wait_turn", "wait_workspace", "wait_other")
+EXTREMES = {"cpu_busy": ("cpu_busy_max", max), "mem_available": ("mem_available_min", min),
+            "running": ("running_max", max), "queued": ("queued_max", max), "free_mem": ("free_mem_min", min)}
+BUILD_COLUMNS = [
+    ("id", "TEXT PRIMARY KEY"), ("ended", "INTEGER"), ("submitted", "INTEGER"), ("key", "TEXT"),
+    ("label", "TEXT"), ("name", "TEXT"), ("lane", "TEXT"), ("caller", "TEXT"), ("repo", "TEXT"),
+    ("state", "TEXT"), ("exit", "INTEGER"), ("from_ci", "INTEGER"),
+    ("wall", "REAL"), ("waited", "REAL"),
+    ("waited_by", "TEXT"),  # JSON: seconds waited by reason (memory, cpu, held, max-jobs, ...)
+    ("est_mem", "INTEGER"), ("est_src", "TEXT"),  # what was planned for it, and why
+    ("mem_peak", "INTEGER"), ("peak_at", "REAL"),  # its peak, and how far into its run
+    ("tail", "INTEGER"),  # the most it used from half a minute after its peak to its end
+    ("profile", "TEXT"),  # JSON: its most memory in each tenth of its run, in MiB
+    ("released", "INTEGER"),  # 1 if its reservation was let go after its peak
+    ("release_at", "REAL"), ("release_hold", "INTEGER"),  # past the peak (also in shadow mode): when, what kept
+    ("after_release_peak", "INTEGER"), ("release_revoked", "INTEGER"),  # the most it used after; taken back
+    ("release_end", "REAL"),  # when that was (seconds in), if it was
+    # Past the peak over all its attempts: how many were, how many then used more than would be kept
+    # and by how much at most, the held room that would be freed (GB-hours), and how many can't say
+    # (a daemon restart left them unwatched for a while).
+    ("past_peak_attempts", "INTEGER"), ("past_peak_over", "INTEGER"), ("past_peak_most_over", "INTEGER"),
+    ("past_peak_freed", "REAL"), ("past_peak_unknown", "INTEGER"), ("past_peak_released", "INTEGER"),
+    ("observed_gap", "INTEGER"),  # picked up after a daemon restart
+    ("cores_granted", "REAL"), ("avg_cores", "REAL"), ("peak_cores", "REAL"), ("cpu_seconds", "REAL"),
+    ("requeues", "INTEGER"), ("paused", "REAL"), ("oom", "INTEGER"), ("mem_high", "INTEGER"),
+    ("mem_wait", "REAL"),
+]
+CI_UNITS = ("actions.runner.*", "gha-*", "*-runner-*", "gitlab-runner*")  # CI runner services, by unit name
+
+
+def memory_profile(trace: list, wall: float, buckets: int = 10) -> list[int] | None:
+    """The most memory a build used in each tenth of its run, in MiB, from (seconds in, bytes)."""
+    if not trace or wall <= 0:
+        return None
+    out = [0] * buckets
+    for at, mem in trace:
+        i = min(buckets - 1, max(0, int(at / wall * buckets)))
+        out[i] = max(out[i], int(mem) >> 20)
+    return out
+
+
+def rollup_sql(column: str, how: str) -> str:
+    """How a period's value of a column comes from its minutes (see METRIC_COLUMNS)."""
+    if how in ("SUM", "MAX", "MIN"):
+        return f"{how}({column})"
+    weight = how.partition(":")[2] or "sampled"
+    return f"SUM({column} * {weight}) / NULLIF(SUM(CASE WHEN {column} IS NOT NULL THEN {weight} END), 0)"
+
+
+class Consumers:
+    """Who uses the machine, read from the cgroups once a minute: CPU since the last reading, and
+    the memory each group needs now (as cgroup_stats counts it: not page cache)."""
+
+    def __init__(self):
+        self.manager = user_manager_cgroup()
+        self.last: tuple[float, dict[str, int]] | None = None
+
+    @staticmethod
+    def children(path: str) -> list[str]:
+        try:
+            return sorted(os.listdir(path))
+        except OSError:
+            return []
+
+    def groups(self, builds: str) -> dict[str, list[str]]:
+        apps = os.path.join(self.manager, "app.slice")
+        found = {"builds": [builds], "apps": [apps], "ci": [], "containers": []}
+        for parent in (self.manager, apps):  # newer systemd puts user services in app.slice
+            for name in self.children(parent):
+                if name.endswith(".service") and any(fnmatch.fnmatch(name, p) for p in CI_UNITS):
+                    found["ci"].append(os.path.join(parent, name))
+        for name in self.children(os.path.join(self.manager, "user.slice")):
+            if name.startswith("libpod-") and name.endswith(".scope"):
+                found["containers"].append(os.path.join(self.manager, "user.slice", name))
+        system = "/sys/fs/cgroup/system.slice"
+        for name in self.children(system):
+            if any(fnmatch.fnmatch(name, p) for p in CI_UNITS) and name.endswith(".service"):
+                found["ci"].append(os.path.join(system, name))
+            elif (name.startswith("docker-") and name.endswith(".scope")) or name in ("docker.service",
+                                                                                      "containerd.service"):
+                found["containers"].append(os.path.join(system, name))
+        return found
+
+    def read(self, builds: str, busy: float) -> dict:
+        now = time.monotonic()
+        usages: dict[str, int] = {}
+        found = self.groups(builds)
+        apps = found["apps"][0]
+        totals: dict[str, list] = {}
+        inside_apps = [0, 0.0]  # CI runners within app.slice: taken off the apps' figures
+        for group, paths in found.items():
+            mem, cores = 0, 0.0
+            for path in paths:
+                stats = cgroup_stats(path)
+                if stats is None:
+                    if self.last is not None and path in self.last[1]:
+                        usages[path] = self.last[1][path]  # unreadable this once: keep its baseline
+                    continue
+                usage, need, _ = stats
+                usages[path] = usage
+                share = 0.0
+                if self.last is not None and now > self.last[0]:
+                    # A cgroup not seen last time is new since, and one whose count went down was
+                    # started again: either way, all its time is in this minute.
+                    before = self.last[1].get(path, 0)
+                    delta = usage - before if usage >= before else usage
+                    share = min(delta / 1e6 / (now - self.last[0]), float(os.cpu_count() or 1))
+                mem += need
+                cores += share
+                if group == "ci" and path.startswith(apps + os.sep):
+                    inside_apps[0] += need
+                    inside_apps[1] += share
+            totals[group] = [mem, cores]
+        totals["apps"][0] = max(0, totals["apps"][0] - inside_apps[0])
+        totals["apps"][1] = max(0.0, totals["apps"][1] - inside_apps[1])
+        out: dict = {}
+        for group, (mem, cores) in totals.items():
+            out[f"{group}_mem"] = mem
+            if self.last is not None:
+                out[f"{group}_cores"] = round(cores, 3)
+        if self.last is not None:
+            out["other_cores"] = round(max(0.0, busy - sum(c for _, c in totals.values())), 3)
+        self.last = (now, usages)
+        return out
+
+
+class Metrics:
+    """The analytics file, metrics.db: one row a minute (kept MINUTE_DAYS), one an hour rolled up
+    from them (HOUR_DAYS), and one per finished build (BUILD_DAYS, at most BUILD_ROWS). Rows past
+    their age are deleted once an hour and SQLite reuses the space, so the file levels off. The
+    daemon only adds up numbers it already has; a thread of its own writes the file and reads the
+    cgroups, so the loop never waits on the disk. If the file can't be used, that is logged (at
+    most once an hour) and the queue carries on without it."""
+
+    MINUTE_DAYS, HOUR_DAYS, BUILD_DAYS, BUILD_ROWS = 14, 365, 180, 100_000
+    WAL_LIMIT = 64 << 20  # the write-ahead log is cut back to this after a checkpoint
+    WAL_MAX = 256 << 20  # past this (a reader holding it open), rows are dropped until it shrinks
+
+    def __init__(self, path: str):
+        self.path = path
+        self.items: queue.Queue = queue.Queue(maxsize=10000)
+        self.thread: threading.Thread | None = None
+        self.lock = threading.Lock()
+        self.stopping = False
+        self.failed = False
+        self.dropped = False
+        self.complained_at = -1e18
+        self.minute: int | None = None
+        self.last: float | None = None
+        self.seconds = 0.0
+        self.sums: dict[str, float] = collections.defaultdict(float)
+        self.extremes: dict[str, float] = {}
+        self.builds_cgroup = ""
+
+    def trouble(self, message: str) -> None:
+        """Log a problem with the analytics, at most once an hour."""
+        now = time.monotonic()
+        if now - self.complained_at >= 3600:
+            self.complained_at = now
+            log(message, level=4)
+
+    # ---- on the daemon's loop
+
+    def observe(self, now: float, values: dict, builds_cgroup: str) -> None:
+        """Add one tick's numbers to the minute; a new minute sends the last one to be written."""
+        minute = int(now // 60) * 60
+        self.builds_cgroup = builds_cgroup
+        if self.minute is not None and minute != self.minute:
+            self.emit(builds_cgroup)
+        if minute != self.minute:
+            self.minute, self.last, self.seconds = minute, None, 0.0
+            self.sums.clear()
+            self.extremes.clear()
+        weight = 1.0 if self.last is None else min(max(now - self.last, 0.0), 5.0)
+        self.last = now
+        if weight <= 0:
+            return
+        self.seconds += weight
+        for name, value in values.items():
+            self.sums[name] += float(value) * weight
+            if name in EXTREMES:
+                column, pick = EXTREMES[name]
+                self.extremes[column] = pick(self.extremes.get(column, value), value)
+        if values.get("wait_memory", 0) > 0:
+            self.sums["mem_wait_seconds"] += weight
+            self.sums["@idle_cores_mem_wait"] += max(values["cpu_target"] - values["cpu_busy"], 0.0) * weight
+            self.sums["@free_mem_mem_wait"] += max(values["mem_available"] - values["mem_floor"], 0) * weight
+            self.sums["@growth_mem_wait"] += values["growth"] * weight
+
+    def emit(self, builds_cgroup: str) -> None:
+        if self.seconds <= 0 or self.minute is None:
+            return
+        types = {name: kind for name, kind, _ in METRIC_COLUMNS}
+        row: dict = {"_kind": "minute", "t": self.minute, "sampled": round(self.seconds, 1),
+                     "_builds": builds_cgroup}
+        waited = self.sums.get("mem_wait_seconds", 0.0)
+        for name, total in self.sums.items():
+            if name.startswith("@"):
+                column = name[1:]
+                value = total / waited if waited else None
+            elif name == "mem_wait_seconds":
+                column, value = name, total
+            else:
+                column, value = name, total / self.seconds
+            if value is not None:
+                row[column] = int(value) if types.get(column) == "INTEGER" else round(value, 3)
+        for column, value in self.extremes.items():
+            row[column] = int(value) if types.get(column) == "INTEGER" else round(float(value), 3)
+        self.put(row)
+
+    def build(self, row: dict) -> None:
+        self.put({"_kind": "build", **row})
+
+    def put(self, item) -> None:
+        if self.failed or self.stopping:
+            return
+        with self.lock:
+            if self.thread is not None and not self.thread.is_alive():
+                self.trouble("the analytics writer had stopped; starting it again")
+                self.thread = None
+            if self.thread is None:
+                self.thread = threading.Thread(target=self.run, name="metrics", daemon=True)
+                self.thread.start()
+        try:
+            self.items.put_nowait(item)
+        except queue.Full:
+            if not self.dropped:
+                self.dropped = True
+                self.trouble("the analytics writer is behind; dropping rows until it catches up")
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while self.items.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return not self.items.unfinished_tasks
+
+    def stop(self, timeout: float = 2.0) -> None:
+        if not self.stopping and self.minute is not None and self.seconds > 0:
+            self.emit(self.builds_cgroup)  # the minute so far
+            self.minute = None
+        with self.lock:
+            self.stopping = True
+            thread = self.thread
+        if thread is not None and thread.is_alive():
+            try:
+                self.items.put(None, timeout=timeout)
+            except queue.Full:
+                pass
+            thread.join(timeout)
+
+    # ---- on its own thread
+
+    def open(self):
+        import sqlite3
+        os.makedirs(os.path.dirname(self.path), mode=0o700, exist_ok=True)
+        new = not os.path.exists(self.path)
+        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        if new:
+            db.execute("PRAGMA auto_vacuum = INCREMENTAL")  # freed pages go back to the disk
+        db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA synchronous = NORMAL")
+        db.execute(f"PRAGMA journal_size_limit = {self.WAL_LIMIT}")
+        for table in ("minute", "hour"):
+            db.execute(f"CREATE TABLE IF NOT EXISTS {table} (t INTEGER PRIMARY KEY)")
+            have = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+            for name, kind, _ in METRIC_COLUMNS:
+                if name not in have:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+        db.execute("CREATE TABLE IF NOT EXISTS build (id TEXT PRIMARY KEY)")
+        have = {row[1] for row in db.execute("PRAGMA table_info(build)")}
+        for name, kind in BUILD_COLUMNS:
+            if name not in have:
+                db.execute(f"ALTER TABLE build ADD COLUMN {name} {kind.replace(' PRIMARY KEY', '')}")
+        db.execute("CREATE INDEX IF NOT EXISTS build_ended ON build (ended)")
+        db.execute("CREATE INDEX IF NOT EXISTS build_key ON build (key)")
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            pass
+        return db
+
+    def wal_too_big(self, db) -> bool:
+        """Checkpoint a write-ahead log that has grown, and say if it is still too big (a reader
+        holds it open): rows are dropped until it shrinks, rather than the disk filling."""
+        try:
+            size = os.path.getsize(self.path + "-wal")
+        except OSError:
+            return False
+        if size <= self.WAL_LIMIT:
+            return False
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try:
+            size = os.path.getsize(self.path + "-wal")
+        except OSError:
+            return False
+        if size > self.WAL_MAX:
+            self.trouble(f"the analytics file's write-ahead log is {fmt_size(size)} and can't be cut back "
+                         "(a reader holds it open); dropping rows until it shrinks")
+            return True
+        return False
+
+    def run(self) -> None:
+        import sqlite3
+        try:
+            db = self.open()
+        except (sqlite3.Error, OSError) as e:
+            self.trouble(f"can't open the analytics file {self.path}: {e}; the queue carries on without it")
+            self.failed = True
+            while True:  # let flush() and stop() see an empty queue
+                item = self.items.get()
+                self.items.task_done()
+                if item is None:
+                    return
+        consumers = Consumers()
+        cleaned = -1e18  # monotonic: when the rows were last rolled up and trimmed
+        since: float | None = None  # the earliest minute written since then
+        written = 0
+        full = False
+        while True:
+            item = self.items.get()
+            try:
+                if item is None:
+                    db.close()
+                    return
+                kind = item.pop("_kind")
+                if written % 100 == 0:
+                    full = self.wal_too_big(db)
+                written += 1
+                if kind == "minute":
+                    builds = item.pop("_builds")
+                    item.update(consumers.read(builds, float(item.get("cpu_busy") or 0.0)))
+                    if not full:
+                        names = [n for n in item if n == "t" or n in {c for c, _, _ in METRIC_COLUMNS}]
+                        db.execute(f"INSERT OR REPLACE INTO minute ({', '.join(names)}) VALUES "
+                                   f"({', '.join('?' * len(names))})", [item[n] for n in names])
+                        since = min(since, float(item["t"])) if since is not None else float(item["t"])
+                elif kind == "build" and not full:
+                    names = [n for n, _ in BUILD_COLUMNS if n in item]
+                    db.execute(f"INSERT OR REPLACE INTO build ({', '.join(names)}) VALUES "
+                               f"({', '.join('?' * len(names))})", [item[n] for n in names])
+                if time.monotonic() - cleaned >= 3600:
+                    cleaned = time.monotonic()  # (a failure is tried again in an hour)
+                    self.clean(db, time.time(), since)
+                    since = None
+                    full = self.wal_too_big(db)
+                self.dropped = False
+            except Exception as e:  # never let the writer die on a row
+                self.trouble(f"can't write to the analytics file {self.path}: {e!r}")
+            finally:
+                self.items.task_done()
+
+    def clean(self, db, now: float, since: float | None = None) -> None:
+        """Roll the minutes up into hours (from the newest hour on, or the earliest minute written
+        since the last time, so the hour still going and late minutes are rolled again), and delete
+        rows past their age, keeping at most BUILD_ROWS builds. On an error, nothing is kept."""
+        names = [n for n, _, _ in METRIC_COLUMNS]
+        rolled = ", ".join(rollup_sql(n, how) for n, _, how in METRIC_COLUMNS)
+        newest = db.execute("SELECT MAX(t) FROM hour").fetchone()[0]
+        start = int(newest) if newest is not None else 0
+        if since is not None:
+            start = min(start, int(since // 3600) * 3600)
+        db.execute("BEGIN")
+        try:
+            db.execute(f"INSERT OR REPLACE INTO hour (t, {', '.join(names)}) SELECT (t / 3600) * 3600, {rolled} "
+                       "FROM minute WHERE t >= ? GROUP BY t / 3600", (start,))
+            db.execute("DELETE FROM minute WHERE t < ?", (now - self.MINUTE_DAYS * 86400,))
+            db.execute("DELETE FROM hour WHERE t < ?", (now - self.HOUR_DAYS * 86400,))
+            db.execute("DELETE FROM build WHERE ended < ?", (now - self.BUILD_DAYS * 86400,))
+            db.execute("DELETE FROM build WHERE id IN (SELECT id FROM build ORDER BY ended DESC "
+                       "LIMIT -1 OFFSET ?)", (self.BUILD_ROWS,))
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        db.execute("PRAGMA incremental_vacuum").fetchall()  # (it frees a page per row it returns)
 
 
 # --------------------------------------------------------------------------------------------
@@ -1860,7 +2330,12 @@ class Ticket:
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
-               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci")
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci",
+               "waited_by", "wait_mark", "peak_at", "tail", "released", "release_at", "release_hold",
+               "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
+               "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
+               "past_peak_unknown", "past_peak_released", "release_est", "release_oom_base", "release_breach",
+               "release_open_at_gap")
 
     def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
                  directory: str | None):
@@ -1927,6 +2402,36 @@ class Ticket:
         self.dedupe = None  # same source, command, directory, lane and environment: the same build
         self.caller = None  # the unit its client ran in: a session, a CI runner
         self.from_ci = False  # submitted from a GitHub Actions job, which reports its own result
+        self.waited_by: dict[str, float] = {}  # seconds queued, by the reason it waited
+        self.wait_mark: float | None = None  # when that was last added up
+        self.peak_at = 0.0  # seconds into this attempt when it reached mem_peak (time paused not counted)
+        self.tail = 0  # the most it has used from half a minute after that peak on
+        self.trace: list[list[float]] = []  # [seconds in, most memory] every TRACE_SECONDS, for its profile
+        self.trace_merges = 1  # each point now covers this many TRACE_SECONDS
+        self.released = False  # its reservation was let go after its peak (release_after_peak = true)
+        # Past the peak, worked out in "shadow" mode too: when (seconds in) and what it would hold,
+        # the most it used from then on, and whether it went past that and was taken back.
+        self.release_at: float | None = None
+        self.release_hold = 0
+        self.after_release_peak = 0
+        self.release_revoked = False
+        self.release_end: float | None = None  # when it went past that (seconds in)
+        self.peak_cpu = 0.0  # CPU-seconds this attempt had used when it reached mem_peak
+        # The same over all attempts, kept across requeues: see close_release_audit.
+        self.past_peak_attempts = self.past_peak_over = self.past_peak_most_over = self.past_peak_unknown = 0
+        self.past_peak_freed = 0.0  # byte-seconds of held room it would have freed
+        self.past_peak_released = 0  # attempts really released (mode true)
+        self.release_est = 0  # its expected peak when the release was decided
+        self.release_oom_base = 0  # its OOM kills then
+        self.release_breach = False  # taken back because it went over its hold or was killed for memory
+        self.kills_seen = 0  # OOM kills in its supervisor's result, wherever the limit was (not saved)
+        self.kills_own_cap = False  # and whether one was at its own MemoryMax (not saved)
+        self.release_open_at_gap = False  # its decision still stood when a daemon restart left it unwatched
+        self.release_stood_at_load = False  # ... when this daemon loaded it (not saved)
+        self.release_dirty = False  # measure() took its decision back: the daemon saves the ticket
+        self.settled_since: float | None = None  # it has looked past its peak since then
+        self.swap_now = 0  # bytes of it in swap
+        self.observed_gap = False  # picked up after a daemon restart: its peak may have been missed
         self.frozen = False  # paused to give the machine its memory back
         self.frozen_at = None
         self.requeues = 0  # times it was stopped to free memory and queued again
@@ -1998,6 +2503,25 @@ class Ticket:
             if k in rec:
                 setattr(t, k, rec[k])
         t.take_waits(0, 0, 0)  # numbers only, whatever the file said
+        waited = t.waited_by if isinstance(t.waited_by, dict) else {}
+        t.waited_by = {str(k): v for k, v in ((k, sane_count(v)) for k, v in waited.items()) if v is not None}
+        t.peak_at = sane_count(t.peak_at) or 0.0
+        t.tail = int(sane_count(t.tail) or 0)
+        t.released = t.released is True
+        t.release_at = sane_count(t.release_at)
+        t.release_hold = int(sane_count(t.release_hold) or 0)
+        t.after_release_peak = int(sane_count(t.after_release_peak) or 0)
+        t.release_revoked = t.release_revoked is True
+        t.release_breach = t.release_breach is True
+        t.release_open_at_gap = t.release_open_at_gap is True
+        t.observed_gap = t.observed_gap is True
+        t.release_end = sane_count(t.release_end)
+        t.peak_cpu = sane_count(t.peak_cpu) or 0.0
+        for name in ("past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_unknown",
+                     "past_peak_released", "release_est", "release_oom_base"):
+            setattr(t, name, int(sane_count(getattr(t, name)) or 0))
+        t.past_peak_freed = sane_count(t.past_peak_freed, 1e18) or 0.0
+        t.wait_mark = sane_count(t.wait_mark)
         return t
 
     def measure(self, now: float) -> None:
@@ -2025,13 +2549,55 @@ class Ticket:
                 self.peak_cores = max(self.peak_cores, self.cores_now)
         self.cpu_usec = usage
         self.mem_now = need
+        self.swap_now = cgroup_swap(self.cg)
+        pausing = max(0.0, now - self.frozen_at) if self.frozen and self.frozen_at else 0.0
+        elapsed = max(0.0, now - (self.started or now) - self.frozen_attempt - pausing)
         if need > self.mem_peak:
             self.mem_peak = need
             self.peak_mem_cores = self.granted
+            self.peak_at, self.tail = elapsed, 0
+            self.peak_cpu = max(0, usage - (self.cpu_usec_base or 0)) / 1e6
+        elif elapsed - self.peak_at >= 30 and not self.frozen:
+            self.tail = max(self.tail, need)
+        if not self.frozen:
+            self.note_trace(elapsed, need)
+        if self.release_at is not None and (not self.release_revoked or self.release_breach):
+            # Past its peak: did it need more, and how much more? After a breach it is still
+            # followed: the room let go may already be another build's, so all of it counts.
+            used = need + self.swap_now
+            self.after_release_peak = max(self.after_release_peak, used)
+            if used > self.release_hold and not self.release_revoked:
+                self.release_revoked = self.release_breach = self.release_dirty = True
+                self.release_end = round(elapsed, 1)
+                if self.released:
+                    log(f"{self.id} grew past what was kept for it after its peak ({fmt_size(used)} > "
+                        f"{fmt_size(self.release_hold)}); holding its full {fmt_size(self.est_mem)} again", level=4)
         self.oom_kills = max(0, oom - (self.oom_base or 0))
+        if self.release_at is not None and not self.release_revoked and self.oom_kills > self.release_oom_base:
+            self.release_revoked = self.release_breach = self.release_dirty = True  # something in it was killed for memory
+            self.release_end = round(elapsed, 1)
+            if self.released:
+                log(f"{self.id} had a process killed for memory after its peak; holding its full "
+                    f"{fmt_size(self.est_mem)} again", level=4)
         waits = cgroup_memory_waits(self.cg)
         if waits is not None:
             self.take_waits(*waits)
+
+    TRACE_SECONDS = 10.0
+    TRACE_POINTS = 720
+
+    def note_trace(self, elapsed: float, need: int) -> None:
+        """The most memory in each TRACE_SECONDS of the run; past TRACE_POINTS, neighbours are
+        merged, so a long run keeps its shape in a bounded list."""
+        step = self.TRACE_SECONDS * self.trace_merges
+        if self.trace and elapsed - self.trace[-1][0] < step:
+            self.trace[-1][1] = max(self.trace[-1][1], need)
+            return
+        self.trace.append([elapsed, need])
+        if len(self.trace) > self.TRACE_POINTS:
+            pairs = [[a[0], max(a[1], b[1])] for a, b in zip(self.trace[::2], self.trace[1::2])]
+            self.trace = pairs + ([self.trace[-1]] if len(self.trace) % 2 else [])
+            self.trace_merges *= 2
 
     def take_waits(self, some, full, high) -> None:
         """Keep the largest memory waits seen: the cgroup's counters only grow while it lives. A
@@ -2092,6 +2658,7 @@ class Daemon:
         self.cfg = self.load_config()
         self.runner = self.runner_for_config(self.cfg)
         self.history = History(os.path.join(state_dir, "history.jsonl"), self.cfg.history_keys)
+        self.metrics = Metrics(os.path.join(state_dir, "metrics.db"))
         self.tickets: dict[str, Ticket] = {}
         self.watchers: dict[str, set[Conn]] = collections.defaultdict(set)
         self.helpers: list[tuple[subprocess.Popen, float]] = []
@@ -2426,7 +2993,7 @@ class Daemon:
             shutil.rmtree(t.dir, ignore_errors=True)
             return None, f"can't create the ticket: {e}"
         t.env = job_env
-        t.queued_at = now
+        t.queued_at = t.wait_mark = now
         self.estimate(t, now)
         self.tickets[tid] = t
         self.save(t)
@@ -2765,6 +3332,10 @@ class Daemon:
 
     def requeue(self, t: Ticket, now: float) -> None:
         """A build stopped to free memory is gone: queue it again, at the front, or fail it."""
+        result = read_json(os.path.join(t.dir, "result.json"))  # its kills, before the file goes
+        if isinstance(result, dict):
+            t.kills_seen = max(t.kills_seen, int(sane_count(result.get("oom_kills")) or 0))
+            t.kills_own_cap = t.kills_own_cap or oom_of(result)
         if t.cancel_requested:
             self.finalize(t, now, None)  # cancelled while it was being stopped: it stays cancelled
             return
@@ -2804,7 +3375,9 @@ class Daemon:
         t.attempt_offsets = offsets
         if t.frozen and t.frozen_at:
             t.frozen_attempt += max(0.0, now - t.frozen_at)
-        t.attempts_wall += max(0.0, now - (t.started or now) - t.frozen_attempt)
+        attempt = max(0.0, now - (t.started or now) - t.frozen_attempt)
+        self.close_release_audit(t, attempt)
+        t.attempts_wall += attempt
         t.frozen_total += t.frozen_attempt
         t.frozen_attempt = 0.0
         t.attempts_cpu += max(0, t.cpu_usec - (t.cpu_usec_base or 0)) / 1e6
@@ -2820,12 +3393,17 @@ class Daemon:
         t.samples.clear()
         t.cores_now, t.mem_now, t.cpu_usec, t.grant_area = 0.0, 0, 0, 0.0
         t.mem_peak, t.peak_cores, t.peak_mem_cores = 0, 0.0, 0
+        t.peak_at, t.tail, t.trace, t.trace_merges, t.released = 0.0, 0, [], 1, False
+        t.release_at, t.release_hold, t.after_release_peak, t.release_revoked = None, 0, 0, False
+        t.settled_since, t.swap_now, t.observed_gap, t.release_end, t.peak_cpu = None, 0, False, None, 0.0
+        t.release_est = t.release_oom_base = t.kills_seen = 0
+        t.release_breach = t.kills_own_cap = t.release_open_at_gap = False
         t.mem_wait_some = t.mem_wait_full = 0.0
         t.mem_high = 0
         t.source_verified = None  # the next attempt is checked afresh
         t.source_checks = {}
         t.requeues += 1
-        t.queued_at = now
+        t.queued_at = t.wait_mark = now
         t.reason_cat, t.reason = "memory", "stopped to free memory; it goes first once there is room"
         self.save(t)
         self.broadcast(t, now)
@@ -3027,12 +3605,169 @@ class Daemon:
 
     # ---- admission
 
+    def add_wait(self, t: Ticket, now: float) -> None:
+        """Count the time since the last pass as waited for the reason the ticket had then."""
+        if t.wait_mark is not None and now > t.wait_mark:
+            reason = t.reason_cat or "new"
+            t.waited_by[reason] = round(t.waited_by.get(reason, 0.0) + (now - t.wait_mark), 1)
+        t.wait_mark = now
+
+    def save_queued(self, now: float) -> None:
+        """At shutdown: queued tickets' waits so far, by reason, so the next daemon goes on from them,
+        and every running build's latest state (its peak, its past-the-peak record)."""
+        for t in list(self.tickets.values()):
+            if t.state == "queued":
+                self.add_wait(t, now)
+            if t.state not in FINISHED and not t.flock:
+                self.save(t)
+
+    def still_to_grow(self, t: Ticket, now: float) -> int:
+        """What a running build may still grow into: its expected peak less what it holds now. With
+        release_after_peak = true, a build released past its peak (past_peak_hold) is held to what its
+        command's runs used after their peaks instead. In "shadow" mode the same is worked out and
+        recorded, but the full room stays held; a decision made in shadow mode never takes effect,
+        even if the mode is switched on later."""
+        full = max(0, t.est_mem - t.mem_now)
+        if not self.cfg.release_after_peak and t.release_at is not None and not t.release_revoked:
+            t.release_revoked, t.release_end = True, round(max(0.0, now - (t.started or now)), 1)  # switched off
+            self.save(t)
+        if not self.cfg.release_after_peak or t.flock or t.state != "running":
+            return full
+        hold = self.past_peak_hold(t, now)
+        if hold is None or self.cfg.release_after_peak is not True or not t.released:  # ("shadow")
+            return full
+        return max(0, min(t.est_mem, hold) - t.mem_now)
+
+    def past_peak_hold(self, t: Ticket, now: float) -> int | None:
+        """The memory to keep held for a build that is past its peak, or None. It is past its peak
+        once all of these have held for SETTLE_SECONDS:
+        - its lane allows it; it isn't a cold build or one given a size (--mem); it hasn't been
+          paused or asked to pause, or gone over its MemoryHigh, this attempt; and it wasn't picked
+          up after a daemon restart (any of these later takes a release back);
+        - History.after_peak has its command's runs (the runs behind the estimate, all successful);
+        - it has run 1.25 times the latest of their peaks and a minute more, and used 1.25 times
+          the most CPU-seconds any of them had used by its peak (so a build on fewer cores, slower
+          to its peak, waits for it); and its own peak was a minute or more ago;
+        - its peak reached 0.8 of the peak behind the estimate, on no more cores than that had;
+        - what it uses now, swap included, is at most 0.7 of its peak and at most what those runs
+          used after their peaks, times 1.1 (the hold).
+        Once released, a build that uses more than its hold is taken back for the rest of the
+        attempt (measure() notices on every sample)."""
+        if t.observed_gap and t.cpu_usec_base is None and t.release_at is not None and not t.release_revoked:
+            return None  # picked up after a restart: the first sample says first whether it went over meanwhile
+        if (not self.could_release(t) or t.observed_gap or t.frozen or t.freeze_asked is not None
+                or t.frozen_attempt > 0 or t.mem_high > 0 or t.mem_peak <= 0 or not t.started
+                or t.oom_kills > t.release_oom_base or (t.release_at is None and t.oom_kills > 0)):
+            t.settled_since = None
+            if t.release_at is not None and not t.release_revoked:
+                t.release_revoked, t.release_end = True, round(max(0.0, now - t.started), 1)
+                t.release_breach = t.oom_kills > t.release_oom_base
+                self.save(t)
+                if t.released:
+                    log(f"{t.id} was paused, restarted, slowed at its MemoryHigh or opted out after its peak; "
+                        f"holding its full {fmt_size(t.est_mem)} again", level=4)
+            return None
+        if t.release_at is not None:
+            return None if t.release_revoked else t.release_hold
+        after = self.history.after_peak(t.key, self.cfg, now)
+        if after is None:
+            t.settled_since = None
+            return None
+        latest, tail, top_peak, top_cores, peak_cpu = after
+        hold = int(tail * 1.1)
+        used = t.mem_now + t.swap_now
+        elapsed = now - t.started
+        cpu = max(0, t.cpu_usec - (t.cpu_usec_base or 0)) / 1e6
+        if not (elapsed >= latest * 1.25 + 60 and cpu >= peak_cpu * 1.25 and elapsed - t.peak_at >= 60
+                and t.mem_peak >= 0.8 * top_peak
+                and (not top_cores or (t.granted <= top_cores and (t.peak_mem_cores or t.granted) <= top_cores))
+                and used <= 0.7 * t.mem_peak and used <= hold and hold < t.est_mem):
+            t.settled_since = None
+            return None
+        if t.settled_since is None:
+            t.settled_since = now
+        if now - t.settled_since < self.SETTLE_SECONDS:
+            return None
+        t.release_at, t.release_hold, t.after_release_peak = round(elapsed, 1), hold, used
+        t.release_est, t.release_oom_base = t.est_mem, t.oom_kills
+        if self.cfg.release_after_peak is True:
+            t.released = True
+            log(f"{t.id} is past its peak ({fmt_size(t.mem_peak)}, {elapsed:.0f}s in); holding "
+                f"{fmt_size(hold)} for it instead of {fmt_size(t.est_mem)}")
+        self.save(t)  # so a restart knows a decision was made
+        return hold
+
+    def could_release(self, t: Ticket) -> bool:
+        """What rules a build out of "past the peak" from the start: its lane opts out, it is a cold
+        build, or its caller gave its size."""
+        return self.lane(t.lane).release_after_peak and not t.cold and not t.mem_given
+
+    def close_release_audit(self, t: Ticket, elapsed: float) -> None:
+        """At the end of an attempt (it finished, or was stopped to be queued again), add up what
+        "past the peak" said about it, so a requeue doesn't lose it:
+        - picked up after a daemon restart: unknown, if it had a decision or its command could have
+          had one (part of it ran unwatched);
+        - past its peak: went over what would be kept (a sample over it, or killed for memory after
+          the decision, which a sample may have missed), and by how much at most; and the held room
+          it would have freed, from the decision until it went over or ended, against the
+          reservation it had at the decision."""
+        kills = max(t.oom_kills, t.kills_seen)
+        if t.observed_gap:
+            # A daemon restart left it unwatched for a while. A decision taken back before that is
+            # counted as usual, and so is a breach seen after it; a decision that stood across the
+            # gap, or none where its command could have had one, says nothing.
+            if t.release_at is None:
+                after = self.history.after_peak(t.key, self.cfg, time.time()) if self.cfg.release_after_peak else None
+                if (after is not None and t.measured and self.could_release(t) and t.mem_high == 0
+                        and t.frozen_attempt == 0 and int(after[1] * 1.1) < t.est_mem
+                        and (not after[3] or t.granted <= after[3])
+                        and elapsed >= after[0] * 1.25 + 60 + self.SETTLE_SECONDS):
+                    t.past_peak_unknown += 1  # it could have had a decision while nobody watched
+                return
+            if t.release_open_at_gap and not t.release_breach:
+                # Killed for memory, the decision standing when this daemon loaded it, and no sample
+                # since (its cgroup was gone first: a kill in the result, or systemd's verdict): the
+                # kill came while the decision stood. Anything else, nobody can say.
+                killed = kills > t.release_oom_base or (t.oom and not t.timed_out and not t.cancel_requested)
+                if killed and t.release_stood_at_load and t.cpu_usec_base is None:
+                    t.release_revoked = t.release_breach = True
+                else:
+                    t.past_peak_unknown += 1
+                    return
+        if t.release_at is None:
+            return
+        t.past_peak_attempts += 1
+        t.past_peak_released += int(t.released)
+        over = t.after_release_peak - t.release_hold  # (followed while the decision stood, and after a breach)
+        if not (t.release_revoked and not t.release_breach):  # taken back for another reason: what came after isn't the rule's
+            killed = kills > t.release_oom_base or (t.oom and not t.timed_out and not t.cancel_requested)
+            if killed:
+                lane = self.lane(t.lane)
+                own = t.kills_own_cap and lane.mem_cap and self.runner_of(t).name == "systemd"
+                # At its own cap it used that much; killed from outside (the slice's limit, oomd), it
+                # may not have grown at all, so count what was let go.
+                size = (lane.mem_cap if own else (t.release_est or t.est_mem)) - t.release_hold
+                over = max(over, size, 1)
+                t.release_breach = True
+                if t.release_end is None:
+                    t.release_end = round(elapsed, 1)
+        if over > 0:
+            t.past_peak_over += 1
+            t.past_peak_most_over = max(t.past_peak_most_over, over)
+        until = t.release_end if t.release_end is not None else elapsed
+        t.past_peak_freed += max(0, (t.release_est or t.est_mem) - t.release_hold) * max(0.0, until - t.release_at)
+
+    SETTLE_SECONDS = 30
+
     def schedule(self, now: float) -> None:
         if self.stopping:
             return
         cfg, m = self.cfg, self.machine
+        for t in self.tickets.values():
+            if t.state == "queued":
+                self.add_wait(t, now)
         running = self.active()
-        growth = sum(max(0, t.est_mem - t.mem_now) for t in running)
+        growth = sum(self.still_to_grow(t, now) for t in running)
         ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in running
                       if t.started and now - t.started < cfg.ramp_seconds)
         # Cores that resizable builds could hand back, down to their minimum.
@@ -3167,6 +3902,8 @@ class Daemon:
 
     def start(self, t: Ticket, now: float, granted: int) -> None:
         lane = self.lane(t.lane)
+        self.add_wait(t, now)
+        t.wait_mark = None
         t.state = "starting"
         t.started = now
         t.wait_total += max(0.0, now - (t.queued_at or t.submitted))
@@ -3228,11 +3965,12 @@ class Daemon:
         cpu_cap = cfg.cpu_target * m.ncpu
         waiting = next((t for t in self.queue() if t.reason_cat in ("cpu", "held")), None)
         spare = cpu_cap - max(m.busy, m.busy_now) - ramping - (waiting.need if waiting else 0)
-        free_mem = m.mem_available - sum(max(0, t.est_mem - t.mem_now) for t in self.active()) - cfg.mem_floor
+        free_mem = m.mem_available - sum(self.still_to_grow(t, now) for t in self.active()) - cfg.mem_floor
         changed = []
         waiting_for_memory = any(t.reason_cat == "memory" for t in self.queue(now))
         if spare >= 1 and free_mem > 0 and not waiting_for_memory:
-            growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted),
+            growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted
+                              and (t.release_at is None or t.release_revoked)),
                              key=lambda t: t.granted / max(t.want, 1))
             for t in growers:
                 add = int(min(t.want - t.granted, math.floor(spare)))
@@ -3311,6 +4049,9 @@ class Daemon:
             if t.state == "starting" and not self.check_starting(t, now):
                 continue
             t.measure(now)
+            if t.release_dirty:  # a take-back is saved at once, so a crash can't bring the decision back
+                t.release_dirty = False
+                self.save(t)
             if t.requeue_pending:
                 if self.runner_of(t).alive(t):
                     if t.stop_sent is None or now - t.stop_sent >= 30:
@@ -3455,6 +4196,8 @@ class Daemon:
         t.env = None
         if isinstance(result, dict):  # the supervisor's reading, taken as the build ended
             t.take_waits(result.get("mem_wait_some"), result.get("mem_wait_full"), result.get("mem_high"))
+            t.kills_seen = max(t.kills_seen, int(sane_count(result.get("oom_kills")) or 0))
+            t.kills_own_cap = t.kills_own_cap or oom_of(result)
         exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
         lane = self.lane(t.lane)
         t.exit = exit_code
@@ -3479,6 +4222,7 @@ class Daemon:
             t.wait_total += max(0.0, now - t.queued_at)  # it ends without having run: all of it was waiting
         # Time spent paused is neither how long it takes nor time its cores were used.
         wall = max(now - (t.started or now) - (t.frozen_attempt if t.started else 0.0), 0.0)
+        self.close_release_audit(t, wall)
         t.frozen_total += t.frozen_attempt
         t.frozen_attempt = 0.0
         used = t.cpu_usec - (t.cpu_usec_base or 0)
@@ -3511,6 +4255,9 @@ class Daemon:
                     "mem_wait_full": round(t.mem_wait_full, 1), "mem_high": t.mem_high,
                     "waited": round(t.wait_total, 1), "caller": t.caller,
                     "requeues": t.requeues,
+                    "peak_at": round(t.peak_at, 1) if t.measured and not t.observed_gap else None,
+                    "tail": t.tail if t.measured and not t.observed_gap else None,
+                    "peak_cpu": round(t.peak_cpu, 1) if t.measured and not t.observed_gap else None,
                 })
             except OSError as e:
                 log(f"can't record {t.id} in history: {e}")
@@ -3526,6 +4273,10 @@ class Daemon:
         if t.dedupe and t.state in ("succeeded", "failed") and not t.source_changed:
             self.check_source(t, "end", now)
         self.record_outcome(t, wall)
+        try:
+            self.record_build(t, wall)
+        except Exception as e:  # the analytics must never cost a build its ending
+            self.metrics.trouble(f"can't record {t.id} for the analytics: {e!r}")
         if t.state == "succeeded" and command_words(t.argv)[:2] == ["git", "push"] and t.source:
             for post in self.status_posts:  # a push may have brought commits that were waiting
                 if post.get("repo") == t.source.get("remote"):
@@ -3563,6 +4314,56 @@ class Daemon:
                 f.write(json.dumps(record, separators=(",", ":")) + "\n")
         except OSError as e:
             log(f"can't record {t.id}'s outcome: {e}")
+
+    def record_build(self, t: Ticket, wall: float) -> None:
+        """A finished build's row in the analytics file: what it waited for, what was planned for
+        it, and what it used, with the shape of its memory over its last attempt."""
+        if t.flock or not self.cfg.metrics:
+            return
+        whole = t.measured and not t.observed_gap  # watched from start to end
+        profile = memory_profile(t.trace, wall) if whole else None
+        self.metrics.build({
+            "id": t.id, "ended": round(t.ended or time.time()), "submitted": round(t.submitted), "key": t.key,
+            "label": t.label[:200], "name": t.name, "lane": t.lane, "caller": t.caller,
+            "repo": (t.source or {}).get("repo") or t.workspace, "state": t.state, "exit": t.exit,
+            "from_ci": int(bool(t.from_ci)), "wall": round(wall + t.attempts_wall, 1), "waited": round(t.wait_total, 1),
+            "waited_by": json.dumps(t.waited_by, separators=(",", ":"), sort_keys=True),
+            "est_mem": t.est_mem, "est_src": t.est_src, "mem_peak": max(t.mem_peak, t.attempts_peak),
+            "peak_at": round(t.peak_at, 1) if whole else None, "tail": t.tail if whole else None,
+            "profile": json.dumps(profile) if profile else None, "released": int(t.released),
+            "release_at": t.release_at, "release_hold": t.release_hold if t.release_at is not None else None,
+            "after_release_peak": t.after_release_peak if t.release_at is not None else None,
+            "release_revoked": int(t.release_revoked), "release_end": t.release_end,
+            "past_peak_attempts": t.past_peak_attempts, "past_peak_over": t.past_peak_over,
+            "past_peak_most_over": t.past_peak_most_over,
+            "past_peak_freed": round(t.past_peak_freed / (1 << 30) / 3600, 3), "past_peak_unknown": t.past_peak_unknown,
+            "past_peak_released": t.past_peak_released,
+            "observed_gap": int(t.observed_gap),
+            "cores_granted": round(t.grant_area / wall, 2) if wall > 0 and t.grant_area else t.max_granted,
+            "avg_cores": round(t.avg_cores, 2), "peak_cores": round(t.peak_cores, 2),
+            "cpu_seconds": round(t.attempts_cpu + max(0, t.cpu_usec - (t.cpu_usec_base or 0)) / 1e6, 1),
+            "requeues": t.requeues, "paused": round(t.frozen_total + t.frozen_attempt, 1), "oom": int(bool(t.oom)),
+            "mem_high": t.mem_high + t.attempts_mem_high, "mem_wait": round(t.mem_wait_some + t.attempts_mem_wait, 1),
+        })
+
+    def observe_metrics(self, now: float) -> None:
+        """This tick's numbers, added to the minute the analytics file will get."""
+        if not self.cfg.metrics:
+            return
+        m, cfg, budget = self.machine, self.cfg, self.budget
+        running = [t for t in self.active() if not t.flock]
+        queued = [t for t in self.tickets.values() if t.state == "queued"]
+        waits = collections.Counter(WAIT_COLUMN.get(t.reason_cat, "wait_other") for t in queued)
+        values = {
+            "cores": m.ncpu, "cpu_target": cfg.cpu_target * m.ncpu, "cpu_busy": m.busy_now,
+            "mem_total": m.mem_total, "mem_floor": cfg.mem_floor, "mem_available": m.mem_available,
+            "swap_used": m.swap_used, "psi_cpu": m.psi_cpu, "psi_mem": m.psi_mem,
+            "running": len(self.active()), "queued": len(queued),
+            "reserved": sum(t.est_mem for t in running), "growth": budget.get("growth_reserved", 0),
+            "free_mem": budget.get("free_mem", 0), "free_cpu": budget.get("free_cores", 0),
+        }
+        values.update({name: waits.get(name, 0) for name in WAIT_COLUMNS})
+        self.metrics.observe(now, values, os.path.join(self.cg_base, slice_path(cfg.slice)))
 
     def run_hooks(self, t: Ticket, now: float) -> None:
         for command in (t.notify, *t.extra_notify, self.cfg.on_finish):
@@ -3677,6 +4478,7 @@ class Daemon:
                 if os.path.exists(os.path.join(directory, "env.json")):
                     env = read_json(os.path.join(directory, "env.json"))
                     t.env = env if isinstance(env, dict) else None
+                    t.reason_cat = "restart"  # the time the daemon was away is waited for that
                     log(f"kept {t.id} in the queue across the restart")
                 else:
                     self.finalize(t, now, None, error="its environment file is gone")
@@ -3688,6 +4490,9 @@ class Daemon:
                 except OSError:
                     t.js = None
             t.cpu_usec_base = None  # count CPU from here; the cgroup's counter started before
+            t.observed_gap = True  # it ran unwatched for a while: its peak and after may have been missed
+            t.release_stood_at_load = t.release_at is not None and not t.release_revoked
+            t.release_open_at_gap = t.release_open_at_gap or t.release_stood_at_load
             if isinstance(t.freeze_asked, list) and len(t.freeze_asked) >= 2 and t.cg:
                 wanted = bool(t.freeze_asked[0])
                 t.freeze_asked = (wanted, now)  # sent again, with a full minute: its sender went with the old daemon
@@ -3763,6 +4568,10 @@ class Daemon:
         self.drop_unwatched(now)
         self.scan_flock_slots(now)
         self.schedule(now)
+        try:
+            self.observe_metrics(now)
+        except Exception as e:  # nor the loop its tick
+            self.metrics.trouble(f"can't add up this tick for the analytics: {e!r}")
         tick = time.monotonic()
         if tick - self.last_rebalance >= self.REBALANCE_SECONDS:
             self.last_rebalance = tick
@@ -3916,6 +4725,7 @@ class Daemon:
         self.memory_lines.put(None)
         for thread in threads:
             thread.join(timeout)
+        self.metrics.stop(timeout)
 
     def drop_unwatched(self, now: float) -> None:
         """A build that `buildq run` submitted is meant to be followed. Once no one has followed it
@@ -4352,9 +5162,10 @@ def supervise(directory: str) -> int:
                 write_json(os.path.join(directory, "result.json"),
                            {"exit": code, "ended": time.time(), "timed_out": timed_out,
                             "oom_kills": events.get("oom_kill", 0),
-                            # "max" counts the times the build reached its own MemoryMax; a kill
-                            # without it came from outside (the slice's limit, systemd-oomd).
-                            "hit_own_cap": events.get("max", 0) > 0,
+                            # "oom" counts the times an allocation was about to fail at the build's
+                            # own MemoryMax ("max" only counts reclaim there); a kill without it came
+                            # from outside (the slice's limit, systemd-oomd).
+                            "hit_own_cap": events.get("oom", 0) > 0,
                             # None: not measured (no cgroup of its own)
                             "mem_wait_some": None if some is None else round(some, 1),
                             "mem_wait_full": None if full is None else round(full, 1), "mem_high": high})
@@ -4422,6 +5233,7 @@ async def serve(args) -> None:
     await stop.wait()
     daemon.stopping = True  # from here on nothing new starts
     daemon.thaw_all(time.time())
+    daemon.save_queued(time.time())
     daemon.guard_slice(stopping=True)
     ticker.cancel()
     daemon.stop_memory_watch()

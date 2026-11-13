@@ -1323,7 +1323,10 @@ def median(values: list[float]) -> float | None:
 def cmd_report(args) -> int:
     """What the queue's record of finished builds says, per command (or lane, or caller): how often
     it ran and failed, how long it took and waited, its peak memory, how often it went over its
-    MemoryHigh, how long it waited on memory, and how often it was killed or stopped for memory."""
+    MemoryHigh, how long it waited on memory, and how often it was killed or stopped for memory.
+    With --capacity, how busy the machine and the queue were instead (capacity_report)."""
+    if args.capacity:
+        return capacity_report(args)
     since = time.time() - args.since
     groups: dict[str, list[dict]] = collections.defaultdict(list)
     base = os.path.join(state_dir(), "outcomes.jsonl")
@@ -1389,6 +1392,160 @@ def cmd_report(args) -> int:
     print("FAILED: didn't succeed (failed, cancelled, timed out or lost). HIGH: went over its MemoryHigh, where the "
           "kernel slows it. MEMWAIT: time spent waiting on memory in all. KILLED: killed for memory, or stopped to "
           "free it. AGAIN: times stopped for memory and started over.")
+    return 0
+
+
+def metrics_db():
+    """The analytics file the daemon keeps (metrics.db), read-only, or None if there is none yet."""
+    import sqlite3
+    import urllib.parse
+    path = os.path.join(state_dir(), "metrics.db")
+    if not os.path.exists(path):
+        print(f"buildq: no analytics yet: the daemon writes {short_path(path)} once a minute "
+              "(with metrics = true, the default)", file=sys.stderr)
+        return None
+    return sqlite3.connect(f"file:{urllib.parse.quote(path)}?mode=ro", uri=True, timeout=10)
+
+
+def cmd_query(args) -> int:
+    """Run one read-only SQL query on the analytics file; with no query, show its tables."""
+    import sqlite3
+    db = metrics_db()
+    if db is None:
+        return 1
+    sql = " ".join(args.sql).strip()
+    try:
+        db.execute("PRAGMA query_only = ON")  # nothing written, an ATTACHed file included
+        if not sql:
+            for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"):
+                columns = [f"{row[1]} {row[2]}".strip() for row in db.execute(f"PRAGMA table_info({table})")]
+                print(f"{table}: {', '.join(columns)}")
+            print("Tables and columns are described in docs/design.md, under Analytics.")
+            return 0
+        cursor = db.execute(sql)
+        rows = cursor.fetchmany(args.limit + 1) if args.limit else cursor.fetchall()
+        names = [d[0] for d in cursor.description or []]
+    except sqlite3.Error as e:
+        print(f"buildq: {e}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()  # before printing: a reader left open would keep the daemon's log of writes growing
+    more = bool(args.limit) and len(rows) > args.limit
+    rows = rows[: args.limit] if args.limit else rows
+    if args.json:
+        print(json.dumps([dict(zip(names, row)) for row in rows], indent=2))
+    else:
+        print("\t".join(names))
+        for row in rows:
+            print("\t".join("" if v is None else (f"{v:.3f}".rstrip("0").rstrip(".") if isinstance(v, float) else str(v))
+                            for v in row))
+    if more:
+        print(f"(first {args.limit} rows; --limit 0 shows all)", file=sys.stderr)
+    return 0
+
+
+def capacity_report(args) -> int:
+    """How busy the machine and the queue were, by day (or hour), from the analytics file: what
+    builds waited for, what was idle or held while they waited on memory, and who used the
+    machine. Days are local days."""
+    import sqlite3
+    db = metrics_db()
+    if db is None:
+        return 1
+    since = time.time() - args.since
+    table = "minute" if args.since <= 14 * 86400 else "hour"
+    group = 3600 if args.hourly else 86400
+    offset = time.localtime().tm_gmtoff  # local days (an hour off around a change of clocks)
+
+    def weighted(column, weight="sampled"):
+        return f"SUM({column} * {weight}) / NULLIF(SUM(CASE WHEN {column} IS NOT NULL THEN {weight} END), 0)"
+
+    try:
+        rows = db.execute(f"""
+            SELECT ((t + ?) / {group}) * {group} - ? AS period,
+                   SUM(wait_memory * sampled) / 60, SUM(wait_cpu * sampled) / 60,
+                   SUM((wait_held + wait_turn + wait_workspace + wait_other) * sampled) / 60,
+                   {weighted("idle_cores_mem_wait", "mem_wait_seconds")},
+                   {weighted("free_mem_mem_wait", "mem_wait_seconds")},
+                   {weighted("growth_mem_wait", "mem_wait_seconds")},
+                   {weighted("cpu_busy")}, {weighted("builds_cores")}, {weighted("ci_cores")},
+                   {weighted("containers_cores")}, {weighted("apps_cores")},
+                   MIN(mem_available_min), MAX(cores)
+            FROM {table} WHERE t >= ? GROUP BY period ORDER BY period""", (offset, offset, since)).fetchall()
+        builds = db.execute("SELECT waited_by, est_mem, mem_peak, past_peak_released, past_peak_attempts, past_peak_over, "
+                            "past_peak_most_over, past_peak_freed, past_peak_unknown FROM build WHERE ended >= ?",
+                            (since,)).fetchall()
+    except sqlite3.Error as e:
+        print(f"buildq: {e}", file=sys.stderr)
+        return 2
+    finally:
+        db.close()
+    waited: dict[str, float] = collections.defaultdict(float)
+    ratios, released = [], 0
+    would, over, worst, freed, unknown = 0, 0, 0, 0.0, 0
+    for waited_by, est_mem, mem_peak, was_released, attempts, overs, most_over, gb_hours, unsure in builds:
+        try:
+            for reason, seconds in (json.loads(waited_by or "{}") or {}).items():
+                waited[reason] += float(seconds)
+        except (ValueError, TypeError, AttributeError):
+            pass
+        if est_mem and mem_peak is not None:
+            ratios.append(mem_peak / est_mem)
+        released += was_released or 0
+        would += attempts or 0
+        over += overs or 0
+        worst = max(worst, most_over or 0)
+        freed += gb_hours or 0.0
+        unknown += unsure or 0
+    names = ("period", "waited_memory_minutes", "waited_cpu_minutes", "waited_other_minutes",
+             "idle_cores_while_waiting_on_memory", "free_memory_while_waiting_on_memory",
+             "held_for_growth_while_waiting_on_memory", "busy_cores", "build_cores", "ci_cores",
+             "container_cores", "app_cores", "lowest_free_memory", "cores")
+    past_peak = {"past_peak": would, "went_over_what_was_kept": over, "most_over": worst,
+                 "held_gb_hours_freed": round(freed, 1), "past_peak_unknown": unknown, "released": released}
+    if args.json:
+        print(json.dumps({"periods": [dict(zip(names, row)) for row in rows], "builds": len(builds),
+                          "waited_seconds_by_reason": waited, "median_peak_of_plan": median(ratios),
+                          **past_peak}, indent=2))
+        return 0
+    if not rows:
+        print(f"no analytics for the last {fmt_age(args.since)} yet")
+        return 0
+
+    def mins(value):
+        return fmt_age(value * 60) if value else "-"
+
+    def cores(value):
+        return f"{value:.1f}" if value is not None else "-"
+
+    def size(value):
+        return fmt_size(value) if value is not None else "-"
+
+    print(f"the last {fmt_age(args.since)}, by {'hour' if args.hourly else 'day'}")
+    print(f"{'PERIOD':<11} {'MEMWAIT':>7} {'CPUWAIT':>7} {'OTHER':>6}  {'IDLE':>5} {'FREE':>6} {'HELD':>6}  "
+          f"{'BUSY':>5} {'BUILDS':>6} {'CI':>5} {'CONT':>5} {'APPS':>5}  {'LOWEST':>6}")
+    for row in rows:
+        stamp = time.strftime("%m-%d %H:%M" if args.hourly else "%a %m-%d", time.localtime(row[0]))
+        print(f"{stamp:<11} {mins(row[1]):>7} {mins(row[2]):>7} {mins(row[3]):>6}  {cores(row[4]):>5} "
+              f"{size(row[5]):>6} {size(row[6]):>6}  {cores(row[7]):>5} {cores(row[8]):>6} {cores(row[9]):>5} "
+              f"{cores(row[10]):>5} {cores(row[11]):>5}  {size(row[12]):>6}")
+    print("MEMWAIT, CPUWAIT, OTHER: build-time spent waiting for memory, for cores, for anything else (a turn, "
+          "held room, a busy workspace). While builds waited on memory: IDLE, cores under the CPU target; FREE, "
+          "memory above the floor; HELD, what running builds might still grow into. BUSY: cores in use, of which "
+          "BUILDS, CI runners, containers (CONT) and the user's apps (APPS). LOWEST: the least memory free.")
+    if builds:
+        reasons = ", ".join(f"{reason} {fmt_age(seconds)}" for reason, seconds in
+                            sorted(waited.items(), key=lambda kv: -kv[1]) if seconds >= 1) or "nothing"
+        ratio = median(ratios)
+        print(f"{len(builds)} builds finished; they waited for: {reasons}.")
+        if ratio is not None:
+            print(f"Their memory peaked at a median {ratio:.0%} of what was planned for them.")
+        if would or unknown:
+            print(f"Past the peak: {would} attempts were past their peak{f' ({released} let go)' if released else ''}; "
+                  f"{over} of them later used more than would have been kept"
+                  f"{f' (by up to {fmt_size(worst)})' if over else ''}; about {freed:.0f} GB-hours of held "
+                  "room would have been freed"
+                  f"{f'; {unknown} more were picked up after a daemon restart and can say nothing' if unknown else ''}.")
     return 0
 
 
@@ -1480,6 +1637,13 @@ def main(argv=None) -> int:
     report.add_argument("--by", choices=("command", "lane", "caller"), default="command")
     report.add_argument("--top", type=int, default=25, help="show this many (default 25)")
     report.add_argument("--json", action="store_true")
+    report.add_argument("--capacity", action="store_true",
+                        help="what builds waited for and what sat idle meanwhile, by day, from the analytics")
+    report.add_argument("--hourly", action="store_true", help="with --capacity: by hour instead of by day")
+    query = sub.add_parser("query", help="a read-only SQL query on the analytics (no query: list its tables)")
+    query.add_argument("sql", nargs="*", help="one SQL statement; quote it")
+    query.add_argument("--json", action="store_true")
+    query.add_argument("--limit", type=int, default=200, help="show at most this many rows (0: all; default 200)")
     helper = sub.add_parser("help", help="`buildq help agents`: how a coding agent uses the queue")
     helper.add_argument("topic", nargs="?", default="agents")
     sub.add_parser("ping", help="check that the daemon answers")
@@ -1488,7 +1652,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
-                "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source}
+                "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source,
+                "query": cmd_query}
     return handlers[args.cmd](args)
 
 

@@ -120,5 +120,20 @@ build may be queued already.
 - `buildq status <ticket>`: one ticket. A short prefix of the ticket works.
 - `buildq help agents`: this page, for an agent without skills.
 
+## Questions about the machine
+
+When the owner asks how busy the machine has been, what builds wait for, or whether capacity sits
+idle, answer from the queue's analytics rather than guessing:
+
+- `buildq report --capacity` (`--hourly`, `--since 2d`): by day, the build-time spent waiting for
+  memory, for cores and for anything else; the cores, memory and growth room idle or held while
+  builds waited on memory; cores used by builds, CI, containers and the user's apps; and how
+  close builds' peaks came to what was planned.
+- `buildq report` (`--by lane`, `--by caller`): per command, runs, failures, time, waits, peaks
+  and kills.
+- `buildq query "SELECT …"`: anything else, read-only. `buildq query` alone lists the tables:
+  `minute` (14 days), `hour` (a year), `build` (180 days, one row per finished build, with what it
+  waited for and its memory profile).
+
 The command decides its lane: front-end tools, Rust, .NET and so on, as this machine's
 configuration says. A lane sets a build's priority, cores and memory cap.

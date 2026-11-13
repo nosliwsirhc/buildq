@@ -86,6 +86,17 @@ reuse_window = "2h"
 # named build passes on a commit with no changes on top, so pull requests show it was verified here.
 github_status = false
 
+# Keep metrics.db, the analytics: a row a minute (14 days), an hour (a year) and a finished build
+# (180 days), a few tens of megabytes at most. `buildq report --capacity` and `buildq query` read it.
+metrics = true
+
+# Let go of the room held for a running build's peak once it is clearly past it, keeping what its
+# command's runs used after their peaks (README, "Past the peak"). "shadow" (the default) works it
+# out and records it in the analytics without letting go: turn it on (true) once
+# `buildq report --capacity` shows no build going past what would have been kept. false: off.
+# A lane can opt out with release_after_peak = false (do that for docker build: dockerd holds the memory).
+release_after_peak = "shadow"
+
 # A shell command run when any build finishes, with BUILDQ_TICKET, BUILDQ_STATE, BUILDQ_EXIT,
 # BUILDQ_OOM, BUILDQ_LABEL, BUILDQ_NAME, BUILDQ_CWD and BUILDQ_LOG set. Example:
 # on_finish = 'notify-send "build $BUILDQ_STATE" "$BUILDQ_LABEL"'
@@ -188,6 +199,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # cores = 8
 # mem = "16G"
 # min_mem = "16G"
+# release_after_peak = false   # its memory is dockerd's: the build's own trace says nothing about it
 #
 # [[lane_rules]]
 # match = "^(docker|podman) (build|buildx|compose)"
