@@ -1,5 +1,6 @@
 """Unit tests for buildqd: admission, cores, order, turns, history, keys, configuration, the supervisor."""
 
+import argparse
 import importlib.machinery
 import importlib.util
 import json
@@ -29,6 +30,7 @@ def load(name):
 buildqd = load("buildqd")
 buildqd.log = lambda message, level=None: None  # keep test output readable
 GIB = buildqd.GIB
+MIB = buildqd.MIB
 
 
 class FakeMachine:
@@ -2951,6 +2953,259 @@ class Sizes(unittest.TestCase):
         self.assertGreater(machine.mem_available, 0)
         self.assertLessEqual(machine.busy, machine.ncpu + 0.01)
 
+
+
+class Top(unittest.TestCase):
+    """buildq top: what it reads, and what it draws."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(buildq.GLYPHS.update, dict(buildq.GLYPHS))
+
+    def cgroup(self, name, usec, anon, swap=0, rbytes=0, wbytes=0, some=0.0):
+        path = os.path.join(self.tmp.name, name)
+        os.makedirs(path, exist_ok=True)
+        files = {"cpu.stat": f"usage_usec {usec}\n", "memory.stat": f"anon {anon}\nkernel 0\nshmem 0\nslab_reclaimable 0\n",
+                 "memory.swap.current": f"{swap}\n",
+                 "io.stat": f"253:0 rbytes={rbytes} wbytes={wbytes}\n259:0 rbytes={rbytes} wbytes={wbytes}\n",
+                 "memory.pressure": f"some avg10={some} avg60=0 avg300=0 total=0\nfull avg10=0.00 avg60=0 avg300=0 total=0\n",
+                 "memory.events": "low 0\nhigh 3\nmax 0\noom 0\noom_kill 1\n"}
+        for file, text in files.items():
+            with open(os.path.join(path, file), "w") as f:
+                f.write(text)
+        return path
+
+    def test_a_cgroup_sample_and_its_rates_counting_stacked_devices_once(self):
+        path = self.cgroup("b", 0, 2 * GIB, swap=GIB, some=4.5)
+        buildq._HOLDERS.clear()
+        self.addCleanup(buildq._HOLDERS.clear)
+        now = time.monotonic()
+        buildq._HOLDERS.update({"253:0": ([], now), "259:0": (["253:0"], now)})  # dm-crypt on a partition of it
+        sample = buildq.cgroup_sample(path)
+        self.assertEqual((sample["mem"], sample["swap"], sample["psi_mem"]["some"]), (2 * GIB, GIB, 4.5))
+        self.assertEqual((sample["events"]["high"], sample["events"]["oom_kill"]), (3, 1))
+        sampler = buildq.TopSampler()
+        self.assertIsNone(sampler.cgroup(path, 100.0)["cores"])  # nothing to compare with yet
+        self.cgroup("b", 4_000_000, 2 * GIB, rbytes=20 * MIB, wbytes=2 * MIB)
+        second = sampler.cgroup(path, 102.0)
+        self.assertAlmostEqual(second["cores"], 2.0)
+        self.assertAlmostEqual(second["read_rate"], 10 * MIB)  # not 20: what went through dm-crypt counts once
+        self.assertIsNone(buildq.cgroup_sample(os.path.join(self.tmp.name, "gone")))
+        os.remove(os.path.join(path, "memory.stat"))  # going away mid-read
+        self.assertIsNone(buildq.cgroup_sample(path))
+
+    def test_stacked_io_is_counted_once_per_interval(self):
+        buildq._HOLDERS.clear()
+        self.addCleanup(buildq._HOLDERS.clear)
+        now = time.monotonic()
+        zero = {d: (0, 0) for d in ("253:0", "253:1", "259:0", "8:0", "8:16")}
+
+        def rate(holders, after, before=zero):
+            buildq._HOLDERS.clear()
+            buildq._HOLDERS.update({d: (h, now) for d, h in holders.items()})
+            return buildq.io_rate(before, after, 1.0)[0]
+        self.assertEqual(rate({"259:0": ["253:0"]}, {"253:0": (10, 0), "259:0": (30, 0)}), 30)  # 20 to a plain partition
+        self.assertEqual(rate({"259:0": ["253:0", "253:0"]}, {"253:0": (10, 0), "259:0": (30, 0)}), 30)  # an LV on 2 parts
+        self.assertEqual(rate({"8:0": ["253:1"], "8:16": ["253:1"]},  # striped over two disks, 20 plain on one
+                              {"253:1": (100, 0), "8:0": (70, 0), "8:16": (50, 0)}), 120)
+        self.assertEqual(rate({"259:0": []}, {"259:0": (8 * GIB + 5, 0)},  # the dm device went away: no burst
+                              before={"253:0": (8 * GIB, 0), "259:0": (8 * GIB, 0)}), 5)
+        self.assertEqual(rate({"8:0": ["253:1"], "8:16": ["253:1"]},  # a stripe split 100/0 in the interval
+                              {"253:1": (100, 0), "8:0": (100, 0), "8:16": (0, 0)}), 100)
+        self.assertEqual(rate({"8:0": ["9:0"], "8:16": ["9:0"]},  # RAID1 reads from one mirror
+                              {"9:0": (100, 0), "8:0": (100, 0), "8:16": (0, 0)}, before={**zero, "9:0": (0, 0)}), 100)
+        self.assertEqual(rate({}, {"259:0": (7, 0)}), 7)  # nothing stacked: itself, once
+        self.assertEqual(buildq.text_width("e\u0301\u200dx\ufe0f"), 2)
+
+    def snap(self, running=None):
+        running = running or [
+            {"id": "a" * 36, "short": "aaaaaaaa", "lane": "heavy", "elapsed": 600, "granted": 8, "want": 8, "need": 2,
+             "est_mem": 20 * GIB, "mem_now": 4 * GIB, "mem_peak": 18 * GIB, "label": "cargo test --locked\n\x1b[31mred",
+             "write_dirs": ["/h/t/target"], "waited_by": {"memory": 120.0}, "waited": 120, "cwd": "/src",
+             "est_src": "largest of the last 3 runs", "peak_at": 90.0, "release_at": 300.0, "release_hold": 2 * GIB,
+             "log": None, "peak_cores": 7.5},
+            {"id": "b" * 36, "short": "bbbbbbbb", "lane": "web", "elapsed": 30, "granted": 2, "est_mem": 6 * GIB,
+             "mem_now": GIB, "mem_peak": GIB, "label": "pnpm test", "write_dirs": ["/h/t/target/tmp"]}]
+        queued = [{"short": "cccccccc", "lane": "heavy", "waited": 400, "est_mem": 20 * GIB, "held": False,
+                   "reason": "needs 20G of memory; 2.0G is free after the 16G floor and what running builds may still grow into"}]
+        return {"time": 1794600000.0,
+                "machine": {"cores": 32, "busy": 20.0, "mem_total": 128 * GIB, "mem_available": 60 * GIB,
+                            "swap_total": 8 * GIB, "swap_used": 6 * GIB, "psi_cpu": {"some": 3.0},
+                            "psi_memory": {"some": 0.5, "full": 0.1}, "psi_io": {},
+                            "filesystems": [{"mount": "/", "device": "nvme0n1p3", "free": 1000 * GIB, "size": 1860 * GIB,
+                                             "floor": 372 * GIB, "read": 18 * MIB, "write": 45 * MIB}]},
+                "groups": {"builds": {"cores": 9.0, "mem": 5 * GIB, "swap": 0, "read_rate": MIB, "write_rate": 2 * MIB,
+                                      "known": True, "psi_mem": {"some": 0.2}},
+                           "ci": {"cores": 6.0, "mem": 8 * GIB, "swap": 0, "known": True},
+                           "containers": {"cores": 0.0, "mem": 0, "swap": 0, "known": True},
+                           "apps": {"cores": 2.0, "mem": 14 * GIB, "swap": GIB, "known": True}},
+                "builds": {"a" * 36: {"cores": 1.5, "mem": 4 * GIB, "swap": 0, "read_rate": 3 * MIB, "write_rate": 0,
+                                      "psi_mem": {"some": 12.0}, "events": {"high": 2, "oom_kill": 0}},
+                           "b" * 36: {"cores": 1.9, "mem": GIB, "swap": 0, "psi_mem": {}}},
+                "dir_sizes": {"/h/t/target": (41 * GIB, False, 60.0)},
+                "overview": {"version": "0.2.0", "paused": None, "running": running, "queued": queued,
+                             "budget": {"cpu_cap": 28.8, "growth_reserved": 30 * GIB, "free_mem": 2 * GIB},
+                             "config": {"mem_floor": 16 * GIB, "disk_floor": "20%"}}}
+
+    def draw(self, snap, width=220, height=0, **kw):
+        with mock.patch.object(buildq, "safe_dir", side_effect=lambda p: p if isinstance(p, str) and p.startswith("/h/") else None):
+            return buildq.render_top(snap, width, height, **kw)
+
+    def test_the_screen(self):
+        lines, order = self.draw(self.snap(), detail=True, selected="a" * 36)
+        text = "\n".join(t for t, _ in lines)
+        for expected in ("20.0 of 32 busy · target 28.8", "60G free", "held for growth 30G", "6.0G of 8.0G",
+                         "/: 1000G free of 1860G · floor 372G · read 18M/s · write 45M/s", "CI 6.0c 8.0G",
+                         "other 3.0c", "pressure: io -", "2 running · 1 waiting", "aaaaaaaa", "1.5/8", "4.0G/18G/20G",
+                         "≥41G", "cargo test --locked·red", "memory 2m00s", "would keep 2.0G", "needs 20G of memory"):
+            self.assertIn(expected, text)
+        self.assertNotIn("\x1b", text)
+        self.assertEqual(order, ["a" * 36, "b" * 36])
+        colour = next(c for t, c in lines if "aaaaaaaa" in t and "1.5/8" in t)
+        self.assertEqual(colour, "bad")  # 12% memory pressure: it is being slowed
+
+    def test_the_selection_follows_the_build_not_the_row(self):
+        for sort in ("age", "cpu"):
+            lines, order = self.draw(self.snap(), selected="b" * 36, sort=sort)
+            marked = next(t for t, _ in lines if t.startswith("▶"))
+            self.assertIn("bbbbbbbb", marked, sort)
+        self.assertEqual(self.draw(self.snap(), sort="cpu")[1][0], "b" * 36)  # 1.9 cores before 1.5
+
+    def test_a_small_screen_scrolls_to_the_selected_build_and_keeps_its_detail(self):
+        rows = [{"id": f"{i:036d}", "short": f"{i:08d}", "lane": "heavy", "elapsed": 1000 - i, "granted": 2,
+                 "est_mem": GIB, "mem_now": 0, "mem_peak": 0, "label": f"job {i}", "write_dirs": []} for i in range(20)]
+        for pick in (0, 4, 8, 10, 18, 19):
+            lines, order = self.draw(self.snap(rows), width=80, height=24, selected=f"{pick:036d}", detail=True)
+            self.assertLessEqual(len(lines), 24)
+            self.assertTrue(all(len(t) <= 80 for t, _ in lines))
+            self.assertTrue(any(t.startswith("▶") and f"{pick:08d}" in t for t, _ in lines), pick)
+            self.assertTrue(any(t.startswith("-- " + f"{pick:036d}") for t, _ in lines), pick)
+            self.assertTrue(any("above," in t and "below" in t for t, _ in lines), pick)
+        log = [f"LOG{i:02d}" for i in range(12)]
+        lines = self.draw(self.snap(rows), width=80, height=24, selected=f"{3:036d}", detail=True, log_lines=log)[0]
+        text = "\n".join(t for t, _ in lines)
+        self.assertIn("LOG11", text)  # the newest lines are the ones kept
+        narrow = self.draw(self.snap(rows), width=70, height=24)[0]
+        row = next(t for t, _ in narrow if "00000000" in t)
+        self.assertIn("job 0", row)  # the command keeps its room
+        self.assertNotIn("LANE", next(t for t, _ in narrow if "TICKET" in t))
+        short = self.draw(self.snap(rows), width=100, height=12, selected=f"{9:036d}")[0]
+        self.assertTrue(any(t.startswith("▶") and "00000009" in t for t, _ in short))  # the header gave way
+        header = next(t for t, _ in lines if "TICKET" in t)
+        self.assertIn("COMMAND", header)
+        self.assertNotIn("SWAP", header)  # 80 columns: the last optional columns go first
+        self.assertIn("LANE", header)
+
+    def test_shared_folders_are_marked_and_unknown_sizes_say_so(self):
+        snap = self.snap()
+        snap["dir_sizes"]["/h/t/target/tmp"] = (GIB, True, 5.0)
+        lines = self.draw(snap)[0]  # one build's folder lies inside the other's: both are marked
+        self.assertTrue(any("41G*" in t and "aaaaaaaa" in t for t, _ in lines))
+        self.assertTrue(any("1.0G*" in t and "bbbbbbbb" in t for t, _ in lines))
+        snap["overview"]["running"][1]["write_dirs"] = ["/h/t/target"]  # the same folder
+        self.assertTrue(any("41G*" in t and "bbbbbbbb" in t for t, _ in self.draw(snap)[0]))
+        snap["dir_sizes"] = {}
+        self.assertTrue(any("…" in t and "aaaaaaaa" in t for t, _ in self.draw(snap)[0]))
+
+    def test_ascii_when_the_terminal_isnt_utf8(self):
+        buildq.use_ascii()
+        snap = self.snap()
+        snap["overview"]["running"][1]["label"] = "pnpm test \u00e9t\u00e9\ttab\x9bx"
+        text = "\n".join(t for t, _ in self.draw(snap, selected="a" * 36, detail=True)[0])
+        text.encode("ascii")  # nothing a non-UTF-8 terminal can't show
+        self.assertIn("> aaaaaaaa", text)
+        self.assertIn("tab", text)
+
+    def test_with_no_daemon_it_still_shows_the_machine(self):
+        snap = self.snap()
+        snap["overview"] = None
+        lines, order = self.draw(snap)
+        text = "\n".join(t for t, _ in lines)
+        self.assertIn("daemon not answering", text)
+        self.assertEqual(order, [])
+
+    def test_only_folders_inside_home_are_measured(self):
+        home = os.path.join(self.tmp.name, "home")
+        os.makedirs(os.path.join(home, "target", "deep"))
+        os.symlink("/", os.path.join(home, "root"))
+        with mock.patch.dict(os.environ, HOME=home):
+            self.assertEqual(buildq.safe_dir(os.path.join(home, "target")), os.path.realpath(os.path.join(home, "target")))
+            for bad in ("/", "//", home, os.path.join(home, "root"), self.tmp.name, os.path.join(home, "missing"), None):
+                self.assertIsNone(buildq.safe_dir(bad), bad)
+            row = {"write_dirs": [os.path.join(home, "target", "deep"), os.path.join(home, "target"), "/"]}
+            self.assertEqual(buildq.folders_of(row), [os.path.realpath(os.path.join(home, "target"))])
+
+    def test_folder_sizes_count_hard_links_once(self):
+        folder = os.path.join(self.tmp.name, "target")
+        os.makedirs(os.path.join(folder, "deep"))
+        with open(os.path.join(folder, "deep", "a"), "wb") as f:
+            f.write(os.urandom(200_000))
+        os.link(os.path.join(folder, "deep", "a"), os.path.join(folder, "b"))
+        size, complete, cut = buildq.DirSizes.measure(folder, 30)
+        self.assertEqual((complete, cut), (True, False))
+        self.assertLess(size, 2 * 200_000)  # the linked file once
+        self.assertGreaterEqual(size, 200_000)
+        self.assertEqual(buildq.DirSizes.measure(os.path.join(self.tmp.name, "missing"), 30)[:2], (None, False))
+
+    def test_du_vanishing_entries_are_fine_unreadable_ones_are_partial(self):
+        class Done:
+            def __init__(self, out, err, code):
+                self.out, self.err, self.returncode = out, err, code
+            def communicate(self, timeout=None):
+                return self.out, self.err
+        for err, complete in ((b"du: cannot access 'x/y': No such file or directory\n", True),
+                              (b"du: cannot read directory 'x/z': Permission denied\n", False)):
+            with mock.patch.object(buildq.subprocess, "Popen", return_value=Done(b"4096\tx\n", err, 1)):
+                self.assertEqual(buildq.DirSizes.measure("x", 5), (4096, complete, False))
+
+    def test_a_new_stacked_device_makes_the_holders_be_read_again(self):
+        buildq._HOLDERS.clear()
+        self.addCleanup(buildq._HOLDERS.clear)
+        buildq._HOLDERS["259:0"] = ([], time.monotonic())  # read before dm-0 existed
+        holders = {"/sys/dev/block/259:0/holders": [], "/sys/dev/block/259:0/p3/holders": ["dm-0"],
+                   "/sys/dev/block/253:0/holders": []}
+        with mock.patch.object(buildq.glob, "glob", side_effect=lambda p: ["/sys/dev/block/259:0/p3/holders"]
+                               if p.startswith("/sys/dev/block/259:0/") else []), \
+                mock.patch.object(buildq.os, "listdir", side_effect=lambda p: holders.get(p, [])), \
+                mock.patch.object(buildq, "read_text", side_effect=lambda p: "253:0\n" if p.endswith("/dm-0/dev") else None):
+            first = {"259:0": (30, 0), "253:0": (10, 0)}
+            buildq.io_rate({"259:0": (0, 0)}, first, 1.0)  # dm-0 is new: what is stacked is read afresh
+            self.assertEqual(buildq.io_rate(first, {"259:0": (60, 0), "253:0": (20, 0)}, 1.0)[0], 30)  # not 40
+
+    def test_the_holders_of_a_disk_include_its_partitions(self):
+        buildq._HOLDERS.clear()
+        self.addCleanup(buildq._HOLDERS.clear)
+        holders = {"/sys/dev/block/259:0/holders": [], "/sys/dev/block/259:0/nvme0n1p3/holders": ["dm-0"]}
+        with mock.patch.object(buildq.glob, "glob", return_value=["/sys/dev/block/259:0/nvme0n1p3/holders"]), \
+                mock.patch.object(buildq.os, "listdir", side_effect=lambda p: holders[p]), \
+                mock.patch.object(buildq, "read_text", side_effect=lambda p: "253:0\n" if p == "/sys/class/block/dm-0/dev" else None):
+            self.assertEqual(buildq.holders_of("259:0"), ["253:0"])
+
+    def test_du_runs_in_the_c_locale_and_wide_text_fits(self):
+        seen = {}
+
+        class Done:
+            returncode = 0
+            def communicate(self, timeout=None):
+                return b"1\tx\n", b""
+        def popen(command, **kw):
+            seen.update(kw.get("env") or {})
+            return Done()
+        with mock.patch.object(buildq.subprocess, "Popen", side_effect=popen):
+            buildq.DirSizes.measure("x", 5)
+        self.assertEqual(seen.get("LC_ALL"), "C")
+        self.assertEqual(buildq.text_width("日本x"), 5)
+        for odd in ("\u202e", "\u061c", "\ufeff", "\u0600", "\u2028", "\U000e0041"):
+            self.assertNotIn(odd, buildq.clean("ls " + odd + "x"))
+        self.assertIn("\u200c", buildq.clean("\u0645\u06cc\u200c\u062e"))  # Persian keeps its non-joiner
+        self.assertEqual(buildq.fit("日本語", 5), "日本")
+
+    def test_the_interval_is_checked(self):
+        self.assertEqual(buildq.interval_arg("2"), 2.0)
+        for bad in ("-1", "0", "0.1", "nan", "inf", "x"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
+                buildq.interval_arg(bad)
 
 if __name__ == "__main__":
     unittest.main()

@@ -98,6 +98,7 @@ buildq cancel [--all] TICKET...                  # take it out of the queue, or 
 buildq pause [REASON] / buildq resume            # start nothing new (running builds carry on), or go on
 buildq report [--since 7d] [--by command|lane|caller] [--json]   # what the history says
 buildq report --capacity [--hourly] [--since 7d]  # what builds waited for, and what sat idle meanwhile
+buildq top [--interval 2] [--once]                # a live view of the machine and each build, like btop
 buildq query ["SQL"] [--json]                     # a read-only query on the analytics (none: list the tables)
 buildq help agents                               # the page for coding agents
 buildq ping                                      # check that the daemon answers
@@ -450,6 +451,39 @@ memory at the same moment, so don't run both as gates side by side for long.
   queue carries on. `buildq report --capacity` sums it up by day (`--hourly` by hour);
   `buildq query "SELECT …"` answers anything else, read-only (`buildq query` alone lists the
   tables, and [docs/design.md](docs/design.md#analytics) describes every column).
+- **`buildq top`** is a live view of the queue, like `btop`:
+  - **The machine, at the top:**
+    - CPU busy against the queue's target;
+    - memory used and free, the floor, what is held for running builds to grow into, and the room left;
+    - swap;
+    - one DISK line per filesystem builds write to (`/` always): free space against `disk_floor`,
+      worked out for that filesystem, with read and write rates;
+    - CPU, memory and disk pressure ("-" where the kernel doesn't report it).
+  - **Who uses it:** buildq's builds together, CI runners, containers and your apps, each with its cores, memory and swap.
+  - **One row per running build:**
+    - its CPU used out of the cores given;
+    - its memory now, its peak and its plan;
+    - its swap;
+    - its own memory pressure (how much the kernel is slowing it);
+    - its disk read and write rates (I/O through dm-crypt or LVM counted once; a mirror's writes
+      count each copy, and a filesystem in a loop file counts twice);
+    - the space its folders take: its `CARGO_TARGET_DIR` (for cargo with none, the `target/`
+      beside its `Cargo.lock`) and its `TMPDIR`, only those inside your home. They're measured with
+      `ionice -c3 du -sx` in the background, each at most every five minutes. "≥" means only in
+      part, "…" not yet, "?" it couldn't be, and "*" a folder another running build shares.
+  - **Below the builds:** the waiting builds and why each waits.
+  - **Keys:**
+    - `s` sorts by age, CPU, memory, I/O or disk;
+    - ↑↓ select a build (the selection stays on that build when the order changes; the list
+      scrolls on a small screen; narrow terminals drop the last columns first, and LANE and AGE
+      under 80 columns);
+    - Enter shows its plan, pressure, waits and folders;
+    - `l` shows the end of its output;
+    - `q` quits.
+
+  `--once` prints one snapshot, measuring folders first for up to 20 seconds. It's also what you
+  get without a terminal. `top` reads the cgroups and `/proc` itself, so watching costs the daemon
+  one status request per refresh. Without a UTF-8 locale it draws in ASCII.
 - **A broken configuration** is reported in the journal; the daemon keeps the last good one.
 - **Before a reboot:** `buildq pause "rebooting at noon"`, wait for the running builds to finish
   (`buildq status`), reboot, then `buildq resume`. The pause is kept across restarts, and queued
