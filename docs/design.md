@@ -96,8 +96,12 @@ and walks the queue in order, starting each ticket for which, in this order:
    This gates starts only: builds that started in the same pass, or are running, can still write
    below it, so cleanup (old build directories) keeps the disk above it;
 4. in an exclusive lane, no build of the same lane, or of a lane with the same `workspace_group`,
-   runs in its workspace. A running build holds its workspace under the group it started with as
-   well as its lane's group now, so a reload that changes or removes a lane doesn't free it.
+   runs in its workspace. A running build holds its workspace under the group it started with,
+   and under the group the lane it started in has now; both are saved with the ticket, so a reload
+   or restart that regroups or removes a lane doesn't free it, and a lane removed (the ticket put in
+   the default lane) leaves only the group it started with. A ticket saved before groups were
+   recorded takes its lane's group when picked up (or, its lane gone, the lane's name, which is what
+   the older daemon held), saved at once.
    Non-exclusive lanes take no part, and a config whose group mixes them, or names no other lane,
    is refused. A build that has waited `starve_seconds` and is held holds its workspace too, so
    a quicker lane in its group can't keep taking it. The wait reason names the build holding the

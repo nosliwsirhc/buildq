@@ -2398,7 +2398,7 @@ class Ticket:
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
-               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group", "lane_reassigned",
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group", "group_lane",
                "waited_by", "wait_mark", "peak_at", "tail", "released", "release_at", "release_hold",
                "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
                "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
@@ -2473,7 +2473,7 @@ class Ticket:
         # Its lane's workspace_group when it started, kept across reloads: "" for a non-exclusive
         # lane (no group); None when unknown (saved before groups were recorded).
         self.workspace_group: str | None = None
-        self.lane_reassigned = False  # its lane was gone at a restart and it was put in the default lane
+        self.group_lane: str | None = None  # the lane it started in: it also holds that lane's group as it is now
         self.waited_by: dict[str, float] = {}  # seconds queued, by the reason it waited
         self.wait_mark: float | None = None  # when that was last added up
         self.peak_at = 0.0  # seconds into this attempt when it reached mem_peak (time paused not counted)
@@ -2587,7 +2587,7 @@ class Ticket:
         t.release_revoked = t.release_revoked is True
         t.release_breach = t.release_breach is True
         t.release_open_at_gap = t.release_open_at_gap is True
-        t.lane_reassigned = t.lane_reassigned is True
+        t.group_lane = t.group_lane if isinstance(t.group_lane, str) else None
         t.observed_gap = t.observed_gap is True
         t.write_dirs = [r for r in (within_home(d) for d in t.write_dirs if isinstance(d, str))
                         if r][:4] if isinstance(t.write_dirs, list) else []
@@ -3885,9 +3885,11 @@ class Daemon:
         for t in running:
             if not t.workspace:
                 continue
+            # Under the group it started with, and the group the lane it started in has now (a reload
+            # may have regrouped it); a lane removed since holds only the group it started with.
             groups = {t.workspace_group} if isinstance(t.workspace_group, str) and t.workspace_group else set()
-            if t.lane in cfg.lanes and cfg.lanes[t.lane].exclusive and not t.lane_reassigned:  # (a lane removed since: its group at start)
-                groups.add(cfg.lanes[t.lane].workspace_group)
+            if t.group_lane in cfg.lanes and cfg.lanes[t.group_lane].exclusive:
+                groups.add(cfg.lanes[t.group_lane].workspace_group)
             for group in groups:
                 busy_workspaces[(group, t.workspace)] = t
         if self.paused is not None:
@@ -4026,6 +4028,7 @@ class Daemon:
         t.reason = t.reason_cat = ""
         t.granted = t.max_granted = granted
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
+        t.group_lane = t.lane
         env_path = os.path.join(t.dir, "env.json")
         try:
             env = read_json(env_path)
@@ -4587,14 +4590,16 @@ class Daemon:
                 self.submissions[str(other)] = t.id
             if t.state in FINISHED:
                 continue
-            if t.state in ("starting", "running") and t.workspace_group is None and t.lane in self.cfg.lanes:
-                lane = self.cfg.lanes[t.lane]  # saved before groups were recorded: its group, while its lane is known
-                t.workspace_group = lane.workspace_group if lane.exclusive else ""
+            if t.state in ("starting", "running") and t.group_lane is None:
+                # Saved before groups were recorded: it started in this lane, under this lane's group
+                # (or, the lane being gone, the lane's own name, which is what the old daemon held).
+                t.group_lane = t.lane
+                if t.workspace_group is None:
+                    lane = self.cfg.lanes.get(t.lane)
+                    t.workspace_group = (lane.workspace_group if lane.exclusive else "") if lane else t.lane
                 self.save(t)  # at once: a crash before the next save mustn't lose it
             if t.lane not in self.cfg.lanes:
                 t.lane = self.cfg.default_lane
-                t.lane_reassigned = True  # (its workspace stays held under the group it started with only)
-                self.save(t)
             if t.state == "queued":
                 if os.path.exists(os.path.join(directory, "env.json")):
                     env = read_json(os.path.join(directory, "env.json"))

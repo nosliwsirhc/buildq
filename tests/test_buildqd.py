@@ -355,7 +355,7 @@ class Admission(DaemonCase):
         self.with_check_lane()
         tree = self.workdir("tree")
         check = self.submit(("cargo", "check"), lane="check", cwd=tree)
-        check.workspace_group = None  # saved by an older daemon
+        check.workspace_group = check.group_lane = None  # saved by an older daemon
         self.daemon.save(check)
         again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
         self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
@@ -363,6 +363,52 @@ class Admission(DaemonCase):
         self.assertEqual(again.tickets[check.id].workspace_group, "heavy")
         with open(os.path.join(check.dir, "ticket.json")) as f:
             self.assertEqual(json.load(f)["workspace_group"], "heavy")  # saved at once, not only in memory
+
+    def restart(self, config):
+        with open(self.config_path, "w") as f:
+            f.write(config)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
+        again.load_tickets(self.now + 10)
+        return again
+
+    def test_across_a_restart_without_its_lane_a_build_holds_only_the_group_it_started_with(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)
+        lone = BASE_CONFIG.replace('default_lane = "heavy"', 'default_lane = "lone"') + '[lanes.lone]\ncores = 2\nmem = "1G"\n'
+        again = self.restart(lone)  # the check lane is gone; the default lane is an exclusive one of its own
+        self.assertEqual((again.tickets[check.id].lane, again.tickets[check.id].workspace_group), ("lone", "heavy"))
+        other, error = again.submit({"argv": ["make"], "cwd": tree, "lane": "lone", "env": {}}, self.now + 11)
+        self.assertEqual(other.state, "running")  # not the group it started with
+        test, error = again.submit({"argv": ["cargo", "test"], "cwd": tree, "lane": "heavy", "env": {}}, self.now + 12)
+        self.assertEqual((test.state, test.reason_cat), ("queued", "workspace"))
+
+    def test_a_build_from_before_groups_whose_lane_is_gone_holds_its_lanes_name(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)
+        check.workspace_group = check.group_lane = None  # saved by an older daemon
+        self.daemon.save(check)
+        again = self.restart(BASE_CONFIG)  # and the upgrade dropped its lane
+        self.assertEqual(again.tickets[check.id].workspace_group, "check")  # what the old daemon held
+        twice = self.restart(BASE_CONFIG)  # a second restart doesn't take it for the default lane's
+        self.assertEqual((twice.tickets[check.id].workspace_group, twice.tickets[check.id].group_lane), ("check", "check"))
+
+    def test_a_queued_build_moved_to_another_lane_holds_that_lanes_group_once_it_starts(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        self.daemon.cfg.max_jobs = 0
+        queued = self.submit(("make",), lane="check", cwd=tree)
+        self.daemon.save(queued)
+        regrouped = (BASE_CONFIG.replace("[lanes.heavy]\n", '[lanes.heavy]\nworkspace_group = "cargo"\n')
+                     + '[lanes.cheq]\npriority = 40\nworkspace_group = "cargo"\ncores = 2\nmem = "4G"\n')
+        again = self.restart(regrouped)  # the check lane is gone: the queued build goes to heavy and starts
+        started = again.tickets[queued.id]
+        again.schedule(self.now + 20)
+        self.assertEqual((started.state, started.group_lane), ("running", "heavy"))
+        check, error = again.submit({"argv": ["cargo", "check"], "cwd": tree, "lane": "cheq", "env": {}}, self.now + 21)
+        self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
 
     def test_a_running_build_keeps_its_workspace_when_its_lane_is_removed(self):
         self.with_check_lane()
