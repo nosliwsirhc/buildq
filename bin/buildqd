@@ -348,7 +348,17 @@ class Config:
         self.mem_floor = parse_size(d["mem_floor"], mem_total)
         if not 0 <= self.mem_floor < mem_total:
             raise ValueError("mem_floor must be less than the machine's memory")
-        self.disk_floor = parse_size(d["disk_floor"])
+        # A size, or a percentage of each build's own filesystem ("20%"), worked out where it runs.
+        floor = d["disk_floor"]
+        if isinstance(floor, str) and floor.strip().endswith("%"):
+            try:
+                share = float(floor.strip()[:-1])
+            except ValueError:
+                raise ValueError(f"disk_floor: not a percentage: {floor!r}") from None
+            share = number(share, "disk_floor", 0, 99)
+            self.disk_floor, self.disk_floor_share = 0, share / 100
+        else:
+            self.disk_floor, self.disk_floor_share = parse_size(floor), 0.0
         self.cpu_psi_block = number(d["cpu_psi_block"], "cpu_psi_block", 0, 1000)
         self.mem_psi_block = number(d["mem_psi_block"], "mem_psi_block", 0, 1000)
         self.ramp_seconds = number(d["ramp_seconds"], "ramp_seconds", 0, 3600)
@@ -422,7 +432,8 @@ class Config:
     def summary(self) -> dict:
         return {
             "max_jobs": self.max_jobs, "cpu_target": self.cpu_target, "mem_floor": self.mem_floor,
-            "disk_floor": self.disk_floor, "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
+            "disk_floor": f"{self.disk_floor_share * 100:g}%" if self.disk_floor_share else self.disk_floor,
+            "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "slice": self.slice,
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
@@ -490,10 +501,11 @@ def pressure(resource: str, kind: str) -> float:
     return 0.0
 
 
-def disk_free(path: str) -> int | None:
+def disk_space(path: str) -> tuple[int, int] | None:
+    """(bytes free to an unprivileged user, the filesystem's size) where a path lives, or None."""
     try:
         st = os.statvfs(path)
-        return st.f_bavail * st.f_frsize
+        return st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
     except OSError:
         return None
 
@@ -3605,6 +3617,23 @@ class Daemon:
 
     # ---- admission
 
+    def disk_short(self, t: Ticket) -> tuple[int, int, int] | None:
+        """(free, floor, size) of the filesystem where a build would write that is furthest under
+        its floor, or None if every one has its floor free. The floor is disk_floor (a size) or,
+        given as a percentage, disk_floor_share of that filesystem's own size. A path whose
+        filesystem can't be read is skipped. The floor gates starts only: builds already running
+        can still write below it."""
+        worst = None
+        for path in t.disk_paths or [t.cwd]:
+            space = disk_space(path)
+            if space is None:
+                continue
+            free, size = space
+            floor = max(self.cfg.disk_floor, int(self.cfg.disk_floor_share * size))
+            if free < floor and (worst is None or free - floor < worst[0] - worst[1]):
+                worst = (free, floor, size)
+        return worst
+
     def add_wait(self, t: Ticket, now: float) -> None:
         """Count the time since the last pass as waited for the reason the ticket had then."""
         if t.wait_mark is not None and now > t.wait_mark:
@@ -3803,14 +3832,17 @@ class Daemon:
             if not os.path.isdir(t.cwd):
                 self.finalize(t, now, None, error=f"its working directory {t.cwd} is gone")
                 continue
-            free_disk = min((f for f in map(disk_free, t.disk_paths or [t.cwd]) if f is not None), default=None)
+            short = self.disk_short(t)
             if t.est_mem > m.mem_total - cfg.mem_floor:
                 reason, holds = ("too-big", f"needs {fmt_size(t.est_mem)} of memory, more than this machine has "
                                             f"({fmt_size(m.mem_total - cfg.mem_floor)} above the floor); cancel it "
                                             "or give its lane a smaller MemoryMax"), False
-            elif free_disk is not None and free_disk < cfg.disk_floor:
-                reason, holds = ("disk", f"only {fmt_size(free_disk)} of disk is free where it runs "
-                                         f"(disk_floor is {fmt_size(cfg.disk_floor)})"), False
+            elif short is not None:
+                free, floor, size = short
+                said = (f"{cfg.disk_floor_share * 100:g}% of its {fmt_size(size)}, {fmt_size(floor)}"
+                        if floor > cfg.disk_floor else fmt_size(floor))
+                reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
+                                         f"(disk_floor is {said})"), False
             elif lane.exclusive and (t.lane, t.workspace) in busy_workspaces:
                 reason, holds = ("workspace", "another build in the same workspace is running; they would "
                                               "fight over its build directory"), False

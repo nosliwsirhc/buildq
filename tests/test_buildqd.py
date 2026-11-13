@@ -262,6 +262,43 @@ class Admission(DaemonCase):
         self.daemon.cfg.disk_floor = 1 << 60
         self.assertEqual(self.submit().reason_cat, "disk")
 
+    def test_disk_floor_as_a_share_of_each_filesystem(self):
+        self.daemon.cfg.disk_floor, self.daemon.cfg.disk_floor_share = 0, 0.2
+        with mock.patch.object(buildqd, "disk_space", return_value=(300 * GIB, 1900 * GIB)):
+            t = self.submit()
+        self.assertEqual(t.reason_cat, "disk")
+        self.assertIn("20% of its 1900G, 380G", t.reason)
+        with mock.patch.object(buildqd, "disk_space", return_value=(400 * GIB, 1900 * GIB)):
+            self.assertNotEqual(self.submit().reason_cat, "disk")
+        cfg = buildqd.Config(buildqd.tomllib.loads('disk_floor = "20%"'), 128 * GIB, 32)
+        self.assertEqual((cfg.disk_floor, cfg.disk_floor_share, cfg.summary()["disk_floor"]), (0, 0.2, "20%"))
+        for bad in ('"100%"', '"x%"', '"-5%"'):
+            with self.assertRaises(ValueError, msg=bad):
+                buildqd.Config(buildqd.tomllib.loads(f"disk_floor = {bad}"), 128 * GIB, 32)
+
+    def test_each_filesystem_is_held_to_its_own_share(self):
+        self.daemon.cfg.disk_floor, self.daemon.cfg.disk_floor_share = 0, 0.125
+        spaces = {"/big": (400 * GIB, 1900 * GIB), "/small": (GIB, 16 * GIB), "/gone": None}
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, (GIB, 16 * GIB))):
+            t = self.submit()  # (held at submission too, by its working directory)
+        t.disk_paths = ["/big", "/gone", "/small"]
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces[path]):
+            self.daemon.schedule(self.now)
+        self.assertEqual(t.reason_cat, "disk")
+        self.assertIn("1.0G of disk is free", t.reason)
+        self.assertIn("12.5% of its 16G, 2.0G", t.reason)  # the small one, by its own size
+        spaces["/small"] = (4 * GIB, 16 * GIB)
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces[path]):
+            self.daemon.schedule(self.now + 1)
+        self.assertNotEqual(t.reason_cat, "disk")
+        self.daemon.cfg.disk_floor, self.daemon.cfg.disk_floor_share = 500 * GIB, 0.0
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, (GIB, 16 * GIB))):
+            u = self.submit()
+        u.disk_paths = ["/big"]
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces[path]):
+            self.daemon.schedule(self.now + 2)
+        self.assertIn("(disk_floor is 500G)", u.reason)
+
     def test_one_build_per_workspace_in_an_exclusive_lane(self):
         tree = self.workdir("tree")
         os.makedirs(os.path.join(tree, "api"))

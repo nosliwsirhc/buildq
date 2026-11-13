@@ -207,7 +207,7 @@ order and starts every build that fits:
 | Cores | its minimum cores fit in what is free: `cpu_target` × cores − busy cores − cores that builds just started haven't reached yet + cores that resizable builds could give back. Skipped when nothing is running, so outside load can slow the queue but never stall it, and for lanes with `waits_for_cpu = false`. |
 | Pressure | memory pressure (PSI `full avg10`) ≤ `mem_psi_block`; CPU pressure (`some avg10`) ≤ `cpu_psi_block` while a build runs (not for lanes with `waits_for_cpu = false`) |
 | Count | fewer than `max_jobs` builds run, not counting up to `extra_jobs` of its own lane |
-| Disk | its filesystem has at least `disk_floor` free |
+| Disk | its filesystem has at least `disk_floor` free (a size, or a percentage of that filesystem's size, such as `"20%"`). This gates starts only: builds already running can still write below it. |
 | Workspace | in an exclusive lane, no other build of that lane runs in its workspace (its `CARGO_TARGET_DIR`, or its git worktree); they would only fight over the build directory |
 
 **Order.** A build that has waited `starve_seconds`, or was stopped once to free memory, goes
