@@ -410,6 +410,25 @@ class Admission(DaemonCase):
         check, error = again.submit({"argv": ["cargo", "check"], "cwd": tree, "lane": "cheq", "env": {}}, self.now + 21)
         self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
 
+    def test_a_build_queued_in_a_lane_a_reload_removed_records_the_lane_it_starts_under(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        self.daemon.cfg.max_jobs = 0
+        queued = self.submit(("make",), lane="check", cwd=tree)
+        regrouped = BASE_CONFIG.replace("[lanes.heavy]\n", '[lanes.heavy]\nworkspace_group = "cargo"\n') + (
+            '[lanes.cheq]\npriority = 40\nworkspace_group = "cargo"\ncores = 2\nmem = "4G"\n')
+        with open(self.config_path, "w") as f:
+            f.write(BASE_CONFIG)
+        self.daemon.cfg = self.daemon.load_config()  # the check lane is gone; it starts under heavy
+        self.daemon.schedule(self.now + 1)
+        self.assertEqual((queued.state, queued.group_lane, queued.workspace_group), ("running", "heavy", "heavy"))
+        with open(self.config_path, "w") as f:
+            f.write(regrouped)
+        self.daemon.cfg = self.daemon.load_config()  # heavy joins "cargo" while it runs
+        check = self.submit(("cargo", "check"), lane="cheq", cwd=tree)
+        self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
+        self.assertIn("heavy lane", check.reason)
+
     def test_a_running_build_keeps_its_workspace_when_its_lane_is_removed(self):
         self.with_check_lane()
         tree = self.workdir("tree")

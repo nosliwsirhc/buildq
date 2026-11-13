@@ -2588,6 +2588,7 @@ class Ticket:
         t.release_breach = t.release_breach is True
         t.release_open_at_gap = t.release_open_at_gap is True
         t.group_lane = t.group_lane if isinstance(t.group_lane, str) else None
+        t.workspace_group = t.workspace_group if isinstance(t.workspace_group, str) else None
         t.observed_gap = t.observed_gap is True
         t.write_dirs = [r for r in (within_home(d) for d in t.write_dirs if isinstance(d, str))
                         if r][:4] if isinstance(t.write_dirs, list) else []
@@ -3925,8 +3926,8 @@ class Daemon:
                 holder = busy_workspaces[(lane.workspace_group, t.workspace)]
                 what = "is running" if holder.state != "queued" else "has waited longest and is held"
                 reason, holds = ("workspace", f"another build in the same workspace {what} ({holder.label[:60]}, "
-                                              f"{holder.lane} lane, {holder.id[:8]}); they would fight over its build "
-                                              "directory"), False
+                                              f"{holder.group_lane or holder.lane} lane, {holder.id[:8]}); they would "
+                                              "fight over its build directory"), False
             elif m.psi_mem > cfg.mem_psi_block:
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
                                              f"{cfg.mem_psi_block:g}%)")
@@ -4028,7 +4029,7 @@ class Daemon:
         t.reason = t.reason_cat = ""
         t.granted = t.max_granted = granted
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
-        t.group_lane = t.lane
+        t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
         env_path = os.path.join(t.dir, "env.json")
         try:
             env = read_json(env_path)
