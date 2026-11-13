@@ -424,7 +424,9 @@ memory at the same moment, so don't run both as gates side by side for long.
   their builds ended, so an older one never replaces a newer one. A commit GitHub
   doesn't have yet is tried again after the next `git push` run through buildq from that
   repository, and every ten minutes, for a day; the first refusal is logged with `gh`'s message.
-  Statuses go to the `origin` remote's repository (in a fork, the fork).
+  Statuses go to the `origin` remote's repository (in a fork, the fork). The daemon looks for `gh`
+  on its `PATH`, then in `~/.local/bin` and `~/bin`, since a systemd user service's `PATH` often
+  has neither.
 
 ## CI jobs
 

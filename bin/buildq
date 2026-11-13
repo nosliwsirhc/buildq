@@ -309,8 +309,18 @@ def print_ticket(row: dict) -> None:
     print(f"  in        {short_path(row['cwd'])}")
     src = row.get("source")
     if src:
+        if row.get("source_changed"):  # (found as it started or as it ended)
+            checked = ("; it changed after it was recorded, so the result isn't of this source"
+                       if row["state"] in FINISHED else
+                       "; it changed after it was recorded, so the result won't count as this source's")
+        elif row.get("source_verified"):
+            checked = "; the same when the build started and ended"
+        elif row.get("source_verified") is False:  # finished, but a check of it failed
+            checked = "; it couldn't be checked, so no later run reuses it"
+        else:
+            checked = ""
         print(f"  source    commit {src['commit'][:10]}{' + uncommitted changes' if src.get('dirty') else ''}"
-              f" (fingerprint {src['fingerprint'][:12]})")
+              f" (fingerprint {src['fingerprint'][:12]}){checked}")
     if row.get("caller"):
         print(f"  from      {row['caller']}")
     if row.get("frozen"):
