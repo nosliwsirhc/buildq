@@ -3619,8 +3619,10 @@ class Daemon:
 
     def disk_short(self, t: Ticket) -> tuple[int, int, int] | None:
         """(free, floor, size) of the filesystem where a build would write that is furthest under
-        its floor, or None if every one has its floor free. The floor is disk_floor, or
-        disk_floor_share of that filesystem's size if that is more."""
+        its floor, or None if every one has its floor free. The floor is disk_floor (a size) or,
+        given as a percentage, disk_floor_share of that filesystem's own size. A path whose
+        filesystem can't be read is skipped. The floor gates starts only: builds already running
+        can still write below it."""
         worst = None
         for path in t.disk_paths or [t.cwd]:
             space = disk_space(path)
@@ -3837,7 +3839,7 @@ class Daemon:
                                             "or give its lane a smaller MemoryMax"), False
             elif short is not None:
                 free, floor, size = short
-                said = (f"{cfg.disk_floor_share:.0%} of its {fmt_size(size)}, {fmt_size(floor)}"
+                said = (f"{cfg.disk_floor_share * 100:g}% of its {fmt_size(size)}, {fmt_size(floor)}"
                         if floor > cfg.disk_floor else fmt_size(floor))
                 reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
                                          f"(disk_floor is {said})"), False

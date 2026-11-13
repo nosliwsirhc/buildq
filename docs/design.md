@@ -91,7 +91,9 @@ and walks the queue in order, starting each ticket for which, in this order:
 2. its expected memory is at most the machine's memory less `mem_floor` (otherwise it waits with
    "too big", holding nothing);
 3. its filesystem has `disk_floor` free (a size, or, given as a percentage, that share of the
-   filesystem's own size; with several paths a build writes to, each is checked against its own);
+   filesystem's own size; with several paths a build writes to, each is checked against its own).
+   This gates starts only: builds that started in the same pass, or are running, can still write
+   below it, so cleanup (old build directories) keeps the disk above it;
 4. in an exclusive lane, no build of the same lane runs in its workspace;
 5. memory pressure is at most `mem_psi_block`;
 6. it has a turn: its lane has a free `extra_jobs` turn, or fewer than `max_jobs` builds hold
