@@ -948,6 +948,19 @@ def configured_memory_max(slice_name: str) -> str | None:
     return out if out.isdigit() else None
 
 
+def find_gh() -> str:
+    """gh, from PATH or from where a user install puts it: a systemd user service's PATH is often
+    just /usr/local/bin:/usr/bin, without ~/.local/bin."""
+    found = shutil.which("gh")
+    if found:
+        return found
+    for where in ("~/.local/bin/gh", "~/bin/gh"):
+        path = os.path.expanduser(where)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return "gh"
+
+
 def find_flock_holder(path: str, inode: int) -> int | None:
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
@@ -2110,7 +2123,8 @@ class Daemon:
         if not isinstance(self.status_posts, list):
             self.status_posts = []
         self.status_procs: list[tuple[subprocess.Popen, dict, float]] = []
-        self.gh = ["gh"]  # tests put a stand-in here
+        self.gh: list | None = None  # None: found as each status is sent (tests put a stand-in here)
+        self.gh_unrunnable = False  # said so in the log already, until gh runs again
         self.source_command = [sys.executable, os.path.join(os.path.dirname(SELF), "buildq"), "source"]
         self.source_checks: list[tuple[subprocess.Popen, str, str, float, int]] = []
         self.source_wanted: collections.deque = collections.deque()  # (ticket, phase, attempt) waiting a turn
@@ -2971,7 +2985,8 @@ class Daemon:
             changed = True
         for post in list(self.status_posts):
             if now - post["first"] > 86400:
-                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: it didn't take it for a day")
+                why = "it didn't take it" if post.get("logged") else "gh couldn't be run"  # (logged: GitHub said no)
+                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: {why} for a day")
                 self.status_posts.remove(post)
                 changed = True
         busy = {id(p) for _, p, _ in self.status_procs}
@@ -2984,17 +2999,21 @@ class Daemon:
             if any(p.get("where") == post.get("where") and (p.get("order") or [0, ""]) > (post.get("order") or [0, ""])
                    for p in self.status_posts):
                 continue  # a newer result for it is queued
-            command = [*self.gh, "api", "--method", "POST", f"repos/{post['repo']}/statuses/{post['sha']}",
+            command = [*(self.gh or [find_gh()]), "api", "--method", "POST", f"repos/{post['repo']}/statuses/{post['sha']}",
                        "-f", f"state={post['state']}", "-f", f"context={post['context']}",
                        "-f", f"description={post['description']}"]
             try:
                 proc = subprocess.Popen(command, stdin=DEVNULL, stdout=DEVNULL, stderr=subprocess.PIPE,
                                         start_new_session=True)
             except OSError as e:
-                log(f"can't run gh to tell GitHub a build's result: {e}")
+                if not self.gh_unrunnable:  # once, not once per result every ten minutes
+                    where = " (it isn't on PATH, in ~/.local/bin or in ~/bin)" if command[0] == "gh" else ""
+                    log(f"can't run gh to tell GitHub a build's result{where}: {e}")
+                    self.gh_unrunnable = True
                 post["next"] = now + 600
                 changed = True
                 continue
+            self.gh_unrunnable = False
             self.status_procs.append((proc, post, now + 60))
         if changed:
             self.save_status_posts()

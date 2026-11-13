@@ -48,6 +48,7 @@ mem = "32M"
 exclusive = false
 priority = 100
 extra_jobs = 1
+waits_for_cpu = false
 [[lane_rules]]
 match = "^echo-fast "
 lane = "fast"
@@ -228,6 +229,19 @@ class EndToEnd(Harness):
         while time.time() < deadline and not self.daemon.ticket(mine).get("source_verified"):
             time.sleep(0.1)  # its tree is checked again as it ends
         self.assertTrue(self.daemon.ticket(mine).get("source_verified"), self.daemon.log())
+        self.assertIn("the same when the build started and ended", self.q("status", mine[:8]).stdout)
+        def settled(row):  # changed (seen at its start or its end), or checked at both
+            return row.get("source_changed") or row.get("source_verified") is not None
+
+        deadline = time.time() + 20
+        while time.time() < deadline and not settled(self.daemon.ticket(first)):
+            time.sleep(0.1)
+        verdict = self.daemon.ticket(first)
+        self.assertTrue(settled(verdict), self.daemon.log())
+        said = ("it changed after it was recorded" if verdict.get("source_changed")
+                else "the same when the build started and ended" if verdict.get("source_verified")
+                else "it couldn't be checked")  # (a stalled test edits after it ended; a check can fail)
+        self.assertIn(said, self.q("status", first[:8]).stdout)
         again = self.q("run", "--reuse", "--", "sh", "-c", "sleep 2; echo done")
         self.assertIn("passed this command", again.stderr)
         self.assertEqual(again.stdout, "done\n")  # the earlier run's output, at once

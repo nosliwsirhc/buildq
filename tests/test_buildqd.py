@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1274,6 +1275,71 @@ class GitHubStatuses(DaemonCase):
         push = self.submit(("git", "push"), source=SOURCE)
         self.finish(push, 0)
         self.assertLessEqual(post["next"], self.now + 60)
+
+    def test_gh_is_found_on_path_first_then_where_a_user_install_puts_it(self):
+        def place(path, executable=True):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(path, 0o755 if executable else 0o644)
+            return path
+
+        with tempfile.TemporaryDirectory() as home:
+            on_path = os.path.join(home, "path")
+            with mock.patch.dict(os.environ, HOME=home, PATH=on_path):
+                self.assertEqual(buildqd.find_gh(), "gh")  # nowhere: left to the error that says so
+                place(os.path.join(home, ".local", "bin", "gh"), executable=False)
+                self.assertEqual(buildqd.find_gh(), "gh")  # not runnable: not taken
+                home_bin = place(os.path.join(home, "bin", "gh"))
+                self.assertEqual(buildqd.find_gh(), home_bin)
+                local = place(os.path.join(home, ".local", "bin", "gh"))
+                self.assertEqual(buildqd.find_gh(), local)  # ~/.local/bin before ~/bin
+                first = place(os.path.join(on_path, "gh"))
+                self.assertEqual(buildqd.find_gh(), first)  # PATH before both
+
+    def test_gh_that_cant_run_is_logged_once_and_tried_again_later(self):
+        self.daemon.gh = [os.path.join(self.tmp.name, "no-such-gh")]
+        for argv in (("cargo", "test"), ("cargo", "check")):
+            t = self.submit(argv, source=SOURCE)
+            self.finish(t, 0)
+        self.settle()
+        with mock.patch.object(buildqd, "log") as log:
+            self.drain(self.now + 60)
+            self.drain(self.now + 700)  # ten minutes on, tried again
+        said = [c for c in log.call_args_list if "can't run gh" in str(c)]
+        self.assertEqual(len(said), 1, log.call_args_list)
+        self.assertNotIn("isn't on PATH", str(said[0]))  # a set path: no search to blame
+        self.assertEqual(len(self.daemon.status_posts), 2)  # both kept for later
+        missing = self.daemon.gh
+        self.daemon.gh = None  # found as it is sent: nowhere
+        with mock.patch.object(buildqd, "find_gh", return_value="gh"), \
+                mock.patch.dict(os.environ, PATH=os.path.join(self.tmp.name, "empty")), \
+                mock.patch.object(buildqd, "log") as log:
+            self.drain(self.now + 1400)
+        self.assertEqual([c for c in log.call_args_list if "can't run gh" in str(c)], [])  # the same outage
+        self.daemon.gh = [sys.executable, "-c", "pass"]  # gh runs again
+        self.drain(self.now + 2100)
+        self.daemon.gh = missing
+        for argv in (("cargo", "clippy"),):
+            t = self.submit(argv, source=SOURCE)
+            self.finish(t, 0)
+        self.settle()
+        with mock.patch.object(buildqd, "log") as log:
+            self.drain(self.now + 2200)
+        said = [c for c in log.call_args_list if "can't run gh" in str(c)]
+        self.assertEqual(len(said), 1, log.call_args_list)  # a new outage is said again
+
+    def test_a_gh_found_nowhere_says_where_it_was_looked_for(self):
+        self.daemon.gh = None
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        with mock.patch.object(buildqd, "find_gh", return_value="gh"), \
+                mock.patch.dict(os.environ, PATH=os.path.join(self.tmp.name, "empty")), \
+                mock.patch.object(buildqd, "log") as log:
+            self.drain(self.now + 60)
+        (said,) = [c for c in log.call_args_list if "can't run gh" in str(c)]
+        self.assertIn("isn't on PATH, in ~/.local/bin or in ~/bin", str(said))
 
     def test_off_means_nothing_is_sent(self):
         t = self.submit(("cargo", "test"), source=SOURCE)
