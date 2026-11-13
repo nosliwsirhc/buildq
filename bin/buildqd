@@ -2398,7 +2398,7 @@ class Ticket:
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
-               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group",
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group", "lane_reassigned",
                "waited_by", "wait_mark", "peak_at", "tail", "released", "release_at", "release_hold",
                "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
                "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
@@ -2587,6 +2587,7 @@ class Ticket:
         t.release_revoked = t.release_revoked is True
         t.release_breach = t.release_breach is True
         t.release_open_at_gap = t.release_open_at_gap is True
+        t.lane_reassigned = t.lane_reassigned is True
         t.observed_gap = t.observed_gap is True
         t.write_dirs = [r for r in (within_home(d) for d in t.write_dirs if isinstance(d, str))
                         if r][:4] if isinstance(t.write_dirs, list) else []
@@ -4593,6 +4594,7 @@ class Daemon:
             if t.lane not in self.cfg.lanes:
                 t.lane = self.cfg.default_lane
                 t.lane_reassigned = True  # (its workspace stays held under the group it started with only)
+                self.save(t)
             if t.state == "queued":
                 if os.path.exists(os.path.join(directory, "env.json")):
                     env = read_json(os.path.join(directory, "env.json"))
