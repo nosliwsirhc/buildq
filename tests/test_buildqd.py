@@ -153,6 +153,7 @@ class DaemonCase(unittest.TestCase):
                 return
 
     def tearDown(self):
+        self.doCleanups()  # daemons a test started (reload()) stop their threads before the files go
         self.daemon.stop_memory_watch()
         for t in self.daemon.tickets.values():
             self.daemon.close_jobserver(t)
