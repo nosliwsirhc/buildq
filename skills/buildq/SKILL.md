@@ -131,6 +131,7 @@ idle, answer from the queue's analytics rather than guessing:
   close builds' peaks came to what was planned.
 - `buildq report` (`--by lane`, `--by caller`): per command, runs, failures, time, waits, peaks
   and kills.
+- `buildq top --once`: the machine and every running build right now: CPU, memory, swap, pressure, disk I/O and the size of each build's folders (it measures them first for up to 20 seconds; "…" means not measured yet), plus what waits and why. Without `--once` it is a live screen for the owner, like `btop`.
 - `buildq query "SELECT …"`: anything else, read-only. `buildq query` alone lists the tables:
   `minute` (14 days), `hour` (a year), `build` (180 days, one row per finished build, with what it
   waited for and its memory profile).

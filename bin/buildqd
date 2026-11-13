@@ -1369,6 +1369,40 @@ def workspace_of(cwd: str, env: dict) -> str:
     return "tree:" + os.path.realpath(top)
 
 
+def within_home(path: str) -> str | None:
+    """`path` resolved, if it lies inside the user's home (not home itself); else None. The
+    folders `buildq top` measures are kept to these."""
+    home = os.path.realpath(os.path.expanduser("~"))
+    real = os.path.realpath(path)
+    return real if real.startswith(home + os.sep) else None
+
+
+def write_dirs_of(cwd: str, env: dict, argv: list[str]) -> list[str]:
+    """Where a build fills the disk, for `buildq top`: its CARGO_TARGET_DIR (for cargo with none,
+    the target/ beside the nearest Cargo.lock) and its TMPDIR, in the environment it runs with.
+    Only folders inside the user's home count, and none inside another."""
+    found = []
+    target = env.get("CARGO_TARGET_DIR")
+    if target:
+        found.append(os.path.join(cwd, target))
+    elif command_words(argv)[:1] == ["cargo"]:
+        here = os.path.abspath(cwd)
+        for _ in range(12):
+            if os.path.exists(os.path.join(here, "Cargo.lock")):
+                found.append(os.path.join(here, "target"))
+                break
+            if os.path.dirname(here) == here:
+                break
+            here = os.path.dirname(here)
+    if env.get("TMPDIR"):
+        found.append(os.path.join(cwd, env["TMPDIR"]))
+    kept: list[str] = []
+    for real in sorted({r for r in map(within_home, found) if r}, key=len):
+        if not any(real == k or real.startswith(k + os.sep) for k in kept):
+            kept.append(real)
+    return kept
+
+
 def disk_paths_of(cwd: str, env: dict) -> list[str]:
     """Where a build writes: its directory, its CARGO_TARGET_DIR and its TMPDIR, as far as they
     exist (or their nearest existing parent), each filesystem once."""
@@ -2347,7 +2381,7 @@ class Ticket:
                "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
                "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
                "past_peak_unknown", "past_peak_released", "release_est", "release_oom_base", "release_breach",
-               "release_open_at_gap")
+               "release_open_at_gap", "write_dirs")
 
     def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
                  directory: str | None):
@@ -2441,6 +2475,7 @@ class Ticket:
         self.release_open_at_gap = False  # its decision still stood when a daemon restart left it unwatched
         self.release_stood_at_load = False  # ... when this daemon loaded it (not saved)
         self.release_dirty = False  # measure() took its decision back: the daemon saves the ticket
+        self.write_dirs: list[str] = []  # its CARGO_TARGET_DIR and TMPDIR, absolute: what it fills on disk
         self.settled_since: float | None = None  # it has looked past its peak since then
         self.swap_now = 0  # bytes of it in swap
         self.observed_gap = False  # picked up after a daemon restart: its peak may have been missed
@@ -2527,6 +2562,8 @@ class Ticket:
         t.release_breach = t.release_breach is True
         t.release_open_at_gap = t.release_open_at_gap is True
         t.observed_gap = t.observed_gap is True
+        t.write_dirs = [r for r in (within_home(d) for d in t.write_dirs if isinstance(d, str))
+                        if r][:4] if isinstance(t.write_dirs, list) else []
         t.release_end = sane_count(t.release_end)
         t.peak_cpu = sane_count(t.peak_cpu) or 0.0
         for name in ("past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_unknown",
@@ -2642,6 +2679,9 @@ class Ticket:
             "held": self.held if self.state == "queued" else False, "ahead": ahead,
             "log": self.log, "dir": self.dir, "outside": self.flock[0] if self.flock else None,
             "cancel_requested": self.cancel_requested, "runner": self.runner, "timeout": self.timeout,
+            # for `buildq top`: where to read it, and what it fills
+            "cg": self.cg, "write_dirs": self.write_dirs, "disk_paths": self.disk_paths, "swap_now": self.swap_now, "waited_by": self.waited_by,
+            "peak_at": round(self.peak_at, 1), "release_at": self.release_at, "release_hold": self.release_hold,
         }
 
 
@@ -2982,7 +3022,6 @@ class Daemon:
                 self.save(earlier)
                 return earlier, None
         t.workspace = workspace_of(cwd, env)
-        t.disk_paths = disk_paths_of(cwd, env)
         if isinstance(submission, str) and len(submission) <= 100:
             t.submission = submission
             self.submissions[submission] = tid
@@ -2997,6 +3036,8 @@ class Daemon:
             job_env.setdefault(key, value.replace("{id}", tid))
         job_env["BUILDQ_JOB"] = tid
         job_env["BUILDQ_TICKET"] = tid
+        t.disk_paths = disk_paths_of(cwd, job_env)  # (configured defaults included: a TMPDIR elsewhere counts)
+        t.write_dirs = write_dirs_of(cwd, job_env, argv)
         try:
             os.makedirs(t.dir)
             write_json(os.path.join(t.dir, "env.json"), job_env)

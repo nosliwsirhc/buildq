@@ -69,8 +69,10 @@ import collections
 import glob
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import select
 import shlex
 import signal
@@ -195,13 +197,14 @@ class Channel:
             pass
 
 
-def connect(timeout: float) -> Channel | None:
+def connect(timeout: float, socket_timeout: float = 5) -> Channel | None:
     """Connect, retrying while the daemon restarts: up to `timeout` seconds while the socket
-    refuses connections, and 2 seconds while it doesn't exist (a daemon that isn't installed)."""
+    refuses connections, and 2 seconds (or `timeout`, if less) while it doesn't exist (a daemon
+    that isn't installed)."""
     start = time.monotonic()
     while True:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5)
+        sock.settimeout(socket_timeout)
         try:
             sock.connect(socket_path())
             uid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
@@ -213,14 +216,14 @@ def connect(timeout: float) -> Channel | None:
             return Channel(sock)
         except OSError as e:
             sock.close()
-            limit = 2.0 if isinstance(e, FileNotFoundError) else timeout
+            limit = min(2.0, timeout) if isinstance(e, FileNotFoundError) else timeout
             if time.monotonic() - start >= limit:
                 return None
             time.sleep(0.25)
 
 
-def request(message: dict, timeout: float = 15) -> dict | None:
-    channel = connect(3)
+def request(message: dict, timeout: float = 15, connect_timeout: float = 3) -> dict | None:
+    channel = connect(connect_timeout, min(5.0, timeout))
     if channel is None:
         return None
     try:
@@ -1549,6 +1552,911 @@ def capacity_report(args) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------------------------
+# buildq top: a live view of the machine and each build, like btop for the queue
+
+CI_UNITS = ("actions.runner.*", "gha-*", "*-runner-*", "gitlab-runner*")  # as the daemon's analytics
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+
+
+def clean(text: str) -> str:
+    """Text safe to draw: no escape sequences; tabs as spaces; every control and format character
+    (newlines, C1, bidi and zero-width marks, line separators) replaced, since a label can hold a
+    script; in ASCII mode, ASCII only."""
+    import unicodedata
+    text = ANSI.sub("", str(text).expandtabs(4))
+    text = "".join(GLYPHS["ctl"] if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") and c != "\u200c" else c
+                   for c in text)  # (U+200C stays: Persian uses it inside words, and it moves nothing)
+    return text.encode("ascii", "replace").decode() if GLYPHS["ctl"] == "?" else text
+
+
+def char_width(c: str) -> int:
+    """Columns a character takes on a terminal: wide (CJK, emoji) 2; marks and format characters
+    (variation selectors, joiners) 0. (Drawn text has been through clean(), which replaces most
+    format characters; this also serves text that hasn't.)"""
+    import unicodedata
+    if unicodedata.category(c) in ("Mn", "Me", "Cf") and c != "\u00ad":
+        return 0
+    return 2 if unicodedata.east_asian_width(c) in "WF" else 1
+
+
+def text_width(text: str) -> int:
+    return sum(char_width(c) for c in text)
+
+
+def fit(text: str, width: int) -> str:
+    """The longest start of `text` that takes at most `width` columns."""
+    used, out = 0, []
+    for c in text:
+        w = char_width(c)
+        if used + w > width:
+            break
+        used += w
+        out.append(c)
+    return "".join(out)
+
+
+def read_text(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def pressure_of(text: str | None) -> dict:
+    """{"some": avg10, "full": avg10} from a *.pressure file; empty if it can't be read (PSI off)."""
+    out = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("some", "full"):
+            for part in parts[1:]:
+                if part.startswith("avg10="):
+                    try:
+                        out[parts[0]] = float(part[6:])
+                    except ValueError:
+                        pass
+    return out
+
+
+_HOLDERS: dict[str, tuple[list[str], float]] = {}
+
+
+def holders_of(device: str) -> list[str]:
+    """MAJ:MIN of the devices stacked on a block device or on any of its partitions (dm-crypt,
+    LVM, md). Known for a minute at a time: devices can be opened while top runs."""
+    known = _HOLDERS.get(device)
+    if known is None or time.monotonic() - known[1] > 60:
+        base, found = f"/sys/dev/block/{device}", []  # (each once: an LV over two partitions shows twice)
+        for holders in [os.path.join(base, "holders"), *glob.glob(os.path.join(base, "*", "holders"))]:
+            try:
+                names = os.listdir(holders)
+            except OSError:
+                continue
+            for name in names:
+                number = (read_text(f"/sys/class/block/{name}/dev") or "").strip()
+                if number:
+                    found.append(number)
+        known = (list(dict.fromkeys(found)), time.monotonic())
+        _HOLDERS[device] = known
+    return known[0]
+
+
+def io_counters(text: str | None) -> dict[str, tuple[int, int]]:
+    """MAJ:MIN -> (bytes read, bytes written) from a cgroup's io.stat."""
+    per = {}
+    for line in (text or "").splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        rbytes = wbytes = 0
+        for part in fields[1:]:
+            name, _, value = part.partition("=")
+            if name == "rbytes" and value.isdigit():
+                rbytes = int(value)
+            elif name == "wbytes" and value.isdigit():
+                wbytes = int(value)
+        per[fields[0]] = (rbytes, wbytes)
+    return per
+
+
+def io_rate(before: dict, after: dict, span: float) -> tuple[float, float]:
+    """Bytes read and written per second between two io.stat readings, each byte once. I/O through
+    dm-crypt, LVM or md is charged at the stacked device and again at the disks below (io.stat
+    names whole disks). So devices are grouped with what is stacked on them, and each group counts
+    the larger of what its bottom devices (nothing below them: the disks) and its top devices
+    (nothing stacked on them) did in the interval:
+    exact for dm-crypt, LVM, stripes however the bytes were split, and a plain partition beside a
+    stacked one; a mirror's writes count each copy. Only devices in both readings count, so a
+    stacked device that came or went shows no burst, and a new one makes what is stacked be looked
+    at afresh. Loop devices aren't holders: a filesystem in a file counts twice."""
+    if span <= 0:
+        return 0.0, 0.0
+    if any(d not in before for d in after):
+        _HOLDERS.clear()  # something new: what is stacked may have changed
+    deltas = {d: (max(0, after[d][0] - before[d][0]), max(0, after[d][1] - before[d][1])) for d in after if d in before}
+    above = {d: [h for h in dict.fromkeys(holders_of(d)) if h in deltas and h != d] for d in deltas}
+    group = {d: d for d in deltas}
+
+    def root(x):
+        while group[x] != x:
+            group[x] = group[group[x]]
+            x = group[x]
+        return x
+
+    for d, holders in above.items():
+        for h in holders:
+            group[root(d)] = root(h)
+    stacked_on_something = {h for holders in above.values() for h in holders}
+    members = collections.defaultdict(list)
+    for d in deltas:
+        members[root(d)].append(d)
+    read = write = 0.0
+    for devices in members.values():
+        bottom = [d for d in devices if d not in stacked_on_something]  # nothing below it
+        top = [d for d in devices if not above[d]]  # nothing above it
+        read += max(sum(deltas[d][0] for d in bottom), sum(deltas[d][0] for d in top))
+        write += max(sum(deltas[d][1] for d in bottom), sum(deltas[d][1] for d in top))
+    return read / span, write / span
+
+
+def cgroup_sample(path: str) -> dict | None:
+    """What a cgroup is doing now: CPU time, the memory it needs (anon + shmem + kernel less
+    reclaimable slab, as the daemon counts it), swap, bytes read and written, pressure, and memory
+    events. None if it is gone or only partly readable (it is going)."""
+    cpu, memory = read_text(os.path.join(path, "cpu.stat")), read_text(os.path.join(path, "memory.stat"))
+    if cpu is None or memory is None:
+        return None
+    usage = 0
+    for line in cpu.splitlines():
+        if line.startswith("usage_usec "):
+            usage = int(line.split()[1])
+    stat = {}
+    for line in memory.splitlines():
+        name, _, value = line.partition(" ")
+        if name in ("anon", "kernel", "shmem", "slab_reclaimable") and value.strip().isdigit():
+            stat[name] = int(value)
+    need = stat.get("anon", 0) + stat.get("shmem", 0) + max(0, stat.get("kernel", 0) - stat.get("slab_reclaimable", 0))
+    swap = (read_text(os.path.join(path, "memory.swap.current")) or "").strip()
+    io = io_counters(read_text(os.path.join(path, "io.stat")))
+    events = {}
+    for line in (read_text(os.path.join(path, "memory.events")) or "").splitlines():
+        name, _, value = line.partition(" ")
+        if value.strip().isdigit():
+            events[name] = int(value)
+    return {"usage": usage, "mem": need, "swap": int(swap) if swap.isdigit() else 0, "io": io,
+            "psi_mem": pressure_of(read_text(os.path.join(path, "memory.pressure"))),
+            "psi_cpu": pressure_of(read_text(os.path.join(path, "cpu.pressure"))),
+            "psi_io": pressure_of(read_text(os.path.join(path, "io.pressure"))), "events": events}
+
+
+def user_manager_dir() -> str:
+    for line in (read_text("/proc/self/cgroup") or "").splitlines():
+        if line.startswith("0::"):
+            match = re.match(r"(.*/user@\d+\.service)(?:/|$)", line[3:].strip())
+            if match:
+                return "/sys/fs/cgroup" + match.group(1)
+    uid = os.getuid()
+    return f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+def slice_dir(name: str) -> str:
+    parts = name[: -len(".slice")].split("-")
+    return "/".join("-".join(parts[: i + 1]) + ".slice" for i in range(len(parts)))
+
+
+def safe_dir(path) -> str | None:
+    """A folder `top` may measure: it resolves to an existing directory inside the user's home
+    (not home itself). Anything else (/, a symlink out of home, //) is left alone."""
+    if not isinstance(path, str) or not path:
+        return None
+    home = os.path.realpath(os.path.expanduser("~"))
+    real = os.path.realpath(path)
+    return real if real.startswith(home + os.sep) and os.path.isdir(real) else None
+
+
+def folders_of(row: dict) -> list[str]:
+    """A build's folders, resolved, safe, each once, none inside another."""
+    kept: list[str] = []
+    for real in sorted({r for r in map(safe_dir, row.get("write_dirs") or []) if r}, key=len):
+        if not any(real == k or real.startswith(k + os.sep) for k in kept):
+            kept.append(real)
+    return kept
+
+
+class DirSizes:
+    """The disk space build folders take, measured in the background by `du -sx` at idle I/O
+    priority: it stays on one filesystem, counts a hard-linked file once, never follows a symlink,
+    and can be killed. Each folder at most every RESCAN seconds; a `du` past LIMIT seconds is
+    stopped and the folder shows as not measured."""
+
+    RESCAN, LIMIT = 300.0, 60.0
+
+    def __init__(self, background: bool = True):
+        import atexit
+        import threading
+        self.proc: subprocess.Popen | None = None  # the du running now
+        self.stopping = False
+        atexit.register(self.stop)
+        self.sizes: dict[str, tuple[int | None, bool, float]] = {}  # folder -> (bytes, complete, measured at)
+        self.wanted: list[str] = []
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        if background:
+            threading.Thread(target=self.run, name="dir-sizes", daemon=True).start()
+
+    def want(self, folders) -> None:
+        with self.lock:
+            self.wanted = list(dict.fromkeys(folders))
+        self.wake.set()
+
+    def get(self, folder: str) -> tuple[int | None, bool, float] | None:
+        """(bytes or None, complete, seconds ago) or None if not measured yet."""
+        with self.lock:
+            found = self.sizes.get(folder)
+        return None if found is None else (found[0], found[1], time.monotonic() - found[2])
+
+    def due(self) -> list[str]:
+        with self.lock:
+            return [f for f in self.wanted if f not in self.sizes or time.monotonic() - self.sizes[f][2] >= self.RESCAN]
+
+    def run(self) -> None:
+        while not self.stopping:
+            self.wake.wait(5)
+            self.wake.clear()
+            for folder in self.due():
+                if self.stopping:
+                    return
+                try:
+                    self.measure_into(folder, self.LIMIT)
+                except Exception:  # a thread that died would leave every folder "not yet" for good
+                    pass
+
+    def stop(self) -> None:
+        """Kill the du running now: quitting top must not leave a walk going."""
+        self.stopping = True
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+
+    def measure_into(self, folder: str, limit: float, keep_cut: bool = True) -> None:
+        if self.stopping:
+            return
+        size, complete, cut = self.measure(folder, limit, self)
+        if cut and not keep_cut:
+            return  # (--once: its deadline, not the folder's fault; it shows as not measured yet)
+        with self.lock:
+            self.sizes[folder] = (size, complete, time.monotonic())
+
+    @staticmethod
+    def measure(folder: str, limit: float, owner=None) -> tuple[int | None, bool, bool]:
+        """(bytes or None, complete, cut off by the limit). du exits 1 when an entry vanished mid-walk,
+        which a running build does all the time; only an entry it couldn't read makes it partial."""
+        command = ["du", "-sx", "--block-size=1", folder]
+        if shutil.which("ionice"):
+            command = ["ionice", "-c3", *command]
+        try:
+            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, preexec_fn=die_with(os.getpid()),
+                                    env={**os.environ, "LC_ALL": "C"})  # (its messages are matched below)
+        except OSError:
+            return None, False, False
+        if owner is not None:
+            owner.proc = proc
+        try:
+            out, err = proc.communicate(timeout=limit)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass  # stuck in the kernel (a hung mount): it goes when it can
+            return None, False, True
+        finally:
+            if owner is not None:
+                owner.proc = None
+        match = re.match(rb"\s*(\d+)", out or b"")
+        size = int(match.group(1)) if match else None
+        unreadable = b"ermission denied" in (err or b"") or b"Input/output error" in (err or b"")
+        return size, size is not None and not unreadable, False
+
+
+class TopSampler:
+    """One snapshot each refresh: the daemon's overview, the machine (from /proc), every
+    filesystem builds write to, the groups that use the machine (buildq's builds, CI runners,
+    containers, the user's apps), and every running build's own cgroup. Rates come from the
+    change since the last snapshot."""
+
+    def __init__(self, sizes: DirSizes | None = None):
+        self.last: dict[str, tuple[float, dict]] = {}
+        self.manager = user_manager_dir()
+        self.sizes = sizes
+
+    def rate(self, key: str, now: float, values: dict) -> dict:
+        before = self.last.get(key)
+        self.last[key] = (now, values)
+        if before is None or now <= before[0]:
+            return {}
+        span = now - before[0]
+        return {name: max(0.0, (values[name] - before[1].get(name, values[name])) / span)
+                for name in values if isinstance(values[name], (int, float))}
+
+    @staticmethod
+    def mounts() -> list[tuple[str, str]]:
+        """(mount point, source device name) from the mount table, in order (a later mount over the
+        same point wins). btrfs gives each subvolume a device number of its own, so a path is matched
+        to its mount by the longest mount point it lies under, not by its device number."""
+        found = []
+        for line in (read_text("/proc/self/mountinfo") or "").splitlines():
+            fields = line.split()
+            if len(fields) > 4 and " - " in line:
+                source = line.split(" - ", 1)[1].split()[1:2]
+                device = os.path.basename(os.path.realpath(source[0])) if source and source[0].startswith("/dev/") else ""
+                found.append((re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]), device))
+        return found
+
+    @staticmethod
+    def mount_of(path: str, mounts: list[tuple[str, str]]) -> tuple[str, str]:
+        real, best = os.path.realpath(path), ("/", "")
+        for point, device in mounts:
+            if (real == point or real.startswith(point.rstrip("/") + "/")) and len(point) >= len(best[0]):
+                best = (point, device)
+        return best
+
+    def filesystems(self, now: float, paths, floor_setting) -> list[dict]:
+        """`/` and every filesystem a build writes to, once each: free, size, floor, I/O rates."""
+        mounts = self.mounts()
+        stats = {}
+        for line in (read_text("/proc/diskstats") or "").splitlines():
+            parts = line.split()
+            if len(parts) > 9:
+                stats[parts[2]] = (int(parts[5]) * 512, int(parts[9]) * 512)
+        out, seen = [], set()
+        for path in ["/", *paths]:
+            try:
+                vfs = os.statvfs(path)
+            except OSError:
+                continue
+            mount, device = self.mount_of(path, mounts)
+            key = device or mount
+            if key in seen:
+                continue  # (btrfs subvolumes of one disk)
+            seen.add(key)
+            size, free = vfs.f_blocks * vfs.f_frsize, vfs.f_bavail * vfs.f_frsize
+            if isinstance(floor_setting, str) and floor_setting.endswith("%"):
+                floor = int(float(floor_setting[:-1]) / 100 * size)
+            else:
+                floor = int(floor_setting or 0)
+            fs = {"mount": mount, "device": device, "free": free, "size": size, "floor": floor}
+            if device in stats:
+                rate = self.rate(f"disk:{device}", now, {"read": stats[device][0], "write": stats[device][1]})
+                fs["read"], fs["write"] = rate.get("read"), rate.get("write")
+            out.append(fs)
+        return out
+
+    def machine(self, now: float, overview: dict | None) -> dict:
+        config = (overview or {}).get("config") or {}
+        cores = ((overview or {}).get("machine") or {}).get("cores") or os.cpu_count() or 1
+        out = {"cores": cores}
+        fields = (read_text("/proc/stat") or "cpu 0 0 0 0").splitlines()[0].split()[1:]
+        ticks = [int(x) for x in fields[:8]] + [0] * (8 - len(fields[:8]))
+        rate = self.rate("machine:cpu", now, {"busy": sum(ticks) - ticks[3] - ticks[4], "total": sum(ticks)})
+        if rate.get("total"):
+            out["busy"] = rate["busy"] / rate["total"] * (os.cpu_count() or cores)
+        info = {}
+        for line in (read_text("/proc/meminfo") or "").splitlines():
+            name, _, value = line.partition(":")
+            if value.split():
+                info[name] = int(value.split()[0]) * 1024
+        out.update(mem_total=info.get("MemTotal", 0), mem_available=info.get("MemAvailable", 0),
+                   swap_total=info.get("SwapTotal", 0), swap_used=info.get("SwapTotal", 0) - info.get("SwapFree", 0))
+        for resource in ("cpu", "memory", "io"):
+            out[f"psi_{resource}"] = pressure_of(read_text(f"/proc/pressure/{resource}"))
+        rows = ((overview or {}).get("running") or []) + ((overview or {}).get("queued") or [])
+        paths = list(dict.fromkeys(p for row in rows for p in (row.get("disk_paths") or []) if isinstance(p, str)))
+        out["filesystems"] = self.filesystems(now, paths, config.get("disk_floor"))
+        return out
+
+    def group_paths(self, config: dict) -> dict[str, list[str]]:
+        import fnmatch
+        apps = os.path.join(self.manager, "app.slice")
+        found = {"builds": [os.path.join(self.manager, slice_dir(config.get("slice") or "buildq.slice"))],
+                 "ci": [], "containers": [], "apps": [apps]}
+
+        def children(path):
+            try:
+                return sorted(os.listdir(path))
+            except OSError:
+                return []
+
+        for parent in (self.manager, apps):
+            for name in children(parent):
+                if name.endswith(".service") and any(fnmatch.fnmatch(name, p) for p in CI_UNITS):
+                    found["ci"].append(os.path.join(parent, name))
+        system = "/sys/fs/cgroup/system.slice"
+        for name in children(system):
+            if any(fnmatch.fnmatch(name, p) for p in CI_UNITS) and name.endswith(".service"):
+                found["ci"].append(os.path.join(system, name))
+            elif (name.startswith("docker-") and name.endswith(".scope")) or name in ("docker.service", "containerd.service"):
+                found["containers"].append(os.path.join(system, name))
+        for name in children(os.path.join(self.manager, "user.slice")):
+            if name.startswith("libpod-") and name.endswith(".scope"):
+                found["containers"].append(os.path.join(self.manager, "user.slice", name))
+        return found
+
+    def cgroup(self, path: str, now: float) -> dict | None:
+        sample = cgroup_sample(path)
+        if sample is None:
+            self.last.pop(path, None)
+            return None
+        before = self.last.get(path)
+        rate = self.rate(path, now, {"usage": sample["usage"]})
+        sample["cores"] = rate["usage"] / 1e6 if rate else None
+        if before is not None and "io" in before[1]:
+            sample["read_rate"], sample["write_rate"] = io_rate(before[1]["io"], sample["io"], now - before[0])
+        else:
+            sample["read_rate"] = sample["write_rate"] = None
+        self.last[path] = (now, {"usage": sample["usage"], "io": sample["io"]})
+        return sample
+
+    def snapshot(self, overview: dict | None) -> dict:
+        now = time.monotonic()
+        config = (overview or {}).get("config") or {}
+        snap = {"time": time.time(), "overview": overview, "machine": self.machine(now, overview), "groups": {},
+                "builds": {}, "dir_sizes": {}}
+        found = self.group_paths(config)
+        samples = {path: self.cgroup(path, now) for paths in found.values() for path in paths}
+        apps_dir = os.path.join(self.manager, "app.slice") + os.sep
+        for group, paths in found.items():
+            total = {"cores": 0.0, "mem": 0, "swap": 0, "read_rate": 0.0, "write_rate": 0.0, "known": True}
+            for path in paths:
+                sample = samples.get(path)
+                if sample is None:
+                    continue
+                total["mem"] += sample["mem"]
+                total["swap"] += sample["swap"]
+                if sample["cores"] is None:
+                    total["known"] = False  # seen for the first time: no rate yet
+                else:
+                    total["cores"] += sample["cores"]
+                    total["read_rate"] += sample["read_rate"] or 0
+                    total["write_rate"] += sample["write_rate"] or 0
+                if group == "builds":
+                    total["psi_mem"], total["psi_cpu"], total["psi_io"] = sample["psi_mem"], sample["psi_cpu"], sample["psi_io"]
+            snap["groups"][group] = total
+        apps = snap["groups"].get("apps")
+        for path in found["ci"]:  # CI runners in app.slice aren't the user's apps
+            sample = samples.get(path)
+            if apps and sample and path.startswith(apps_dir):
+                apps["mem"] = max(0, apps["mem"] - sample["mem"])
+                apps["swap"] = max(0, apps["swap"] - sample["swap"])
+                apps["cores"] = max(0.0, apps["cores"] - (sample["cores"] or 0.0))
+        folders = []
+        for row in (overview or {}).get("running") or []:
+            if row.get("cg"):
+                sample = self.cgroup(row["cg"], now)
+                if sample is not None:
+                    snap["builds"][row["id"]] = sample
+            snap.setdefault("folders", {})[row["id"]] = folders_of(row)
+            folders.extend(snap["folders"][row["id"]])
+        if self.sizes is not None:
+            self.sizes.want(folders)
+            snap["dir_sizes"] = {f: self.sizes.get(f) for f in folders}
+        return snap
+
+
+# ---- drawing: lines of (text, colour) so the same code feeds curses and --once
+
+GLYPHS = {"full": "█", "empty": "░", "mark": "▶", "atleast": "≥", "sep": "·", "more": "…", "ctl": "·"}
+
+
+def use_ascii() -> None:
+    """Without a UTF-8 locale, draw with ASCII."""
+    GLYPHS.update(full="#", empty=".", mark=">", atleast=">=", sep="|", more="...", ctl="?")
+
+
+def bar(fraction: float, width: int) -> str:
+    fraction = min(max(fraction, 0.0), 1.0)
+    full = int(round(fraction * width))
+    return GLYPHS["full"] * full + GLYPHS["empty"] * (width - full)
+
+
+def level(fraction: float) -> str:
+    return "ok" if fraction < 0.6 else "warn" if fraction < 0.85 else "bad"
+
+
+def rate_text(value) -> str:
+    if value is None:
+        return "-"
+    if value < 1024:
+        return "0"
+    return f"{value / 1024:.0f}K/s" if value < MIB else fmt_size(value) + "/s"
+
+
+def pct(values: dict, kind: str) -> str:
+    """A pressure figure, or "-" when the kernel doesn't say (PSI off)."""
+    return f"{values[kind]:.1f}%" if kind in values else "-"
+
+
+def running_order(snap: dict, sort: str) -> list[dict]:
+    """The running builds in the order the screen lists them."""
+    builds = snap.get("builds", {})
+
+    def use(row, name):
+        return (builds.get(row["id"]) or {}).get(name) or 0
+
+    keys = {"age": lambda r: -(r.get("elapsed") or 0), "cpu": lambda r: -use(r, "cores"),
+            "mem": lambda r: -(use(r, "mem") or r.get("mem_now") or 0),
+            "io": lambda r: -(use(r, "read_rate") + use(r, "write_rate")),
+            "disk": lambda r: -(build_disk(snap, r)[0] or 0)}
+    return sorted((snap.get("overview") or {}).get("running") or [], key=keys.get(sort, keys["age"]))
+
+
+def folders_in(snap: dict, row: dict) -> list[str]:
+    found = snap.get("folders", {}).get(row.get("id"))
+    return found if found is not None else folders_of(row)
+
+
+def build_disk(snap: dict, row: dict) -> tuple[int | None, str]:
+    """What a build's folders take, and a mark: "" (measured), "≥" (only in part), "…" (not yet),
+    "?" (couldn't be), "-" (no folders). The row adds "*" when another running build shares one."""
+    folders = folders_in(snap, row)
+    if not folders:
+        return None, "-"
+    measured = [snap.get("dir_sizes", {}).get(folder) for folder in folders]
+    if all(found is None for found in measured):
+        return None, GLYPHS["more"]  # not measured yet
+    if all(found is None or found[0] is None for found in measured):
+        return None, "?"  # couldn't be measured
+    total = sum(found[0] for found in measured if found and found[0] is not None)
+    partial = any(found is None or found[0] is None or not found[1] for found in measured)
+    return total, GLYPHS["atleast"] if partial else ""
+
+
+def shared_folders(snap: dict) -> set[str]:
+    """Folders that another running build also writes to: the same folder, or one inside the other."""
+    owned = [(row["id"], folder) for row in (snap.get("overview") or {}).get("running") or []
+             for folder in folders_in(snap, row)]
+    shared = set()
+    for i, (a, fa) in enumerate(owned):
+        for b, fb in owned[i + 1:]:
+            if a != b and (fa == fb or fa.startswith(fb + os.sep) or fb.startswith(fa + os.sep)):
+                shared.update((fa, fb))
+    return shared
+
+
+def render_top(snap: dict, width: int, height: int, selected: str | None = None, sort: str = "age",
+               detail: bool = False, log_lines: list[str] | None = None) -> tuple[list[tuple[str, str]], list[str]]:
+    """The screen as lines of (text, colour), and the running builds' ids in screen order. Colour is
+    "", "head", "ok", "warn", "bad" or "dim". With a height, the build list scrolls to keep the
+    selected build in view, and its detail and log get room of their own; height 0 draws it all."""
+    m, groups, ov = snap["machine"], snap["groups"], snap.get("overview")
+    sep = GLYPHS["sep"]
+    barw = max(8, min(40, width - 80))
+    head: list[tuple[str, str]] = []
+
+    def put(lines, text, colour=""):
+        lines.append((fit(clean(text), width).rstrip(), colour))
+
+    stamp = time.strftime("%H:%M:%S", time.localtime(snap["time"]))
+    state = ("daemon not answering" if ov is None else
+             f"PAUSED: {(ov['paused'] or {}).get('reason') or ''}" if ov.get("paused") else f"buildqd {ov.get('version', '')}")
+    put(head, f"buildq top  {stamp}  {state}   q quit {sep} s sort ({sort}) {sep} up/down select {sep} enter detail "
+              f"{sep} l log", "head")
+    cores = m.get("cores", 1)
+    target = ((ov or {}).get("budget") or {}).get("cpu_cap") or cores
+    busy = m.get("busy")
+    if busy is not None:
+        put(head, f"CPU   {bar(busy / cores, barw)} {busy:5.1f} of {cores} busy {sep} target {target:.1f} {sep} pressure "
+                  f"{pct(m.get('psi_cpu', {}), 'some')}", level(busy / max(target, 1)))
+    else:
+        put(head, "CPU   (measuring)", "dim")
+    total, avail = m.get("mem_total") or 1, m.get("mem_available") or 0
+    budget = (ov or {}).get("budget") or {}
+    floor = ((ov or {}).get("config") or {}).get("mem_floor") or 0
+    pm = m.get("psi_memory", {})
+    put(head, f"MEM   {bar(1 - avail / total, barw)} {fmt_size(total - avail)} used {sep} {fmt_size(avail)} free {sep} "
+              f"floor {fmt_size(floor)} {sep} held for growth {fmt_size(budget.get('growth_reserved') or 0)} {sep} room "
+              f"{fmt_size(max(budget.get('free_mem') or 0, 0))} {sep} pressure {pct(pm, 'some')} some, {pct(pm, 'full')} full",
+        level(1 - avail / total))
+    if m.get("swap_total"):
+        put(head, f"SWAP  {bar(m['swap_used'] / m['swap_total'], barw)} {fmt_size(m['swap_used'])} of "
+                  f"{fmt_size(m['swap_total'])}", level(m["swap_used"] / m["swap_total"]))
+    for fs in m.get("filesystems") or []:
+        used = fs["size"] - fs["free"]
+        put(head, f"DISK  {bar(used / max(fs['size'], 1), barw)} {fs['mount']}: {fmt_size(fs['free'])} free of "
+                  f"{fmt_size(fs['size'])}{f' {sep} floor ' + fmt_size(fs['floor']) if fs['floor'] else ''} {sep} read "
+                  f"{rate_text(fs.get('read'))} {sep} write {rate_text(fs.get('write'))}",
+            "bad" if fs["floor"] and fs["free"] < fs["floor"] else level(used / max(fs["size"], 1)))
+    parts = []
+    for name, label in (("builds", "builds"), ("ci", "CI"), ("containers", "containers"), ("apps", "apps")):
+        g = groups.get(name)
+        if g:
+            cores_text = f"{g['cores']:.1f}c" if g.get("known") else "-"
+            swap_text = f" +{fmt_size(g['swap'])} swap" if g["swap"] else ""
+            parts.append(f"{label} {cores_text} {fmt_size(g['mem'])}{swap_text}")
+    named = ("builds", "ci", "containers", "apps")
+    if busy is not None and all(groups.get(n, {}).get("known") for n in named):
+        parts.append(f"other {max(0.0, busy - sum(groups[n]['cores'] for n in named if n in groups)):.1f}c")
+    put(head, "WHO   " + f" {sep} ".join(parts) + f" {sep} pressure: io {pct(m.get('psi_io', {}), 'some')}")
+    b = groups.get("builds")
+    if b and b.get("known"):
+        bp = b.get("psi_mem") or {}
+        put(head, f"QUEUE builds together: {b['cores']:.1f} cores {sep} {fmt_size(b['mem'])} memory {sep} "
+                  f"{fmt_size(b['swap'])} swap {sep} read {rate_text(b['read_rate'])} {sep} write {rate_text(b['write_rate'])} "
+                  f"{sep} memory pressure {pct(bp, 'some')} some, {pct(bp, 'full')} full")
+
+    running = running_order(snap, sort)
+    order = [row["id"] for row in running]
+    queued = list((ov or {}).get("queued") or [])
+    if selected not in order:
+        selected = order[0] if order else None
+    builds, shared = snap.get("builds", {}), shared_folders(snap)
+
+    # Columns: the core ones always; then, as width allows, disk, memory pressure, I/O, swap.
+    narrow = width < 80
+    core = [("TICKET", 9)] + ([] if narrow else [("LANE", 6), ("AGE", 6)]) + [("CPU used/given", 14),
+                                                                            ("MEMORY now/peak/plan", 24)]
+    optional = [("DISK", 8), ("MEMP", 6), ("READ/s", 8), ("WRITE/s", 8), ("SWAP", 7)]
+    used_width = 2 + sum(w + 1 for _, w in core)
+    shown = []
+    for name, w in optional:  # in order: the last ones go first
+        if used_width + w + 1 + 12 > width:
+            break
+        shown.append((name, w))
+        used_width += w + 1
+    shown_names = {name for name, _ in shown}
+    cmdw = max(0, width - used_width - 1)
+
+    def cell(text, w, right=False):
+        text = fit(clean(text), w)
+        pad = " " * (w - text_width(text))
+        return pad + text if right else text + pad
+
+    table: list[tuple[str, str]] = []
+    header = "  " + " ".join(cell(n, w, n == "AGE") for n, w in core)
+    header += "".join(" " + cell(n, w, True) for n, w in optional if n in shown_names) + "  COMMAND"
+    put(table, f"{len(running)} running {sep} {len(queued)} waiting", "head")
+    put(table, header, "dim")
+    rows: list[tuple[str, str]] = []
+    for row in running:
+        s = builds.get(row["id"]) or {}
+        given = row.get("granted") or 0
+        used = s.get("cores")
+        cpu = (f"{bar(used / max(given, 1), 6)} {used:4.1f}/{given}" if used is not None else f"{'':6} {'-':>4}/{given}")
+        mem_now = s.get("mem", row.get("mem_now") or 0)
+        plan = row.get("est_mem") or 0
+        mem = f"{bar(mem_now / plan, 6) if plan else ' ' * 6} {fmt_size(mem_now)}/{fmt_size(row.get('mem_peak') or 0)}/{fmt_size(plan)}"
+        size, mark = build_disk(snap, row)
+        disk = mark if size is None else (mark if mark == GLYPHS["atleast"] else "") + fmt_size(size) + (
+            "*" if any(f in shared for f in folders_in(snap, row)) else "")
+        psi = s.get("psi_mem") or {}
+        values = {"DISK": disk, "MEMP": pct(psi, "some") if s else "-", "READ/s": rate_text(s.get("read_rate")),
+                  "WRITE/s": rate_text(s.get("write_rate")),
+                  "SWAP": fmt_size(s.get("swap", 0)) if s else "-"}
+        marker = GLYPHS["mark"] if row["id"] == selected else " "
+        some = psi.get("some", 0.0)
+        colour = "bad" if some >= 10 or row.get("frozen") else "warn" if some >= 1 or (plan and mem_now > plan) else ""
+        lane_age = "" if narrow else f"{cell(row['lane'], 6)} {cell(fmt_age(row.get('elapsed') or 0), 6, True)} "
+        line = (f"{marker} {cell(row['short'], 9)} {lane_age}"
+                f"{cell(cpu, 14)} {cell(mem, 24)}" + "".join(" " + cell(values[n], w, True) for n, w in optional if n in shown_names)
+                + "  " + cell(row.get("label") or "", cmdw))
+        put(rows, line, colour)
+
+    pane: list[tuple[str, str]] = []
+    if detail and selected:
+        row = next(r for r in running if r["id"] == selected)
+        s = builds.get(row["id"]) or {}
+        put(pane, f"-- {row['id']}  {row.get('name') or ''}", "head")
+        put(pane, f"  command   {row.get('label') or ''}")
+        put(pane, f"  in        {row.get('cwd')}")
+        put(pane, f"  plan      {fmt_size(row.get('est_mem') or 0)} ({row.get('est_src') or '?'}); peak "
+                  f"{fmt_size(row.get('mem_peak') or 0)} at {fmt_age(row.get('peak_at') or 0)} in")
+        put(pane, f"  cores     {row.get('granted')} given (wants {row.get('want')}, at least {row.get('need')}); "
+                  f"{'-' if s.get('cores') is None else format(s['cores'], '.1f')} in use, {row.get('peak_cores') or 0:.1f} at most")
+        if s:
+            ev = s.get("events") or {}
+            put(pane, f"  pressure  memory {pct(s.get('psi_mem') or {}, 'some')} some, {pct(s.get('psi_mem') or {}, 'full')} full "
+                      f"{sep} cpu {pct(s.get('psi_cpu') or {}, 'some')} {sep} io {pct(s.get('psi_io') or {}, 'some')} {sep} "
+                      f"over MemoryHigh {ev.get('high', 0)}x {sep} OOM kills {ev.get('oom_kill', 0)}")
+        else:
+            put(pane, "  pressure  - (no cgroup of its own to read, or not visible from here)")
+        waits = ", ".join(f"{k} {fmt_age(v)}" for k, v in sorted((row.get("waited_by") or {}).items(), key=lambda kv: -kv[1]))
+        put(pane, f"  waited    {fmt_age(row.get('waited') or 0)}{f' ({waits})' if waits else ''}")
+        for folder in folders_in(snap, row):
+            found = snap.get("dir_sizes", {}).get(folder)
+            said = ("measuring" if found is None else "couldn't be measured" if found[0] is None else
+                    ("at least " if not found[1] else "") + fmt_size(found[0]) + f", {fmt_age(found[2])} ago")
+            put(pane, f"  writes    {folder}: {said}{' (shared with another build)' if folder in shared else ''}")
+        if row.get("release_at") is not None:
+            put(pane, f"  past its peak at {fmt_age(row['release_at'])} in: would keep {fmt_size(row.get('release_hold') or 0)}")
+    log_pane: list[tuple[str, str]] = []
+    if log_lines is not None and selected:
+        put(log_pane, f"-- the end of {selected[:8]}'s output", "head")
+        for text in log_lines:
+            put(log_pane, "  " + text, "dim")
+
+    waiting: list[tuple[str, str]] = []
+    if queued:
+        put(waiting, "WAITING", "head")
+        for row in queued:
+            put(waiting, f"  {cell(row['short'], 9)} {cell(row['lane'], 7)} {cell(fmt_age(row.get('waited') or 0), 6, True)}  "
+                         f"needs {fmt_size(row.get('est_mem') or 0):>6}  {row.get('reason') or ''}",
+                "warn" if row.get("held") else "")
+
+    if not height:
+        both = pane + log_pane
+        return head + [("", "")] + table + rows + ([("", "")] + both if both else []) + (
+            [("", "")] + waiting if waiting else []), order
+    # Fit the screen: the machine; the table header; the detail and log (at most half the screen,
+    # the newest log lines kept); as many build rows as fit, the selected one in view; then
+    # waiting builds in what is left.
+    pane_room = max(0, height // 2 - 1)
+    pane = pane[:pane_room]
+    log_pane = log_pane[:1] + log_pane[1:][-max(0, pane_room - len(pane) - 1):] if pane_room - len(pane) > 1 else []
+    both = pane + log_pane
+    head = head[:max(3, height - 6)]  # a short terminal keeps the title, CPU and memory, and the builds
+    room = height - len(head) - 1 - len(table) - (len(both) + 1 if both else 0) - (min(len(waiting), 3) + 1 if waiting else 0)
+    room = max(1, room)
+    if len(rows) <= room:
+        visible = rows
+    else:
+        slots = max(1, room - 1)  # one line says what is above and below
+        index = order.index(selected) if selected in order else 0
+        start = min(max(0, index - slots + 1), len(rows) - slots)
+        visible = rows[start:start + slots]
+        if room > 1:
+            visible.append((f"  {GLYPHS['more']} {start} above, {len(rows) - start - slots} below (up/down)", "dim"))
+    screen = head + [("", "")] + table + visible + ([("", "")] + both if both else [])
+    left = height - len(screen) - 1
+    if waiting and left > 1:
+        screen += [("", "")] + waiting[:left]
+        if len(waiting) > left:
+            screen[-1] = (f"  {GLYPHS['more']} {len(waiting) - left + 1} more waiting", "dim")
+    return screen[:height], order
+
+
+def tail_lines(path, count: int = 12) -> list[str]:
+    if not path:
+        return []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384))
+            return [clean(line) for line in f.read().decode(errors="replace").splitlines()[-count:]]
+    except OSError:
+        return ["(its output can't be read)"]
+
+
+def interval_arg(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("not a number") from None
+    if not math.isfinite(value) or value < 0.5:
+        raise argparse.ArgumentTypeError("at least 0.5 seconds")
+    return value
+
+
+def print_top_once(sampler: TopSampler) -> int:
+    """One snapshot as text: two looks a second apart (rates need two), folder sizes measured
+    first for up to 20 seconds in all (a folder not done by then shows as not measured yet)."""
+    overview = request({"op": "status"}, 3)
+    if sampler.sizes is not None and overview is not None:
+        deadline = time.monotonic() + 20
+        for row in overview.get("running") or []:
+            for folder in folders_of(row):
+                left = deadline - time.monotonic()
+                if left > 1 and sampler.sizes.get(folder) is None:
+                    sampler.sizes.measure_into(folder, left, keep_cut=False)
+    sampler.snapshot(request({"op": "status"}, 3))
+    time.sleep(1.0)
+    snap = sampler.snapshot(request({"op": "status"}, 3))
+    if snap["overview"] is None:
+        unreachable()
+    width = shutil.get_terminal_size((220, 24)).columns if sys.stdout.isatty() else 220
+    encoding = sys.stdout.encoding or "utf-8"
+    for text, _ in render_top(snap, width, 0)[0]:
+        print(text.encode(encoding, "replace").decode(encoding, "replace"))
+    return 0 if snap["overview"] is not None else 75
+
+
+def cmd_top(args) -> int:
+    """A live view of the machine and each build, refreshed every --interval seconds."""
+    import locale
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:  # a locale named in the environment but not installed
+        pass
+    encoding = locale.getpreferredencoding(False) or "ascii"
+    if "utf" not in encoding.lower().replace("-", ""):
+        use_ascii()
+    if args.once or not sys.stdout.isatty():
+        sampler = TopSampler(DirSizes(background=False))
+        try:
+            return print_top_once(sampler)
+        finally:
+            sampler.sizes.stop()
+    import curses
+    sizes = DirSizes()
+
+    def run(screen) -> int:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        screen.timeout(100)
+        colours = {"": 0}
+        try:
+            if curses.has_colors():
+                curses.use_default_colors()
+                for i, (name, fg) in enumerate((("head", curses.COLOR_CYAN), ("ok", curses.COLOR_GREEN),
+                                                 ("warn", curses.COLOR_YELLOW), ("bad", curses.COLOR_RED),
+                                                 ("dim", curses.COLOR_BLUE)), start=1):
+                    curses.init_pair(i, fg, -1)
+                    colours[name] = curses.color_pair(i) | (curses.A_BOLD if name == "head" else 0)
+        except curses.error:
+            colours = {"": 0}  # no default colours on this terminal: plain text
+        sampler = TopSampler(sizes)
+        sorts = ["age", "cpu", "mem", "io", "disk"]
+        sort, selected, detail, logs = "age", None, False, False
+        snap, next_at, order, dirty = None, 0.0, [], True
+        while True:
+            if time.monotonic() >= next_at:
+                snap = sampler.snapshot(request({"op": "status"}, 1.5, connect_timeout=0.5))
+                next_at = time.monotonic() + args.interval  # (after the request: a slow daemon isn't asked again at once)
+                dirty = True
+            if dirty:
+                height, width = screen.getmaxyx()
+                row = next((r for r in (snap["overview"] or {}).get("running") or [] if r["id"] == selected), None)
+                log = tail_lines(row.get("log")) if logs and row else None
+                lines, order = render_top(snap, max(width, 20), height, selected, sort, detail, log)
+                if order and selected not in order:
+                    selected = order[0]  # (kept while the daemon doesn't answer: it comes back to the same build)
+                screen.erase()
+                for y, (text, colour) in enumerate(lines):
+                    if y == height - 1:
+                        text = fit(text, width - 1)  # (curses can't write the bottom-right cell)
+                    try:
+                        screen.addstr(y, 0, text.encode(encoding, "replace").decode(encoding, "replace"),
+                                      colours.get(colour, 0))
+                    except (curses.error, UnicodeError):
+                        pass
+                screen.refresh()
+                dirty = False
+            key = screen.getch()
+            if key == -1:
+                continue
+            dirty = True
+            if key in (ord("q"), ord("Q")):
+                return 0
+            if key == ord("s"):
+                sort = sorts[(sorts.index(sort) + 1) % len(sorts)]
+            elif key in (curses.KEY_DOWN, ord("j")) and order:
+                selected = order[min(order.index(selected) + 1 if selected in order else 0, len(order) - 1)]
+            elif key in (curses.KEY_UP, ord("k")) and order:
+                selected = order[max(order.index(selected) - 1 if selected in order else 0, 0)]
+            elif key in (10, 13, curses.KEY_ENTER, ord("d")):
+                detail = not detail
+            elif key == ord("l"):
+                logs = not logs
+            # KEY_RESIZE: redrawn at the new size, without taking a new sample
+
+    try:
+        return curses.wrapper(run)
+    except KeyboardInterrupt:
+        return 0
+    except curses.error:  # no usable terminal (TERM unset, dumb): one snapshot instead
+        sizes.stop()
+        once = TopSampler(DirSizes(background=False))
+        try:
+            return print_top_once(once)
+        finally:
+            once.sizes.stop()
+    finally:
+        sizes.stop()
+
+
 def skill_file() -> str | None:
     """The agents' page: the installed skill (with this machine's notes), or the one beside this program."""
     data = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
@@ -1640,6 +2548,9 @@ def main(argv=None) -> int:
     report.add_argument("--capacity", action="store_true",
                         help="what builds waited for and what sat idle meanwhile, by day, from the analytics")
     report.add_argument("--hourly", action="store_true", help="with --capacity: by hour instead of by day")
+    top = sub.add_parser("top", help="a live view of the machine and each build (q quits)")
+    top.add_argument("--interval", type=interval_arg, default=2.0, help="seconds between refreshes (default 2, at least 0.5)")
+    top.add_argument("--once", action="store_true", help="print one snapshot and exit (also when not a terminal)")
     query = sub.add_parser("query", help="a read-only SQL query on the analytics (no query: list its tables)")
     query.add_argument("sql", nargs="*", help="one SQL statement; quote it")
     query.add_argument("--json", action="store_true")
@@ -1653,7 +2564,7 @@ def main(argv=None) -> int:
     handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
                 "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source,
-                "query": cmd_query}
+                "query": cmd_query, "top": cmd_top}
     return handlers[args.cmd](args)
 
 

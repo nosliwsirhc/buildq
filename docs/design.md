@@ -91,7 +91,8 @@ and walks the queue in order, starting each ticket for which, in this order:
 2. its expected memory is at most the machine's memory less `mem_floor` (otherwise it waits with
    "too big", holding nothing);
 3. its filesystem has `disk_floor` free (a size, or, given as a percentage, that share of the
-   filesystem's own size; with several paths a build writes to, each is checked against its own).
+   filesystem's own size; with several paths a build writes to, each is checked against its own,
+   including a `TMPDIR` or `CARGO_TARGET_DIR` set by `[env]`).
    This gates starts only: builds that started in the same pass, or are running, can still write
    below it, so cleanup (old build directories) keeps the disk above it;
 4. in an exclusive lane, no build of the same lane runs in its workspace;
@@ -427,6 +428,76 @@ file): its key, lane, caller, state, exit, whether it was killed or stopped for 
 was queued again, its run and queue time, peak memory, memory waits and MemoryHigh breaches.
 `buildq report` reads it, as Slurm's `sacct` reads its accounting. The history (`history.jsonl`)
 keeps only the runs estimates learn from. The analytics' `build` table (below) has a fuller row.
+
+## buildq top
+
+The client draws it with `curses`; there's nothing to install. Each refresh does three things.
+
+**It asks the daemon for its overview.** Each running ticket's row carries:
+- its cgroup (`cg`);
+- its `disk_paths`;
+- its `write_dirs`, its swap and its wait record.
+
+The daemon works out `write_dirs` when the build is submitted, from the environment it runs with
+(configured defaults included):
+- its `CARGO_TARGET_DIR`, or for a cargo command with none, the `target/` beside the nearest
+  `Cargo.lock`;
+- its `TMPDIR`.
+
+Only folders inside the user's home count, none inside another. They're saved with the ticket and
+checked again on load.
+
+**It reads the rest itself:**
+- `/proc/stat`, `/proc/meminfo` and `/proc/pressure/*`;
+- one filesystem line for `/` and for each `disk_path` of a running or waiting build:
+  - its `statvfs`;
+  - its floor, worked out against its own size;
+  - its I/O, from `/proc/diskstats` for the device the mount table names. A path's mount is the
+    longest mount point it lies under, because btrfs subvolumes have device numbers of their own.
+    Mounts from one device show once;
+- each running build's cgroup: `cpu.stat`, `memory.stat`, `memory.swap.current`, `io.stat`,
+  `memory.events` and the `*.pressure` files;
+- the same files for the groups the analytics use.
+
+A sample whose `cpu.stat` or `memory.stat` can't be read is dropped (the cgroup is going).
+`io.stat` charges I/O through dm-crypt, LVM or md at the stacked device and again at the disks
+below (named as whole disks). So `top` groups each device with what is stacked on it, and over
+each interval counts each group once: the larger of what its bottom devices (the disks) and its
+top devices (nothing stacked on them) did. That is exact for dm-crypt, LVM, stripes however the
+bytes were split, and a plain partition beside an encrypted one. A mirror's writes count each
+copy, and a loop device isn't a holder, so a filesystem in a file counts twice. Only devices in
+both readings count, so a stacked device that came or went shows no burst. What is stacked is
+looked at again every minute, and at once when a new device appears.
+
+**It turns counters into rates** from the change since the last refresh.
+
+**Folder sizes come from a thread of its own.** It runs `ionice -c3 du -sx --block-size=1` on each
+folder that passes `safe_dir`: it resolves to an existing directory inside home. Each folder is
+measured at most every five minutes, and a `du` running past 60 seconds is killed. Quitting kills
+the `du` running then, and a `du` whose `top` died is killed by the kernel (`PR_SET_PDEATHSIG`).
+`du` stays on one filesystem, counts hard links once and never follows symlinks. An entry that
+vanished mid-walk, which a running build's files do all the time, is fine; one it couldn't read
+makes the size "at least". `du` runs in the C locale, so its messages can be read. `--once` measures in the foreground first, for up to 20
+seconds in all, then takes its two looks a second apart.
+
+**Drawing.** `render_top` turns a snapshot into lines of text and a colour, plus the order of the
+running builds:
+- The selection is a ticket id, so it stays on its build when the order changes.
+- With a height, the build list scrolls to keep the selected build in view, with one line saying
+  how many are above and below. Its detail and log get up to half the screen, keeping the newest
+  log lines, and waiting builds take what is left.
+- The screen is redrawn only for a new snapshot, a key or a resize. A resize doesn't take a new
+  sample. A status request has half a second to connect and 1.5 seconds to answer. While the
+  daemon doesn't answer, the selection stays on its build.
+- Narrow terminals drop the optional columns, from the end of the list first, and LANE and AGE
+  under 80 columns; a short terminal drops the machine's later lines before any build. Text is cut
+  and padded by display width (wide characters take two columns).
+- Labels and log lines have their escape sequences removed and every control and format character
+  (newlines, C1, bidi and zero-width marks) replaced.
+- Without a UTF-8 locale it draws in ASCII.
+
+The same code serves `curses` and `--once`. If `curses` can't start, `top` prints one snapshot
+instead.
 
 ## Analytics
 

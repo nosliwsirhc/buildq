@@ -252,6 +252,24 @@ class EndToEnd(Harness):
         self.assertIn("passed this command", again.stderr)
         self.assertEqual(again.stdout, "done\n")  # the earlier run's output, at once
 
+    def test_top_shows_a_running_build(self):
+        ticket = self.submit("--", "sh", "-c", "end=$(($(date +%s)+30)); while [ $(date +%s) -lt $end ]; do :; done")
+        self.wait_for(ticket, ("running",))
+        out = self.q("top", "--once")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        for expected in ("CPU", "MEM", "DISK", "1 running", ticket[:8]):
+            self.assertIn(expected, out.stdout)
+        row = next(line for line in out.stdout.splitlines() if ticket[:8] in line)
+        if self.runner == "systemd":  # a cgroup of its own: its CPU is measured
+            time.sleep(1)
+            out = self.q("top", "--once")
+            row = next(line for line in out.stdout.splitlines() if ticket[:8] in line)
+            found = re.search(r"(\d+\.\d)/\d+", row)
+            self.assertIsNotNone(found, out.stdout)
+            used = float(found.group(1))
+            self.assertGreater(used, 0.2, out.stdout)
+        self.q("cancel", ticket)
+
     def test_pause_and_resume(self):
         self.assertEqual(self.q("pause", "maintenance").returncode, 0)
         ticket = self.submit("--", "true")
