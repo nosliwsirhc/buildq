@@ -97,6 +97,8 @@ buildq logs   TICKET [--follow] [--tail N]       # its output
 buildq cancel [--all] TICKET...                  # take it out of the queue, or stop it (--all: a shared one)
 buildq pause [REASON] / buildq resume            # start nothing new (running builds carry on), or go on
 buildq report [--since 7d] [--by command|lane|caller] [--json]   # what the history says
+buildq report --capacity [--hourly] [--since 7d]  # what builds waited for, and what sat idle meanwhile
+buildq query ["SQL"] [--json]                     # a read-only query on the analytics (none: list the tables)
 buildq help agents                               # the page for coding agents
 buildq ping                                      # check that the daemon answers
 ```
@@ -238,6 +240,34 @@ This is GNU parallel's `--memsuspend` and `--memfree`. With swap on zram, which 
 pausing alone frees little; stopping does. A build is queued again at most three times, and not
 if the daemon has restarted since it started (its environment isn't kept on disk once it starts).
 Paused builds are resumed when the daemon stops.
+
+**Past the peak.** A build keeps room held for its expected peak until it ends. A `cargo test`
+whose compile peaked at 18 GB holds that through an hour of tests at 2 GB. `release_after_peak`
+lets go of most of it once the build is clearly past its peak, keeping what its command's runs
+used after their peaks, plus a tenth. All of these must hold for 30 seconds:
+- The runs behind the estimate (the biggest, and at least three recent ones) all succeeded, weren't
+  slowed at their `MemoryHigh`, and say when they peaked. None of them peaked in its last minute or
+  last tenth, and no run in the estimate's window was killed for memory.
+- This run has gone a quarter longer than the latest of those peaks and a minute more, and done a
+  quarter more CPU work than any of them had by its peak (so a run on fewer cores waits for its
+  peak). Its own peak was a minute or more ago.
+- It reached four fifths of the peak behind the estimate, on no more cores.
+- It now uses (swap included) at most 70% of its peak, and no more than its command used after its
+  peaks.
+- It isn't a cold build or one given a size (`--mem`). It hasn't been paused or gone over its
+  `MemoryHigh` this attempt. It wasn't picked up after a daemon restart. Its lane allows it: `release_after_peak = false` in a
+  lane turns it off there, for builds whose memory is used elsewhere, such as `docker build`.
+
+A released build that grows past what was kept (or is killed for memory), or is then paused,
+picked up after a restart or slowed at its `MemoryHigh`, is held in full again. A build past its
+peak gets no more cores.
+
+The default is `"shadow"`: the queue works all of this out and records it in the analytics, but
+keeps holding everything (its only effect on scheduling: a build past its peak gets no more cores,
+as with `true`) (a decision made in shadow mode never takes effect, even if the mode is
+switched on mid-run). `buildq report --capacity` then says how many attempts were past their peak,
+how many later used more than would have been kept and by how much, how much held room it would
+have freed, and how many can't say because a restart left them unwatched. Turn it on (`true`) once that shows no build going past what was kept; `false` turns it off.
 
 **Estimates.** A command's expected peak memory is the largest of its runs within `history_days`
 (every day's biggest run is kept, however many smaller ones follow), with a margin. More cores mean
@@ -404,8 +434,22 @@ memory at the same moment, so don't run both as gates side by side for long.
   The next daemon picks both up.
 - **Files** are in `~/.local/state/buildq`: `tickets/<id>/` (the ticket, its output log, its
   result), `history.jsonl` (one line per finished build; delete it to forget every estimate),
-  `memory.log` (the memory watch, kept to about 1 MiB plus one older file), and
-  `config.last-good.toml`. Everything is private to the user.
+  `memory.log` (the memory watch, kept to about 1 MiB plus one older file), `metrics.db` (the
+  analytics, below), and `config.last-good.toml`. Everything is private to the user.
+- **Analytics.** With `metrics = true` (the default), the daemon keeps `metrics.db`, a SQLite file:
+  - one row a minute, kept 14 days, and one an hour, kept a year: CPU busy and the target, free
+    memory and the floor, what is held for running builds to grow into and the room left, swap and
+    pressure, builds running and waiting by reason, and the cores and memory of buildq's builds, CI
+    runners, containers and the user's apps;
+  - one row per finished build, kept 180 days: seconds waited by reason, the memory planned for it
+    and where that estimate came from, its peak and when it came, what it used after the peak, a
+    ten-point memory profile, and cores granted and used.
+
+  Rows past their age are deleted once an hour (and the build table is kept to 100,000 rows), and
+  the space is reused, so the file levels off at a few tens of megabytes. A thread of its own writes it; if it can't, that is logged once and the
+  queue carries on. `buildq report --capacity` sums it up by day (`--hourly` by hour);
+  `buildq query "SELECT …"` answers anything else, read-only (`buildq query` alone lists the
+  tables, and [docs/design.md](docs/design.md#analytics) describes every column).
 - **A broken configuration** is reported in the journal; the daemon keeps the last good one.
 - **Before a reboot:** `buildq pause "rebooting at noon"`, wait for the running builds to finish
   (`buildq status`), reboot, then `buildq resume`. The pause is kept across restarts, and queued
@@ -437,16 +481,26 @@ as machine load, but never waiting its turn. On a self-hosted runner on the same
 as the same user, a workflow step can queue its heavy command instead:
 
 ```yaml
-env:
-  BUILDQ_FALLBACK: run          # if the daemon is down, run the step unqueued rather than wait
 steps:
   - run: |
-      q=; command -v buildq >/dev/null && q="buildq run --name ci:${{ github.job }} --"
-      $q cargo test --locked
+      b=$(command -v buildq || echo "$HOME/.local/bin/buildq")
+      if [ -x "$b" ]; then
+        exec env BUILDQ_FALLBACK=run "$b" run --name "ci:$GITHUB_JOB" -- cargo test --locked
+      fi
+      echo "::warning::no build queue (buildq) on this runner; running unqueued"
+      exec cargo test --locked
 ```
 
-On a runner without buildq (GitHub-hosted, or another machine), `q` stays empty and the command
-runs as before. While the queue is paused (`buildq pause`), such a step waits like any other build,
+- **`exec`** makes buildq the step's process, so cancelling the job reaches it and cancels the build.
+- **`BUILDQ_FALLBACK=run`**, set on the command itself, runs the step unqueued if the daemon is down,
+  rather than waiting.
+- **`~/.local/bin`:** a runner whose service starts `run.sh` directly doesn't read its `.path` file
+  (only `bin/runsvc.sh` does), so its jobs get systemd's bare `PATH`. Look there as above, or give the
+  runner's unit `Environment=PATH=…`.
+- **GitHub statuses:** a build from an Actions job never posts a `buildq/…` success; the job reports
+  its own result.
+
+On a runner without buildq (GitHub-hosted, or another machine), the step warns and runs as before. While the queue is paused (`buildq pause`), such a step waits like any other build,
 up to the job's timeout. Cancelling the job cancels the build. CI jobs then share turns fairly with
 everything else (each runner is a caller of its own); a `ci` lane can give them a priority or caps
 of their own (see [config.example.toml](config.example.toml)).

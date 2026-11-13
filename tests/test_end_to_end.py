@@ -196,6 +196,12 @@ class EndToEnd(Harness):
         self.assertIn("sh -c", detail.stdout)
         rows = json.loads(self.q("status", ticket, "--json").stdout)
         self.assertEqual((rows[0]["state"], rows[0]["exit"]), ("failed", 3))
+        deadline = time.time() + 20
+        found = ""
+        while time.time() < deadline and ticket not in found:  # the analytics are written by a thread
+            found = self.q("query", f"SELECT id, state, exit FROM build WHERE id = '{ticket}'").stdout
+            time.sleep(0.2)
+        self.assertIn(f"{ticket}\tfailed\t3", found, self.daemon.log())
         self.assertIn(ticket[:8], self.q("list").stdout)
 
     def git_repo(self):

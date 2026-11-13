@@ -78,7 +78,7 @@ same of the daemon.
 Each pass computes:
 
 ```
-growth     = Σ running builds of max(0, expected_mem − mem_now)
+growth     = Σ running builds of max(0, expected_mem − mem_now)   (with release_after_peak = true, see "Past the peak")
 ramping    = Σ builds started < ramp_seconds ago of max(0, granted − cores_now)
 shrinkable = Σ running resizable builds of (granted − min_cores)
 free_mem   = MemAvailable − growth − mem_floor
@@ -115,6 +115,73 @@ test that fails is the reason its client sees.
 danger is what it will grow into: a Rust build can spend a minute at 2 GB and then reach 20 GB in
 its last crate. So each running build's expected peak, less what it holds, is set aside until it
 ends.
+
+**Past the peak.** `release_after_peak` is `false`, `"shadow"` (the default) or `true`. Except
+with `false`, each pass works out for every running build whether it is past its peak
+(`past_peak_hold`), and if so the memory to keep: `hold = 1.1 × tail`. With `true`, its
+`expected_mem` becomes `min(expected_mem, hold)`; in shadow mode nothing changes, but the build
+records it. A build is past its peak once all of these have held for 30 seconds:
+- its lane has `release_after_peak` (default true; false for builds whose memory is used outside
+  their cgroup, like `docker build`), and it isn't a cold build or one given a size (`--mem`), wasn't
+  picked up after a restart, hasn't been paused or asked to pause, and hasn't gone over its
+  `MemoryHigh` this attempt (any of these, later, takes a release back);
+- `History.after_peak` has, from the runs the estimate reads (the last `history_runs` within
+  `history_days`, and the biggest within `history_days`): the run behind the estimate and at least
+  three recent runs that succeeded without being killed for memory or slowed at their `MemoryHigh`,
+  ran a minute or more, and say when they peaked (`peak_at`), after how much CPU (`peak_cpu`) and
+  what they used after (`tail`); none of the recent successful runs peaked in its last minute or
+  last tenth, and no run in the window was killed for memory. Failed runs don't count: a failure may
+  have skipped a later, bigger phase. A command whose peak comes at its end never qualifies;
+- this attempt has run 1.25 × the latest of those `peak_at`s plus sixty seconds, has used 1.25 × the
+  most CPU-seconds any of them had used by its peak (CPU work barely depends on the cores, so a run
+  given fewer cores, slower to its peak, waits for it), and its own peak was sixty seconds ago or
+  more;
+- its peak is at least 0.8 of the peak behind the estimate, reached on no more cores than that one
+  had (and it has no more now);
+- it uses now, swap included, at most 0.7 of its peak and at most `hold`, and `hold` is below its
+  `expected_mem`.
+
+From then on every measurement updates the most it uses (`after_release_peak`). If it goes over
+`hold`, or a process in it is killed for memory, it is taken back for the rest of the attempt and
+held in full again, as a breach (`release_breach`), and still followed: the room let go may
+already be another build's, so how far it went over counts in full. A disqualifier above
+appearing, or the mode switched to `false`, takes it back too, not as a breach, and for the rest
+of the attempt. Either is logged when it was really released. A build killed for memory before
+any decision is never released that attempt. Only a build released with the mode `true` is
+held to its hold: a decision recorded in shadow mode never takes effect, even after a reload
+switches the mode on. A build past its peak (released, or decided in shadow mode) gets no more
+cores from the rebalancer: its hold was measured with the cores it had, and shadow mode should see
+what `true` would do. That is the only way shadow mode changes scheduling. Resuming a paused build always uses the full expected peak. The decision is
+saved with the ticket as it is made, and so is a take-back, as it happens; the daemon saves every
+unfinished ticket when it stops. After a restart, a standing decision is only taken back after the
+build's first sample, which says first whether it went over or was killed while nobody watched.
+
+At the end of each attempt (it finished, or was stopped to be queued again), `close_release_audit`
+adds the attempt to the ticket's totals:
+- picked up after a restart (once, or more; the mark stays for the attempt): a decision taken back
+  before the restart, or a breach seen after it (a sample over, or a kill for memory since the
+  decision, while the decision stood when the daemon loaded it and before any sample since, so it
+  came while the decision stood: from the result or systemd's verdict), is counted as usual; a
+  decision that stood across the restart otherwise, or none where its command could have had one
+  (nothing rules it out, the hold would be below its plan, it ran long enough, unpaused and under
+  its `MemoryHigh`), is unknown;
+- past its peak: whether it went over (a sample over its hold, or a kill for memory after the
+  decision, counted from the cgroup's samples and from the supervisor's result, wherever the limit
+  was, which a sample may miss; then by its enforced lane cap less the hold if it was killed at its
+  own cap, or else by what was let go, its expected peak at the decision less the hold, since a
+  build killed from outside may not have grown at all) and the most by which; the held room it would have freed,
+  `expected_mem` at the decision less the hold, from the decision until it went over, was taken
+  back or ended; and whether it was really released. After a take-back for another reason (a
+  pause, say), what the build does is no longer the rule's doing and isn't counted as going over.
+
+These go into the `build` row, so a requeue loses nothing.
+
+What stops a build that grows again before it is taken back is the same as for any build that
+outgrows its estimate: its own lane's `MemoryMax`, the slice guard (`slice_guard`) on all builds
+together, and the memory give-back, which stops builds when memory runs very short (pausing one
+frees no memory). Shadow mode is there to measure how often that would happen before it can:
+`buildq report --capacity` counts the builds that were past their peak, the ones that later went
+over their hold and by how much, and the held room that would have been freed.
 
 **Ramp.** A build takes a few seconds to fill its cores, and busy cores are a ten-second average.
 Without the ramp term, a burst of submissions would all see the same idle machine.
@@ -356,7 +423,71 @@ Every finished ticket appends a line to `outcomes.jsonl` (kept to about 8 MiB pl
 file): its key, lane, caller, state, exit, whether it was killed or stopped for memory, how often it
 was queued again, its run and queue time, peak memory, memory waits and MemoryHigh breaches.
 `buildq report` reads it, as Slurm's `sacct` reads its accounting. The history (`history.jsonl`)
-keeps only the runs estimates learn from.
+keeps only the runs estimates learn from. The analytics' `build` table (below) has a fuller row.
+
+## Analytics
+
+`metrics.db` is a SQLite file in the state directory (WAL, `auto_vacuum = INCREMENTAL`, mode 0600).
+The daemon's loop only adds up numbers it has anyway; a thread named `metrics` owns the
+connection, reads the cgroups once a minute, writes, and cleans up. Items reach it through a
+bounded queue (10,000); if that fills, rows are dropped. A thread that died is started again on the
+next row. Errors are logged at most once an hour, and the queue carries on without the file;
+`metrics = false` turns it off, and an error in the loop's own part only skips that part. The
+write-ahead log is cut back to 64 MiB after checkpoints (`journal_size_limit`); if a reader holds it
+open past 256 MiB, rows are dropped until it shrinks. Clients read the file directly, read-only
+and with `query_only` (`buildq query`, `buildq report --capacity`), and close it before printing;
+the daemon isn't involved.
+
+**`minute`** (kept 14 days) and **`hour`** (kept 365 days) have the same columns. `t` is the start
+of the minute or hour, in epoch seconds. A minute's averages are weighted by the time between the
+daemon's passes (at most 5 s each); `*_max` and `*_min` are the extremes. An hour sums `sampled`
+and `mem_wait_seconds`, weights its averages by `sampled`, and weights the `*_mem_wait` columns by
+`mem_wait_seconds`, so an hour says the same as its minutes. Build-minutes waited are
+`SUM(wait_* × sampled) / 60` in either table.
+
+| Column | Meaning |
+| --- | --- |
+| `sampled` | seconds of the period the daemon saw |
+| `cores`, `cpu_target` | the machine's cores, and `cpu_target × cores` |
+| `cpu_busy`, `cpu_busy_max` | busy cores (`/proc/stat`, all CPU time but idle and iowait) |
+| `mem_total`, `mem_floor`, `mem_available`, `mem_available_min`, `swap_used` | bytes |
+| `psi_cpu`, `psi_mem` | CPU "some" and memory "full" pressure, avg10 |
+| `running`, `running_max`, `queued`, `queued_max` | builds |
+| `reserved` | the running builds' expected peaks, together (bytes) |
+| `growth` | what was held for them to grow into, as admission saw it |
+| `free_mem`, `free_mem_min`, `free_cpu` | admission's room for new builds |
+| `wait_memory`, `wait_cpu`, `wait_held`, `wait_turn`, `wait_workspace`, `wait_other` | builds waiting, by reason: memory (with memory pressure), cores (with CPU pressure), room held for a starving build, `max_jobs`, a busy workspace, anything else (too big ever to fit, disk, paused, not yet looked at). |
+| `mem_wait_seconds` | seconds in which at least one build waited on memory |
+| `idle_cores_mem_wait`, `free_mem_mem_wait`, `growth_mem_wait` | over those seconds: cores under the CPU target, memory above the floor, and what was held for running builds to grow into |
+| `builds_cores`, `builds_mem`, `ci_cores`, `ci_mem`, `containers_cores`, `containers_mem`, `apps_cores`, `apps_mem`, `other_cores` | who used the machine: the build slice; CI runner services (`actions.runner.*`, `gha-*`, `*-runner-*`, `gitlab-runner*`, under the user
+manager, in its `app.slice`, or system services); Docker and containerd scopes and rootless podman; the user's `app.slice` less any CI runners in it; and the rest of the busy cores. Memory is what `cgroup_stats` counts (not page cache). The first minute after a start has no cores; a cgroup new since the last reading, or started again under the same name, counts all its time in this minute; one that can't be read keeps its baseline; no group counts more than the machine's cores. |
+
+**`build`** (kept 180 days), one row per finished ticket: `id`, `ended`, `submitted`, `key`,
+`label`, `name`, `lane`, `caller`, `repo`, `state`, `exit`, `from_ci`, `wall` (all attempts),
+`waited`, `waited_by` (JSON: seconds by reason category, as `buildq status` names them: "new" from
+submission to its first pass, "restart" for the time the daemon was away), `est_mem` and `est_src` (the last plan and where it came
+from), `mem_peak`, `peak_at` and `tail` (when the last attempt peaked, and the most it used from
+thirty seconds after that), `profile` (JSON: the most memory in each tenth of the last attempt, in
+MiB), `released` (its hold was let go past the peak), `release_at`, `release_hold`,
+`after_release_peak`, `release_revoked` and `release_end` (past the peak in its last attempt, in
+shadow mode too: when, what would be kept, the most it used after, and whether and when it went
+over), `past_peak_attempts`, `past_peak_over`, `past_peak_most_over`, `past_peak_freed` (GB-hours),
+`past_peak_unknown` and `past_peak_released` (the same over all its attempts), `observed_gap` (picked up after a
+restart), `cores_granted` (average), `avg_cores`,
+`peak_cores`, `cpu_seconds`, `requeues`, `paused`, `oom`, `mem_high`, `mem_wait`.
+
+The profile comes from a trace kept while the build runs: the most memory in each ten seconds,
+with neighbours merged (and the step doubled) whenever it passes 720 points, so a long run's trace
+stays bounded. A build picked up after a daemon restart ran unwatched for a while, so its
+`peak_at`, `tail` and profile are left empty (in the history too). `waited_by` and its last mark are
+saved with the ticket, and queued tickets are saved at shutdown.
+
+Once an hour (by the monotonic clock), the writer rolls minutes into hours, from the newest hour
+row or the earliest minute written since the last time (so the current hour is rewritten until it
+ends), deletes rows past their age (counted from the wall clock), and keeps the 100,000 newest
+builds, all in one transaction that is rolled back on an error (and tried again an hour later),
+then returns freed pages to the disk. The minute in progress is written when the daemon stops.
+New columns are added to an existing file as they appear.
 
 ## Measurement
 
@@ -369,9 +500,10 @@ where the kernel has it.
 usage_usec` over five seconds (the peak counts only windows of three seconds or more), and memory
 as `anon + shmem + kernel − slab_reclaimable` from `memory.stat`. `memory.current` and
 `memory.peak` also count page cache, which a build fills with its own output. OOM kills come from
-`memory.events.local`, which the supervisor reads before its cgroup goes away; its `max` count says
-whether the kill came at the build's own `MemoryMax` (it needs more) or from outside (the slice's
-limit, systemd-oomd), which doesn't say the build needs more. A build that exits 137 with its peak
+`memory.events.local`, which the supervisor reads before its cgroup goes away; its `oom` count (an
+allocation about to fail at the build's own `MemoryMax`; `max` only counts reclaim there) says
+whether the kill came at the build's own limit (it needs more) or from outside (the slice's limit,
+systemd-oomd), which doesn't say the build needs more. A build that exits 137 with its peak
 near its lane's `MemoryMax` also counts as killed for memory.
 
 **Memory waits.** From the cgroup's `memory.pressure`, the total time some of its tasks, and all of
@@ -414,7 +546,9 @@ A finished build adds a line to `history.jsonl` unless it was cancelled, timed o
 signal (exit ≥ 128); a build killed at its own memory cap is recorded too. A build too quick to be
 sampled is recorded as needing little. The line holds its key, peak memory and the cores it had at
 that peak, peak and average cores, the time-weighted cores it was given, wall time, exit status,
-and whether it was cold or killed for memory. Each key keeps its last 100 runs and, for 400 days,
+whether it was cold or killed for memory, and, for a sampled run, when it peaked (`peak_at`, seconds
+into its last attempt, time paused not counted) and the most it used from thirty seconds after that
+peak to its end (`tail`), which "Past the peak" reads. Each key keeps its last 100 runs and, for 400 days,
 each day's biggest run, so a full rebuild isn't forgotten behind a stream of small ones.
 
 The key is `repository|lane|words`. The repository is the name of the git repository holding the
