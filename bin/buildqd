@@ -1860,7 +1860,7 @@ class Ticket:
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
-               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks")
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci")
 
     def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
                  directory: str | None):
@@ -1926,6 +1926,7 @@ class Ticket:
         self.source = None  # the commit it is of, and whether its tree had changes ({repo, commit, dirty, ...})
         self.dedupe = None  # same source, command, directory, lane and environment: the same build
         self.caller = None  # the unit its client ran in: a session, a CI runner
+        self.from_ci = False  # submitted from a GitHub Actions job, which reports its own result
         self.frozen = False  # paused to give the machine its memory back
         self.frozen_at = None
         self.requeues = 0  # times it was stopped to free memory and queued again
@@ -2381,6 +2382,7 @@ class Daemon:
         t.name = str(name)[:200] if name else None
         t.notify = str(notify) if notify else None
         t.caller = sane_caller(msg.get("caller"))
+        t.from_ci = bool(env.get("GITHUB_ACTIONS") and env.get("RUNNER_NAME"))  # (the shim's test, too)
         source = sane_source(msg.get("source"))
         if source and source.get("repo") and paths_inside(argv, cwd, source["repo"]):
             settings = [t.timeout, t.umask, t.rlimits, t.cores_given, t.mem_given, self.cfg.env]
@@ -2903,8 +2905,13 @@ class Daemon:
         local failure on the way to a fix is noise on a pull request). Results are ordered by when
         their builds ended, not when their checks did: an older result never replaces a newer one.
         A commit that isn't on GitHub yet is tried again after the next `git push` run through buildq
-        from that repository, and every ten minutes, for a day."""
+        from that repository, and every ten minutes, for a day. A build from a GitHub Actions job never
+        posts success: the job reports its own result, and on a pull request its commit is usually a
+        merge commit the pull request doesn't show. Its failure can still turn a green buildq posted
+        on the same commit red."""
         src = t.source or {}
+        if t.from_ci and t.state == "succeeded":
+            return
         if not self.cfg.github_status or src.get("dirty") or not src.get("remote") or not src.get("commit") \
                 or t.source_changed or not t.source_verified or not (t.name or reusable_check(t.argv)) \
                 or t.state not in ("succeeded", "failed"):
