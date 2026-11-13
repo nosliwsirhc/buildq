@@ -96,7 +96,10 @@ and walks the queue in order, starting each ticket for which, in this order:
    This gates starts only: builds that started in the same pass, or are running, can still write
    below it, so cleanup (old build directories) keeps the disk above it;
 4. in an exclusive lane, no build of the same lane, or of a lane with the same `workspace_group`,
-   runs in its workspace;
+   runs in its workspace. A running build holds its workspace under the group it started with as
+   well as its lane's group now, so a reload that changes or removes a lane doesn't free it.
+   Non-exclusive lanes take no part, and a config whose group mixes them, or names no other lane,
+   is refused. The wait reason names the build holding the workspace;
 5. memory pressure is at most `mem_psi_block`;
 6. it has a turn: its lane has a free `extra_jobs` turn, or fewer than `max_jobs` builds hold
    ordinary turns;

@@ -351,11 +351,15 @@ a command that keeps doing so is being slowed by its cap, which is worth raising
 has the room.
 
 An exclusive lane (the default) runs one build per workspace: its `CARGO_TARGET_DIR`, or its git
-worktree. Lanes with the same `workspace_group` share that rule. For example, a lane for
-`cargo check` and `cargo clippy`, smaller than a full build and ahead of it, should share a
-`workspace_group` with the cargo lane, so that a check and a `cargo test` in one target folder
-never start together. They would only wait on cargo's lock. [config.example.toml](config.example.toml)
-has such a lane.
+worktree. Exclusive lanes with the same `workspace_group` share that rule. A lane's group is its
+own name unless it says otherwise, so `workspace_group = "heavy"` joins the heavy lane's group. A
+group must be shared with another lane, and every lane in it must be exclusive.
+
+For example, a lane for `cargo check` and `cargo clippy`, smaller than a full build and ahead of
+it, should join the heavy lane's group. A check and a `cargo test` in one target folder then never
+start together: they would only wait on cargo's lock. [config.example.toml](config.example.toml)
+has such a lane. A running build keeps its workspace under the group it started with, even if a
+reload changes or removes its lane.
 
 ## Keeping builds in the queue
 

@@ -202,9 +202,9 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # min_mem = "16G"
 # release_after_peak = false   # its memory is dockerd's: the build's own trace says nothing about it
 #
-# cargo check and clippy: lighter than a full build, ahead of it. workspace_group puts it with the
-# heavy lane, so a check and a cargo test in one target folder never start together (they would
-# only wait on cargo's lock). Give the heavy lane the same workspace_group.
+# cargo check and clippy: lighter than a full build, ahead of it. workspace_group = "heavy" joins the
+# heavy lane's group (a lane's group is its own name unless it says otherwise), so a check and a
+# cargo test in one target folder never start together: they would only wait on cargo's lock.
 #
 # [lanes.check]
 # cores = 2
@@ -212,7 +212,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # max_cores = 4
 # mem = "12G"
 # priority = 40
-# workspace_group = "cargo"
+# workspace_group = "heavy"
 # properties = { MemoryHigh = "16G", MemoryMax = "20G", CPUWeight = 150, IOWeight = 150 }
 #
 # [[lane_rules]]

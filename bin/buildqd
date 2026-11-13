@@ -321,6 +321,7 @@ class Lane:
         if not isinstance(group, str) or not group:
             raise ValueError(f"lanes.{name}.workspace_group must be a name")
         self.workspace_group = group
+        self.group_given = "workspace_group" in raw
         # RUST_TEST_THREADS and NEXTEST_TEST_THREADS win over a project's own settings (a suite
         # pinned to one thread for a shared database, say), so they are set only where asked.
         self.test_threads = boolean(raw.get("test_threads", False), f"lanes.{name}.test_threads")
@@ -394,6 +395,16 @@ class Config:
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
+        for lane in self.lanes.values():
+            if not lane.group_given:
+                continue
+            others = [o for o in self.lanes.values() if o is not lane and o.workspace_group == lane.workspace_group]
+            if not others:
+                raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r} is shared with no other "
+                                 "lane (to join a lane's group, name that lane)")
+            if any(not o.exclusive for o in [lane, *others]):
+                raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r}: every lane in a group "
+                                 "must be exclusive")
         self.default_lane = str(d["default_lane"])
         if self.default_lane not in self.lanes:
             raise ValueError(f"default_lane {self.default_lane!r} is not in lanes {sorted(self.lanes)}")
@@ -2382,7 +2393,7 @@ class Ticket:
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
-               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci",
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group",
                "waited_by", "wait_mark", "peak_at", "tail", "released", "release_at", "release_hold",
                "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
                "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
@@ -2454,6 +2465,7 @@ class Ticket:
         self.dedupe = None  # same source, command, directory, lane and environment: the same build
         self.caller = None  # the unit its client ran in: a session, a CI runner
         self.from_ci = False  # submitted from a GitHub Actions job, which reports its own result
+        self.workspace_group: str | None = None  # its lane's workspace_group when it started (kept across reloads)
         self.waited_by: dict[str, float] = {}  # seconds queued, by the reason it waited
         self.wait_mark: float | None = None  # when that was last added up
         self.peak_at = 0.0  # seconds into this attempt when it reached mem_peak (time paused not counted)
@@ -3860,7 +3872,15 @@ class Daemon:
         count = len(running)
         per_lane = collections.Counter(t.lane for t in running)
         held_mem = held_cpu = 0.0
-        busy_workspaces = {(self.lane(t.lane).workspace_group, t.workspace) for t in running if t.workspace}
+        busy_workspaces: dict[tuple[str, str], Ticket] = {}
+        for t in running:
+            if not t.workspace:
+                continue
+            groups = {t.workspace_group} if isinstance(t.workspace_group, str) else set()
+            if t.lane in cfg.lanes and cfg.lanes[t.lane].exclusive:  # (a lane removed since: its group at start)
+                groups.add(cfg.lanes[t.lane].workspace_group)
+            for group in groups:
+                busy_workspaces[(group, t.workspace)] = t
         if self.paused is not None:
             why = self.paused.get("reason") or "no reason given"
             for t in self.queue(now):
@@ -3891,8 +3911,10 @@ class Daemon:
                 reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
                                          f"(disk_floor is {said})"), False
             elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces:
-                reason, holds = ("workspace", "another build in the same workspace is running; they would "
-                                              "fight over its build directory"), False
+                holder = busy_workspaces[(lane.workspace_group, t.workspace)]
+                reason, holds = ("workspace", f"another build in the same workspace is running ({holder.label[:60]}, "
+                                              f"{holder.lane} lane, {holder.id[:8]}); they would fight over its build "
+                                              "directory"), False
             elif m.psi_mem > cfg.mem_psi_block:
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
                                              f"{cfg.mem_psi_block:g}%)")
@@ -3941,7 +3963,8 @@ class Daemon:
                 shrinkable = max(0, shrinkable - taken_from_others)
                 count += 1
                 per_lane[t.lane] += 1
-                busy_workspaces.add((lane.workspace_group, t.workspace))
+                if lane.exclusive and t.workspace:
+                    busy_workspaces[(lane.workspace_group, t.workspace)] = t
                 continue
             t.reason_cat, t.reason = reason
             if holds and not passes and self.starving(t, now):
@@ -3990,6 +4013,7 @@ class Daemon:
         t.oom_base = 0
         t.reason = t.reason_cat = ""
         t.granted = t.max_granted = granted
+        t.workspace_group = lane.workspace_group if lane.exclusive else None
         env_path = os.path.join(t.dir, "env.json")
         try:
             env = read_json(env_path)

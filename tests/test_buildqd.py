@@ -315,22 +315,62 @@ class Admission(DaemonCase):
         self.daemon.schedule(self.now + 31)
         self.assertEqual(second.state, "running")
 
+    CHECK_LANE = 'priority = 40\nworkspace_group = "heavy"\ncores = 2\nmem = "4G"'
+
+    def with_check_lane(self, extra=""):
+        config = BASE_CONFIG + "[lanes.check]\n" + self.CHECK_LANE + "\n" + extra
+        with open(self.config_path, "w") as f:
+            f.write(config)
+        self.daemon.cfg = self.daemon.load_config()
+        self.assertIn("check", self.daemon.cfg.lanes)
+
     def test_lanes_in_one_workspace_group_run_one_build_per_workspace(self):
-        self.daemon.cfg.lanes["check"] = buildqd.Lane("check", {"cores": 2, "mem": "4G", "workspace_group": "cargo"},
-                                                      128 * GIB, 32)
-        self.daemon.cfg.lanes["heavy"].workspace_group = "cargo"
+        self.with_check_lane()
         tree = self.workdir("tree")
         test = self.submit(("cargo", "test"), cwd=tree)
         check = self.submit(("cargo", "check"), lane="check", cwd=tree)  # the same target folder
         self.assertEqual(self.states(test, check), ["running", "queued"])
         self.assertEqual(check.reason_cat, "workspace")
+        self.assertIn(f"heavy lane, {test.id[:8]}", check.reason)  # it says who holds it
         elsewhere = self.submit(("cargo", "check"), lane="check", cwd=self.workdir("other"))
         self.assertEqual(elsewhere.state, "running")  # another workspace: no wait
         self.finish(test)
         self.daemon.schedule(self.now + 31)
         self.assertEqual(check.state, "running")
-        with self.assertRaises(ValueError):
-            buildqd.Lane("x", {"workspace_group": ""}, 128 * GIB, 32)
+        again = self.submit(("cargo", "test"), cwd=tree)  # and the other way round
+        self.assertEqual((again.state, again.reason_cat), ("queued", "workspace"))
+
+    def test_two_in_one_group_queued_in_the_same_pass_start_one_at_a_time(self):
+        self.with_check_lane()
+        self.daemon.cfg.max_jobs = 0  # hold both in the queue
+        tree = self.workdir("tree")
+        test = self.submit(("cargo", "test"), cwd=tree)
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)
+        self.daemon.cfg.max_jobs = 8
+        self.daemon.schedule(self.now + 1)
+        self.assertEqual(sorted(self.states(test, check)), ["queued", "running"])
+        self.assertEqual(check.state, "running")  # (the check lane comes first)
+
+    def test_a_running_build_keeps_its_workspace_when_its_lane_is_removed(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)
+        self.assertEqual(check.workspace_group, "heavy")
+        with open(self.config_path, "w") as f:
+            f.write(BASE_CONFIG.replace('default_lane = "heavy"', 'default_lane = "web"'))
+        self.daemon.cfg = self.daemon.load_config()  # the check lane is gone; the default lane is web
+        test = self.submit(("cargo", "test"), lane="heavy", cwd=tree)
+        self.assertEqual((test.state, test.reason_cat), ("queued", "workspace"))
+
+    def test_workspace_groups_are_checked(self):
+        def config(extra):
+            return buildqd.Config(buildqd.tomllib.loads(BASE_CONFIG + extra), 128 * GIB, 32)
+        cfg = config("[lanes.check]\n" + self.CHECK_LANE + "\n")
+        self.assertEqual((cfg.lanes["check"].workspace_group, cfg.summary()["lanes"]["check"]["workspace_group"]),
+                         ("heavy", "heavy"))
+        for bad in ('workspace_group = "carg"', 'workspace_group = ""', 'workspace_group = "web"'):
+            with self.assertRaises(ValueError, msg=bad):
+                config(f"[lanes.check]\ncores = 2\n{bad}\n")  # nobody else's; empty; a non-exclusive lane's
 
     def test_a_shared_target_dir_is_one_workspace(self):
         target = os.path.join(self.tmp.name, "target")
