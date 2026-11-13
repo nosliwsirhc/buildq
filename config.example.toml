@@ -1,0 +1,185 @@
+# buildq configuration: ~/.config/buildq/config.toml
+#
+# Every key is optional; the values shown are the defaults unless noted. After editing, check the
+# file and apply it without a restart:
+#
+#   buildqd --check-config
+#   systemctl --user reload buildq
+#
+# A file that doesn't load (or whose lane properties systemd refuses) is reported in the journal,
+# and the daemon keeps the last configuration that did load. Sizes take K, M, G or T, or a
+# percentage of the machine's memory ("10%"). Durations take s, m, h or d ("45m").
+
+# ---- How much may run at once -----------------------------------------------------------------
+
+# The most builds at once, whatever the measurements say. Lanes can add extra_jobs on top.
+max_jobs = 4
+
+# Builds fill the machine up to this fraction of its cores. Busy cores are measured machine-wide,
+# so load buildq didn't start (CI runners, containers, other users) counts too.
+cpu_target = 0.9
+
+# Memory kept free after every running build's expected growth. A build starts only if its
+# expected peak fits in MemAvailable - (what running builds may still grow into) - mem_floor.
+mem_floor = "10%"
+
+# No build starts where its working directory's filesystem has less free than this.
+disk_floor = "2G"
+
+# No new build while CPU pressure ("some", avg10, %) is above this and a build is running, or
+# while memory pressure ("full", avg10, %) is above mem_psi_block.
+cpu_psi_block = 50
+mem_psi_block = 10
+
+# For this long after a build starts, the cores it hasn't reached yet are counted as busy, since
+# the CPU reading lags behind a build that is spinning up.
+ramp_seconds = 90
+
+# A build that has waited this long gets the room it needs held for it, so later builds can't
+# keep passing it. Lanes with may_pass_held = true still may.
+starve_seconds = 600
+
+# A build started by `buildq run` is cancelled once no client has followed it for this long (its
+# client was killed); builds dropped off with `buildq submit` aren't.
+unwatched_seconds = 30
+
+# ---- What builds are expected to need -----------------------------------------------------------
+
+# A command's memory estimate is the largest peak of its last history_runs runs within
+# history_days, times mem_margin, plus 256M. Commands are told apart by repository, lane, tool,
+# subcommand and the options that change the size of the work. At most history_keys commands are
+# remembered; the least recently used are forgotten first.
+history_runs = 30
+history_days = 30
+history_keys = 2000
+mem_margin = 1.15
+
+# ---- Running builds -------------------------------------------------------------------------
+
+# "systemd" runs each build as a transient user service (limits, measurement, clean stops);
+# "direct" runs it as a plain process (no limits, not measured); "auto" uses systemd if it can.
+runner = "auto"
+
+# The slice the build services go in.
+slice = "buildq.slice"
+
+# A build's output log keeps at most this much; past it, only the end is kept.
+max_log = "64M"
+
+# Finished tickets (their status and logs) are kept this long, and at most this many.
+keep_finished = "7d"
+max_finished = 1000
+
+# A shell command run when any build finishes, with BUILDQ_TICKET, BUILDQ_STATE, BUILDQ_EXIT,
+# BUILDQ_OOM, BUILDQ_LABEL, BUILDQ_NAME, BUILDQ_CWD and BUILDQ_LOG set. Example:
+# on_finish = 'notify-send "build $BUILDQ_STATE" "$BUILDQ_LABEL"'
+on_finish = ""
+
+# Lower the slice's MemoryMax every few seconds to what its builds hold plus what the machine has
+# free above half of mem_floor (never above the slice's configured MemoryMax), so all builds
+# together can't take the machine below that, whatever the rest of it is doing.
+slice_guard = true
+
+# The lane a build goes to when neither its caller nor a lane rule names one. (Top-level keys like
+# this one must come before the first [table] below, or TOML puts them in that table.)
+default_lane = "default"
+
+# Environment variables set in every build unless the caller set them; "{id}" becomes the ticket.
+[env]
+
+# ---- Lanes --------------------------------------------------------------------------------------
+
+# A lane is a kind of build. Keys, with their defaults:
+#
+#   cores = 4           cores a build with no history wants
+#   min_cores = 1       the fewest cores a build starts with when the machine is busy
+#   max_cores = cores   the most cores a build may grow to
+#   mem = "4G"          memory a build with no history is expected to need
+#   min_mem = 0         a floor for the memory estimate (a lane whose small runs hide big ones)
+#   priority = 0        higher lanes go first when builds are waiting
+#   extra_jobs = 0      builds of this lane that may run on top of max_jobs
+#   may_pass_held = false   may use room held for a long-waiting build
+#   exclusive = true    one build at a time per workspace (CARGO_TARGET_DIR, or the git worktree)
+#   jobserver = "tools" give builds a jobserver of their own, resized as the machine's load changes:
+#                       "tools" when the command is cargo, make or ninja; true for every build
+#                       (scripts that call them too; needs make 4.4+ inside); false for none
+#   timeout = none      stop a build after this long unless its caller gives --timeout
+#   test_threads = false  also set RUST_TEST_THREADS / NEXTEST_TEST_THREADS to the build's cores
+#                       (they win over a project's own pinned thread counts, so off by default)
+#   properties = {}     systemd properties of the build's service (MemoryHigh, MemoryMax, ...)
+#
+# Defining any lane replaces this default one.
+[lanes.default]
+cores = 4
+mem = "4G"
+properties = { MemoryHigh = "40%", MemoryMax = "50%" }
+
+# An example for a machine shared by agents building Rust, .NET and web front ends. Front-end
+# builds are quick, so they go first and get extra turns; .NET next; cargo last, sized by its
+# history and capped so that one compile can't take the machine. To use it, replace
+# [lanes.default] with these and set default_lane = "heavy" at the top of the file.
+#
+# [lanes.heavy]
+# cores = 8
+# min_cores = 2
+# max_cores = 16
+# mem = "20G"
+# min_mem = "6G"
+# properties = { MemoryHigh = "22G", MemoryMax = "26G" }
+#
+# [lanes.dotnet]
+# cores = 6
+# min_cores = 2
+# max_cores = 12
+# mem = "8G"
+# priority = 50
+# properties = { MemoryHigh = "14G", MemoryMax = "16G" }
+#
+# [lanes.web]
+# cores = 4
+# max_cores = 8
+# mem = "6G"
+# priority = 100
+# extra_jobs = 3
+# may_pass_held = true
+# exclusive = false
+# properties = { MemoryHigh = "10G", MemoryMax = "12G" }
+
+# Lane rules pick the lane for a build whose caller names none: the first whose pattern (a Python
+# regular expression) matches the command's key words, such as "cargo test -p api",
+# "pnpm --filter web build" or "dotnet build", wins.
+#
+# [[lane_rules]]
+# match = "^(pnpm|npm|yarn) (verify:push|verify-push)"   # runs the Rust suite too
+# lane = "heavy"
+#
+# [[lane_rules]]
+# match = "^(pnpm|npm|npx|yarn|bun|bunx|vite|vitest|tsc|eslint|node|playwright) "
+# lane = "web"
+#
+# [[lane_rules]]
+# match = "^dotnet "
+# lane = "dotnet"
+#
+# Image builds compile inside dockerd, outside the build's cgroup, so buildq can't measure them:
+# give them a lane that never learns below what they really need.
+#
+# [lanes.image]
+# cores = 8
+# mem = "16G"
+# min_mem = "16G"
+#
+# [[lane_rules]]
+# match = "^(docker|podman) (build|buildx|compose)"
+# lane = "image"
+
+# ---- Migrating from a flock-based slot script ----------------------------------------------------
+
+# List its lock files, and builds holding one are counted as running builds (measured where they
+# run in a scope of their own, with their expected growth held). Meant for a switch-over and for
+# a fallback that runs only while the daemon is down: polling can't stop both from admitting into
+# the same free memory at the same moment, so don't run the two as gates side by side for long.
+#
+# [[flock_slots]]
+# glob = "~/.cache/build-locks/slot-*.lock"
+# lane = "heavy"

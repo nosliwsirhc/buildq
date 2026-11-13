@@ -1,0 +1,2946 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""buildqd: the daemon behind buildq, a load-aware build queue for one shared Linux machine.
+
+Callers drop off a build and get a ticket, a UUID:
+
+    buildq submit -- cargo test -p api      # prints the ticket and returns at once
+    buildq status <ticket>                  # queued (and why), running (and how big), or finished
+    buildq wait <ticket>                    # blocks until it ends; exits with its exit code
+    buildq run -- cargo test -p api         # submit, stream the output, exit with its exit code
+
+The daemon holds each ticket until the machine has room for its build, judged from what the
+machine is doing right now rather than from a fixed number of slots:
+
+  Memory  The build's expected peak must fit in MemAvailable, less what every running build may
+          still grow into (its expected peak minus what it holds now), less mem_floor. Never
+          skipped. No build starts while memory pressure (PSI "full") is above mem_psi_block.
+  CPU     The build's minimum cores must fit in what is free: cpu_target x cores, less the busy
+          cores measured machine-wide (CI runners, containers and other users included), less the
+          cores that builds started in the last ramp_seconds haven't reached yet, plus the cores
+          that resizable builds could give back. Skipped when no build is running, so outside
+          load can slow the queue but never stall it.
+  Other   At most max_jobs builds; no build while its filesystem has less than disk_floor free;
+          one build at a time per workspace in an exclusive lane.
+
+Each build gets a number of cores between its lane's min_cores and what it can use, its "want",
+learned from earlier runs: a run that used every core it was given wants more next time, a run
+that left cores idle wants fewer. The number goes into the build's environment (CARGO_BUILD_JOBS,
+RUST_TEST_THREADS, MAKEFLAGS -jN, CMAKE_BUILD_PARALLEL_LEVEL, GOMAXPROCS, BUILDQ_CORES) unless the
+caller set those. Builds whose tools speak the GNU make jobserver protocol (cargo, make, ninja)
+also get a jobserver of their own, which the daemon resizes every few seconds: they grow into idle
+cores and give cores back when other builds need them.
+
+Each build runs as a transient systemd user service, buildq-<ticket>.service in buildq.slice, with
+its lane's properties (MemoryHigh, MemoryMax, ...). Inside it, `buildqd --supervise <ticket dir>`
+runs the command with the caller's environment and working directory, copies its output to the
+ticket's output.log, enforces its timeout, stops whatever it leaves behind, and records its exit
+status. Builds don't depend on the caller or the daemon: the daemon can restart while they run and
+picks them up again from the ticket files.
+
+See README.md and docs/design.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import collections
+import fcntl
+import glob
+import itertools
+import json
+import math
+import os
+import re
+import selectors
+import shlex
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import time
+import traceback
+import uuid
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    sys.exit("buildqd needs Python 3.11 or newer (for tomllib).")
+
+VERSION = "0.2.0"
+KIB, MIB, GIB = 1 << 10, 1 << 20, 1 << 30
+UID = os.getuid()
+SELF = os.path.realpath(__file__)
+FINISHED = ("succeeded", "failed", "cancelled", "lost")
+DEVNULL = subprocess.DEVNULL
+
+
+# --------------------------------------------------------------------------------------------
+# Paths and small helpers
+
+
+def runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{UID}"
+
+
+def default_socket() -> str:
+    return os.path.expanduser(os.environ.get("BUILDQ_SOCKET") or os.path.join(runtime_dir(), "buildq.sock"))
+
+
+def default_state_dir() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.expanduser(os.environ.get("BUILDQ_STATE_DIR") or os.path.join(base, "buildq"))
+
+
+def default_config() -> str:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.expanduser(os.environ.get("BUILDQ_CONFIG") or os.path.join(base, "buildq", "config.toml"))
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def write_json(path: str, data) -> None:
+    """Write a JSON file atomically: readers see the old contents or the new, never a part."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, separators=(",", ":"))
+    os.replace(tmp, path)
+
+
+def read_json(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def peer_uid(sock: socket.socket) -> int | None:
+    try:
+        _pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                              struct.calcsize("3i")))
+        return uid
+    except (OSError, AttributeError):
+        return None
+
+
+# --------------------------------------------------------------------------------------------
+# Sizes, durations, numbers
+
+
+def parse_size(value, total: int | None = None) -> int:
+    """'16G', '512M', '1.5T', '2048K', a plain number of bytes, or '10%' of `total` -> bytes."""
+    if isinstance(value, bool):
+        raise ValueError(f"not a size: {value!r}")
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"not a size: {value!r}")
+        return int(value)
+    text = str(value).strip()
+    if text.endswith("%"):
+        if total is None:
+            raise ValueError(f"a percentage needs a total: {value!r}")
+        share = float(text[:-1])
+        if not 0 <= share <= 100:
+            raise ValueError(f"not a percentage: {value!r}")
+        return int(share / 100 * total)
+    match = re.fullmatch(r"([0-9]*\.?[0-9]+)\s*([kKmMgGtT]?)(?:i?[bB])?", text)
+    if not match:
+        raise ValueError(f"not a size: {value!r}")
+    unit = {"": 1, "k": KIB, "m": MIB, "g": GIB, "t": 1 << 40}[match.group(2).lower()]
+    return int(float(match.group(1)) * unit)
+
+
+def parse_duration(value) -> float:
+    """'90', '90s', '10m', '2h', '7d' -> seconds."""
+    if isinstance(value, bool):
+        raise ValueError(f"not a duration: {value!r}")
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        match = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([smhd]?)\s*", str(value))
+        if not match:
+            raise ValueError(f"not a duration: {value!r}")
+        seconds = float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"not a duration: {value!r}")
+    return seconds
+
+
+def boolean(value, what: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{what} must be true or false")
+    return value
+
+
+def number(value, what: str, low: float, high: float, integer: bool = False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{what} must be a number")
+    if not math.isfinite(value) or not low <= value <= high:
+        raise ValueError(f"{what} must be between {low:g} and {high:g}")
+    if integer and int(value) != value:
+        raise ValueError(f"{what} must be a whole number")
+    return int(value) if integer else float(value)
+
+
+def fmt_size(n: float) -> str:
+    if abs(n) >= 10 * GIB:
+        return f"{n / GIB:.0f}G"
+    if abs(n) >= GIB:
+        return f"{n / GIB:.1f}G"
+    return f"{n / MIB:.0f}M"
+
+
+# --------------------------------------------------------------------------------------------
+# Configuration
+
+DEFAULTS = {
+    "max_jobs": 4,
+    "cpu_target": 0.9,
+    "mem_floor": "10%",
+    "disk_floor": "2G",
+    "cpu_psi_block": 50.0,
+    "mem_psi_block": 10.0,
+    "ramp_seconds": 90,
+    "starve_seconds": 600,
+    "unwatched_seconds": 30,
+    "history_runs": 30,
+    "history_days": 30,
+    "history_keys": 2000,
+    "mem_margin": 1.15,
+    "max_log": "64M",
+    "slice": "buildq.slice",
+    "slice_guard": True,
+    "runner": "auto",
+    "default_lane": "default",
+    "keep_finished": "7d",
+    "max_finished": 1000,
+    "on_finish": "",
+    "env": {},
+    "lanes": {"default": {"cores": 4, "mem": "4G", "properties": {"MemoryHigh": "40%", "MemoryMax": "50%"}}},
+    "lane_rules": [],
+    "flock_slots": [],
+}
+PROPERTY_NAME = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class Lane:
+    KEYS = {"cores", "min_cores", "max_cores", "mem", "min_mem", "properties", "may_pass_held", "jobserver",
+            "exclusive", "timeout", "priority", "extra_jobs", "test_threads"}
+
+    def __init__(self, name: str, raw, mem_total: int, ncpu: int):
+        if not isinstance(raw, dict):
+            raise ValueError(f"lanes.{name} must be a table")
+        unknown = set(raw) - self.KEYS
+        if unknown:
+            raise ValueError(f"lanes.{name}: unknown keys {sorted(unknown)}")
+        self.name = name
+        self.cores = number(raw.get("cores", 4), f"lanes.{name}.cores", 1, 4096, integer=True)
+        self.min_cores = number(raw.get("min_cores", 1), f"lanes.{name}.min_cores", 1, 4096, integer=True)
+        self.max_cores = number(raw.get("max_cores", max(self.cores, 1)), f"lanes.{name}.max_cores", 1, 4096,
+                                integer=True)
+        self.max_cores = min(self.max_cores, ncpu)
+        self.cores = min(max(self.cores, self.min_cores), self.max_cores)
+        if self.min_cores > self.max_cores:
+            raise ValueError(f"lanes.{name}: min_cores is more than max_cores")
+        self.mem = parse_size(raw.get("mem", "4G"), mem_total)
+        self.min_mem = parse_size(raw.get("min_mem", 0), mem_total)
+        if not 0 < self.mem <= mem_total:
+            raise ValueError(f"lanes.{name}.mem must be more than 0 and at most the machine's memory")
+        if self.min_mem > mem_total:
+            raise ValueError(f"lanes.{name}.min_mem is more than the machine's memory")
+        properties = raw.get("properties") or {}
+        if not isinstance(properties, dict):
+            raise ValueError(f"lanes.{name}.properties must be a table")
+        self.properties = {}
+        for key, value in properties.items():
+            if not PROPERTY_NAME.match(str(key)) or isinstance(value, (dict, list)) or "\n" in str(value):
+                raise ValueError(f"lanes.{name}.properties: bad property {key!r}")
+            self.properties[str(key)] = str(value).lower() if isinstance(value, bool) else str(value)
+        self.may_pass_held = boolean(raw.get("may_pass_held", False), f"lanes.{name}.may_pass_held")
+        mode = raw.get("jobserver", "tools")
+        modes = {True: "all", "all": "all", "tools": "tools", False: "off", "off": "off"}
+        if mode not in modes:
+            raise ValueError(f"lanes.{name}.jobserver must be true, false or \"tools\"")
+        self.jobserver = modes[mode]  # "tools": only for cargo, make and ninja, which are known to speak it
+        self.exclusive = boolean(raw.get("exclusive", True), f"lanes.{name}.exclusive")
+        # RUST_TEST_THREADS and NEXTEST_TEST_THREADS win over a project's own settings (a suite
+        # pinned to one thread for a shared database, say), so they are set only where asked.
+        self.test_threads = boolean(raw.get("test_threads", False), f"lanes.{name}.test_threads")
+        self.timeout = parse_duration(raw["timeout"]) if raw.get("timeout") else None
+        self.priority = number(raw.get("priority", 0), f"lanes.{name}.priority", -1000, 1000, integer=True)
+        self.extra_jobs = number(raw.get("extra_jobs", 0), f"lanes.{name}.extra_jobs", 0, 1000, integer=True)
+        cap = self.properties.get("MemoryMax")
+        try:
+            self.mem_cap = parse_size(cap, mem_total) if cap and cap != "infinity" else None
+        except ValueError:
+            self.mem_cap = None
+
+    def summary(self) -> dict:
+        return {"cores": self.cores, "min_cores": self.min_cores, "max_cores": self.max_cores, "mem": self.mem,
+                "min_mem": self.min_mem, "properties": self.properties, "may_pass_held": self.may_pass_held,
+                "jobserver": self.jobserver, "exclusive": self.exclusive, "timeout": self.timeout,
+                "priority": self.priority, "extra_jobs": self.extra_jobs}
+
+
+class Config:
+    def __init__(self, raw: dict, mem_total: int, ncpu: int):
+        if not isinstance(raw, dict):
+            raise ValueError("the configuration must be a table")
+        unknown = set(raw) - set(DEFAULTS)
+        if unknown:
+            raise ValueError(f"unknown keys {sorted(unknown)}")
+        d = {**DEFAULTS, **raw}
+        self.max_jobs = number(d["max_jobs"], "max_jobs", 1, 10000, integer=True)
+        self.cpu_target = number(d["cpu_target"], "cpu_target", 0.05, 4)
+        self.mem_floor = parse_size(d["mem_floor"], mem_total)
+        if not 0 <= self.mem_floor < mem_total:
+            raise ValueError("mem_floor must be less than the machine's memory")
+        self.disk_floor = parse_size(d["disk_floor"])
+        self.cpu_psi_block = number(d["cpu_psi_block"], "cpu_psi_block", 0, 1000)
+        self.mem_psi_block = number(d["mem_psi_block"], "mem_psi_block", 0, 1000)
+        self.ramp_seconds = number(d["ramp_seconds"], "ramp_seconds", 0, 3600)
+        self.starve_seconds = number(d["starve_seconds"], "starve_seconds", 1, 7 * 86400)
+        self.unwatched_seconds = number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)
+        self.history_runs = number(d["history_runs"], "history_runs", 1, 1000, integer=True)
+        self.history_days = number(d["history_days"], "history_days", 1, 3650)
+        self.history_keys = number(d["history_keys"], "history_keys", 10, 1_000_000, integer=True)
+        self.mem_margin = number(d["mem_margin"], "mem_margin", 1, 10)
+        self.max_log = parse_size(d["max_log"])
+        self.slice = str(d["slice"])
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+\.slice", self.slice):
+            raise ValueError(f"slice must be a systemd slice name ending in .slice: {self.slice!r}")
+        self.slice_guard = boolean(d["slice_guard"], "slice_guard")
+        self.runner = str(d["runner"])
+        if self.runner not in ("auto", "systemd", "direct"):
+            raise ValueError("runner must be auto, systemd or direct")
+        self.keep_finished = parse_duration(d["keep_finished"])
+        self.max_finished = number(d["max_finished"], "max_finished", 0, 1_000_000, integer=True)
+        self.on_finish = str(d["on_finish"] or "")
+        if not isinstance(d["lanes"], dict) or not d["lanes"]:
+            raise ValueError("lanes must define at least one lane")
+        self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
+        self.default_lane = str(d["default_lane"])
+        if self.default_lane not in self.lanes:
+            raise ValueError(f"default_lane {self.default_lane!r} is not in lanes {sorted(self.lanes)}")
+        if not isinstance(d["env"], dict):
+            raise ValueError("env must be a table")
+        self.env = {}
+        for key, value in d["env"].items():
+            if not ENV_NAME.match(str(key)) or isinstance(value, (dict, list)):
+                raise ValueError(f"env: bad variable {key!r}")
+            if key in DEFAULTS:
+                raise ValueError(f"env.{key} is a top-level setting written after [env]; move it above the "
+                                 "first [table] of the file")
+            self.env[str(key)] = str(value)
+        if not isinstance(d["lane_rules"], list):
+            raise ValueError("lane_rules must be a list of tables")
+        self.lane_rules = []
+        for entry in d["lane_rules"]:
+            if not isinstance(entry, dict) or "match" not in entry or "lane" not in entry:
+                raise ValueError("each lane_rules entry needs a match and a lane")
+            if set(entry) - {"match", "lane"}:
+                raise ValueError(f"lane_rules: unknown keys {sorted(set(entry) - {'match', 'lane'})} "
+                                 "(a top-level key written after a [[lane_rules]] entry lands in it)")
+            if str(entry["lane"]) not in self.lanes:
+                raise ValueError(f"lane_rules: lane {entry['lane']!r} is not in lanes")
+            try:
+                self.lane_rules.append((re.compile(str(entry["match"])), str(entry["lane"])))
+            except re.error as e:
+                raise ValueError(f"lane_rules: bad pattern {entry['match']!r}: {e}") from e
+        if not isinstance(d["flock_slots"], list):
+            raise ValueError("flock_slots must be a list of tables")
+        self.flock_slots = []
+        for entry in d["flock_slots"]:
+            if not isinstance(entry, dict) or "glob" not in entry:
+                raise ValueError("each flock_slots entry needs a glob")
+            if set(entry) - {"glob", "lane"}:
+                raise ValueError(f"flock_slots: unknown keys {sorted(set(entry) - {'glob', 'lane'})}")
+            lane = str(entry.get("lane", self.default_lane))
+            if lane not in self.lanes:
+                raise ValueError(f"flock_slots: lane {lane!r} is not in lanes")
+            self.flock_slots.append((os.path.expanduser(str(entry["glob"])), lane))
+
+    def summary(self) -> dict:
+        return {
+            "max_jobs": self.max_jobs, "cpu_target": self.cpu_target, "mem_floor": self.mem_floor,
+            "disk_floor": self.disk_floor, "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
+            "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "slice": self.slice,
+            "slice_guard": self.slice_guard,
+            "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
+            "max_log": self.max_log, "lanes": {name: lane.summary() for name, lane in self.lanes.items()},
+            "lane_rules": [[rule.pattern, lane] for rule, lane in self.lane_rules],
+            "env": self.env,
+        }
+
+    def lane_for(self, argv: list[str]) -> str:
+        """The lane a command goes to when its caller names none: the first rule that matches
+        its key words (`cargo test -p api`, `pnpm --filter web build`, ...), else default_lane."""
+        words = " ".join(command_words(argv))
+        for rule, lane in self.lane_rules:
+            if rule.search(words):
+                return lane
+        return self.default_lane
+
+
+def load_config_file(path: str, mem_total: int, ncpu: int) -> Config:
+    raw = {}
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            raw = tomllib.load(f)
+    return Config(raw, mem_total, ncpu)
+
+
+# --------------------------------------------------------------------------------------------
+# What the machine is doing
+
+
+def cpu_times() -> tuple[int, int]:
+    """(all jiffies, idle + iowait jiffies) summed over every CPU, from /proc/stat."""
+    with open("/proc/stat") as f:
+        fields = [int(x) for x in f.readline().split()[1:9]]
+    return sum(fields), fields[3] + fields[4]
+
+
+def meminfo() -> dict[str, int]:
+    out = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            name, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts:
+                out[name] = int(parts[0]) * (KIB if len(parts) > 1 else 1)
+    return out
+
+
+def pressure(resource: str, kind: str) -> float:
+    """avg10 of /proc/pressure/<resource> for "some" or "full"; 0 where PSI is unavailable."""
+    try:
+        with open(f"/proc/pressure/{resource}") as f:
+            for line in f:
+                parts = line.split()
+                if parts and parts[0] == kind:
+                    for field in parts[1:]:
+                        name, _, value = field.partition("=")
+                        if name == "avg10":
+                            return float(value)
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def disk_free(path: str) -> int | None:
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize
+    except OSError:
+        return None
+
+
+class Machine:
+    """Machine-wide CPU and memory, sampled once a second by the daemon."""
+
+    TAU = 10.0  # seconds; time constant of the busy-cores average
+
+    def __init__(self):
+        self.ncpu = os.cpu_count() or 1
+        self.busy = 0.0
+        self.busy_now = 0.0
+        self.mem_total = self.mem_available = self.swap_used = 0
+        self.psi_cpu = self.psi_mem = 0.0
+        self._prev = None
+        self._primed = False
+        self.sample(time.monotonic())
+
+    def sample(self, now: float) -> None:
+        total, idle = cpu_times()
+        if self._prev is not None:
+            t0, total0, idle0 = self._prev
+            if total > total0:
+                self.busy_now = max(0.0, 1 - (idle - idle0) / (total - total0)) * self.ncpu
+                if self._primed:
+                    self.busy += (1 - math.exp(-max(now - t0, 0.0) / self.TAU)) * (self.busy_now - self.busy)
+                else:
+                    self.busy = self.busy_now
+                    self._primed = True
+        self._prev = (now, total, idle)
+        info = meminfo()
+        self.mem_total = info.get("MemTotal", 0)
+        self.mem_available = info.get("MemAvailable", info.get("MemFree", 0))
+        self.swap_used = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
+        self.psi_cpu = pressure("cpu", "some")
+        self.psi_mem = pressure("memory", "full")
+
+    def summary(self) -> dict:
+        return {
+            "cores": self.ncpu, "busy": round(self.busy, 2), "busy_now": round(self.busy_now, 2),
+            "mem_total": self.mem_total, "mem_available": self.mem_available, "swap_used": self.swap_used,
+            "psi_cpu_some_avg10": self.psi_cpu, "psi_mem_full_avg10": self.psi_mem,
+        }
+
+
+def user_manager_cgroup() -> str:
+    """The cgroup directory of this user's systemd manager (user@UID.service)."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    match = re.match(r"(.*/user@\d+\.service)(?:/|$)", line[3:].strip())
+                    if match:
+                        return "/sys/fs/cgroup" + match.group(1)
+    except OSError:
+        pass
+    return f"/sys/fs/cgroup/user.slice/user-{UID}.slice/user@{UID}.service"
+
+
+def slice_path(name: str) -> str:
+    """systemd nests a-b.slice inside a.slice: 'a-b.slice' -> 'a.slice/a-b.slice'."""
+    parts = name[: -len(".slice")].split("-")
+    return "/".join("-".join(parts[: i + 1]) + ".slice" for i in range(len(parts)))
+
+
+def cgroup_stats(path: str):
+    """(cpu usage in usec, unreclaimable memory in bytes, oom kills) of a cgroup, or None if gone.
+
+    The memory is anon + shmem + kernel - slab_reclaimable from memory.stat. memory.current and
+    memory.peak also count page cache, which a build fills with its own output and the kernel takes
+    back when it needs to, so they say little about what a build needs.
+    """
+    try:
+        usage = 0
+        with open(os.path.join(path, "cpu.stat")) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == "usage_usec":
+                    usage = int(value)
+                    break
+        stat = {}
+        with open(os.path.join(path, "memory.stat")) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name in ("anon", "kernel", "shmem", "slab_reclaimable"):
+                    stat[name] = int(value)
+        need = stat.get("anon", 0) + stat.get("shmem", 0) + max(0, stat.get("kernel", 0) - stat.get("slab_reclaimable", 0))
+        return usage, need, cgroup_oom_kills(path)
+    except (OSError, ValueError):
+        return None
+
+
+def cgroup_events(path: str) -> dict[str, int]:
+    out = {}
+    try:
+        with open(os.path.join(path, "memory.events.local")) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                out[name] = int(value)
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def cgroup_oom_kills(path: str) -> int:
+    try:
+        with open(os.path.join(path, "memory.events")) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == "oom_kill":
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def cgroup_populated(path: str) -> bool:
+    try:
+        with open(os.path.join(path, "cgroup.events")) as f:
+            return "populated 1" in f.read()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # can't tell (out of descriptors, say): don't call a build gone on that
+
+
+def proc_identity(pid):
+    """(start time in clock ticks since boot, state letter) of a process, or None if it's gone."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            data = f.read()
+        fields = data.rsplit(")", 1)[1].split()
+        return int(fields[19]), fields[0]
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def proc_alive(pid, start) -> bool:
+    ident = proc_identity(pid) if pid else None
+    return bool(ident) and ident[0] == start and ident[1] not in ("Z", "X")
+
+
+def proc_cmdline(pid: int) -> list[str]:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except OSError:
+        return []
+
+
+def proc_cgroup(pid: int) -> str | None:
+    try:
+        with open(f"/proc/{pid}/cgroup") as f:
+            for line in f:
+                if line.startswith("0::"):
+                    return "/sys/fs/cgroup" + line[3:].strip()
+    except OSError:
+        pass
+    return None
+
+
+def proc_children(pid: int) -> list[int]:
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def tagged_processes(job: str, exclude: int | None = None) -> list[int]:
+    """This user's processes whose environment says they belong to build `job` (BUILDQ_JOB),
+    including any that left the build's process group."""
+    tag = f"BUILDQ_JOB={job}".encode()
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == exclude or int(entry) == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{entry}").st_uid != UID:
+                continue
+            with open(f"/proc/{entry}/environ", "rb") as f:
+                if tag in f.read().split(b"\0"):
+                    ident = proc_identity(int(entry))
+                    if ident and ident[1] not in ("Z", "X"):
+                        found.append(int(entry))
+        except OSError:
+            continue
+    return found
+
+
+# --------------------------------------------------------------------------------------------
+# flock(2) slots of an older semaphore script
+
+
+def locked_inodes() -> set[int]:
+    """Inodes of every file with a flock(2) lock on it, from /proc/locks.
+
+    The pid there is whoever took the lock, which for flock(1) on an inherited descriptor is a
+    process that has already exited, and on btrfs the device differs from stat()'s. So this gives
+    only candidates; holds_flock() confirms one.
+    """
+    inodes = set()
+    try:
+        with open("/proc/locks") as f:
+            for line in f:
+                parts = line.split()
+                # "3: FLOCK  ADVISORY  WRITE 2234 00:56:67 0 EOF"; waiters read "3: -> FLOCK ...".
+                if len(parts) >= 6 and parts[1] == "FLOCK":
+                    try:
+                        inodes.add(int(parts[5].rsplit(":", 1)[1]))
+                    except (ValueError, IndexError):
+                        continue
+    except OSError:
+        pass
+    return inodes
+
+
+def holds_flock(pid: int, path: str, inode: int) -> bool:
+    """Whether `pid` holds the flock on `path`.
+
+    A waiter has the file open too, so this looks for a descriptor of that file whose open file
+    description carries the lock: the kernel lists the lock in that descriptor's fdinfo. It uses
+    readlink, not stat, so a descriptor on a hung filesystem can't block it.
+    """
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{fd}") != path:
+                continue
+            with open(f"/proc/{pid}/fdinfo/{fd}") as f:
+                for line in f:
+                    if line.startswith("lock:") and "FLOCK" in line and "->" not in line \
+                            and line.split()[-3].endswith(f":{inode}"):
+                        return True
+        except (OSError, IndexError):
+            continue
+    return False
+
+
+def fifo_in_use(cgroup: str, path: str | None) -> bool:
+    """Whether a process of the build (other than its supervisor's own copy) has its jobserver
+    FIFO open: a tool that opened it speaks the protocol, even before it takes a token."""
+    if not path:
+        return False
+    try:
+        with open(os.path.join(cgroup, "cgroup.procs")) as f:
+            pids = [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return False
+    users = 0
+    for pid in pids:
+        try:
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                try:
+                    if os.readlink(f"/proc/{pid}/fd/{fd}") == path:
+                        users += 1
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    return users > 1  # the supervisor holds it open for the whole build
+
+
+def configured_memory_max(slice_name: str) -> str | None:
+    """The MemoryMax systemd has for the slice, in bytes ("max" for none), or None if it can't say."""
+    try:
+        out = subprocess.run(["systemctl", "--user", "show", "-p", "MemoryMax", "--value", slice_name],
+                             stdin=DEVNULL, capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out == "infinity":
+        return "max"
+    return out if out.isdigit() else None
+
+
+def find_flock_holder(path: str, inode: int) -> int | None:
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{entry}").st_uid != UID:
+                continue
+        except OSError:
+            continue
+        if holds_flock(int(entry), path, inode):
+            return int(entry)
+    return None
+
+
+# --------------------------------------------------------------------------------------------
+# Which command is this? The key that history is kept under, and the build's workspace.
+
+WRAPPERS = {"nice", "ionice", "nohup", "setsid", "stdbuf", "time", "command", "exec", "chrt",
+            "taskset", "sudo", "doas"}
+VALUE_OPTIONS = {"-n", "-c", "-o", "-e", "-i", "-p", "-u", "-g", "-C"}
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+INTERPRETERS = {"python", "python3", "node", "deno", "ruby", "perl", "bun"}
+JS_TOOLS = {"npm", "pnpm", "yarn", "npx", "pnpx", "bunx"}
+CARGO_VALUE_OPTIONS = {"--manifest-path", "--target-dir", "-j", "--jobs", "--color", "--config",
+                       "-Z", "--profile", "--target", "-F", "--features", "--bin", "--test",
+                       "--example", "--bench", "-p", "--package", "--exclude", "--message-format"}
+JS_VALUE_OPTIONS = {"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+JOBSERVER_TOOLS = {"cargo", "make", "gmake", "ninja"}
+SAFE_WORD = re.compile(r"^@?[A-Za-z0-9_.,+:%/-]{1,64}$")  # "@scope/pkg" is an npm package, not an address
+
+
+def strip_wrappers(argv: list[str]) -> list[str]:
+    t = list(argv)
+    while t:
+        head = os.path.basename(t[0])
+        if ASSIGNMENT.match(t[0]):
+            t = t[1:]
+        elif head == "env":
+            t = t[1:]
+            while t and (t[0].startswith("-") or ASSIGNMENT.match(t[0])):
+                t = t[1:]
+        elif head == "timeout":
+            t = t[1:]
+            while t and t[0].startswith("-"):
+                option = t.pop(0)
+                if option in ("-s", "-k", "--signal", "--kill-after") and t:
+                    t.pop(0)
+            t = t[1:]  # the duration
+        elif head in WRAPPERS:
+            t = t[1:]
+            while t and t[0].startswith("-"):
+                option = t.pop(0)
+                if option in VALUE_OPTIONS and t:
+                    t.pop(0)
+            if head in ("taskset", "chrt"):
+                while t and re.fullmatch(r"[0-9a-fA-Fx,\-]+", t[0]):
+                    t.pop(0)
+        else:
+            break
+    return t
+
+
+def positionals(args: list[str], value_options: set[str] = frozenset()) -> list[str]:
+    out, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg.startswith("-"):
+            skip = arg in value_options
+        else:
+            out.append(arg)
+    return out
+
+
+def option_values(args: list[str], names: set[str]) -> list[str]:
+    values = []
+    for i, arg in enumerate(args):
+        if arg in names:
+            if i + 1 < len(args):
+                values.append(args[i + 1])
+            continue
+        for name in names:
+            if name.startswith("--") and arg.startswith(name + "="):
+                values.append(arg[len(name) + 1:])
+            elif len(name) == 2 and not arg.startswith("--") and arg.startswith(name) and len(arg) > 2:
+                values.append(arg[2:])
+    return values
+
+
+def git_toplevel(cwd: str) -> str | None:
+    d = os.path.abspath(cwd)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def repo_name(cwd: str) -> str:
+    """The name of the git repository that holds cwd, the same for every worktree of it."""
+    top = git_toplevel(cwd)
+    if top is None:
+        return os.path.basename(os.path.abspath(cwd).rstrip("/")) or "/"
+    dot_git = os.path.join(top, ".git")
+    if os.path.isdir(dot_git):
+        return os.path.basename(top) or "/"
+    try:
+        with open(dot_git) as f:
+            gitdir = os.path.normpath(os.path.join(top, f.read().split("gitdir:", 1)[1].strip()))
+        common = gitdir
+        commondir = os.path.join(gitdir, "commondir")
+        if os.path.isfile(commondir):
+            with open(commondir) as f:
+                common = os.path.normpath(os.path.join(gitdir, f.read().strip()))
+        if os.path.basename(common) == ".git":
+            return os.path.basename(os.path.dirname(common))
+        return re.sub(r"\.git$", "", os.path.basename(common)) or os.path.basename(top)
+    except (OSError, IndexError):
+        return os.path.basename(top)
+
+
+def command_words(argv: list[str]) -> list[str]:
+    t = strip_wrappers(argv)
+    if "--" in t:
+        t = t[: t.index("--")]
+    if not t:
+        return ["?"]
+    # Nothing that could hold a credential reaches a key, not even through basename().
+    t = [t[0]] + ["…" if re.search(r"://|^[^@\s/]+:[^@\s]*@|^[^-][^=]*=", a) else a for a in t[1:]]
+    tool = os.path.basename(t[0])
+    rest = t[1:]
+    words = [tool]
+    if tool == "cargo":
+        if rest and rest[0].startswith("+"):
+            rest = rest[1:]
+        words += positionals(rest, CARGO_VALUE_OPTIONS)[:1]
+        words += [f"-p {p}" for p in sorted(set(option_values(rest, {"-p", "--package"})))]
+        words += [f"--profile {p}" for p in option_values(rest, {"--profile"})]
+        words += [f for f in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc")
+                  if f in rest]
+    elif tool in JS_TOOLS:
+        words += [f"--filter {f}" for f in sorted(set(option_values(rest, {"--filter", "-F"})))]
+        pos = positionals(rest, JS_VALUE_OPTIONS)
+        if pos[:1] and pos[0] in ("run", "run-script", "exec", "x", "dlx"):
+            pos = pos[1:]
+        words += pos[:1]
+    elif tool == "git":
+        words += positionals(rest, {"-C", "-c", "--git-dir", "--work-tree"})[:1]
+    elif tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS:
+        if "-c" in rest:
+            words.append("-c")
+            i = rest.index("-c")
+            if i + 1 < len(rest):
+                script = [w for w in rest[i + 1].split() if not ASSIGNMENT.match(w)]
+                words += [os.path.basename(w) for w in script[:2]]
+        else:
+            words += [os.path.basename(p) for p in positionals(rest, {"-m"} if "python" in tool else set())[:1]]
+            words += option_values(rest, {"-m"})[:1]
+    elif tool in ("make", "gmake", "ninja"):
+        words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
+    else:
+        words += [os.path.basename(p) for p in positionals(rest)[:2]]
+    # Keys are logged and kept; nothing that could be a secret goes into one.
+    return [w if all(SAFE_WORD.match(part) and not TOKEN_LIKE.match(part) for part in w.split(" ")) else "…"
+            for w in words]
+
+
+def command_key(argv: list[str], cwd: str, lane: str) -> str:
+    return f"{repo_name(cwd)}|{lane}|{' '.join(command_words(argv))}"
+
+
+def workspace_of(cwd: str, env: dict) -> str:
+    """What a build writes to, so two builds that would fight over it run one at a time: its
+    CARGO_TARGET_DIR if it has one, else its git worktree, else its directory."""
+    target = env.get("CARGO_TARGET_DIR")
+    if target:
+        return "target:" + os.path.realpath(os.path.join(cwd, target))
+    top = git_toplevel(cwd)
+    if top in (None, "/", os.path.expanduser("~")):  # a dotfiles repo isn't a workspace
+        top = cwd
+    return "tree:" + os.path.realpath(top)
+
+
+def disk_paths_of(cwd: str, env: dict) -> list[str]:
+    """Where a build writes: its directory, its CARGO_TARGET_DIR and its TMPDIR, as far as they
+    exist (or their nearest existing parent), each filesystem once."""
+    paths, devices = [], set()
+    for raw in (cwd, env.get("CARGO_TARGET_DIR"), env.get("TMPDIR")):
+        if not raw:
+            continue
+        path = os.path.abspath(os.path.join(cwd, raw))
+        while not os.path.exists(path) and os.path.dirname(path) != path:
+            path = os.path.dirname(path)
+        try:
+            dev = os.stat(path).st_dev
+        except OSError:
+            continue
+        if dev not in devices:
+            devices.add(dev)
+            paths.append(path)
+    return paths
+
+
+def asks_for_jobs(args: list[str]) -> bool:
+    return any(a == "-j" or re.fullmatch(r"-j\d+", a) or a == "--jobs" or a.startswith("--jobs=") for a in args)
+
+
+def without_jobs(argv: list[str]) -> list[str]:
+    """argv with make's or ninja's -j/--jobs options removed, so the build's jobserver decides."""
+    out, skip = [], False
+    for i, a in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        if a in ("-j", "--jobs"):
+            skip = i + 1 < len(argv) and argv[i + 1].isdigit()
+            continue
+        if re.fullmatch(r"-j\d+", a) or a.startswith("--jobs="):
+            continue
+        out.append(a)
+    return out
+
+
+def cargo_cold(argv: list[str], cwd: str, env: dict) -> bool:
+    """Whether a cargo command will build from scratch: its target directory has no build of that
+    profile yet. History of warm builds says little about a cold one."""
+    t = strip_wrappers(argv)
+    if not t or os.path.basename(t[0]) != "cargo":
+        return False
+    target = env.get("CARGO_TARGET_DIR")
+    if target:
+        target = os.path.join(cwd, target)
+    else:
+        d = os.path.abspath(cwd)
+        root = None
+        while True:
+            if os.path.exists(os.path.join(d, "Cargo.lock")):
+                root = d
+                break
+            if os.path.exists(os.path.join(d, "Cargo.toml")):
+                root = root or d
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        if root is None:
+            return False
+        target = os.path.join(root, "target")
+    profile = "release" if "--release" in t else "debug"
+    profiles = option_values(t, {"--profile"})
+    if profiles:
+        profile = {"dev": "debug", "test": "debug", "bench": "release"}.get(profiles[0], profiles[0])
+    return not os.path.isdir(os.path.join(target, profile))
+
+
+SECRET_IN_URL = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")
+
+
+SECRET_OPTION = re.compile(r"^(--?[A-Za-z0-9_-]*(?:key|token|secret|passw|pass|auth|cred)[A-Za-z0-9_-]*=).+$", re.I)
+TOKEN_LIKE = re.compile(r"^(?:gh[pousr]_|github_pat_|sk-|xox[abpr]-|AKIA|glpat-)\S+$|^(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9+_=-]{32,}$")
+
+
+def redacted_label(argv: list[str], limit: int = 300) -> str:
+    """The command for display, with NAME=value assignments, secret-looking options and words, and
+    passwords in URLs hidden."""
+    shown = []
+    for arg in argv:
+        arg = re.sub(r"(^|\s)([A-Za-z_][A-Za-z0-9_]*)=\S*", r"\1\2=…", arg)
+        arg = SECRET_OPTION.sub(r"\1…", arg)
+        if TOKEN_LIKE.match(arg):
+            arg = "…"
+        shown.append(SECRET_IN_URL.sub(r"\1…@", arg))
+    text = shlex.join(shown)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# --------------------------------------------------------------------------------------------
+# History of what each command used
+
+
+class Estimate:
+    def __init__(self, want: int, need: int, mem: int, source: str, rigid: bool, wall: float | None = None,
+                 mem_cores: int = 1):
+        self.want, self.need, self.mem, self.source, self.rigid, self.wall = want, need, mem, source, rigid, wall
+        self.mem_cores = mem_cores  # the cores the build had when it needed `mem`
+
+
+class History:
+    KEEP = 100  # recent records per command
+    PEAK_DAYS = 400  # each day's biggest run is kept this long, so a full rebuild isn't forgotten
+
+    def __init__(self, path: str, max_keys: int = 2000):
+        self.path = path
+        self.max_keys = max_keys
+        self.by_key: collections.OrderedDict[str, collections.deque] = collections.OrderedDict()
+        self.peaks: dict[str, dict[int, dict]] = {}  # key -> day -> that day's biggest run
+        self.lines = 0
+        try:
+            with open(path) as f:
+                for line in f:
+                    record = self.valid(line)
+                    if record:
+                        self._remember(record)
+                    self.lines += 1
+        except FileNotFoundError:
+            pass
+        if self.lines > self._bound():
+            self.compact()
+
+    @staticmethod
+    def valid(line: str) -> dict | None:
+        try:
+            r = json.loads(line)
+            if not isinstance(r, dict) or not isinstance(r.get("key"), str):
+                return None
+            r["peak_mem"] = int(r["peak_mem"])
+            r["peak_cores"] = float(r["peak_cores"])
+            r["t"] = float(r.get("t", 0))
+            for name in ("wall", "granted", "avg_cores", "mem_cores"):
+                if r.get(name) is not None:
+                    r[name] = float(r[name])
+                    if not math.isfinite(r[name]) or r[name] < 0:
+                        return None
+            if r["peak_mem"] < 0 or not math.isfinite(r["peak_cores"]):
+                return None
+            return r
+        except (ValueError, KeyError, TypeError, OverflowError):
+            return None
+
+    def _remember(self, record: dict) -> None:
+        key = record["key"]
+        records = self.by_key.pop(key, None) or collections.deque(maxlen=self.KEEP)
+        records.append(record)
+        self.by_key[key] = records  # most recently used last
+        day = int(record["t"] // 86400)
+        peaks = self.peaks.setdefault(key, {})
+        if day not in peaks or record["peak_mem"] > peaks[day]["peak_mem"]:
+            peaks[day] = record
+        for old in [d for d in peaks if d < day - self.PEAK_DAYS]:
+            del peaks[old]
+        while len(self.by_key) > self.max_keys:
+            gone, _ = self.by_key.popitem(last=False)
+            self.peaks.pop(gone, None)
+
+    def _retained(self, key: str) -> list[dict]:
+        recent = list(self.by_key.get(key, ()))
+        seen = {id(r) for r in recent}
+        return [r for r in self.peaks.get(key, {}).values() if id(r) not in seen] + recent
+
+    def _bound(self) -> int:
+        return 1000 + 2 * sum(len(self._retained(k)) for k in self.by_key)
+
+    def add(self, record: dict) -> None:
+        self._remember(record)
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, "a") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self.lines += 1
+        if self.lines > self._bound():
+            self.compact()
+
+    def compact(self) -> None:
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w") as f:
+            for key in self.by_key:
+                for record in sorted(self._retained(key), key=lambda r: r["t"]):
+                    f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        os.replace(tmp, self.path)
+        self.lines = sum(len(self._retained(k)) for k in self.by_key)
+
+    def estimate(self, key: str, lane: Lane, cfg: Config, ncpu: int, cap_enforced: bool, cold: bool,
+                 now: float) -> Estimate:
+        """What the next run of a command needs.
+
+        Memory: the largest peak of its recent runs (the last history_runs within history_days),
+        with a margin. It is never lowered below a seen peak, except down to an enforced MemoryMax,
+        which the build can't exceed anyway. A cold build counts at least as the lane default.
+
+        Cores: a run that used nearly all the cores it was given ("saturated") could have used
+        more, so the build wants half as many again; a run that left cores idle wants a little
+        more than it used. A run that used far more cores than it was given doesn't follow the job
+        count, so the build is "rigid": it needs what it uses, however many cores it is given.
+        """
+        cutoff = now - cfg.history_days * 86400
+        recent = [r for r in self.by_key.get(key, ()) if r["t"] >= cutoff][-cfg.history_runs:]
+        cap = lane.mem_cap if cap_enforced else None
+        rigid = False
+        walls = sorted(float(r["wall"]) for r in recent if r.get("wall") and r.get("exit") == 0) or \
+            sorted(float(r["wall"]) for r in recent if r.get("wall"))
+        wall = walls[len(walls) // 2] if walls else None  # the median time of its successful runs
+        if not recent:
+            want, mem, source = lane.cores, lane.mem, f"{lane.name} lane default"
+            mem_cores = lane.cores
+        else:
+            # Memory: the biggest run within history_days, however many smaller ones came since.
+            window = [r for r in self._retained(key) if r["t"] >= cutoff] or recent
+            top = max(window, key=lambda r: r["peak_mem"])
+            mem_cores = int(top.get("mem_cores") or top.get("granted") or lane.cores) or lane.cores
+            peak = top["peak_mem"]
+            if any(r.get("oom") for r in window):
+                peak = max(peak, cap or int(peak * 1.5), lane.mem)
+            mem = int(peak * cfg.mem_margin) + 256 * MIB
+            wants = []
+            for r in recent:
+                used, given = r["peak_cores"], float(r.get("granted") or 0)
+                sustained = float(r.get("avg_cores") or 0)
+                if given and sustained > given * 1.2 + 0.5:  # not a burst: it ran wider than told
+                    rigid = True
+                    wants.append(used * 1.1)
+                elif given and used >= given * 0.85:
+                    wants.append(given * 1.5)
+                else:
+                    wants.append(used * 1.2)
+            want = max(wants)
+            source = f"largest of the last {len(recent)} run{'s' if len(recent) > 1 else ''}"
+        if cold:
+            if lane.mem > mem:
+                mem, mem_cores = lane.mem, lane.cores
+            want = max(want, lane.max_cores)
+            source += ", cold build"
+        mem = max(mem, lane.min_mem)
+        if cap:
+            mem = min(mem, cap)
+        if rigid:
+            # It uses what it uses; plan for that, but never for more than the lane allows or the
+            # CPU target could ever cover, or it could never start.
+            want = min(max(1, math.ceil(want)), lane.max_cores, max(1, math.floor(cfg.cpu_target * ncpu)))
+            need = want
+            source += ", ignores the job count"
+        else:
+            want = min(max(lane.min_cores, math.ceil(want)), lane.max_cores)
+            need = lane.min_cores
+        return Estimate(want, need, mem, source, rigid, wall, max(1, mem_cores))
+
+
+# --------------------------------------------------------------------------------------------
+# A jobserver of its own for each build: a FIFO of tokens, one per core beyond the first
+
+
+class Jobserver:
+    """GNU make's jobserver protocol over a named pipe (`--jobserver-auth=fifo:PATH`), which make
+    4.4, cargo and ninja 1.13 understand. Each byte in the pipe is a token: a client reads one
+    before starting another process and writes it back when that process ends. The daemon puts
+    tokens in to grow a build and takes free ones out to shrink it."""
+
+    def __init__(self, path: str, create: bool, out: int = 0):
+        self.path = path
+        if create:
+            os.mkfifo(path, 0o600)
+        self.fd = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self.out = out  # tokens the daemon has put into circulation
+        self.used = False
+
+    def free(self) -> int:
+        try:
+            return struct.unpack("i", fcntl.ioctl(self.fd, termios.FIONREAD, b"\0\0\0\0"))[0]
+        except OSError:
+            return 0
+
+    def resize(self, tokens: int) -> None:
+        tokens = max(0, tokens)
+        if tokens > self.out:
+            try:
+                self.out += os.write(self.fd, b"+" * (tokens - self.out))
+            except BlockingIOError:
+                pass
+        elif tokens < self.out:
+            try:
+                taken = len(os.read(self.fd, self.out - tokens))
+            except BlockingIOError:
+                taken = 0
+            self.out -= taken  # tokens in use come back later; the next resize takes them then
+
+    def observe(self) -> None:
+        if not self.used and self.free() < self.out:
+            self.used = True  # something took a token: this build speaks the protocol
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------------------------
+# Running builds: as transient systemd services, or as plain processes
+
+
+class SystemdRunner:
+    """Each build is buildq-<ticket>.service in the configured slice, with its lane's properties."""
+
+    name = "systemd"
+
+    def __init__(self, cg_base: str):
+        self.cg_base = cg_base
+
+    def prepare(self, ticket, slice_name: str) -> None:
+        """Name the build's service before it is started, so a daemon that stops in between can
+        still find it."""
+        ticket.unit = f"buildq-{ticket.id}.service"
+        ticket.cg = os.path.join(self.cg_base, slice_path(slice_name), ticket.unit)
+
+    def unit_state(self, ticket) -> str:
+        """'pending' if systemd has the service or a job to start it, 'gone' if it has neither,
+        'unknown' if systemd can't be asked."""
+        try:
+            out = subprocess.run(["systemctl", "--user", "show", "-p", "LoadState,ActiveState,Job", ticket.unit],
+                                 stdin=DEVNULL, capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return "unknown"
+        props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if not props:
+            return "unknown"
+        if props.get("LoadState") == "loaded" and (props.get("Job") or props.get("ActiveState") in
+                                                   ("active", "activating", "reloading", "deactivating")):
+            return "pending"
+        return "gone"
+
+    def launch(self, ticket, lane: Lane, slice_name: str):
+        self.prepare(ticket, slice_name)
+        unit = ticket.unit
+        properties = [f"--property={k}={v}" for k, v in lane.properties.items()]
+        with open(os.path.join(ticket.dir, "launch.err"), "wb") as err:
+            proc = subprocess.Popen(
+                ["systemd-run", "--user", "--quiet", f"--unit={unit}", f"--slice={slice_name}",
+                 "--property=KillMode=mixed", "--property=OOMPolicy=continue", "--property=TimeoutStopSec=60",
+                 *properties, "--", sys.executable, SELF, "--supervise", ticket.dir],
+                stdin=DEVNULL, stdout=DEVNULL, stderr=err)
+        return proc, False  # running once systemd-run exits 0
+
+    def alive(self, ticket) -> bool:
+        return bool(ticket.cg) and cgroup_populated(ticket.cg)
+
+    def result(self, ticket) -> str:
+        """systemd's Result for the build's service: "success", "exit-code", "signal", "oom-kill" (the
+        kernel or systemd-oomd stopped it for memory), ... or "" if systemd can't say."""
+        try:
+            out = subprocess.run(["systemctl", "--user", "show", "-p", "Result", "--value", ticket.unit],
+                                 stdin=DEVNULL, capture_output=True, text=True, timeout=5).stdout
+            return out.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def cleanup(self, ticket):
+        """Unload the build's service once its outcome is read (a failed one stays loaded until then)."""
+        if not ticket.unit:
+            return None
+        return subprocess.Popen(["systemctl", "--user", "reset-failed", ticket.unit], stdin=DEVNULL,
+                                stdout=DEVNULL, stderr=DEVNULL)
+
+    def stop(self, ticket, force: bool = False):
+        if not ticket.unit:
+            return None
+        command = ["systemctl", "--user", "kill", "--signal=SIGKILL", ticket.unit] if force else \
+                  ["systemctl", "--user", "stop", "--no-block", ticket.unit]
+        return subprocess.Popen(command, stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL)
+
+    @staticmethod
+    def check_lane(lane: Lane) -> str | None:
+        """Whether systemd accepts the lane's properties; the error if it doesn't."""
+        if not lane.properties:
+            return None
+        try:
+            # A transient service, as builds run, so service-only properties are checked too.
+            probe = subprocess.run(["systemd-run", "--user", "--wait", "--quiet", "--collect",
+                                    *[f"--property={k}={v}" for k, v in lane.properties.items()], "true"],
+                                   stdin=DEVNULL, stdout=DEVNULL, stderr=subprocess.PIPE, timeout=30)
+        except (OSError, subprocess.SubprocessError) as e:
+            return str(e)
+        return None if probe.returncode == 0 else probe.stderr.decode(errors="replace").strip()[-300:]
+
+    @staticmethod
+    def available() -> bool:
+        if not shutil.which("systemd-run") or not shutil.which("systemctl"):
+            return False
+        try:
+            return subprocess.run(["systemctl", "--user", "show-environment"], stdin=DEVNULL, stdout=DEVNULL,
+                                  stderr=DEVNULL, timeout=10).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+
+class DirectRunner:
+    """Each build's supervisor is a plain process in a session of its own: no limits, no measurement.
+    What a build leaves behind is found by the BUILDQ_JOB in its environment and stopped."""
+
+    name = "direct"
+
+    def prepare(self, ticket, slice_name: str) -> None:
+        pass
+
+    def result(self, ticket) -> str:
+        return ""
+
+    def cleanup(self, ticket):
+        return None
+
+    def unit_state(self, ticket) -> str:
+        sup = read_json(os.path.join(ticket.dir, "supervisor.json")) or {}
+        if proc_alive(sup.get("pid"), sup.get("start")):
+            ticket.pid, ticket.pid_start = sup["pid"], sup["start"]
+            return "pending"
+        return "gone"
+
+    def launch(self, ticket, lane: Lane, slice_name: str):
+        proc = subprocess.Popen([sys.executable, SELF, "--supervise", ticket.dir], stdin=DEVNULL, stdout=DEVNULL,
+                                stderr=DEVNULL, start_new_session=True)
+        ticket.pid = proc.pid
+        ident = proc_identity(proc.pid)
+        ticket.pid_start = ident[0] if ident else None
+        return proc, True
+
+    def alive(self, ticket) -> bool:
+        if proc_alive(ticket.pid, ticket.pid_start):
+            return True
+        return bool(tagged_processes(ticket.id))  # the supervisor is gone; is anything of the build left?
+
+    def stop(self, ticket, force: bool = False):
+        if proc_alive(ticket.pid, ticket.pid_start):
+            try:
+                os.kill(ticket.pid, signal.SIGKILL if force else signal.SIGTERM)
+            except OSError:
+                pass
+        if force or not proc_alive(ticket.pid, ticket.pid_start):
+            for pid in tagged_processes(ticket.id):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        return None
+
+    @staticmethod
+    def check_lane(lane: Lane) -> str | None:
+        return None
+
+
+# --------------------------------------------------------------------------------------------
+# Tickets
+
+_seq = itertools.count()
+
+
+class Conn:
+    """One client connection; sends newline-delimited JSON."""
+
+    def __init__(self, writer):
+        self.writer = writer
+        self.closed = False
+
+    def send(self, message: dict) -> bool:
+        if self.closed or self.writer is None or self.writer.is_closing():
+            self.closed = True
+            return False
+        try:
+            self.writer.write((json.dumps(message) + "\n").encode())
+            return True
+        except Exception:
+            self.closed = True
+            return False
+
+
+class Ticket:
+    PERSIST = ("id", "name", "argv", "cwd", "lane", "key", "label", "notify", "submitted", "priority", "timeout",
+               "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
+               "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
+               "need", "rigid", "est_mem", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
+               "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured")
+
+    def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
+                 directory: str | None):
+        self.id = tid
+        self.name = None
+        self.argv = argv
+        self.cwd = cwd
+        self.lane = lane
+        self.key = key
+        self.label = redacted_label(argv)
+        self.notify = None
+        self.submitted = submitted
+        self.priority = 0
+        self.timeout = None
+        self.workspace = None
+        self.disk_paths: list[str] = []
+        self.submission = None
+        self.attached = False  # submitted by `buildq run`: cancelled once nobody follows it
+        self.rlimits: dict = {}  # the submitter's soft limits, applied to the build
+        self.umask = 0o022  # the submitter's, so its build writes files as the command run directly would
+        self.exec_argv = None  # what actually runs, when it differs from argv
+        self.grant_area = 0.0  # core-seconds given, for the time-weighted grant
+        self.cold = False
+        self.seq = next(_seq)
+        self.dir = directory
+        self.cores_given = None
+        self.mem_given = None
+        self.state = "queued"
+        self.started = None
+        self.ended = None
+        self.exit = None
+        self.oom = False
+        self.timed_out = False
+        self.error = None
+        self.unit = None
+        self.cg = None
+        self.runner = None
+        self.pid = None
+        self.pid_start = None
+        self.cancel_requested = False
+        self.want = 1
+        self.need = 1
+        self.rigid = False
+        self.expected = None  # seconds it usually takes, from history
+        self.est_mem = 0
+        self.mem_base = 0   # the memory estimate at mem_cores cores
+        self.mem_cores = 1
+        self.est_src = ""
+        self.granted = 0
+        self.max_granted = 0
+        self.jobserver = None  # its FIFO's path
+        self.tokens_out = 0
+        self.elastic = False
+        self.max_log = 0
+        self.mem_peak = 0
+        self.peak_mem_cores = 0
+        self.peak_cores = 0.0
+        self.avg_cores = 0.0
+        self.measured = False
+        # Not kept on disk:
+        self.js: Jobserver | None = None
+        self.launcher = None
+        self.running_since = None
+        self.result_seen = None
+        self.last_watched = time.time()
+        self.last_grant_t = None
+        self.recheck_at = None
+        self.stop_sent = None
+        self.samples: collections.deque = collections.deque()
+        self.cores_now = 0.0
+        self.mem_now = 0
+        self.cpu_usec = 0
+        self.cpu_usec_base = None
+        self.oom_base = 0
+        self.oom_kills = 0
+        self.flock = None  # (lock path, holder pid) for a build found holding a flock slot
+        self.reason = ""
+        self.reason_cat = ""
+        self.held = False
+        self.sent_cat = None
+        self.sent_at = 0.0
+
+    @property
+    def log(self) -> str | None:
+        return os.path.join(self.dir, "output.log") if self.dir else None
+
+    @property
+    def est_cores(self) -> float:
+        return self.granted if self.state in ("starting", "running") and self.granted else self.need
+
+    def record(self) -> dict:
+        return {k: getattr(self, k) for k in self.PERSIST}
+
+    @classmethod
+    def from_record(cls, rec: dict, directory: str) -> "Ticket":
+        t = cls(rec["id"], list(rec["argv"]), rec["cwd"], rec["lane"], rec["key"], float(rec["submitted"]), directory)
+        for k in cls.PERSIST:
+            if k in rec:
+                setattr(t, k, rec[k])
+        return t
+
+    def measure(self, now: float) -> None:
+        if self.js is not None:
+            self.js.observe()
+            if self.js.used and not self.elastic:
+                self.elastic = True
+        if not self.cg:
+            return
+        stats = cgroup_stats(self.cg)
+        if stats is None:
+            return
+        usage, need, oom = stats
+        if self.cpu_usec_base is None:
+            self.cpu_usec_base = usage if self.measured else 0  # picked up after a restart: count from here
+        self.measured = True
+        self.samples.append((now, usage))
+        # Keep about five seconds of samples, so cores_now is a five-second average.
+        while len(self.samples) > 2 and now - self.samples[1][0] >= 5.0:
+            self.samples.popleft()
+        t0, u0 = self.samples[0]
+        if now - t0 >= 1.0:
+            self.cores_now = max(0.0, (usage - u0) / 1e6 / (now - t0))
+            if now - t0 >= 3.0:
+                self.peak_cores = max(self.peak_cores, self.cores_now)
+        self.cpu_usec = usage
+        self.mem_now = need
+        if need > self.mem_peak:
+            self.mem_peak = need
+            self.peak_mem_cores = self.granted
+        self.oom_kills = max(0, oom - (self.oom_base or 0))
+
+    def row(self, now: float, ahead: int | None = None) -> dict:
+        elapsed = round((self.ended or now) - self.started, 1) if self.started else None
+        return {
+            "id": self.id, "short": self.id if self.flock else self.id[:8], "name": self.name,
+            "lane": self.lane, "label": self.label, "key": self.key, "cwd": self.cwd, "state": self.state,
+            "priority": self.priority, "submitted": self.submitted, "started": self.started, "ended": self.ended,
+            "waited": round((self.started or now) - self.submitted, 1), "elapsed": elapsed,
+            "est_cores": self.est_cores, "est_mem": self.est_mem, "est_src": self.est_src,
+            "want": self.want, "need": self.need, "granted": self.granted, "elastic": self.elastic,
+            "rigid": self.rigid, "cold": self.cold, "expected": self.expected,
+            "cores_now": round(self.cores_now, 2), "mem_now": self.mem_now, "mem_peak": self.mem_peak,
+            "peak_cores": round(self.peak_cores, 2), "avg_cores": round(self.avg_cores, 2),
+            "measured": self.measured, "exit": self.exit, "oom": self.oom, "timed_out": self.timed_out,
+            "error": self.error, "reason": self.reason if self.state == "queued" else None,
+            "held": self.held if self.state == "queued" else False, "ahead": ahead,
+            "log": self.log, "dir": self.dir, "outside": self.flock[0] if self.flock else None,
+            "cancel_requested": self.cancel_requested, "runner": self.runner, "timeout": self.timeout,
+        }
+
+
+# --------------------------------------------------------------------------------------------
+# The daemon
+
+
+class Daemon:
+    REBALANCE_SECONDS = 5.0
+
+    def __init__(self, config_path: str, state_dir: str, machine: Machine | None = None, runner=None):
+        self.config_path = config_path
+        self.state_dir = state_dir
+        os.makedirs(state_dir, exist_ok=True)
+        self.last_good = os.path.join(state_dir, "config.last-good.toml")
+        self.machine = machine or Machine()
+        self.tickets_dir = os.path.join(state_dir, "tickets")
+        os.makedirs(self.tickets_dir, exist_ok=True)
+        self.cg_base = user_manager_cgroup()
+        self.override = runner  # tests pass a runner of their own
+        self.runners = {"systemd": SystemdRunner(self.cg_base), "direct": DirectRunner()}
+        if runner is not None:
+            self.runners[runner.name] = runner
+        self._systemd_ok = None
+        self.cfg = None
+        self.cfg = self.load_config()
+        self.runner = self.runner_for_config(self.cfg)
+        self.history = History(os.path.join(state_dir, "history.jsonl"), self.cfg.history_keys)
+        self.tickets: dict[str, Ticket] = {}
+        self.watchers: dict[str, set[Conn]] = collections.defaultdict(set)
+        self.helpers: list[tuple[subprocess.Popen, float]] = []
+        self.budget: dict = {}
+        self.stopping = False
+        self.last_prune = -1e9
+        self.last_rebalance = -1e9
+        self.submissions: dict[str, str] = {}  # the client's submission id -> its ticket
+        self.slice_limit = None  # the slice's configured MemoryMax, read once systemd has the slice
+        self.guard_failed = False
+
+    # ---- configuration
+
+    def runner_for_config(self, cfg: Config):
+        """The runner new builds use. A build already running keeps the runner it started under."""
+        if self.override is not None:
+            return self.override
+        wanted = os.environ.get("BUILDQ_RUNNER") or cfg.runner
+        if wanted not in ("auto", "systemd", "direct"):
+            log(f"BUILDQ_RUNNER={wanted!r} isn't auto, systemd or direct; using {cfg.runner}")
+            wanted = cfg.runner
+        if os.environ.get("INVOCATION_ID") and wanted != "systemd":
+            # Running as a systemd service: the direct runner would put every build inside the
+            # daemon's own small cgroup. A slow probe under load mustn't pick it.
+            if wanted == "direct":
+                log("runner = \"direct\" can't be used while buildqd runs as a systemd service; using systemd")
+            wanted = "systemd"
+        if wanted == "auto":
+            if self._systemd_ok is None:
+                self._systemd_ok = SystemdRunner.available()
+            wanted = "systemd" if self._systemd_ok else "direct"
+        return self.runners[wanted]
+
+    def runner_of(self, t: "Ticket"):
+        return self.runners.get(t.runner) or self.runner
+
+    def load_config(self) -> Config:
+        """The configuration file if it loads and systemd accepts its lanes; else the last one that
+        did; else the defaults. A typo never leaves the queue without its limits."""
+        m = self.machine
+        try:
+            cfg = load_config_file(self.config_path, m.mem_total, m.ncpu)
+            runner = self.runner_for_config(cfg)
+            for lane in cfg.lanes.values():
+                problem = runner.check_lane(lane)
+                if problem:
+                    raise ValueError(f"systemd refuses lanes.{lane.name}.properties: {problem}")
+            if os.path.exists(self.config_path):
+                shutil.copyfile(self.config_path, self.last_good)
+            return cfg
+        except Exception as e:
+            problem = f"config {self.config_path}: {e}"
+        if self.cfg is not None:
+            log(f"{problem}; keeping the configuration in force")
+            return self.cfg
+        try:
+            cfg = load_config_file(self.last_good, m.mem_total, m.ncpu)
+            log(f"{problem}; using the last configuration that loaded ({self.last_good})")
+            return cfg
+        except Exception:
+            log(f"{problem}; no earlier configuration loaded, so using the defaults")
+            return Config({}, m.mem_total, m.ncpu)
+
+    async def reload_async(self) -> None:
+        """Reload without blocking the loop: checking lane properties starts processes."""
+        cfg = await asyncio.get_running_loop().run_in_executor(None, self.load_config)
+        self.apply(cfg)
+
+    def reload(self) -> None:
+        self.apply(self.load_config())
+
+    def apply(self, cfg: "Config") -> None:
+        self.cfg = cfg
+        self.slice_limit = None  # read it again: the slice may have changed
+        self.runner = self.runner_for_config(self.cfg)
+        self.history.max_keys = self.cfg.history_keys
+        log(f"configuration in force: {json.dumps(self.cfg.summary())}")
+        self.schedule(time.time())
+
+    def lane(self, name: str) -> Lane:
+        return self.cfg.lanes.get(name) or self.cfg.lanes[self.cfg.default_lane]
+
+    # ---- the ticket index
+
+    def queue(self, now: float | None = None) -> list[Ticket]:
+        """Queued tickets in the order they get a turn: any that has waited starve_seconds first,
+        then the higher priority (the lane's plus the ticket's own), then the one expected to
+        finish soonest, then the oldest."""
+        now = time.time() if now is None else now
+
+        def order(t: Ticket):
+            lane = self.cfg.lanes.get(t.lane)
+            weight = t.priority + (lane.priority if lane else 0)
+            # A build that has waited starve_seconds goes ahead of everything else, or a stream of
+            # quicker or higher builds could keep it waiting for ever.
+            starving = now - t.submitted >= self.cfg.starve_seconds and not (lane and lane.may_pass_held)
+            return (not starving, -weight, t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
+        return sorted((t for t in self.tickets.values() if t.state == "queued"), key=order)
+
+    def active(self) -> list[Ticket]:
+        """Tickets that hold a turn: starting or running, including builds found in flock slots."""
+        return [t for t in self.tickets.values() if t.state in ("starting", "running")]
+
+    def resolve(self, ref) -> tuple[Ticket | None, str | None]:
+        ref = str(ref or "").strip().lower()
+        if ref in self.tickets:
+            return self.tickets[ref], None
+        if len(ref) < 4:
+            return None, "give at least the first 4 characters of the ticket"
+        matches = [t for tid, t in self.tickets.items() if tid.startswith(ref)]
+        if len(matches) == 1:
+            return matches[0], None
+        if matches:
+            return None, f"{ref} matches {len(matches)} tickets; give more of it"
+        return None, f"no ticket {ref}"
+
+    def position(self, t: Ticket) -> int | None:
+        return self.queue().index(t) if t.state == "queued" else None
+
+    def save(self, t: Ticket) -> None:
+        if not t.dir:
+            return
+        try:
+            write_json(os.path.join(t.dir, "ticket.json"), t.record())
+        except OSError as e:
+            log(f"can't save ticket {t.id}: {e}")
+
+    def broadcast(self, t: Ticket, now: float) -> None:
+        conns = self.watchers.get(t.id)
+        if not conns:
+            return
+        message = {"type": "ticket", **t.row(now, self.position(t))}
+        for conn in list(conns):
+            if not conn.send(message):
+                conns.discard(conn)
+        if t.state in FINISHED:
+            self.watchers.pop(t.id, None)
+
+    def estimate(self, t: Ticket, now: float) -> None:
+        e = self.history.estimate(t.key, self.lane(t.lane), self.cfg, self.machine.ncpu,
+                                  self.runner.name == "systemd", t.cold, now)
+        t.want, t.need, t.est_src, t.rigid, t.expected = e.want, e.need, e.source, e.rigid, e.wall
+        t.mem_base, t.mem_cores = e.mem, e.mem_cores
+        if t.cores_given is not None:
+            if t.rigid:  # it was seen to use more than it is told; telling it less changes nothing
+                t.est_src = f"{t.est_src}; cores given, but it doesn't follow them"
+            else:  # the caller knows how many cores the build should use
+                t.want = t.need = int(t.cores_given)
+                t.est_src = f"{t.est_src}; cores given"
+        if t.mem_given is not None and t.mem_given > t.mem_base:  # a given size may raise, never lower
+            t.mem_base, t.mem_cores = t.mem_given, max(t.mem_cores, t.want)
+            t.est_src = f"{t.est_src}; memory given"
+        t.est_mem = self.mem_for(t, t.granted if t.state in ("starting", "running") and t.granted else t.need)
+
+    def mem_for(self, t: Ticket, cores: int) -> int:
+        """The memory a build needs with `cores` cores. Builds that run more compilers at once need
+        more memory, so past the cores its history was measured at, the estimate grows in
+        proportion, up to the lane's MemoryMax where that is enforced."""
+        base = t.mem_base
+        if t.rigid or cores <= t.mem_cores:
+            return base
+        scaled = int(base * cores / t.mem_cores)
+        lane = self.lane(t.lane)
+        if lane.mem_cap and self.runner_of(t).name == "systemd":
+            scaled = min(scaled, max(lane.mem_cap, base))
+        return scaled
+
+    # ---- submitting, cancelling
+
+    def submit(self, msg: dict, now: float) -> tuple[Ticket | None, str | None]:
+        if self.stopping:
+            return None, "the daemon is stopping; try again in a moment"
+        argv = msg.get("argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv):
+            return None, "no command given"
+        lane_name = str(msg.get("lane") or self.cfg.lane_for(argv))
+        if lane_name not in self.cfg.lanes:
+            return None, f"unknown lane {lane_name!r}; the lanes are {', '.join(sorted(self.cfg.lanes))}"
+        lane = self.cfg.lanes[lane_name]
+        cwd = msg.get("cwd")
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None, "the working directory must be an absolute path"
+        env = msg.get("env")
+        if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+            return None, "the environment must be a map of strings"
+        submission = msg.get("submission")
+        if isinstance(submission, str) and submission in self.submissions:
+            earlier = self.tickets.get(self.submissions[submission])
+            if earlier is not None:
+                return earlier, None  # the client didn't get our answer and asked again
+        tid = str(uuid.uuid4())
+        t = Ticket(tid, argv, cwd, lane_name, command_key(argv, cwd, lane_name), now,
+                   os.path.join(self.tickets_dir, tid))
+        try:
+            t.priority = number(msg.get("priority") or 0, "priority", -1000, 1000, integer=True)
+            if msg.get("timeout") is not None:
+                t.timeout = number(float(msg["timeout"]), "timeout", 1, 30 * 86400)
+            else:
+                t.timeout = lane.timeout
+            if msg.get("cores") is not None:
+                t.cores_given = number(float(msg["cores"]), "cores", 1, self.machine.ncpu)
+            if msg.get("mem") is not None:
+                t.mem_given = parse_size(msg["mem"], self.machine.mem_total)
+        except (TypeError, ValueError, OverflowError) as e:
+            return None, f"bad option: {e}"
+        t.attached = bool(msg.get("attach"))
+        umask = msg.get("umask")
+        if isinstance(umask, int) and not isinstance(umask, bool) and 0 <= umask <= 0o777:
+            t.umask = umask
+        limits = msg.get("rlimits")
+        if isinstance(limits, dict):
+            t.rlimits = {str(k): v for k, v in limits.items() if k in ("NOFILE", "STACK", "CORE") and isinstance(v, int)}
+        name, notify = msg.get("name"), msg.get("notify")
+        t.name = str(name)[:200] if name else None
+        t.notify = str(notify) if notify else None
+        t.workspace = workspace_of(cwd, env)
+        t.disk_paths = disk_paths_of(cwd, env)
+        if isinstance(submission, str) and len(submission) <= 100:
+            t.submission = submission
+            self.submissions[submission] = tid
+        t.cold = cargo_cold(argv, cwd, env)
+        t.max_log = self.cfg.max_log
+        job_env = dict(env)
+        for key, value in self.cfg.env.items():
+            job_env.setdefault(key, value.replace("{id}", tid))
+        job_env["BUILDQ_JOB"] = tid
+        job_env["BUILDQ_TICKET"] = tid
+        try:
+            os.makedirs(t.dir)
+            write_json(os.path.join(t.dir, "env.json"), job_env)
+            open(os.path.join(t.dir, "output.log"), "ab").close()
+        except OSError as e:
+            shutil.rmtree(t.dir, ignore_errors=True)
+            return None, f"can't create the ticket: {e}"
+        self.estimate(t, now)
+        self.tickets[tid] = t
+        self.save(t)
+        log(f"queued {tid} [{lane_name}]: want {t.want} cores (at least {t.need}), {fmt_size(t.est_mem)} "
+            f"({t.est_src}); {t.label!r} in {cwd}")
+        self.schedule(now)
+        return t, None
+
+    def cancel(self, t: Ticket, now: float) -> None:
+        if t.state in FINISHED or t.flock:
+            return
+        t.cancel_requested = True
+        if t.state == "queued":
+            self.finalize(t, now, None)
+            return
+        self.stop(t, now)
+        self.save(t)
+        self.broadcast(t, now)
+        log(f"cancelling {t.id}")
+
+    def stop(self, t: Ticket, now: float, force: bool = False) -> None:
+        t.stop_sent = now
+        try:
+            proc = self.runner_of(t).stop(t, force)
+            if proc is not None:
+                self.helpers.append((proc, now + 60))
+        except OSError as e:
+            log(f"can't stop {t.id}: {e}")
+
+    # ---- admission
+
+    def schedule(self, now: float) -> None:
+        if self.stopping:
+            return
+        cfg, m = self.cfg, self.machine
+        running = self.active()
+        growth = sum(max(0, t.est_mem - t.mem_now) for t in running)
+        ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in running
+                      if t.started and now - t.started < cfg.ramp_seconds)
+        # Cores that resizable builds could hand back, down to their minimum.
+        shrinkable = sum(max(0, t.granted - t.need) for t in running if t.elastic and not t.rigid)
+        ours_now = sum(t.mem_now for t in running if not t.flock)
+        free_mem = m.mem_available - growth - cfg.mem_floor
+        cpu_cap = cfg.cpu_target * m.ncpu
+        free_cpu = cpu_cap - m.busy - ramping
+        self.budget = {
+            "free_mem": free_mem, "free_cores": round(free_cpu, 2), "cpu_cap": round(cpu_cap, 2),
+            "shrinkable_cores": shrinkable, "growth_reserved": growth, "ramp_reserved": round(ramping, 2),
+            "running": len(running),
+        }
+        count = len(running)
+        per_lane = collections.Counter(t.lane for t in running)
+        held_mem = held_cpu = 0.0
+        busy_workspaces = {(t.lane, t.workspace) for t in running if t.workspace}
+        for t in self.queue(now):
+            self.estimate(t, now)  # history or the configuration may have changed since it was queued
+            lane = self.lane(t.lane)
+            passes = lane.may_pass_held
+            hm = 0.0 if passes else held_mem
+            hc = 0.0 if passes else held_cpu
+            t.held = False
+            reason, holds = None, True
+            if not os.path.isdir(t.cwd):
+                self.finalize(t, now, None, error=f"its working directory {t.cwd} is gone")
+                continue
+            free_disk = min((f for f in map(disk_free, t.disk_paths or [t.cwd]) if f is not None), default=None)
+            if t.est_mem > m.mem_total - cfg.mem_floor:
+                reason, holds = ("too-big", f"needs {fmt_size(t.est_mem)} of memory, more than this machine has "
+                                            f"({fmt_size(m.mem_total - cfg.mem_floor)} above the floor); cancel it "
+                                            "or give its lane a smaller MemoryMax"), False
+            elif free_disk is not None and free_disk < cfg.disk_floor:
+                reason, holds = ("disk", f"only {fmt_size(free_disk)} of disk is free where it runs "
+                                         f"(disk_floor is {fmt_size(cfg.disk_floor)})"), False
+            elif lane.exclusive and (t.lane, t.workspace) in busy_workspaces:
+                reason, holds = ("workspace", "another build in the same workspace is running; they would "
+                                              "fight over its build directory"), False
+            elif m.psi_mem > cfg.mem_psi_block:
+                reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
+                                             f"{cfg.mem_psi_block:g}%)")
+            elif per_lane[t.lane] >= lane.extra_jobs and count - sum(
+                    min(n, self.lane(name).extra_jobs) for name, n in per_lane.items()) >= cfg.max_jobs:
+                # Up to extra_jobs builds of a lane run on top of max_jobs, so a lane of quick builds
+                # is never kept waiting for a turn by slow ones; past those it shares the rest.
+                reason = ("max-jobs", f"{count} build{'s are' if count != 1 else ' is'} running, the most "
+                                      f"allowed (max_jobs = {cfg.max_jobs})")
+            elif t.est_mem > free_mem - hm:
+                if t.est_mem <= free_mem:
+                    reason = ("held", "the room it needs is held for a build that has waited longer")
+                elif t.est_mem > m.mem_available + ours_now - cfg.mem_floor:
+                    # It wouldn't fit even with every build of ours gone: holding room for it would
+                    # stop everything else for nothing.
+                    reason, holds = ("memory", f"needs {fmt_size(t.est_mem)} of memory; even with no builds "
+                                               f"running only {fmt_size(m.mem_available + ours_now - cfg.mem_floor)} "
+                                               "would be free"), False
+                else:
+                    reason = ("memory", f"needs {fmt_size(t.est_mem)} of memory; {fmt_size(max(free_mem, 0))} is "
+                                        f"free after the {fmt_size(cfg.mem_floor)} floor and what running builds may "
+                                        "still grow into")
+            elif count > 0 and m.psi_cpu > cfg.cpu_psi_block:
+                reason = ("cpu-pressure", f"CPU pressure is {m.psi_cpu:.0f}% (no new build above "
+                                          f"{cfg.cpu_psi_block:g}% while one runs)")
+            elif count > 0 and t.need > free_cpu + shrinkable - hc:
+                if t.need <= free_cpu + shrinkable:
+                    reason = ("held", "the room it needs is held for a build that has waited longer")
+                else:
+                    reason = ("cpu", f"needs {t.need} core{'s' if t.need != 1 else ''}; "
+                                     f"{max(free_cpu + shrinkable, 0):.1f} of {cpu_cap:.1f} are free "
+                                     f"({m.busy:.1f} busy, {ramping:.1f} expected from builds just started)")
+            if reason is None:
+                room = math.floor(max(free_cpu if count else cpu_cap - m.busy, 0))
+                granted = int(max(t.need, min(t.want, room)))
+                while granted > t.need and self.mem_for(t, granted) > free_mem - hm:
+                    granted -= 1  # more cores would need more memory than is free
+                t.est_mem = self.mem_for(t, granted)
+                self.start(t, now, granted)
+                if t.state in FINISHED:
+                    continue
+                free_mem -= t.est_mem
+                taken_from_others = max(0.0, granted - max(free_cpu, 0))
+                free_cpu -= granted
+                shrinkable = max(0, shrinkable - taken_from_others)
+                count += 1
+                per_lane[t.lane] += 1
+                busy_workspaces.add((t.lane, t.workspace))
+                continue
+            t.reason_cat, t.reason = reason
+            if holds and not passes and now - t.submitted >= cfg.starve_seconds:
+                t.held = True
+                held_mem += t.est_mem
+                held_cpu += t.need
+
+    def build_env(self, t: Ticket) -> dict:
+        """Parallelism for the build's tools, unless the caller chose its own."""
+        g, w = str(t.granted), str(t.want)
+        values = {"BUILDQ_CORES": g, "CMAKE_BUILD_PARALLEL_LEVEL": g, "GOMAXPROCS": g,
+                  # .NET: MSBuild sizes its worker nodes from the processor count, and node reuse
+                  # leaves workers behind after the build, holding memory nobody accounts for.
+                  "DOTNET_PROCESSOR_COUNT": g, "MSBUILDDISABLENODEREUSE": "1",
+                  # ...and the shared compiler server would compile outside the build's cgroup.
+                  "UseSharedCompilation": "false"}
+        if self.lane(t.lane).test_threads:
+            values.update({"RUST_TEST_THREADS": g, "NEXTEST_TEST_THREADS": g})
+        args = strip_wrappers(t.argv)
+        tool = os.path.basename(args[0]) if args else ""
+        # make runs in parallel only when asked (-j): a Makefile not written for it can break. Its
+        # -j is then replaced by the build's jobserver (see start()), since a -j on the command
+        # line makes make ignore the jobserver. ninja is parallel by design. Other tools get the
+        # jobserver through CARGO_MAKEFLAGS, which cargo reads first and hands to build scripts.
+        parallel_make = tool == "ninja" or (tool in ("make", "gmake") and asks_for_jobs(args[1:]))
+        if t.jobserver:
+            flags = f"-j{w} --jobserver-auth=fifo:{t.jobserver}"
+            values["CARGO_MAKEFLAGS"] = flags
+            if parallel_make:
+                values["MAKEFLAGS"] = flags
+        else:
+            values["CARGO_BUILD_JOBS"] = g  # no tokens to bound it, so cargo is told the number
+            if parallel_make:
+                values["MAKEFLAGS"] = f"-j{g}"
+        return values
+
+    def start(self, t: Ticket, now: float, granted: int) -> None:
+        lane = self.lane(t.lane)
+        t.state = "starting"
+        t.started = now
+        t.runner = self.runner.name
+        t.oom_base = 0
+        t.reason = t.reason_cat = ""
+        t.granted = t.max_granted = granted
+        env_path = os.path.join(t.dir, "env.json")
+        try:
+            env = read_json(env_path)
+            if not isinstance(env, dict):
+                raise OSError("its environment file is missing")
+            tool = os.path.basename((strip_wrappers(t.argv) or ["?"])[0])
+            known = tool in JOBSERVER_TOOLS
+            wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
+            if wanted and not t.rigid and not any(k in env for k in ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")):
+                t.elastic = known  # it speaks the protocol even before it takes a token
+                t.jobserver = os.path.join(t.dir, "jobserver")
+                t.js = Jobserver(t.jobserver, create=True)
+                t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
+                t.tokens_out = t.js.out
+            if t.jobserver and tool in ("make", "gmake", "ninja") and asks_for_jobs(t.argv[1:]):
+                t.exec_argv = without_jobs(t.argv)  # its -j would make it ignore the jobserver
+            # The caller's own settings win; the rest go in a file of their own, so a build that
+            # is queued again after a restart gets fresh ones.
+            write_json(os.path.join(t.dir, "parallel.json"),
+                       {k: v for k, v in self.build_env(t).items() if k not in env})
+            self.runner.prepare(t, self.cfg.slice)
+            self.save(t)  # with its service's name, before it exists
+            t.launcher, running = self.runner.launch(t, lane, self.cfg.slice)
+        except OSError as e:
+            self.finalize(t, now, None, error=f"couldn't start the build: {e}")
+            return
+        if running:
+            t.state = "running"
+            t.running_since = now
+        self.save(t)
+        self.broadcast(t, now)
+        log(f"started {t.id} [{t.lane}] with {granted} core{'s' if granted != 1 else ''} (wants {t.want}"
+            f"{', jobserver' if t.jobserver else ''}) after {now - t.submitted:.0f}s ({self.runner.name}): {t.label}")
+
+    # ---- resizing builds that speak the jobserver protocol
+
+    def rebalance(self, now: float) -> None:
+        """Every few seconds, hand idle cores to builds that would use them, and take cores back
+        when the machine is over its target or a queued build is waiting for cores."""
+        m, cfg = self.machine, self.cfg
+        for t in self.active():
+            if t.js is not None and not t.elastic and t.cg and fifo_in_use(t.cg, t.jobserver):
+                t.elastic = t.js.used = True
+        elastic = [t for t in self.active() if t.js is not None and t.elastic and t.state == "running"
+                   and not t.cancel_requested]
+        if not elastic:
+            return
+        ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in self.active()
+                      if t.started and now - t.started < cfg.ramp_seconds and t not in elastic)
+        cpu_cap = cfg.cpu_target * m.ncpu
+        waiting = next((t for t in self.queue() if t.reason_cat in ("cpu", "held")), None)
+        spare = cpu_cap - max(m.busy, m.busy_now) - ramping - (waiting.need if waiting else 0)
+        free_mem = m.mem_available - sum(max(0, t.est_mem - t.mem_now) for t in self.active()) - cfg.mem_floor
+        changed = []
+        waiting_for_memory = any(t.reason_cat == "memory" for t in self.queue(now))
+        if spare >= 1 and free_mem > 0 and not waiting_for_memory:
+            growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted),
+                             key=lambda t: t.granted / max(t.want, 1))
+            for t in growers:
+                add = int(min(t.want - t.granted, math.floor(spare)))
+                while add >= 1 and self.mem_for(t, t.granted + add) - t.est_mem > free_mem:
+                    add -= 1  # the memory more cores would need isn't free
+                if add >= 1:
+                    new_mem = max(t.est_mem, self.mem_for(t, t.granted + add))
+                    free_mem -= new_mem - t.est_mem
+                    t.est_mem = new_mem
+                    t.granted += add
+                    t.max_granted = max(t.max_granted, t.granted)
+                    spare -= add
+                    changed.append(t)
+        elif spare <= -1:
+            deficit = math.ceil(-spare)
+            for t in sorted(elastic, key=lambda t: t.granted - t.need, reverse=True):
+                cut = min(t.granted - t.need, deficit)
+                if cut >= 1:
+                    t.granted -= cut
+                    deficit -= cut
+                    changed.append(t)
+                if deficit <= 0:
+                    break
+        for t in elastic:
+            before = t.js.out
+            t.js.resize(t.granted - 1)
+            if t.js.out != before or t in changed:
+                t.tokens_out = t.js.out
+                self.save(t)
+        for t in changed:
+            log(f"resized {t.id} to {t.granted} cores")
+
+    # ---- keeping all builds together inside what the machine has free
+
+    def guard_slice(self, stopping: bool = False) -> None:
+        """Lower the slice's MemoryMax to what its builds hold plus what the machine has free above
+        half of mem_floor, so all builds together can't take the machine below that: when other work
+        grows, builds are stopped inside their slice, not elsewhere. It never goes above the limit
+        the slice is configured with (the installer's 85% drop-in, or yours), and never below what
+        the builds hold now (so the kernel needn't reclaim anything when it is written); when the
+        daemon stops, the configured limit is put back."""
+        if not self.cfg.slice_guard or self.runner.name != "systemd":
+            return
+        path = os.path.join(self.cg_base, slice_path(self.cfg.slice))
+        if self.slice_limit is None:
+            self.slice_limit = configured_memory_max(self.cfg.slice) or "max"
+        m = self.machine
+        if stopping:
+            value = self.slice_limit
+        else:
+            try:
+                with open(os.path.join(path, "memory.current")) as f:
+                    held = int(f.read())
+            except (OSError, ValueError):
+                return
+            value = held + max(2 * GIB, m.mem_available - self.cfg.mem_floor // 2)
+            if self.slice_limit != "max":
+                value = min(value, int(self.slice_limit))
+        try:
+            with open(os.path.join(path, "memory.max"), "w") as f:
+                f.write(str(value))
+            self.guard_failed = False
+        except OSError as e:
+            if not self.guard_failed:
+                log(f"can't set {self.cfg.slice}'s memory limit ({e}); builds are held only by their own caps")
+            self.guard_failed = True
+
+    # ---- watching builds
+
+    def check(self, now: float) -> None:
+        for t in self.active():
+            if t.flock:
+                t.measure(now)
+                self.outgrown(t)
+                continue
+            if t.state == "starting" and not self.check_starting(t, now):
+                continue
+            t.measure(now)
+            self.outgrown(t)
+            if t.last_grant_t is not None:
+                t.grant_area += t.granted * max(0.0, now - t.last_grant_t)
+            t.last_grant_t = now
+            result = read_json(os.path.join(t.dir, "result.json"))
+            if isinstance(result, dict):
+                # Give systemd a moment to stop anything the build left behind, so the turn ends
+                # with the build's last process.
+                t.result_seen = t.result_seen or now
+                if self.runner_of(t).alive(t):
+                    # Processes the build left behind still hold memory and its workspace: the
+                    # turn lasts until they are gone. Past 15 s, they are killed.
+                    if now - t.result_seen >= 15 and (t.stop_sent is None or now - t.stop_sent >= 30):
+                        log(f"{t.id} ended, but processes it left are still running; killing them")
+                        self.stop(t, now, force=True)
+                    continue
+                self.finalize(t, now, result.get("exit"), oom=oom_of(result),
+                              timed_out=bool(result.get("timed_out")))
+                continue
+            if t.cancel_requested and t.stop_sent and now - t.stop_sent > 75:
+                self.stop(t, now, force=True)
+            if not self.runner_of(t).alive(t) and now - (t.running_since or now) > 3:
+                result = read_json(os.path.join(t.dir, "result.json"))
+                if isinstance(result, dict):
+                    self.finalize(t, now, result.get("exit"), oom=oom_of(result),
+                                  timed_out=bool(result.get("timed_out")))
+                else:
+                    # Killed as a whole, supervisor and all: systemd-oomd, or SIGKILL from outside.
+                    verdict = self.runner_of(t).result(t)
+                    oom = verdict == "oom-kill"
+                    error = None if t.cancel_requested else (
+                        "it was stopped for memory (systemd-oomd or the kernel)" if oom else
+                        f"the build ended without reporting an exit status ({verdict or 'killed?'})")
+                    self.finalize(t, now, None, lost=True, oom=oom, error=error)
+
+    def outgrown(self, t: Ticket) -> None:
+        """A build that passes its estimate was underestimated (a full rebuild where history saw
+        incremental ones, say). From then on, plan it at its lane's enforced MemoryMax, or at half as
+        much again as it holds, so the room it may still grow into stays held."""
+        if not t.measured or t.mem_now <= t.est_mem:
+            return
+        lane = self.lane(t.lane)
+        cap = lane.mem_cap if self.runner_of(t).name == "systemd" else None
+        raised = cap if cap and cap > t.mem_now else int(t.mem_now * 1.5)
+        if raised > t.est_mem:
+            log(f"{t.id} passed its estimate ({fmt_size(t.est_mem)}); planning it at {fmt_size(raised)}")
+            t.est_mem = raised
+
+    def check_starting(self, t: Ticket, now: float) -> bool:
+        """Move a starting build on; True once it runs."""
+        if t.launcher is None:  # found starting after a restart
+            runner = self.runner_of(t)
+            if runner.alive(t) or os.path.exists(os.path.join(t.dir, "result.json")):
+                t.state, t.running_since = "running", now
+                self.save(t)
+                return True
+            if now < (t.recheck_at or 0):
+                return False
+            state = runner.unit_state(t)
+            if state in ("pending", "unknown"):
+                t.recheck_at = now + 10  # systemd has it, or can't say yet: look again
+                return False
+            if os.path.exists(os.path.join(t.dir, "env.json")) and t.cancel_requested:
+                self.finalize(t, now, None)  # it never started, and it was cancelled
+            elif os.path.exists(os.path.join(t.dir, "env.json")):
+                # Systemd has neither the service nor a job to start it, and no supervisor read
+                # its environment: it never started. Queue it again, clearing any failed unit of
+                # that name first, so the next launch can use it.
+                try:
+                    subprocess.run(["systemctl", "--user", "reset-failed", t.unit or "-"], stdin=DEVNULL,
+                                   stdout=DEVNULL, stderr=DEVNULL, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                self.close_jobserver(t, remove=True)
+                t.state, t.started, t.unit, t.cg, t.granted = "queued", None, None, None, 0
+                self.save(t)
+                log(f"requeued {t.id}: it hadn't started when the daemon stopped")
+            else:
+                self.finalize(t, now, None, lost=True,
+                              error="the daemon stopped while the build was starting, and it is gone")
+            return False
+        rc = t.launcher.poll()
+        if rc is None:
+            if now - (t.started or now) < 60:
+                return False
+            t.launcher.kill()  # systemd-run hung; find out what became of the service
+            t.launcher.wait()
+            t.launcher = None
+            t.recheck_at = now
+            return False
+        if rc != 0:
+            state = self.runner_of(t).unit_state(t)
+            if state == "pending":
+                rc = 0  # the service exists: a launch from before a daemon restart got there first
+            elif state == "unknown":
+                t.launcher, t.recheck_at = None, now + 10  # systemd isn't answering; ask again later
+                return False
+        if rc != 0:
+            try:
+                with open(os.path.join(t.dir, "launch.err"), errors="replace") as f:
+                    detail = f.read().strip()[-500:]
+            except OSError:
+                detail = ""
+            self.finalize(t, now, None, error=f"systemd-run couldn't start the build (exit {rc}): {detail}")
+            return False
+        t.launcher = None
+        t.state, t.running_since = "running", now
+        if t.cancel_requested:
+            self.stop(t, now)
+        self.save(t)
+        self.broadcast(t, now)
+        return True
+
+    def close_jobserver(self, t: Ticket, remove: bool = False) -> None:
+        if t.js is not None:
+            t.js.close()
+            t.js = None
+        if remove and t.jobserver:
+            try:
+                os.remove(t.jobserver)
+            except OSError:
+                pass
+            t.jobserver, t.tokens_out = None, 0
+
+    def finalize(self, t: Ticket, now: float, exit_code, oom: bool = False, timed_out: bool = False,
+                 error: str | None = None, lost: bool = False) -> None:
+        if t.state in FINISHED:
+            return
+        exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+        lane = self.lane(t.lane)
+        t.exit = exit_code
+        t.oom = bool(oom or t.oom_kills) or (exit_code == 137 and bool(lane.mem_cap) and t.mem_peak >= 0.9 * lane.mem_cap)
+        t.timed_out = timed_out
+        t.error = error or (f"timed out after {t.timeout or 0:.0f}s" if timed_out else None)
+        t.ended = now
+        if t.cancel_requested:
+            t.state = "cancelled"
+        elif exit_code is None:
+            t.state = "lost" if lost or not error else "failed"
+        else:
+            t.state = "succeeded" if exit_code == 0 else "failed"
+        if t.launcher is not None:
+            t.launcher.poll()
+            t.launcher = None
+        self.close_jobserver(t)
+        wall = max(now - (t.started or now), 0.0)
+        used = t.cpu_usec - (t.cpu_usec_base or 0)
+        t.avg_cores = used / 1e6 / wall if wall > 0 and t.measured else 0.0
+        t.peak_cores = max(t.peak_cores, t.avg_cores)
+        if t.flock:
+            self.tickets.pop(t.id, None)
+            log(f"no longer counting {t.id} ({error or 'lock released'})")
+            return
+        try:
+            os.remove(os.path.join(t.dir, "env.json"))
+        except OSError:
+            pass
+        # A run that a signal ended (a cancel, a timeout) shows how far it got, not what it needs,
+        # so it teaches nothing; a run the kernel killed for memory teaches that it needs more.
+        if t.oom and not t.measured:  # killed before it could be sampled: it needed at least its cap
+            t.mem_peak = max(t.mem_peak, lane.mem_cap or t.est_mem)
+            t.peak_cores = max(t.peak_cores, float(t.max_granted or 1))
+        if exit_code is not None and exit_code < 128 and not t.measured and not t.oom:
+            t.mem_peak = t.mem_peak or 0  # too quick to sample: it needed little, and that is worth knowing
+        learn = t.oom or (exit_code is not None and exit_code < 128 and (t.measured or wall < 2))
+        if learn and not t.cancel_requested and not timed_out:
+            given = round(t.grant_area / wall, 1) if wall > 0 and t.grant_area else t.max_granted
+            try:
+                self.history.add({
+                    "key": t.key, "lane": t.lane, "t": round(time.time()), "wall": round(wall, 1), "exit": exit_code,
+                    "peak_mem": t.mem_peak, "peak_cores": round(t.peak_cores, 2), "avg_cores": round(t.avg_cores, 2),
+                    "granted": given, "mem_cores": t.peak_mem_cores or t.max_granted, "elastic": t.elastic,
+                    "cold": t.cold, "oom": t.oom,
+                })
+            except OSError as e:
+                log(f"can't record {t.id} in history: {e}")
+        try:
+            proc = self.runner_of(t).cleanup(t)
+            if proc is not None:
+                self.helpers.append((proc, now + 60))
+        except OSError:
+            pass
+        self.save(t)
+        self.broadcast(t, now)
+        self.run_hooks(t, now)
+        log(f"{t.state} {t.id} (exit {t.exit}{', killed for memory' if t.oom else ''}"
+            f"{'; ' + t.error if t.error else ''}) after {wall:.0f}s: peak {fmt_size(t.mem_peak)}, "
+            f"{t.peak_cores:.1f} cores at most, {t.avg_cores:.1f} on average, {t.max_granted} given")
+
+    def run_hooks(self, t: Ticket, now: float) -> None:
+        for command in (t.notify, self.cfg.on_finish):
+            if not command:
+                continue
+            env = dict(os.environ, BUILDQ_TICKET=t.id, BUILDQ_STATE=t.state,
+                       BUILDQ_EXIT="" if t.exit is None else str(t.exit), BUILDQ_OOM="1" if t.oom else "0",
+                       BUILDQ_LABEL=t.label, BUILDQ_NAME=t.name or "", BUILDQ_CWD=t.cwd, BUILDQ_LOG=t.log or "")
+            try:
+                proc = subprocess.Popen(["/bin/sh", "-c", command], env=env, cwd=os.path.expanduser("~"),
+                                        stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, start_new_session=True)
+                self.helpers.append((proc, now + 120))
+            except OSError as e:
+                log(f"can't run the finish hook for {t.id}: {e}")
+
+    def reap_helpers(self, now: float) -> None:
+        keep = []
+        for proc, deadline in self.helpers:
+            if proc.poll() is None:
+                if now > deadline:
+                    proc.kill()
+                keep.append((proc, deadline))
+        self.helpers = keep
+
+    # ---- builds started outside the queue, holding flock slots of an older semaphore script
+
+    def scan_flock_slots(self, now: float) -> None:
+        seen = set()
+        if self.cfg.flock_slots:
+            locked = locked_inodes()
+            for pattern, lane in self.cfg.flock_slots:
+                for path in sorted(glob.glob(pattern)):
+                    path = os.path.realpath(path)
+                    try:
+                        inode = os.stat(path).st_ino
+                    except OSError:
+                        continue
+                    if inode not in locked:
+                        continue
+                    tid = "flock:" + path
+                    t = self.tickets.get(tid)
+                    if t and holds_flock(t.flock[1], path, inode):
+                        seen.add(tid)
+                        continue
+                    if t:
+                        self.finalize(t, now, None, error="the lock changed hands")
+                    holder = find_flock_holder(path, inode)
+                    if holder is not None:  # a lock that none of our processes holds isn't one of ours
+                        seen.add(tid)
+                        self.adopt_flock(tid, path, holder, lane, now)
+        for t in [t for t in self.tickets.values() if t.flock and t.id not in seen]:
+            self.finalize(t, now, None, error="lock released")
+
+    def adopt_flock(self, tid: str, path: str, pid: int, lane: str, now: float) -> None:
+        argv, cwd, cg = proc_cmdline(pid), "/", None
+        own = proc_cgroup(pid)
+        children = proc_children(pid)
+        for child in children:
+            child_cg = proc_cgroup(child)
+            if child_cg and child_cg != own and child_cg.endswith(".scope"):
+                argv, cg = proc_cmdline(child) or argv, child_cg
+                break
+        else:
+            if children:
+                argv = proc_cmdline(children[0]) or argv
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            pass
+        argv = argv or [f"(holder of {os.path.basename(path)})"]
+        t = Ticket(tid, argv, cwd, lane, command_key(argv, cwd, lane), now, None)
+        t.state, t.started, t.running_since, t.runner = "running", now, now, "outside"
+        t.flock = (path, pid)
+        t.cg = cg
+        t.oom_base = None
+        self.estimate(t, now)
+        t.granted = t.want
+        t.est_mem = self.mem_for(t, t.granted)
+        self.tickets[tid] = t
+        log(f"counting {tid} (held by pid {pid}, started outside the queue) as a running build: {t.label}")
+
+    # ---- surviving a restart
+
+    def load_tickets(self, now: float) -> None:
+        for path in glob.glob(os.path.join(self.tickets_dir, "*", "ticket.json")):
+            directory = os.path.dirname(path)
+            try:
+                t = Ticket.from_record(read_json(path), directory)
+            except (TypeError, KeyError, ValueError):
+                log(f"skipping unreadable ticket {directory}")
+                continue
+            if t.id != os.path.basename(directory):
+                continue
+            self.tickets[t.id] = t
+            if t.submission:
+                self.submissions[t.submission] = t.id
+            if t.state in FINISHED:
+                continue
+            if t.lane not in self.cfg.lanes:
+                t.lane = self.cfg.default_lane
+            if t.state == "queued":
+                if os.path.exists(os.path.join(directory, "env.json")):
+                    log(f"kept {t.id} in the queue across the restart")
+                else:
+                    self.finalize(t, now, None, error="its environment file is gone")
+                continue
+            if t.jobserver and os.path.exists(t.jobserver):
+                try:
+                    t.js = Jobserver(t.jobserver, create=False, out=t.tokens_out)
+                    t.js.used = t.elastic
+                except OSError:
+                    t.js = None
+            t.cpu_usec_base = None  # count CPU from here; the cgroup's counter started before
+            if t.state == "starting":
+                t.recheck_at = now + 10
+            else:
+                t.running_since = now
+            if t.cancel_requested:
+                self.stop(t, now)  # a cancel in progress when the daemon stopped goes on
+            log(f"picked up {t.id} [{t.lane}] ({t.state}) from before the restart: {t.label}")
+
+    def prune(self, now: float) -> None:
+        finished = sorted((t for t in self.tickets.values() if t.state in FINISHED and t.dir),
+                          key=lambda t: t.ended or 0)
+        excess = len(finished) - self.cfg.max_finished
+        for i, t in enumerate(finished):
+            if i < excess or (t.ended or 0) < now - self.cfg.keep_finished:
+                shutil.rmtree(t.dir, ignore_errors=True)
+                self.tickets.pop(t.id, None)
+                if t.submission:
+                    self.submissions.pop(t.submission, None)
+
+    # ---- status
+
+    def overview(self, now: float) -> dict:
+        queue = self.queue()
+        running = sorted(self.active(), key=lambda t: t.started or 0)
+        recent = sorted((t for t in self.tickets.values() if t.state in FINISHED), key=lambda t: t.ended or 0)[-10:]
+        return {
+            "version": VERSION, "now": now, "runner": self.runner.name, "machine": self.machine.summary(),
+            "budget": self.budget, "config": self.cfg.summary(),
+            "running": [t.row(now) for t in running],
+            "queued": [t.row(now, i) for i, t in enumerate(queue)],
+            "recent": [t.row(now) for t in reversed(recent)],
+        }
+
+    def listing(self, now: float, everything: bool) -> list[dict]:
+        queue = self.queue()
+        rows = []
+        for t in sorted(self.tickets.values(), key=lambda t: t.submitted, reverse=True):
+            if not everything and t.state in FINISHED and (t.ended or 0) < now - 86400:
+                continue
+            rows.append(t.row(now, queue.index(t) if t.state == "queued" else None))
+        return rows
+
+    # ---- the loop
+
+    def tick(self, now: float) -> None:
+        self.machine.sample(time.monotonic())
+        self.check(now)
+        self.drop_unwatched(now)
+        self.scan_flock_slots(now)
+        self.schedule(now)
+        tick = time.monotonic()
+        if tick - self.last_rebalance >= self.REBALANCE_SECONDS:
+            self.last_rebalance = tick
+            self.rebalance(now)
+            self.guard_slice()
+        self.send_waits(now)
+        self.reap_helpers(now)
+        if tick - self.last_prune >= 600:
+            self.last_prune = tick
+            self.prune(now)
+
+    def drop_unwatched(self, now: float) -> None:
+        """A build that `buildq run` submitted is meant to be followed. Once no one has followed it
+        for unwatched_seconds (its client was killed, by an editor or a tool timeout), cancel it rather than let
+        it hold a turn for output nobody reads. Builds dropped off with `buildq submit` stay."""
+        for t in list(self.tickets.values()):
+            if not t.attached or t.state in FINISHED or t.cancel_requested or t.flock:
+                continue
+            if self.watchers.get(t.id):
+                t.last_watched = now
+            elif now - t.last_watched > self.cfg.unwatched_seconds:
+                log(f"cancelling {t.id}: the `buildq run` that submitted it has gone")
+                self.cancel(t, now)
+
+    def send_waits(self, now: float) -> None:
+        for position, t in enumerate(self.queue()):
+            if t.reason_cat != t.sent_cat or now - t.sent_at >= 60:
+                t.sent_cat, t.sent_at = t.reason_cat, now
+                for conn in list(self.watchers.get(t.id, ())):
+                    conn.send({"type": "wait", "id": t.id, "ahead": position, "reason": t.reason,
+                               "category": t.reason_cat, "waited": round(now - t.submitted)})
+
+    async def ticker(self) -> None:
+        while not self.stopping:
+            try:
+                self.tick(time.time())
+            except Exception:
+                log("tick failed:\n" + traceback.format_exc())
+            await asyncio.sleep(1.0)
+
+    def handle_message(self, msg: dict, conn: Conn, now: float) -> None:
+        op = msg.get("op")
+        if op == "submit":
+            t, error = self.submit(msg, now)
+            if t is None:
+                conn.send({"type": "error", "error": error})
+                return
+            if msg.get("watch") and t.state not in FINISHED:
+                self.watchers[t.id].add(conn)
+                t.sent_cat = None  # send the first reason on the next tick
+            conn.send({"type": "ticket", **t.row(now, self.position(t))})
+        elif op in ("watch", "cancel"):
+            t, error = self.resolve(msg.get("ticket"))
+            if t is None:
+                conn.send({"type": "error", "error": error})
+                return
+            if op == "cancel":
+                if t.flock:
+                    conn.send({"type": "error", "error": f"{t.id} was started outside the queue; buildq can't cancel it"})
+                    return
+                self.cancel(t, now)
+                self.schedule(now)
+            elif t.state not in FINISHED:
+                self.watchers[t.id].add(conn)
+                t.sent_cat = None
+            conn.send({"type": "ticket", **t.row(now, self.position(t))})
+        elif op == "status":
+            refs = msg.get("tickets")
+            if refs:
+                rows, errors = [], []
+                for ref in refs if isinstance(refs, list) else [refs]:
+                    t, error = self.resolve(ref)
+                    if t is None:
+                        errors.append(error)
+                    else:
+                        rows.append(t.row(now, self.position(t)))
+                conn.send({"type": "tickets", "tickets": rows, "errors": errors})
+            else:
+                conn.send({"type": "status", **self.overview(now)})
+        elif op == "list":
+            conn.send({"type": "tickets", "tickets": self.listing(now, bool(msg.get("all"))), "errors": []})
+        elif op == "ping":
+            conn.send({"type": "pong", "version": VERSION, "runner": self.runner.name})
+        else:
+            conn.send({"type": "error", "error": f"unexpected op {op!r}"})
+
+    async def handle(self, reader, writer) -> None:
+        conn = Conn(writer)
+        sock = writer.get_extra_info("socket")
+        if sock is not None and peer_uid(sock) not in (UID, None):
+            writer.close()  # only this user's processes may use the queue
+            return
+        try:
+            while not self.stopping:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                    if not isinstance(msg, dict):
+                        raise ValueError("not an object")
+                except ValueError:
+                    conn.send({"type": "error", "error": "each message is one JSON object on one line"})
+                    continue
+                try:
+                    self.handle_message(msg, conn, time.time())
+                except Exception:
+                    log("request failed:\n" + traceback.format_exc())
+                    conn.send({"type": "error", "error": "the daemon failed to handle that request; see its log"})
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError, ValueError):
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log("connection handler failed:\n" + traceback.format_exc())
+        finally:
+            conn.closed = True
+            for conns in self.watchers.values():
+                conns.discard(conn)
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------------------------
+# The supervisor: runs one build inside its service
+
+
+class CappedOutput:
+    """Writes a build's output to its log, up to `limit` bytes; past that it keeps only the last
+    quarter of `limit` and appends it, with a note, when the build ends."""
+
+    def __init__(self, fd: int, limit: int, note: bool = True):
+        self.fd = fd
+        self.limit = limit
+        self.note = note  # not in stdout.log, which a caller may be parsing
+        self.written = 0
+        self.tail: collections.deque = collections.deque()
+        self.tail_bytes = 0
+        self.tail_limit = max(limit // 4, 1)
+        self.dropped = 0
+
+    def _write_all(self, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            try:
+                n = os.write(self.fd, view)
+            except InterruptedError:
+                continue
+            except OSError:
+                return  # a full disk mustn't stop the build
+            view = view[n:]
+
+    def write(self, data: bytes) -> None:
+        if self.limit <= 0 or self.written < self.limit:
+            room = len(data) if self.limit <= 0 else self.limit - self.written
+            self._write_all(data[:room])
+            self.written += min(room, len(data))
+            data = data[room:]
+        if data:
+            self.tail.append(data)
+            self.tail_bytes += len(data)
+            self.dropped += len(data)
+            while self.tail and self.tail_bytes - len(self.tail[0]) >= self.tail_limit:
+                self.tail_bytes -= len(self.tail.popleft())
+
+    def finish(self) -> None:
+        if not self.dropped:
+            return
+        kept = b"".join(self.tail)[-self.tail_limit:]
+        if self.note:
+            self._write_all(f"\n[buildq: {self.dropped - len(kept)} bytes of output left out here; "
+                            f"the last {len(kept)} follow]\n".encode())
+        self._write_all(kept)
+
+
+def oom_of(result: dict) -> bool:
+    """Whether a build's result shows it was killed for memory at its own cap. A kill that came
+    from outside (the slice's limit as other work grew, systemd-oomd) doesn't say the build needs
+    more than it had."""
+    return bool(result.get("oom_kills")) and bool(result.get("hit_own_cap", True))
+
+
+def signal_group(pgid: int, sig: int) -> bool:
+    """Signal a process group; False if it has no processes left."""
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def apply_rlimits(limits) -> None:
+    """The submitter's soft limits (open files, stack, core size), within this process's hard ones."""
+    import resource
+    names = {"NOFILE": resource.RLIMIT_NOFILE, "STACK": resource.RLIMIT_STACK, "CORE": resource.RLIMIT_CORE}
+    for name, value in (limits or {}).items():
+        which = names.get(name)
+        if which is None or not isinstance(value, int):
+            continue
+        try:
+            _, hard = resource.getrlimit(which)
+            soft = value if hard == resource.RLIM_INFINITY or (0 <= value <= hard) else hard
+            if value == resource.RLIM_INFINITY and hard != resource.RLIM_INFINITY:
+                soft = hard
+            resource.setrlimit(which, (soft, hard))
+        except (ValueError, OSError):
+            continue
+
+
+def supervise(directory: str) -> int:
+    """Run one build: its command, with its submitter's environment, directory and limits; its
+    output into output.log (both streams) and stdout.log / stderr.log (each); and, whatever
+    happens, its exit status into result.json."""
+    os.umask(0o077)
+    code, timed_out = 126, False
+    outputs = []
+    jobserver = None
+    try:
+        # Claim the environment atomically: if two supervisors ever start for one build (a launch
+        # from before a daemon restart arriving late), only one gets it, and the other runs nothing.
+        claimed = os.path.join(directory, f"env.{os.getpid()}.json")
+        try:
+            os.rename(os.path.join(directory, "env.json"), claimed)
+        except FileNotFoundError:
+            return 0  # another supervisor has this build; it writes the result
+        me = proc_identity(os.getpid())
+        write_json(os.path.join(directory, "supervisor.json"), {"pid": os.getpid(), "start": me[0] if me else None})
+        spec = read_json(os.path.join(directory, "ticket.json")) or {}
+        job = str(spec.get("id") or os.path.basename(directory))
+        env = read_json(claimed)
+        try:
+            os.remove(claimed)  # the environment can hold secrets; it isn't kept once the build has it
+        except OSError:
+            pass
+        parallel = read_json(os.path.join(directory, "parallel.json"))
+        if isinstance(env, dict) and isinstance(parallel, dict):
+            env.update({str(k): str(v) for k, v in parallel.items()})
+        limit = int(spec.get("max_log") or 0)
+
+        def log_file(name: str, size: int, note: bool = True) -> CappedOutput:
+            fd = os.open(os.path.join(directory, name), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            output = CappedOutput(fd, size, note)
+            outputs.append(output)
+            return output
+
+        combined = log_file("output.log", limit)
+        streams = {1: log_file("stdout.log", limit // 2, note=False), 2: log_file("stderr.log", limit // 2)}
+
+        def note(text: str) -> None:
+            for output in (combined, streams[2]):
+                output.write(text.encode())
+
+        # Hold the build's jobserver open for as long as the build runs: a pipe's tokens last only
+        # while someone has it open, and the daemon may restart in between.
+        if spec.get("jobserver") and os.path.exists(spec["jobserver"]):
+            try:
+                jobserver = os.open(spec["jobserver"], os.O_RDWR | os.O_NONBLOCK)
+            except OSError:
+                jobserver = None
+        apply_rlimits(spec.get("rlimits"))
+        argv, cwd = spec.get("exec_argv") or spec.get("argv"), spec.get("cwd") or "/"
+        timeout = spec.get("timeout")
+        if not isinstance(env, dict) or not argv:
+            note("buildq: this build's command or environment is missing; it can't run.\n")
+            return code
+        pipes = {1: os.pipe(), 2: os.pipe()}
+        try:
+            umask = spec.get("umask")
+            child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=DEVNULL, stdout=pipes[1][1], stderr=pipes[2][1],
+                                     process_group=0, umask=umask if isinstance(umask, int) else 0o022)
+        except (OSError, ValueError) as e:
+            for r, w in pipes.values():
+                os.close(r)
+                os.close(w)
+            note(f"buildq: can't run {argv[0]} in {cwd}: {getattr(e, 'strerror', None) or e}\n")
+            code = 127 if isinstance(e, FileNotFoundError) else 126
+            return code
+        for _, w in pipes.values():
+            os.close(w)
+        write_json(os.path.join(directory, "child.json"), {"pid": child.pid, "pgid": child.pid})
+
+        def forward(signum, _frame):
+            signal_group(child.pid, signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2):
+            signal.signal(sig, forward)
+        selector = selectors.DefaultSelector()
+        for number_, (r, _) in pipes.items():
+            os.set_blocking(r, False)
+            selector.register(r, selectors.EVENT_READ, number_)
+        open_pipes = len(pipes)
+        deadline = time.monotonic() + float(timeout) if timeout else None
+        term_sent = None
+
+        def pump(wait: float) -> None:
+            nonlocal open_pipes
+            if not open_pipes:
+                time.sleep(wait)
+                return
+            for key, _ in selector.select(wait):
+                for _batch in range(64):  # at most 4 MiB at a time, so deadlines are still checked
+                    try:
+                        data = os.read(key.fd, 1 << 16)
+                    except BlockingIOError:
+                        break
+                    except InterruptedError:
+                        continue
+                    if not data:
+                        selector.unregister(key.fd)
+                        open_pipes -= 1
+                        break
+                    combined.write(data)
+                    streams[key.data].write(data)
+
+        while child.poll() is None:
+            pump(0.5)
+            if deadline and time.monotonic() > deadline and term_sent is None:
+                timed_out, term_sent = True, time.monotonic()
+                note(f"\nbuildq: timed out after {float(timeout):.0f}s; stopping it\n")
+                signal_group(child.pid, signal.SIGTERM)
+            if term_sent and time.monotonic() - term_sent > 30:
+                signal_group(child.pid, signal.SIGKILL)
+        # Whatever the build left running in its process group goes too, so its turn ends with it.
+        if signal_group(child.pid, signal.SIGTERM):
+            stop_by = time.monotonic() + 10
+            while signal_group(child.pid, 0) and time.monotonic() < stop_by:
+                pump(0.2)
+            signal_group(child.pid, signal.SIGKILL)
+        # And so does anything that left the group (setsid, a double fork): it still carries this
+        # build's BUILDQ_JOB. Under the direct runner nothing else would find it.
+        strays = tagged_processes(job, exclude=os.getpid())
+        if strays:
+            for pid in strays:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            stop_by = time.monotonic() + 5
+            while tagged_processes(job, exclude=os.getpid()) and time.monotonic() < stop_by:
+                pump(0.2)
+            for pid in tagged_processes(job, exclude=os.getpid()):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+        drain_by = time.monotonic() + 2
+        while open_pipes and time.monotonic() < drain_by:
+            pump(0.1)
+        for r, _ in pipes.values():
+            try:
+                os.close(r)
+            except OSError:
+                pass
+        returncode = child.returncode
+        code = 124 if timed_out else (returncode if returncode >= 0 else 128 - returncode)
+        return code
+    except Exception as e:  # the result must always be written
+        try:
+            for output in outputs[:1]:
+                output.write(f"\nbuildq: the supervisor failed: {e!r}\n".encode())
+        except Exception:
+            pass
+        return code
+    finally:
+        for output in outputs:
+            try:
+                output.finish()
+                os.close(output.fd)
+            except Exception:
+                pass
+        if jobserver is not None:
+            os.close(jobserver)
+        if os.path.exists(os.path.join(directory, "supervisor.json")) and \
+                (read_json(os.path.join(directory, "supervisor.json")) or {}).get("pid") == os.getpid():
+            own = proc_cgroup(os.getpid())
+            events = cgroup_events(own) if own else {}
+            try:
+                write_json(os.path.join(directory, "result.json"),
+                           {"exit": code, "ended": time.time(), "timed_out": timed_out,
+                            "oom_kills": events.get("oom_kill", 0),
+                            # "max" counts the times the build reached its own MemoryMax; a kill
+                            # without it came from outside (the slice's limit, systemd-oomd).
+                            "hit_own_cap": events.get("max", 0) > 0})
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------------------------
+# Serving
+
+
+def listening_socket(path: str):
+    """The socket systemd passed us (socket activation), or one we bind at `path`."""
+    if os.environ.get("LISTEN_PID") == str(os.getpid()) and int(os.environ.get("LISTEN_FDS") or 0) >= 1:
+        for name in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
+            os.environ.pop(name, None)
+        sock = socket.socket(fileno=3)
+        sock.setblocking(False)
+        return sock, False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.connect(path)
+        sys.exit(f"buildqd: something is already listening on {path}")
+    except (FileNotFoundError, ConnectionRefusedError):
+        pass
+    finally:
+        probe.close()
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(path)  # mode 0600: the daemon runs with umask 077
+    sock.listen(128)
+    sock.setblocking(False)
+    return sock, True
+
+
+async def serve(args) -> None:
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    holder: dict = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    loop.add_signal_handler(signal.SIGHUP, lambda: asyncio.ensure_future(holder["daemon"].reload_async())
+                            if "daemon" in holder else None)
+    daemon = Daemon(args.config, args.state_dir)
+    holder["daemon"] = daemon
+    await asyncio.sleep(0.5)
+    daemon.machine.sample(time.monotonic())  # a first CPU reading before the first decision
+    now = time.time()
+    daemon.load_tickets(now)
+    daemon.prune(now)
+    daemon.scan_flock_slots(now)
+    sock, owned = listening_socket(args.socket)
+    server = await asyncio.start_unix_server(daemon.handle, sock=sock, limit=16 << 20)
+    ticker = asyncio.create_task(daemon.ticker())
+    m = daemon.machine
+    log(f"buildqd {VERSION} on {args.socket}: {m.ncpu} cores, {fmt_size(m.mem_total)} memory, "
+        f"{daemon.runner.name} runner; configuration {json.dumps(daemon.cfg.summary())}")
+    await stop.wait()
+    daemon.stopping = True  # from here on nothing new starts
+    daemon.guard_slice(stopping=True)
+    ticker.cancel()
+    server.close()
+    if owned:
+        try:
+            os.unlink(args.socket)
+        except OSError:
+            pass
+    log(f"stopping; {len(daemon.active())} running build(s) carry on, and the next daemon picks them up")
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(prog="buildqd", description="The buildq daemon: a load-aware build queue.")
+    parser.add_argument("--socket", default=default_socket(), help="Unix socket to listen on (default: %(default)s)")
+    parser.add_argument("--state-dir", default=default_state_dir(), help="tickets and history (default: %(default)s)")
+    parser.add_argument("--config", default=default_config(), help="TOML configuration file (default: %(default)s)")
+    parser.add_argument("--check-config", action="store_true", help="load the configuration, print it, and exit")
+    parser.add_argument("--supervise", metavar="TICKET_DIR", help=argparse.SUPPRESS)
+    parser.add_argument("--version", action="version", version=f"buildqd {VERSION}")
+    args = parser.parse_args(argv)
+    os.umask(0o077)  # tickets, logs, history and the socket are private to this user
+    if args.supervise:
+        sys.exit(supervise(args.supervise))
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError):
+        pass
+    if args.check_config:
+        m = Machine()
+        cfg = load_config_file(args.config, m.mem_total, m.ncpu)
+        if SystemdRunner.available():
+            for lane in cfg.lanes.values():
+                problem = SystemdRunner.check_lane(lane)
+                if problem:
+                    sys.exit(f"systemd refuses lanes.{lane.name}.properties: {problem}")
+        print(json.dumps(cfg.summary(), indent=2))
+        return
+    asyncio.run(serve(args))
+
+
+if __name__ == "__main__":
+    main()

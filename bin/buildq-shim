@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""buildq-shim: send heavy commands through buildq without anyone having to remember to.
+
+Install it as links named after the tools (cargo, pnpm, npm, npx, yarn, make, ninja, dotnet)
+in a directory that comes first on PATH (`./install.sh --shims`). Each link runs this program,
+which finds the real tool further down PATH and then:
+
+  - runs a heavy invocation as `buildq run -- <the real tool> ARGS...`: it waits its turn, its
+    output streams as usual, and it exits with the tool's exit code;
+  - runs anything else (cargo fmt, cargo metadata, pnpm dev, vitest in watch mode, ...) directly;
+  - runs everything directly inside a build, which already holds a turn.
+
+Heavy means it compiles or runs a whole suite: any cargo subcommand but the few that never
+compile (fmt, metadata, tree, clean, ...), npm/pnpm/yarn scripts named build*, test*, lint*,
+check*, e2e* and the like, `vitest run`, `jest`, `vite build`, `tsc`, `playwright test`, make and
+ninja (except dry runs and long-running targets such as dev, serve or up), `dotnet build/test/
+publish/pack`. A watch mode is never heavy: it would hold a turn for as long as it runs.
+`cargo run` and `dotnet run` queue the build, then run the program directly, with stdin.
+
+BUILDQ_SHIM=off in the environment turns the shim off for one command. In CI jobs (CI or
+GITHUB_ACTIONS set) and under rust-analyzer, tools always run directly.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+# Cargo subcommands that never compile; anything else, external subcommands included (insta,
+# sqlx, xtask, hack, ...), is treated as a build. `watch` runs here and sends what it starts back
+# through the shim, so each of its runs is queued instead of the watcher holding a turn.
+CARGO_LIGHT = {"fmt", "metadata", "tree", "version", "help", "search", "login", "logout", "owner", "yank",
+               "locate-project", "pkgid", "read-manifest", "verify-project", "clean", "new", "init", "add",
+               "remove", "rm", "update", "fetch", "generate-lockfile", "vendor", "config", "report", "info",
+               "uninstall", "watch", "deny", "audit", "outdated", "udeps-list", "machete", "sort"}
+JS_SCRIPT_PREFIXES = ("build", "test", "typecheck", "type-check", "check", "lint", "e2e", "verify", "storybook:build",
+                      "build-storybook", "test-storybook", "ci")
+import re
+
+# make targets that start something long-running (a dev server, containers) or just tidy up.
+MAKE_LIGHT_TARGET = re.compile(r"(^|[-_:.])(dev|watch|up|down|serve|server|start|run|stop|help|clean|shell|logs|"
+                               r"format|fmt|open)($|[-_:.])")
+JS_TOOLS = {"vitest", "vite", "tsc", "vue-tsc", "playwright", "storybook", "build-storybook", "jest", "eslint",
+            "next", "nuxt", "astro"}
+INFO = {"--help", "-h", "--version", "-V", "version", "help", "--list"}  # asks, builds nothing
+
+
+def positionals(args, value_options=()):
+    out, skip = [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg.startswith("-"):
+            skip = arg in value_options
+        else:
+            out.append(arg)
+    return out
+
+
+def watching(args: list[str]) -> bool:
+    return any(a in ("--watch", "--watchAll", "watch") or a.startswith("--watch=") for a in args)
+
+
+def js_script_heavy(name: str) -> bool:
+    lowered = name.lower()
+    if "watch" in lowered or lowered.startswith(("dev", "start", "serve", "preview")):
+        return False
+    return lowered.startswith(JS_SCRIPT_PREFIXES)
+
+
+def js_tool_heavy(tool: str, args: list[str]) -> bool:
+    if watching(args):
+        return False
+    if tool == "vitest":
+        # Without "run" it watches at a terminal, and runs the whole suite once without one.
+        return "run" in args or "--run" in args or not sys.stdout.isatty()
+    if tool == "vite":
+        return positionals(args)[:1] == ["build"]
+    if tool in ("tsc", "vue-tsc"):
+        return not {"--version", "-v", "--help", "-h", "-w"} & set(args)
+    if tool == "playwright":
+        return positionals(args)[:1] == ["test"]
+    if tool in ("storybook", "build-storybook"):
+        return tool == "build-storybook" or positionals(args)[:1] == ["build"]
+    if tool in ("jest", "eslint"):
+        return True
+    if tool in ("next", "nuxt", "astro"):
+        return positionals(args)[:1] == ["build"]
+    return False
+
+
+def heavy(tool: str, args: list[str]) -> bool:
+    if args and all(a in INFO for a in args):
+        return False
+    if tool == "cargo":
+        rest = args[1:] if args and args[0].startswith("+") else args
+        sub = positionals(rest, {"-Z", "--config", "--color", "-C", "--manifest-path"})[:2]
+        if not sub:
+            return False  # cargo -V, cargo --list, ...
+        if watching(args) or (sub[0] not in ("build", "b", "check", "c", "test", "t", "run", "r", "clippy")
+                              and sub[1:] and sub[1] in ("watch", "dev", "serve")):
+            return False  # cargo leptos watch, cargo tauri dev, ...: runs until stopped
+        return sub[0] not in CARGO_LIGHT
+    if watching(args):
+        return False
+    if tool in ("npm", "pnpm", "yarn", "bun"):
+        pos = positionals(args, {"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"})
+        if pos[:1] in (["run"], ["run-script"]):
+            pos = pos[1:]
+        if pos[:1] in (["exec"], ["dlx"], ["x"]) and len(pos) > 1:
+            return js_tool_heavy(os.path.basename(pos[1]), args[args.index(pos[1]) + 1:])
+        if pos and pos[0] in JS_TOOLS:  # pnpm vitest, yarn tsc: the tool itself
+            return js_tool_heavy(pos[0], args[args.index(pos[0]) + 1:])
+        return bool(pos) and js_script_heavy(pos[0])
+    if tool in ("npx", "pnpx", "bunx"):
+        pos = positionals(args, {"-p", "--package"})
+        return bool(pos) and js_tool_heavy(os.path.basename(pos[0]), args[args.index(pos[0]) + 1:])
+    if tool in ("make", "gmake", "ninja"):
+        if {"-n", "--dry-run", "--just-print", "--recon", "-q", "--question", "-t", "--touch"} & set(args):
+            return False
+        targets = [a for a in positionals(args, {"-C", "-f", "-j", "-l", "-o", "-W", "--directory", "--file"})
+                   if "=" not in a]
+        return not targets or not all(MAKE_LIGHT_TARGET.search(t) for t in targets)
+    if tool == "dotnet":
+        return positionals(args)[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
+    if tool in ("docker", "podman"):
+        pos = positionals(args)
+        return pos[:1] == ["build"] or pos[:2] in (["buildx", "build"], ["compose", "build"], ["image", "build"])
+    return False
+
+
+def passed_through() -> bool:
+    """CI jobs and editors run their tools directly: CI has its own runners' limits, and an editor
+    kills and restarts its checks far too often to queue them."""
+    if os.environ.get("BUILDQ_SHIM") == "off":
+        return True
+    # A GitHub Actions job, not merely CI=true (which people set to turn watch modes off).
+    if os.environ.get("GITHUB_ACTIONS") and os.environ.get("RUNNER_NAME"):
+        return True
+    pid = os.getppid()
+    for _ in range(40):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() in ("rust-analyzer", "rust-analyzer-proc-macro-srv"):
+                    return True
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def build_then_run(tool: str, args: list[str]) -> list[str] | None:
+    """For `cargo run` and `dotnet run`: the arguments of the matching build, else None."""
+    if tool == "cargo":
+        lead = [args[0]] if args and args[0].startswith("+") else []
+        rest = args[len(lead):]
+        before = rest[: rest.index("--")] if "--" in rest else rest
+        pos = positionals(before, {"-Z", "--config", "--color", "-C", "--manifest-path"})
+        if not pos or pos[0] not in ("run", "r"):
+            return None
+        i = before.index(pos[0])
+        return lead + before[:i] + ["build"] + before[i + 1:]
+    if tool == "dotnet":
+        before = args[: args.index("--")] if "--" in args else args
+        pos = positionals(before)
+        if pos[:1] != ["run"]:
+            return None
+        i = before.index("run")
+        build = before[:i] + ["build"] + before[i + 1:]
+        return [a for a in build if a not in ("--no-build", "--no-restore")]
+    return None
+
+
+def real_tool(name: str) -> str | None:
+    """The tool the shim stands in for: the first one of that name on PATH that isn't a shim."""
+    me = os.path.realpath(__file__)
+    here = os.path.realpath(os.path.dirname(os.path.abspath(sys.argv[0])))
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory or os.path.realpath(directory) == here:
+            continue
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK) and os.path.realpath(candidate) != me:
+            return candidate
+    return None
+
+
+def main() -> int:
+    name = os.path.basename(sys.argv[0])
+    args = sys.argv[1:]
+    if name == "buildq-shim":
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    tool = real_tool(name)
+    if tool is None:
+        print(f"buildq-shim: no {name} on PATH besides this shim", file=sys.stderr)
+        return 127
+    if not passed_through() and heavy(name, args):
+        buildq = os.environ.get("BUILDQ_BIN") or os.path.join(os.path.dirname(os.path.realpath(__file__)), "buildq")
+        queued = [sys.executable, buildq, "run", "--"]
+        build_first = build_then_run(name, args)
+        if build_first is not None:
+            # Build in the queue, then run the program here: it may read stdin, and it may run for
+            # hours (a server), which mustn't hold a turn.
+            code = subprocess.call(queued + [tool, *build_first])
+            if code != 0:
+                return code
+            os.execv(tool, [tool, *args] + (["--no-build"] if name == "dotnet" and "--no-build" not in args else []))
+        # `buildq run` runs it directly when this is already inside a build.
+        os.execv(sys.executable, queued + [tool, *args])
+    os.execv(tool, [tool, *args])
+    return 127
+
+
+if __name__ == "__main__":
+    sys.exit(main())

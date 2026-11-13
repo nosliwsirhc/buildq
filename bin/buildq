@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""buildq: drop off a build, get a ticket, and check on it later.
+
+  buildq submit [OPTIONS] [--] COMMAND [ARGS...]   queue a build; prints its ticket and returns at once
+  buildq run    [OPTIONS] [--] COMMAND [ARGS...]   queue it, stream its output, exit with its exit code
+  buildq status [TICKET...] [--json]               a ticket in detail, or the whole queue and the machine
+  buildq list   [--all] [--json]                   every ticket: queued, running and recently finished
+  buildq wait   TICKET [--timeout DURATION]        block until it finishes; exit with its exit code
+  buildq logs   TICKET [--follow] [--tail N]       its output
+  buildq cancel TICKET...                          take it out of the queue, or stop it
+  buildq ping                                      check that the daemon answers
+
+A ticket is a UUID; any unique prefix of four or more characters works in its place.
+
+Options for submit and run:
+  --lane NAME          the kind of build, from the daemon's configuration
+  --cores N            use N cores, in place of the size learned from earlier runs
+  --mem SIZE           expect at least this peak memory (for example 6G); it can raise the
+                       learned size, never lower it
+  --priority N         higher runs first (default 0)
+  --timeout DURATION   stop the build after this long (for example 45m)
+  --name TEXT          a name to show in place of the command
+  --notify COMMAND     a shell command to run when it finishes (BUILDQ_TICKET, BUILDQ_STATE,
+                       BUILDQ_EXIT, BUILDQ_LOG, ... are set)
+
+The build runs in the background with the environment and working directory of the command that
+submitted it, and no stdin. `buildq run` streams its output to stdout and exits with its exit
+code (128 + N if signal N ended it). Interrupting `buildq run` (Ctrl-C, SIGTERM, SIGHUP) cancels
+the build, and so does killing it outright, once no client has followed the build for the
+daemon's unwatched_seconds. A build dropped off with `buildq submit` runs on alone.
+
+Exit codes of the client itself: 2 for a refused request, 75 when the daemon can't be reached
+(BUILDQ_FALLBACK=fail, or submit), 124 when `wait --timeout` runs out, 125 when a build ended
+without an exit status (cancelled before it ran, or lost).
+
+Environment:
+  BUILDQ_SOCKET    the daemon's socket (default $XDG_RUNTIME_DIR/buildq.sock)
+  BUILDQ_FALLBACK  what `buildq run` does when the daemon can't be reached. Unset: wait for it,
+                   retrying every few seconds. "fail": exit 75. "run": run the command at once,
+                   unqueued. Anything else: a command prefix to run the command through instead
+                   (an older semaphore script, say).
+  BUILDQ_JOB       set inside every build. A `buildq run` inside a build runs its command directly,
+                   because the build already has a turn.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import glob
+import json
+import os
+import select
+import shlex
+import signal
+import socket
+import struct
+import sys
+import time
+import uuid
+
+VERSION = "0.2.0"
+GIB, MIB = 1 << 30, 1 << 20
+FINISHED = ("succeeded", "failed", "cancelled", "lost")
+
+
+def socket_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.expanduser(os.environ.get("BUILDQ_SOCKET") or os.path.join(runtime, "buildq.sock"))
+
+
+def state_dir() -> str:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.expanduser(os.environ.get("BUILDQ_STATE_DIR") or os.path.join(base, "buildq"))
+
+
+def note(text: str) -> None:
+    print(f"buildq: {text}", file=sys.stderr, flush=True)
+
+
+def fmt_size(n) -> str:
+    n = n or 0
+    if abs(n) >= 10 * GIB:
+        return f"{n / GIB:.0f}G"
+    if abs(n) >= GIB:
+        return f"{n / GIB:.1f}G"
+    return f"{n / MIB:.0f}M"
+
+
+def fmt_age(seconds) -> str:
+    seconds = max(0, int(seconds or 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
+
+
+def parse_duration(text: str) -> float:
+    import re
+    match = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([smhd]?)\s*", str(text))
+    if not match:
+        raise argparse.ArgumentTypeError(f"not a duration: {text!r} (try 90s, 10m or 2h)")
+    return float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+
+
+def short_path(path) -> str:
+    if not path:
+        return ""
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
+# --------------------------------------------------------------------------------------------
+# Talking to the daemon
+
+
+class Lost(Exception):
+    """The connection to the daemon failed or went quiet."""
+
+
+class Channel:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.buffer = b""
+
+    def send(self, message: dict) -> None:
+        try:
+            self.sock.settimeout(10)
+            self.sock.sendall((json.dumps(message) + "\n").encode())
+        except OSError as e:
+            raise Lost(str(e)) from e
+
+    def poll(self, timeout: float) -> dict | None:
+        """The next message, or None if none arrives within `timeout` seconds."""
+        deadline = time.monotonic() + timeout
+        while b"\n" not in self.buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                ready, _, _ = select.select([self.sock], [], [], remaining)
+                if not ready:
+                    return None
+                self.sock.settimeout(5)
+                chunk = self.sock.recv(65536)
+            except OSError as e:
+                raise Lost(str(e)) from e
+            if not chunk:
+                raise Lost("the daemon closed the connection")
+            self.buffer += chunk
+        line, _, self.buffer = self.buffer.partition(b"\n")
+        try:
+            return json.loads(line)
+        except ValueError as e:
+            raise Lost(f"a message from the daemon isn't JSON: {line[:200]!r}") from e
+
+    def recv(self, timeout: float) -> dict:
+        message = self.poll(timeout)
+        if message is None:
+            raise Lost(f"no answer from the daemon in {timeout:.0f}s")
+        return message
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def connect(timeout: float) -> Channel | None:
+    """Connect, retrying while the daemon restarts: up to `timeout` seconds while the socket
+    refuses connections, and 2 seconds while it doesn't exist (a daemon that isn't installed)."""
+    start = time.monotonic()
+    while True:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        try:
+            sock.connect(socket_path())
+            uid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                      struct.calcsize("3i")))[1]
+            if uid != os.getuid():
+                sock.close()
+                note(f"refusing {socket_path()}: it belongs to uid {uid}, not to this user")
+                return None
+            return Channel(sock)
+        except OSError as e:
+            sock.close()
+            limit = 2.0 if isinstance(e, FileNotFoundError) else timeout
+            if time.monotonic() - start >= limit:
+                return None
+            time.sleep(0.25)
+
+
+def request(message: dict, timeout: float = 15) -> dict | None:
+    channel = connect(3)
+    if channel is None:
+        return None
+    try:
+        channel.send(message)
+        return channel.recv(timeout)
+    except Lost:
+        return None
+    finally:
+        channel.close()
+
+
+def unreachable() -> int:
+    note(f"the queue daemon isn't answering at {socket_path()} "
+         "(systemctl --user status buildq; journalctl --user -u buildq)")
+    return 75
+
+
+# --------------------------------------------------------------------------------------------
+# Describing tickets
+
+
+def state_text(row: dict) -> str:
+    state = row["state"]
+    if state == "queued":
+        ahead = row.get("ahead")
+        place = f", {ahead} ahead" if ahead else ""
+        return f"queued for {fmt_age(row['waited'])}{place}"
+    if state == "starting":
+        return "starting"
+    if state == "running":
+        return f"running for {fmt_age(row['elapsed'])}, after {fmt_age(row['waited'])} in the queue"
+    after = f" after {fmt_age(row['elapsed'])}" if row.get("elapsed") is not None else ""
+    if state == "succeeded":
+        return f"succeeded{after}"
+    if state == "failed":
+        bits = [f"exit {row['exit']}"] if row.get("exit") is not None else []
+        if row.get("oom"):
+            bits.append("killed for memory")
+        if row.get("timed_out"):
+            bits.append("timed out")
+        detail = f" ({', '.join(bits)})" if bits else ""
+        return f"failed{detail}{after}"
+    if state == "cancelled":
+        return f"cancelled{after}"
+    return f"lost{after}"
+
+
+def title(row: dict) -> str:
+    return row.get("name") or row["label"]
+
+
+def summary_line(row: dict) -> str:
+    text = f"{row['short']} {state_text(row)}"
+    if row.get("measured") and row["state"] in FINISHED:
+        text += f"; peak {fmt_size(row['mem_peak'])}, {row['peak_cores']:.1f} cores"
+    if row.get("error"):
+        text += f"; {row['error']}"
+    return text
+
+
+def print_ticket(row: dict) -> None:
+    print(f"ticket {row['id']}  ({row['lane']} lane{', priority ' + str(row['priority']) if row.get('priority') else ''})")
+    print(f"  state     {state_text(row)}")
+    if row["state"] == "queued" and row.get("reason"):
+        print(f"  waiting   {row['reason']}")
+    if row.get("error"):
+        print(f"  error     {row['error']}")
+    if row.get("name"):
+        print(f"  name      {row['name']}")
+    print(f"  command   {row['label']}")
+    print(f"  in        {short_path(row['cwd'])}")
+    if row["state"] in ("starting", "running") and row.get("measured"):
+        print(f"  using     {row['cores_now']:.1f} cores, {fmt_size(row['mem_now'])} now; "
+              f"peak {fmt_size(row['mem_peak'])}, {row['peak_cores']:.1f} cores")
+    elif row["state"] in FINISHED and row.get("measured"):
+        print(f"  used      peak {fmt_size(row['mem_peak'])}, {row['peak_cores']:.1f} cores at most, "
+              f"{row['avg_cores']:.1f} on average")
+    if row.get("granted"):
+        live = " (resized live through its jobserver)" if row.get("elastic") else ""
+        print(f"  cores     {row['granted']} given{live}; it can use up to {row['want']}")
+    print(f"  expected  {row['est_cores']:g} cores, {fmt_size(row['est_mem'])} ({row['est_src']})")
+    if row.get("log"):
+        print(f"  log       {short_path(row['log'])}")
+
+
+def print_overview(s: dict) -> None:
+    m, b, c = s["machine"], s.get("budget") or {}, s["config"]
+    print(f"buildqd {s['version']} ({s['runner']} runner): {m['cores']} cores, {m['busy']:.1f} busy "
+          f"(target {b.get('cpu_cap', 0):.1f}); memory {fmt_size(m['mem_available'])} available of "
+          f"{fmt_size(m['mem_total'])} (floor {fmt_size(c['mem_floor'])}); pressure cpu "
+          f"{m['psi_cpu_some_avg10']:.0f}%, memory {m['psi_mem_full_avg10']:.0f}%")
+    if b:
+        print(f"room for new builds: {max(b['free_cores'], 0):.1f} cores, {fmt_size(max(b['free_mem'], 0))} "
+              f"(after {fmt_size(b['growth_reserved'])} held for running builds to grow into)")
+    print()
+    running, queued, recent = s["running"], s["queued"], s.get("recent") or []
+    print(f"running {len(running)} of at most {c['max_jobs']}")
+    for r in running:
+        if r.get("outside"):
+            use = f"~{r['est_cores']:g} cores ~{fmt_size(r['est_mem'])}"
+            tag = f"  [outside the queue: holds {os.path.basename(r['outside'])}]"
+        else:
+            cores = f"{r['cores_now']:.1f}/{r['granted'] or r['est_cores']:g} cores" if r["measured"] else f"~{r['est_cores']:g} cores"
+            memory = f"{fmt_size(r['mem_now'])}/{fmt_size(r['est_mem'])}" if r["measured"] else f"~{fmt_size(r['est_mem'])}"
+            use, tag = f"{cores} {memory}", ""
+        print(f"  {r['short']:<9} {r['lane']:<6} {fmt_age(r['elapsed']):>6}  {use:<22} {title(r)}{tag}")
+    print(f"queued {len(queued)}")
+    for r in queued:
+        print(f"  {r['short']:<9} {r['lane']:<6} {fmt_age(r['waited']):>6}  "
+              f"{'needs ' + fmt_size(r['est_mem']):<22} {title(r)}")
+        print(f"  {'':<9} {'':<6} {'':>6}  waiting: {r['reason'] or 'deciding'}")
+    if recent:
+        print("finished recently")
+        for r in recent[:5]:
+            print(f"  {r['short']:<9} {r['lane']:<6} {fmt_age(s['now'] - (r['ended'] or s['now'])):>6}  "
+                  f"{state_text(r):<22} {title(r)}")
+
+
+def print_list(rows: list[dict], now: float) -> None:
+    if not rows:
+        print("no tickets")
+        return
+    print(f"{'TICKET':<9} {'LANE':<6} {'SUBMITTED':>9}  {'STATE':<40} COMMAND")
+    for r in rows:
+        print(f"{r['short']:<9} {r['lane']:<6} {fmt_age(now - r['submitted']) + ' ago':>9}  "
+              f"{state_text(r)[:40]:<40} {title(r)}")
+
+
+# --------------------------------------------------------------------------------------------
+# Following a ticket to its end
+
+
+def local_ticket_dir(ref: str) -> str | None:
+    """The ticket's directory, found on disk without the daemon."""
+    matches = glob.glob(os.path.join(state_dir(), "tickets", glob.escape(ref) + "*"))
+    return matches[0] if len(matches) == 1 else None
+
+
+def files_final(directory: str | None) -> dict | None:
+    """The ticket's final state from its files, for when the daemon can't be asked."""
+    if not directory:
+        return None
+    try:
+        with open(os.path.join(directory, "ticket.json")) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        record = {}
+    try:
+        with open(os.path.join(directory, "result.json")) as f:
+            result = json.load(f)
+    except (OSError, ValueError):
+        result = None
+    state = record.get("state")
+    if state in FINISHED:
+        exit_code = record.get("exit")
+    elif result is not None:
+        exit_code = result.get("exit")
+        state = "succeeded" if exit_code == 0 else "failed"
+    else:
+        return None
+    tid = record.get("id") or os.path.basename(directory)
+    return {"id": tid, "short": tid[:8], "state": state, "exit": exit_code, "elapsed": None,
+            "oom": record.get("oom"), "error": record.get("error"), "measured": False,
+            "timed_out": (result or {}).get("timed_out")}
+
+
+def reraise(signum: int) -> int:
+    """End this process by the signal that interrupted it, so a calling shell sees an interrupted
+    command (and a script stops) rather than an ordinary exit status."""
+    if signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        sys.stdout.flush()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+    return 128 + signum
+
+
+class Follower:
+    """Follows one ticket until it finishes: queue updates, its output, signals."""
+
+    def __init__(self, row: dict, channel: Channel | None, stream: bool, cancel_on_signal: bool,
+                 quiet: bool = False):
+        self.row = row
+        self.channel = channel
+        self.stream = stream
+        self.cancel_on_signal = cancel_on_signal
+        self.quiet = quiet
+        self.offset = 0
+        self.offsets = {1: 0, 2: 0}
+        self.split = False  # stream stdout.log and stderr.log to stdout and stderr
+        self.last_file_check = time.monotonic()
+        self.signals: list[int] = []
+        self.last_category = None
+        self.last_note = 0.0
+        self.daemon_lost_at = None
+
+    def on_signal(self, signum, _frame) -> None:
+        self.signals.append(signum)
+
+    def copy_file(self, path: str, offset: int, out) -> int:
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    offset += len(chunk)
+                    out.write(chunk)
+            out.flush()
+        except FileNotFoundError:
+            pass
+        return offset
+
+    def copy_output(self) -> None:
+        path = self.row.get("log")
+        if not self.stream or not path:
+            return
+        try:
+            if self.split and self.row.get("dir"):
+                d = self.row["dir"]
+                self.offsets[1] = self.copy_file(os.path.join(d, "stdout.log"), self.offsets[1], sys.stdout.buffer)
+                self.offsets[2] = self.copy_file(os.path.join(d, "stderr.log"), self.offsets[2], sys.stderr.buffer)
+            else:
+                self.offset = self.copy_file(path, self.offset, sys.stdout.buffer)
+        except BrokenPipeError:
+            # The reader went away (`| head`): stop like a build killed by SIGPIPE would.
+            self.stream = False
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except OSError:
+                pass
+            self.signals.append(signal.SIGPIPE)
+
+    def handle(self, message: dict) -> None:
+        kind = message.get("type")
+        if kind == "wait" and not self.quiet:
+            now = time.monotonic()
+            if message.get("category") != self.last_category or now - self.last_note >= 55:
+                ahead = message.get("ahead") or 0
+                place = f"{ahead} ahead, " if ahead else ""
+                note(f"waiting ({place}{fmt_age(message.get('waited'))} so far): {message.get('reason')}")
+                self.last_category, self.last_note = message.get("category"), now
+        elif kind == "ticket":
+            previous = self.row["state"]
+            self.row = message
+            if previous == "queued" and message["state"] in ("starting", "running") and not self.quiet \
+                    and (message.get("waited") or 0) >= 2:
+                note(f"starting after {fmt_age(message['waited'])} in the queue.")
+
+    def reconnect(self) -> None:
+        self.channel = connect(2)
+        if self.channel is None:
+            return
+        try:
+            self.channel.send({"op": "watch", "ticket": self.row["id"]})
+        except Lost:
+            self.channel.close()
+            self.channel = None
+
+    def run(self, timeout: float | None = None) -> int:
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, self.on_signal)
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        cancel_sent = None
+        directory = self.row.get("dir")
+        while self.row["state"] not in FINISHED:
+            if self.signals:
+                if not self.cancel_on_signal:
+                    return reraise(self.signals[0])
+                if cancel_sent is None:
+                    cancel_sent = time.monotonic()
+                    if request({"op": "cancel", "ticket": self.row["id"]}) is None:
+                        note(f"couldn't reach the daemon to cancel {self.row['short']}; it may still run")
+                        return reraise(self.signals[0])
+                    if not self.quiet:
+                        note(f"cancelling {self.row['short']}")
+                elif len(self.signals) > 1 or time.monotonic() - cancel_sent > 60:
+                    return reraise(self.signals[0])
+            message = None
+            if self.channel is not None:
+                try:
+                    message = self.channel.poll(0.2)
+                except Lost:
+                    self.channel.close()
+                    self.channel = None
+            if self.channel is None:
+                if self.daemon_lost_at is None:
+                    self.daemon_lost_at = time.monotonic()
+                elif time.monotonic() - self.daemon_lost_at >= 5:
+                    self.daemon_lost_at = time.monotonic()
+                    self.reconnect()
+                final = files_final(directory)
+                if final is not None:
+                    self.row = {**self.row, **final}
+                    break
+                time.sleep(0.2)
+            elif message is not None:
+                if message.get("type") == "error":
+                    note(message.get("error", "the daemon refused"))
+                    return 2
+                self.handle(message)
+            elif time.monotonic() - self.last_file_check >= 5:
+                # A final message can be lost (a full disk on the daemon's side, say); the ticket's
+                # own files say when it is over.
+                self.last_file_check = time.monotonic()
+                final = files_final(directory)
+                if final is not None:
+                    self.row = {**self.row, **final}
+                    break
+            self.copy_output()
+            if deadline is not None and time.monotonic() > deadline and self.row["state"] not in FINISHED:
+                note(f"{self.row['short']} is still {self.row['state']}; `buildq wait {self.row['short']}` to keep waiting")
+                return 124
+        self.copy_output()
+        if self.channel is not None:
+            self.channel.close()
+        if self.signals:
+            return reraise(self.signals[0])
+        if not self.quiet:
+            note(summary_line(self.row))
+        exit_code = self.row.get("exit")
+        return exit_code if isinstance(exit_code, int) else 125
+
+
+# --------------------------------------------------------------------------------------------
+# Commands
+
+
+def rlimits() -> dict:
+    import resource
+    out = {}
+    for name in ("NOFILE", "STACK", "CORE"):
+        try:
+            out[name] = resource.getrlimit(getattr(resource, f"RLIMIT_{name}"))[0]
+        except (ValueError, OSError, AttributeError):
+            pass
+    return out
+
+
+def current_umask() -> int:
+    mask = os.umask(0o022)
+    os.umask(mask)
+    return mask
+
+
+def submit_message(args, command: list[str], watch: bool, submission: str) -> dict:
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = os.environ.get("PWD") or "/"
+    # The submission id lets the daemon recognise this build if it has to be sent again.
+    return {"op": "submit", "submission": submission, "argv": command, "cwd": cwd, "env": dict(os.environ),
+            "lane": args.lane, "attach": watch, "rlimits": rlimits(), "umask": current_umask(),
+            "cores": args.cores, "mem": args.mem, "priority": args.priority, "timeout": args.timeout,
+            "name": args.name, "notify": args.notify, "watch": watch}
+
+
+def the_command(args) -> list[str] | None:
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    if not command:
+        note(f"no command given. Usage: buildq {args.cmd} [OPTIONS] [--] COMMAND [ARGS...]")
+        return None
+    return command
+
+
+def fallback(command: list[str], lane: str | None, why: str) -> int | None:
+    """What to do when the daemon can't be reached. None means: wait for it and try again."""
+    choice = os.environ.get("BUILDQ_FALLBACK", "").strip()
+    if not choice:
+        return None
+    if choice == "fail":
+        note(f"{why}; not running the command (BUILDQ_FALLBACK=fail).")
+        return 75
+    os.environ["BUILDQ_LANE"] = lane or ""
+    os.environ["BUILDQ_FALLBACK_ACTIVE"] = "1"  # a nested buildq run inside it runs directly
+    argv = command if choice == "run" else shlex.split(choice) + command
+    note(f"{why}; running the command " + ("now, unqueued." if choice == "run" else f"through `{choice}` instead."))
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as e:
+        note(f"can't run {argv[0]}: {e}")
+        return 127
+
+
+def inside_a_build() -> bool:
+    """Whether this process is inside a build that already holds a turn."""
+    if os.environ.get("BUILDQ_FALLBACK_ACTIVE"):
+        return True
+    job = os.environ.get("BUILDQ_JOB", "")
+    if not job or "/" in job or job.startswith("."):
+        return False
+    try:
+        with open("/proc/self/cgroup") as f:
+            if f"/buildq-{job}.service" in f.read():
+                return True
+    except OSError:
+        pass
+    try:  # the direct runner has no cgroup to show it: its ticket says instead
+        with open(os.path.join(state_dir(), "tickets", job, "ticket.json")) as f:
+            record = json.load(f)
+        return record.get("runner") == "direct" and record.get("state") in ("starting", "running")
+    except (OSError, ValueError):
+        return False
+
+
+def cmd_submit(args) -> int:
+    command = the_command(args)
+    if command is None:
+        return 2
+    if inside_a_build():
+        note("this is inside a build already, which holds a turn: run the command directly. "
+             "(A build it waited for could wait for this one's workspace for ever.)")
+        return 2
+    channel = connect(10)
+    if channel is None:
+        note("nothing was queued.")
+        return unreachable()
+    try:
+        channel.send(submit_message(args, command, watch=False, submission=str(uuid.uuid4())))
+        reply = channel.recv(30)
+    except Lost as e:
+        note(f"lost the daemon while submitting ({e}); check `buildq list` before submitting again")
+        return 75
+    finally:
+        channel.close()
+    if reply.get("type") != "ticket":
+        note(reply.get("error", "the daemon refused the build"))
+        return 2
+    print(reply["id"])
+    detail = f": {reply['reason']}" if reply["state"] == "queued" and reply.get("reason") else ""
+    note(f"ticket {reply['id']} [{reply['lane']}] {state_text(reply)}{detail}")
+    return 0
+
+
+def cmd_run(args) -> int:
+    command = the_command(args)
+    if command is None:
+        return 2
+    if inside_a_build():
+        try:
+            os.execvp(command[0], command)  # already inside a build's turn
+        except OSError as e:
+            note(f"can't run {command[0]}: {e}")
+            return 127
+    # Interrupts are caught from here on, so one that comes while the build is being submitted
+    # still cancels it once its ticket is known.
+    pending: list[int] = []
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: pending.append(signum))
+    submission = str(uuid.uuid4())
+    sent = False  # once the daemon may have the build, it must not also run some other way
+    waiting_since, last_note = None, 0.0
+    while True:
+        if pending:
+            return reraise(pending[0])
+        channel = connect(10)
+        if channel is not None:
+            try:
+                sent = True
+                channel.send(submit_message(args, command, watch=True, submission=submission))
+                reply = channel.recv(30)
+                break
+            except Lost as e:
+                channel.close()
+                why = f"lost the queue daemon while submitting ({e}); sending it again"
+        else:
+            why = f"the queue daemon isn't answering at {socket_path()}"
+        if not sent:
+            code = fallback(command, args.lane, why)
+            if code is not None:
+                return code
+        now = time.monotonic()
+        waiting_since = waiting_since or now
+        if now - last_note >= 60:
+            note(f"{why}; waiting for it ({fmt_age(now - waiting_since)} so far; "
+                 "systemctl --user status buildq)")
+            last_note = now
+        for _ in range(25):
+            if pending:
+                break
+            time.sleep(0.2)
+    if reply.get("type") != "ticket":
+        channel.close()
+        note(reply.get("error", "the daemon refused the build"))
+        return 2
+    note(f"ticket {reply['id']} [{reply['lane']}]; Ctrl-C cancels it, "
+         f"`buildq status {reply['short']}` shows it from anywhere.")
+    follower = Follower(reply, channel, stream=True, cancel_on_signal=True)
+    follower.split = True  # the build's stdout to stdout, its stderr to stderr
+    follower.signals = pending  # an interrupt that already came cancels it straight away
+    return follower.run()
+
+
+def open_watch(ref: str) -> tuple[Channel | None, dict | None, int | None]:
+    channel = connect(10)
+    if channel is None:
+        directory = local_ticket_dir(ref)
+        final = files_final(directory)
+        if final is None:
+            return None, None, unreachable()
+        return None, {**final, "dir": directory, "log": os.path.join(directory, "output.log"),
+                      "label": "", "lane": "", "name": None}, None
+    try:
+        channel.send({"op": "watch", "ticket": ref})
+        reply = channel.recv(15)
+    except Lost as e:
+        channel.close()
+        note(f"lost the daemon ({e})")
+        return None, None, 75
+    if reply.get("type") != "ticket":
+        channel.close()
+        note(reply.get("error", "unknown ticket"))
+        return None, None, 1
+    return channel, reply, None
+
+
+def cmd_wait(args) -> int:
+    channel, row, failed = open_watch(args.ticket)
+    if failed is not None:
+        return failed
+    return Follower(row, channel, stream=False, cancel_on_signal=False, quiet=args.quiet).run(args.timeout)
+
+
+def cmd_logs(args) -> int:
+    if args.follow:
+        channel, row, failed = open_watch(args.ticket)
+        if failed is not None:
+            return failed
+        follower = Follower(row, channel, stream=True, cancel_on_signal=False, quiet=True)
+        if args.tail is not None:
+            follower.offset = tail_offset(row["log"], args.tail)
+        code = follower.run()
+        return 0 if code < 124 or code > 125 else code
+    reply = request({"op": "status", "tickets": [args.ticket]})
+    if reply is None:
+        directory = local_ticket_dir(args.ticket)
+        path = os.path.join(directory, "output.log") if directory else None
+    elif reply.get("errors"):
+        note(reply["errors"][0])
+        return 1
+    else:
+        path = reply["tickets"][0]["log"]
+    if not path or not os.path.exists(path):
+        note("no output yet" if path else "no such ticket")
+        return 0 if path else 1
+    start = tail_offset(path, args.tail) if args.tail is not None else 0
+    with open(path, "rb") as f:
+        f.seek(start)
+        while chunk := f.read(1 << 20):
+            sys.stdout.buffer.write(chunk)
+    return 0
+
+
+def tail_offset(path: str, lines: int) -> int:
+    """The offset where the last `lines` lines of the file begin."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            block, data, offset = 1 << 16, b"", size
+            while offset > 0 and data.count(b"\n") <= lines:
+                offset = max(0, offset - block)
+                f.seek(offset)
+                data = f.read(size - offset)
+            if data.count(b"\n") <= lines:
+                return offset
+            cut = len(data)
+            for _ in range(lines + 1):
+                cut = data.rfind(b"\n", 0, cut)
+            return offset + cut + 1
+    except OSError:
+        return 0
+
+
+def cmd_cancel(args) -> int:
+    status = 0
+    for ref in args.tickets:
+        reply = request({"op": "cancel", "ticket": ref})
+        if reply is None:
+            return unreachable()
+        if reply.get("type") != "ticket":
+            note(reply.get("error", f"couldn't cancel {ref}"))
+            status = 1
+            continue
+        verb = "cancelled" if reply["state"] in FINISHED else "stopping"
+        print(f"{verb} {reply['id']}: {title(reply)}")
+    return status
+
+
+def cmd_status(args) -> int:
+    if args.tickets:
+        reply = request({"op": "status", "tickets": args.tickets})
+        if reply is None:
+            return unreachable()
+        for error in reply.get("errors") or []:
+            note(error)
+        if args.json:
+            print(json.dumps(reply["tickets"], indent=2))
+        else:
+            for i, row in enumerate(reply["tickets"]):
+                if i:
+                    print()
+                print_ticket(row)
+        return 1 if reply.get("errors") else 0
+    reply = request({"op": "status"})
+    if reply is None or reply.get("type") != "status":
+        return unreachable()
+    reply.pop("type", None)
+    if args.json:
+        print(json.dumps(reply, indent=2))
+    else:
+        print_overview(reply)
+    return 0
+
+
+def cmd_list(args) -> int:
+    reply = request({"op": "list", "all": args.all})
+    if reply is None:
+        return unreachable()
+    if args.json:
+        print(json.dumps(reply["tickets"], indent=2))
+    else:
+        print_list(reply["tickets"], time.time())
+    return 0
+
+
+def cmd_ping(_args) -> int:
+    reply = request({"op": "ping"})
+    if reply is None or reply.get("type") != "pong":
+        return unreachable()
+    print(f"buildqd {reply.get('version')} ({reply.get('runner')} runner) is answering at {socket_path()}")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="buildq", description="Drop off builds, get tickets, check on them.")
+    parser.add_argument("--version", action="version", version=f"buildq {VERSION}")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def build_options(p):
+        p.add_argument("--lane", help="the kind of build, from the daemon's configuration")
+        p.add_argument("--cores", type=float, help="use this many cores, in place of the learned size")
+        p.add_argument("--mem", help="expect at least this peak memory (for example 6G); raises, never lowers")
+        p.add_argument("--priority", type=int, default=0, help="higher runs first (default 0)")
+        p.add_argument("--timeout", type=parse_duration, help="stop the build after this long (for example 45m)")
+        p.add_argument("--name", help="a name to show in place of the command")
+        p.add_argument("--notify", metavar="COMMAND", help="a shell command to run when the build finishes")
+        p.add_argument("command", nargs=argparse.REMAINDER, help="the command and its arguments")
+
+    build_options(sub.add_parser("submit", help="queue a build; prints its ticket"))
+    build_options(sub.add_parser("run", help="queue a build, stream its output, exit with its exit code"))
+    status = sub.add_parser("status", help="a ticket in detail, or the queue and the machine")
+    status.add_argument("tickets", nargs="*")
+    status.add_argument("--json", action="store_true")
+    listing = sub.add_parser("list", help="every ticket")
+    listing.add_argument("--all", action="store_true", help="include builds that finished more than a day ago")
+    listing.add_argument("--json", action="store_true")
+    wait = sub.add_parser("wait", help="block until a build finishes; exits with its exit code")
+    wait.add_argument("ticket")
+    wait.add_argument("--timeout", type=parse_duration, help="give up after this long (exit 124)")
+    wait.add_argument("--quiet", action="store_true", help="print nothing; just exit with the code")
+    logs = sub.add_parser("logs", help="a build's output")
+    logs.add_argument("ticket")
+    logs.add_argument("--follow", "-f", action="store_true", help="keep printing until the build finishes")
+    logs.add_argument("--tail", "-n", type=int, help="start with the last N lines")
+    cancel = sub.add_parser("cancel", help="take builds out of the queue, or stop them")
+    cancel.add_argument("tickets", nargs="+")
+    sub.add_parser("ping", help="check that the daemon answers")
+    args = parser.parse_args(argv)
+    handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
+                "logs": cmd_logs, "cancel": cmd_cancel, "ping": cmd_ping}
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

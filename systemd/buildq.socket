@@ -1,0 +1,10 @@
+[Unit]
+Description=buildq build queue (socket)
+Documentation=https://github.com/nosliwsirhc/buildq
+
+[Socket]
+ListenStream=%t/buildq.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

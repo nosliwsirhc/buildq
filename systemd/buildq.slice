@@ -1,0 +1,14 @@
+[Unit]
+Description=Jobs run through buildq
+Documentation=https://github.com/nosliwsirhc/buildq
+
+[Slice]
+# Every buildq build runs as a service inside this slice. Together they get one CPU and IO weight,
+# so under contention all builds share roughly what one other top-level slice of the session
+# gets, instead of one share per build.
+CPUWeight=100
+IOWeight=100
+# A backstop for the total memory of all jobs together. Size it for your machine, for example
+# in a drop-in (systemctl --user edit buildq.slice):
+#MemoryHigh=70%
+#MemoryMax=80%

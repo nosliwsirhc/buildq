@@ -1,0 +1,25 @@
+[Unit]
+Description=buildq build queue daemon
+Documentation=https://github.com/nosliwsirhc/buildq
+Requires=buildq.socket
+After=buildq.socket
+# Restart however often it takes: builds that can't reach the queue wait for it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/buildqd
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=1
+# Stopping the daemon stops only the daemon. Builds run in services of their own (or, with the
+# direct runner, in sessions of their own) and carry on; the next daemon picks them up.
+KillMode=process
+# The daemon is small; keep it answering on a saturated machine.
+CPUWeight=1000
+MemoryMax=512M
+# Room for a descriptor per build and per client, so a busy queue never misreads a build as gone.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

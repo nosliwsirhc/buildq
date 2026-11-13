@@ -1,0 +1,121 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# buildq-rustc-guard: refuse to compile Rust outside buildq.
+#
+# Make it cargo's rustc wrapper (`./install.sh --rustc-guard=DIR` does this):
+#
+#   # DIR/.cargo/config.toml (applies to cargo run anywhere under DIR)
+#   [build]
+#   rustc-wrapper = "/home/you/.local/bin/buildq-rustc-guard"
+#
+# Cargo then runs every rustc through it as `buildq-rustc-guard <rustc> ARGS...`. It lets the
+# compile go ahead when any of these is true, and otherwise stops it with a message saying how to
+# run the build:
+#
+#   - the process is inside a buildq build: its cgroup is in buildq.slice (the kernel sets that,
+#     so an environment variable can't fake it), or, for a build of the direct runner, BUILDQ_JOB
+#     names a ticket that is running under that runner;
+#   - it isn't a compile: cargo asking rustc for its version or target information;
+#   - it is a GitHub Actions job (GITHUB_ACTIONS and RUNNER_NAME set; CI=true alone isn't enough,
+#     since people set it to turn watch modes off), or buildq's own fallback (BUILDQ_FALLBACK_ACTIVE);
+#   - it descends from rust-analyzer (editors keep checking code).
+#
+# ~/.config/buildq/guard.env can add to that, in NAME="value" lines (it is read, not run):
+#   ALLOW_ENV="VAR1 VAR2"      more variables whose presence lets a compile through
+#   ALLOW_PARENTS="name ..."   more parent process names
+#   SLICE="other.slice"        the slice builds run in, if not buildq.slice
+#
+# This is a guardrail for well-meaning agents and scripts, not a security boundary: anyone can
+# point RUSTC_WRAPPER elsewhere.
+
+rustc=$1
+shift
+
+pass() { exec "$rustc" "$@"; }
+
+# Inside a buildq build: the common case, so it is checked first and costs one read.
+cgroup=$(cat /proc/self/cgroup 2>/dev/null)
+case $cgroup in
+  */buildq.slice/*) pass "$@" ;;
+esac
+
+# Not a compile: version and target queries.
+compiling=no
+for arg in "$@"; do
+  case $arg in
+    --print|--print=*|-vV|-V|--version) pass "$@" ;;
+    --crate-name) compiling=yes ;;
+  esac
+done
+[ "$compiling" = no ] && pass "$@"
+
+[ -n "${GITHUB_ACTIONS:-}" ] && [ -n "${RUNNER_NAME:-}" ] && pass "$@"
+[ -n "${BUILDQ_FALLBACK_ACTIVE:-}" ] && pass "$@"
+
+# Extra settings, read line by line; a mistake in the file can't stop the checks above.
+allow_env= allow_parents=rust-analyzer slice=
+config=${XDG_CONFIG_HOME:-$HOME/.config}/buildq/guard.env
+if [ -r "$config" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      ALLOW_ENV=*) value=${line#ALLOW_ENV=} ;;
+      ALLOW_PARENTS=*) value=${line#ALLOW_PARENTS=} ;;
+      SLICE=*) value=${line#SLICE=} ;;
+      *) continue ;;
+    esac
+    value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
+    case $line in
+      ALLOW_ENV=*) allow_env="$allow_env $value" ;;
+      ALLOW_PARENTS=*) allow_parents="$allow_parents $value" ;;
+      SLICE=*) slice=$value ;;
+    esac
+  done < "$config"
+fi
+if [ -n "$slice" ]; then
+  case $cgroup in
+    */"$slice"/*) pass "$@" ;;
+  esac
+fi
+
+# A build of the direct runner has no cgroup to show it; its ticket says it is running.
+if [ -n "${BUILDQ_JOB:-}" ]; then
+  state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
+  case $BUILDQ_JOB in
+    */*|.*) ;;
+    *) ticket=$state_dir/tickets/$BUILDQ_JOB/ticket.json
+       if grep -q '"state":"running"' "$ticket" 2>/dev/null && grep -q '"runner":"direct"' "$ticket" 2>/dev/null; then
+         pass "$@"
+       fi ;;
+  esac
+fi
+
+for name in $allow_env; do
+  case $name in *[!A-Za-z0-9_]*|"") continue ;; esac
+  eval "value=\${$name:-}"
+  [ -n "$value" ] && pass "$@"
+done
+
+pid=$PPID
+depth=0
+while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 40 ]; do
+  comm=$(cat "/proc/$pid/comm" 2>/dev/null) || break
+  for name in $allow_parents; do
+    [ "$comm" = "$name" ] && pass "$@"
+  done
+  pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+  depth=$((depth + 1))
+done
+
+crate=unknown
+previous=
+for arg in "$@"; do
+  [ "$previous" = --crate-name ] && crate=$arg
+  previous=$arg
+done
+cat >&2 <<EOF
+buildq: refusing to compile $crate outside the build queue on this machine.
+Run the cargo command through buildq, which waits for room and then runs it:
+    buildq run -- cargo ...
+(or the wrapper this machine's agents use). See buildq-rustc-guard for what it allows.
+EOF
+exit 1
