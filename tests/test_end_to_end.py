@@ -197,6 +197,68 @@ class EndToEnd(Harness):
         self.assertEqual((rows[0]["state"], rows[0]["exit"]), ("failed", 3))
         self.assertIn(ticket[:8], self.q("list").stdout)
 
+    def git_repo(self):
+        """Make the working directory a repository with one commit, so builds record their source."""
+        git = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "init.defaultBranch=main"]
+        subprocess.run([*git, "init", "-q"], cwd=self.work, check=True)
+        with open(os.path.join(self.work, "a.txt"), "w") as f:
+            f.write("one\n")
+        subprocess.run([*git, "add", "a.txt"], cwd=self.work, check=True)
+        subprocess.run([*git, "commit", "-qm", "one"], cwd=self.work, check=True)
+
+    def test_the_same_build_of_the_same_source_runs_once(self):
+        self.git_repo()
+        first = self.submit("--", "sh", "-c", "sleep 2; echo done")
+        joined = self.q("submit", "--", "sh", "-c", "sleep 2; echo done")
+        self.assertEqual(joined.stdout.strip(), first, joined.stderr)
+        self.assertIn("already", joined.stderr)
+        detail = self.q("status", first[:8]).stdout
+        self.assertIn("source    commit", detail)
+        with open(os.path.join(self.work, "a.txt"), "w") as f:
+            f.write("two\n")  # an uncommitted change: different source, a build of its own
+        changed = self.submit("--", "sh", "-c", "sleep 2; echo done")
+        self.assertNotEqual(changed, first)
+        self.assertIn("+ uncommitted changes", self.q("status", changed[:8]).stdout)
+        self.assertEqual(self.q("wait", first).returncode, 0)
+        ran = self.q("run", "--reuse", "--", "sh", "-c", "sleep 2; echo done")
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertNotIn("passed this command", ran.stderr)  # the source changed since: it ran
+        mine = re.search(r"ticket ([0-9a-f-]{36})", ran.stderr).group(1)
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.daemon.ticket(mine).get("source_verified"):
+            time.sleep(0.1)  # its tree is checked again as it ends
+        self.assertTrue(self.daemon.ticket(mine).get("source_verified"), self.daemon.log())
+        again = self.q("run", "--reuse", "--", "sh", "-c", "sleep 2; echo done")
+        self.assertIn("passed this command", again.stderr)
+        self.assertEqual(again.stdout, "done\n")  # the earlier run's output, at once
+
+    def test_pause_and_resume(self):
+        self.assertEqual(self.q("pause", "maintenance").returncode, 0)
+        ticket = self.submit("--", "true")
+        self.assertIn("PAUSED", self.q("status").stdout)
+        self.assertIn("maintenance", self.daemon.ticket(ticket)["reason"])
+        self.assertEqual(self.q("resume").returncode, 0)
+        self.assertEqual(self.q("wait", ticket, "--timeout", "30s").returncode, 0)
+
+    def test_a_failed_wait_shows_the_end_of_the_output(self):
+        ticket = self.submit("--", "sh", "-c", "echo first; echo the-error >&2; exit 2")
+        waited = self.q("wait", ticket)
+        self.assertEqual(waited.returncode, 2)
+        self.assertIn("the last 20 lines", waited.stderr)
+        self.assertIn("the-error", waited.stderr)
+
+    def test_report_and_help(self):
+        for _ in range(2):
+            self.assertEqual(self.q("run", "--", "sh", "-c", "exit 0").returncode, 0)
+        report = self.q("report")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertIn("RUNS", report.stdout)
+        rows = json.loads(self.q("report", "--json").stdout)
+        self.assertEqual(sum(r["runs"] for r in rows), 2)
+        helped = self.q("help", "agents")
+        self.assertEqual(helped.returncode, 0, helped.stderr)
+        self.assertIn("name: buildq", helped.stdout)
+
     def test_a_build_that_can_never_fit_is_said_to_be_cancelled(self):
         submitted = self.q("submit", "--mem", "100T", "--", "true")
         self.assertIn("can't fit on this machine as it is: cancel it", submitted.stderr)
@@ -232,13 +294,14 @@ class EndToEnd(Harness):
         self.close(first), self.close(second)
 
     def test_a_fast_lane_goes_first_and_has_its_own_turn(self):
-        slow = self.submit("sleep", "3")
+        slow = self.submit("sleep", "8")  # long enough that the fast one is done first on a busy machine
         self.wait_for(slow, ("running",))
         queued_slow = self.submit("sleep", "1")
         fast = self.submit("echo-fast", "quick")  # its lane rule picks the fast lane
         row = self.wait_for(fast, ("succeeded",), timeout=10)  # beside the running build, past the queued one
         self.assertEqual(row["lane"], "fast")
-        self.assertEqual(self.daemon.ticket(queued_slow)["state"], "queued")
+        waiting = self.daemon.ticket(queued_slow)  # (on a busy machine it may have started since: not before)
+        self.assertTrue(waiting["state"] == "queued" or waiting["started"] >= row["ended"], waiting)
 
     def test_interrupting_run_cancels_the_build(self):
         client = self.q_background("run", "sleep", "30")

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ def load(name):
 
 
 buildqd = load("buildqd")
-buildqd.log = lambda message: None  # keep test output readable
+buildqd.log = lambda message, level=None: None  # keep test output readable
 GIB = buildqd.GIB
 
 
@@ -47,10 +48,17 @@ class FakeMachine:
 
 class FakeRunner:
     name = "systemd"  # so lane caps count as enforced, as they are in production
+    can_freeze = True
 
     def __init__(self):
         self.running = set()
         self.stopped = []
+        self.forced = []
+        self.frozen = []
+
+    def freeze(self, ticket, frozen):
+        self.frozen.append((ticket.id, frozen))
+        return None
 
     def launch(self, ticket, lane, slice_name):
         self.running.add(ticket.id)
@@ -73,6 +81,8 @@ class FakeRunner:
 
     def stop(self, ticket, force=False):
         self.stopped.append(ticket.id)
+        if force:
+            self.forced.append(ticket.id)
         return None
 
     @staticmethod
@@ -104,6 +114,10 @@ exclusive = false
 """
 
 
+
+SOURCE = {"repo": "/src/project", "commit": "a" * 40, "fingerprint": "b" * 32, "dirty": False, "remote": "owner/project"}
+
+
 class DaemonCase(unittest.TestCase):
     config = BASE_CONFIG
 
@@ -116,8 +130,26 @@ class DaemonCase(unittest.TestCase):
         self.runner = FakeRunner()
         self.state = os.path.join(self.tmp.name, "state")
         self.daemon = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        self.seen_source = dict(SOURCE)  # what `buildq source` finds when the daemon checks a build's tree
+        self.daemon.source_command = [sys.executable, "-c",
+                                      "import sys; print(open(sys.argv[1]).read())", self.source_file(), "--"]
         self.now = time.time()
         self.dirs = 0
+
+    def source_file(self):
+        path = os.path.join(self.tmp.name, "seen-source.json")
+        with open(path, "w") as f:
+            json.dump(self.seen_source, f)
+        return path
+
+    def settle(self):
+        """Let the daemon's source checks finish and be read."""
+        for _ in range(100):
+            for proc, *_ in list(self.daemon.source_checks):
+                proc.wait(10)
+            self.daemon.collect_source_checks(self.now)
+            if not self.daemon.source_checks:
+                return
 
     def tearDown(self):
         self.daemon.stop_memory_watch()
@@ -310,6 +342,946 @@ class QuickLanesDontWaitForCpu(DaemonCase):
         self.assertEqual((web.state, web.granted), ("running", 1))
         self.daemon.rebalance(self.now + 1)
         self.assertEqual(heavy.granted, 15)
+
+
+buildq = load("buildq")
+
+
+class SourceRecords(unittest.TestCase):
+    """The client's fingerprint, on real repositories."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(self.repo)
+        self.git("init", "-q")
+        with open(os.path.join(self.repo, "a.txt"), "w") as f:
+            f.write("one\n")
+        self.git("add", "a.txt")
+        self.git("commit", "-qm", "one")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args, where=None):
+        subprocess.run(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "init.defaultBranch=main",
+                        "-C", where or self.repo, *args], check=True, capture_output=True)
+
+    def test_a_record_changes_with_the_tree_and_only_with_it(self):
+        clean = buildq.source_of(self.repo)
+        self.assertEqual((clean["dirty"], buildq.source_of(self.repo)), (False, clean))
+        with open(os.path.join(self.repo, "new.txt"), "w") as f:
+            f.write("x")
+        dirty = buildq.source_of(self.repo)
+        self.assertTrue(dirty["dirty"])
+        self.assertNotEqual(dirty["fingerprint"], clean["fingerprint"])
+        os.chmod(os.path.join(self.repo, "new.txt"), 0o755)  # same size and time, another mode
+        self.assertNotEqual(buildq.source_of(self.repo)["fingerprint"], dirty["fingerprint"])
+
+    def test_no_record_where_git_would_run_a_filter_or_hide_changes(self):
+        with open(os.path.join(self.repo, ".gitattributes"), "w") as f:
+            f.write("*.bin filter=lfs\n")  # untracked still: git applies it all the same
+        self.assertIsNone(buildq.source_of(self.repo))
+        os.remove(os.path.join(self.repo, ".gitattributes"))
+        self.git("update-index", "--skip-worktree", "a.txt")
+        self.assertIsNone(buildq.source_of(self.repo))
+        self.git("update-index", "--no-skip-worktree", "a.txt")
+        self.assertIsNotNone(buildq.source_of(self.repo))
+
+    def test_no_record_with_a_repository_inside(self):
+        nested = os.path.join(self.repo, "nested")
+        os.makedirs(nested)
+        self.git("init", "-q", where=nested)
+        with open(os.path.join(nested, "b.txt"), "w") as f:
+            f.write("b")
+        self.git("add", "b.txt", where=nested)
+        self.git("commit", "-qm", "b", where=nested)
+        self.assertIsNone(buildq.source_of(self.repo))
+        with open(os.path.join(self.repo, ".git", "info", "exclude"), "a") as f:
+            f.write("nested/\n")  # ignored, it is no longer part of the tree's source
+        self.assertIsNotNone(buildq.source_of(self.repo))
+
+    def test_a_deleted_tracked_attributes_file_means_no_record(self):
+        with open(os.path.join(self.repo, ".gitattributes"), "w") as f:
+            f.write("*.txt text\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "attributes")
+        self.assertIsNotNone(buildq.source_of(self.repo))
+        os.remove(os.path.join(self.repo, ".gitattributes"))  # git falls back to the index's copy
+        self.assertIsNone(buildq.source_of(self.repo))
+
+    def test_a_symlinked_attributes_file_means_no_record(self):
+        with open(os.path.join(self.repo, ".gitattributes"), "w") as f:
+            f.write("*.txt text\n")
+        self.git("add", ".gitattributes")
+        self.git("commit", "-qm", "attributes")
+        os.remove(os.path.join(self.repo, ".gitattributes"))
+        with open(os.path.join(self.tmp.name, "harmless"), "w") as f:
+            f.write("")
+        os.symlink(os.path.join(self.tmp.name, "harmless"), os.path.join(self.repo, ".gitattributes"))
+        self.assertIsNone(buildq.source_of(self.repo))  # git reads the index's copy, not the link
+
+    def test_a_relative_attributes_file_is_read_from_the_top(self):
+        os.makedirs(os.path.join(self.repo, "src"))
+        with open(os.path.join(self.repo, "src", "x.txt"), "w") as f:
+            f.write("x")
+        self.git("add", "src/x.txt")
+        self.git("commit", "-qm", "src")
+        with open(os.path.join(self.repo, ".git", "local-attributes"), "w") as f:
+            f.write("*.txt filter=clean-it\n")
+        self.git("config", "core.attributesFile", ".git/local-attributes")
+        self.assertIsNone(buildq.source_of(os.path.join(self.repo, "src")))
+
+    def test_a_submodule_means_no_record(self):
+        other = os.path.join(self.tmp.name, "other")
+        os.makedirs(other)
+        self.git("init", "-q", where=other)
+        with open(os.path.join(other, "b.txt"), "w") as f:
+            f.write("b")
+        self.git("add", "b.txt", where=other)
+        self.git("commit", "-qm", "b", where=other)
+        self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", other, "sub")
+        self.git("commit", "-qm", "sub")
+        self.assertIsNone(buildq.source_of(self.repo))
+
+    def test_an_ignored_attributes_file_still_counts(self):
+        with open(os.path.join(self.repo, ".git", "info", "exclude"), "a") as f:
+            f.write(".gitattributes\n")
+        with open(os.path.join(self.repo, ".gitattributes"), "w") as f:
+            f.write("*.txt filter=clean-it\n")
+        self.assertIsNone(buildq.source_of(self.repo))
+
+    def test_an_attributes_file_that_is_a_pipe_doesnt_hang_it(self):
+        os.mkfifo(os.path.join(self.repo, ".gitattributes"))
+        started = time.monotonic()
+        self.assertIsNone(buildq.source_of(self.repo))  # not knowing what it says means no record
+        self.assertLess(time.monotonic() - started, 4)
+
+    def test_a_pipe_doesnt_hang_it(self):
+        os.mkfifo(os.path.join(self.repo, "pipe"))
+        started = time.monotonic()
+        self.assertIsNotNone(buildq.source_of(self.repo))
+        self.assertLess(time.monotonic() - started, 4)
+
+
+class Pausing(DaemonCase):
+    def test_a_paused_queue_starts_nothing_and_stays_paused_across_a_restart(self):
+        running = self.submit(cores=2)
+        self.daemon.pause("rebooting at noon", self.now)
+        waiting = self.submit(cores=1)
+        self.assertEqual((running.state, waiting.state, waiting.reason_cat), ("running", "queued", "paused"))
+        self.assertIn("rebooting at noon", waiting.reason)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        self.assertEqual(again.paused["reason"], "rebooting at noon")
+        self.daemon.resume(self.now + 1)
+        self.assertEqual(waiting.state, "running")
+        self.assertFalse(os.path.exists(os.path.join(self.state, "paused.json")))
+
+
+class FairShares(DaemonCase):
+    def test_a_caller_with_fewer_builds_running_goes_first(self):
+        self.daemon.cfg.max_jobs = 2
+        busy = [self.submit(cores=1, caller="agent-a.scope") for _ in range(2)]
+        self.assertEqual([t.state for t in busy], ["running", "running"])
+        quick = self.submit(cores=1, caller="agent-a.scope")
+        slow = self.submit(cores=1, caller="agent-b.scope")
+        self.daemon.history.add({"key": quick.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
+                                 "wall": 10, "exit": 0})
+        self.daemon.schedule(self.now)
+        self.assertEqual(quick.expected, 10)  # quicker, but its caller already has two running
+        self.assertEqual([t.id for t in self.daemon.queue()], [slow.id, quick.id])
+
+
+class FairSharesInterleave(DaemonCase):
+    def test_callers_take_turns_within_one_pass(self):
+        self.daemon.cfg.max_jobs = 0 + 1
+        blocker = self.submit(cores=1, caller="z.scope")
+        burst = [self.submit(cores=1, caller="a.scope") for _ in range(3)]
+        late = self.submit(cores=1, caller="b.scope")
+        order = [t.caller for t in self.daemon.queue(self.now)]
+        self.assertEqual(order[:2], ["a.scope", "b.scope"])  # b doesn't wait behind all of a's burst
+        del blocker, burst, late
+
+
+class SameSource(DaemonCase):
+    def test_the_same_build_on_the_same_source_joins_the_one_running(self):
+        first = self.submit(("cargo", "test"), source=SOURCE)
+        cwd = first.cwd
+        second = self.submit(("cargo", "test"), cwd=cwd, source=SOURCE, notify="echo joined")
+        self.assertIs(second, first)
+        self.assertEqual((self.daemon.submit_outcome, first.joiners, first.extra_notify),
+                         ({"joined": True}, 1, ["echo joined"]))
+        other_env = self.submit(("cargo", "test"), cwd=cwd, source=SOURCE, env={"DATABASE_URL": "elsewhere"})
+        other_tree = self.submit(("cargo", "test"), cwd=cwd, source={**SOURCE, "fingerprint": "c" * 32})
+        other_timeout = self.submit(("cargo", "test"), cwd=cwd, source=SOURCE, timeout=10)
+        forced = self.submit(("cargo", "test"), cwd=cwd, source=SOURCE, again=True)
+        self.assertEqual(len({first.id, other_env.id, other_tree.id, other_timeout.id, forced.id}), 5)
+        unknown = self.submit(("cargo", "test"), cwd=cwd)  # no source recorded: nothing to compare
+        self.assertNotEqual(unknown.id, first.id)
+
+    def follow(self, t, submission):
+        """A `buildq run` following the build, for the submission it made or joined."""
+        class Following:
+            def send(self, message):
+                return True
+        conn = Following()
+        conn.submission = submission
+        self.daemon.watchers[t.id].add(conn)
+
+    def test_a_shared_build_stops_only_when_nobody_waits_for_it(self):
+        run = self.submit(("cargo", "test"), source=SOURCE, attach=True, submission="first")
+        self.submit(("cargo", "test"), cwd=run.cwd, source=SOURCE, attach=True, submission="second")
+        self.follow(run, "first")
+        self.follow(run, "second")
+
+        class Conn:
+            sent = []
+
+            def send(self, message):
+                self.sent.append(message)
+                return True
+        conn = Conn()
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id}, conn, self.now)
+        self.assertIn("is shared", conn.sent[-1]["error"])  # a plain cancel doesn't stop it for everyone
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id, "submission": "second"}, conn, self.now)
+        self.assertTrue(conn.sent[-1]["kept"])
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id, "submission": "second"}, conn, self.now)
+        self.assertTrue(conn.sent[-1]["kept"])  # the same one again: it waits no more, but first still does
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id, "submission": "stranger"}, conn, self.now)
+        self.assertTrue(conn.sent[-1]["kept"])  # not one of its submissions: nothing happens
+        self.assertFalse(run.cancel_requested)
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id, "submission": "first"}, conn, self.now)
+        self.assertTrue(run.cancel_requested)  # the last one went
+
+    def test_a_run_killed_outright_doesnt_make_a_build_look_shared(self):
+        owner = self.submit(("cargo", "test"), source=SOURCE, submission="owner")
+        self.submit(("cargo", "test"), cwd=owner.cwd, source=SOURCE, attach=True, submission="gone")  # never follows
+
+        class Conn:
+            sent = []
+
+            def send(self, message):
+                self.sent.append(message)
+                return True
+        self.daemon.started_at = self.now - 1000
+        self.daemon.handle_message({"op": "cancel", "ticket": owner.id}, Conn(), self.now)
+        self.assertFalse(owner.cancel_requested)  # within unwatched_seconds the run may be reconnecting
+        self.daemon.handle_message({"op": "cancel", "ticket": owner.id}, Conn(), self.now + 100)
+        self.assertTrue(owner.cancel_requested)
+
+    def test_a_run_killed_outright_stops_waiting_after_a_while(self):
+        owner = self.submit(("cargo", "test"), source=SOURCE, submission="owner")
+        self.submit(("cargo", "test"), cwd=owner.cwd, source=SOURCE, attach=True, submission="killed")
+        self.follow(owner, "owner-follower-wait")  # someone else (a `buildq wait`) follows the ticket
+        self.daemon.started_at = self.now - 1000
+        self.daemon.drop_unwatched(self.now + 100)  # the killed run never followed again
+        self.assertEqual(list(owner.interests), ["owner"])
+
+    def test_a_new_joiners_grace_holds_off_the_unwatched_cancel(self):
+        run = self.submit(("cargo", "test"), source=SOURCE, attach=True, submission="first")
+        run.last_watched = self.now  # its client last followed now, and went
+        self.daemon.submit({"argv": ["cargo", "test"], "cwd": run.cwd, "env": {}, "submission": "later",
+                            "source": SOURCE, "attach": True}, self.now + 29)  # joins, then its connection drops
+        self.daemon.started_at = self.now - 1000
+        self.daemon.drop_unwatched(self.now + 31)
+        self.assertFalse(run.cancel_requested)  # the joiner's 30 s aren't up
+        self.daemon.drop_unwatched(self.now + 61)
+        self.assertTrue(run.cancel_requested)
+
+    def test_a_ticket_from_before_this_version_doesnt_break_the_tick(self):
+        t = self.submit(("cargo", "test"), attach=True, submission="old")
+        t.followed = {}  # saved by an earlier version: no follow history
+        t.last_watched = self.now
+        self.daemon.drop_unwatched(self.now + 5)  # no error
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertTrue(t.cancel_requested)  # nobody followed it: cancelled, as before
+
+    def test_a_run_following_again_is_kept_waiting_across_a_restart(self):
+        owner = self.submit(("cargo", "test"), source=SOURCE, submission="owner")
+        self.submit(("cargo", "test"), cwd=owner.cwd, source=SOURCE, attach=True, submission="joiner")
+        del owner.interests["joiner"]  # given up for gone
+
+        class Conn:
+            submission = None
+
+            def send(self, message):
+                return True
+        self.daemon.handle_message({"op": "watch", "ticket": owner.id, "submission": "joiner"}, Conn(), self.now)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again.load_tickets(self.now + 1)
+        self.assertIn("joiner", again.tickets[owner.id].interests)
+        again.stop_memory_watch()
+        for x in again.tickets.values():
+            again.close_jobserver(x)
+
+    def test_a_resent_joined_submission_is_told_it_joined(self):
+        first = self.submit(("cargo", "test"), source=SOURCE, submission="a")
+        self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE, submission="b")
+        self.assertEqual(self.daemon.submit_outcome, {"joined": True})
+        self.daemon.submit({"argv": ["cargo", "test"], "cwd": first.cwd, "env": {}, "submission": "b",
+                            "source": SOURCE}, self.now)
+        self.assertEqual(self.daemon.submit_outcome, {"joined": True})
+
+    def test_the_run_that_made_a_build_others_joined_doesnt_cancel_it(self):
+        run = self.submit(("cargo", "test"), source=SOURCE, attach=True, submission="owner-1")
+        self.submit(("cargo", "test"), cwd=run.cwd, source=SOURCE, attach=True, submission="joiner")
+        self.follow(run, "owner-1")
+        self.follow(run, "joiner")
+
+        class Conn:
+            sent = []
+
+            def send(self, message):
+                self.sent.append(message)
+                return True
+        conn = Conn()
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id, "submission": "owner-1"}, conn, self.now)
+        self.assertTrue(conn.sent[-1].get("kept"))
+        self.assertEqual((run.state, run.cancel_requested), ("running", False))
+        self.daemon.handle_message({"op": "cancel", "ticket": run.id, "all": True}, conn, self.now)
+        self.assertTrue(run.cancel_requested)
+
+    def test_a_dropped_off_submission_that_joins_a_run_keeps_it_alive(self):
+        run = self.submit(("cargo", "test"), source=SOURCE, attach=True)
+        self.assertTrue(run.attached)
+        self.submit(("cargo", "test"), cwd=run.cwd, source=SOURCE)
+        self.assertFalse(run.attached)  # nobody's client owns it now: it isn't cancelled when the run goes
+
+    def test_a_resent_submission_that_joined_gets_the_same_ticket(self):
+        first = self.submit(("sh", "push.sh"), source=SOURCE)
+        joined = self.submit(("sh", "push.sh"), cwd=first.cwd, source=SOURCE, submission="resend-me")
+        self.assertIs(joined, first)
+        self.finish(first, 0)
+        self.settle()
+        again = self.submit(("sh", "push.sh"), cwd=first.cwd, source=SOURCE, submission="resend-me")
+        self.assertIs(again, first)  # not a second push
+
+    def test_a_passed_check_answers_the_same_one_again(self):
+        first = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(first, 0)
+        self.settle()
+        self.assertTrue(first.source_verified)
+        again = self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE)
+        self.assertIs(again, first)
+        self.assertEqual(self.daemon.submit_outcome, {"reused": True})
+        forced = self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE, again=True)
+        self.assertIsNot(forced, first)
+
+    def test_a_check_of_a_stopped_attempt_says_nothing_of_the_next(self):
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.assertEqual(len(self.daemon.source_checks), 1)  # attempt 0's start check, still running
+        t.requeues = 1  # it was stopped and queued again meanwhile
+        t.source_checks = {}
+        self.settle()
+        self.assertEqual(t.source_checks, {})
+
+    def test_a_build_whose_tree_changed_while_it_ran_answers_nothing(self):
+        first = self.submit(("cargo", "test"), source=SOURCE)
+        self.settle()  # the start check matched
+        self.seen_source = {**SOURCE, "fingerprint": "d" * 32}  # someone edited the tree meanwhile
+        self.daemon.source_command[3] = self.source_file()
+        self.finish(first, 0)
+        self.settle()
+        self.assertEqual((first.source_verified, first.source_changed), (False, True))
+        again = self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE)
+        self.assertIsNot(again, first)
+
+    def test_a_build_that_makes_files_or_a_script_runs_again(self):
+        for argv in (("cargo", "build"), ("sh", "run-tests.sh"), ("pnpm", "test")):
+            first = self.submit(argv, source=SOURCE)
+            self.finish(first, 0)
+            self.settle()
+            again = self.submit(argv, cwd=first.cwd, source=SOURCE)
+            self.assertIsNot(again, first, argv)
+            self.assertEqual(self.daemon.submit_outcome["passed_before"]["id"], first.id)
+            self.finish(again, 0)
+            self.settle()
+            taken = self.submit(argv, cwd=first.cwd, source=SOURCE, reuse=True)
+            self.assertIn(taken.id, (first.id, again.id), argv)
+
+    def test_a_command_that_reaches_outside_the_tree_matches_nothing(self):
+        argv = ("cargo", "test", "--manifest-path", "../other/Cargo.toml")
+        first = self.submit(argv, source={**SOURCE, "repo": self.workdir("repo")}, cwd=self.workdir("repo"))
+        self.assertIsNone(first.dedupe)
+        self.assertTrue(buildqd.paths_inside(["cargo", "test", "--manifest-path=sub/Cargo.toml"], "/r", "/r"))
+        self.assertFalse(buildqd.paths_inside(["cargo", "test", "--manifest-path=/elsewhere/Cargo.toml"], "/r", "/r"))
+        repo = self.workdir("linked")
+        os.symlink(self.tmp.name, os.path.join(repo, "external"))  # a one-word path that leads outside
+        self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "-p", "external"], repo, repo))
+        self.assertTrue(buildqd.paths_inside(["cargo", "test", "test_name"], repo, repo))
+
+    def test_a_failure_or_an_old_pass_is_never_reused(self):
+        failed = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(failed, 101)
+        self.settle()
+        retry = self.submit(("cargo", "test"), cwd=failed.cwd, source=SOURCE)
+        self.assertIsNot(retry, failed)
+        self.finish(retry, 0)
+        self.settle()
+        retry.ended = self.now - 3 * 3600  # longer ago than the 2h reuse_window
+        later = self.submit(("cargo", "test"), cwd=failed.cwd, source=SOURCE)
+        self.assertIsNot(later, retry)
+
+    def test_the_ticket_says_what_it_built_and_who_asked(self):
+        t = self.submit(("cargo", "test"), source={**SOURCE, "dirty": True}, caller="t3code-claude-1.scope")
+        row = t.row(self.now)
+        self.assertEqual((row["source"]["commit"], row["source"]["dirty"], row["caller"]),
+                         ("a" * 40, True, "t3code-claude-1.scope"))
+        self.assertIsNone(buildqd.sane_source({**SOURCE, "commit": "not-a-sha"}))
+
+    def test_which_commands_are_checks_and_which_start_over_safely(self):
+        checks = [("cargo", "test", "-p", "api"), ("cargo", "+nightly", "check"), ("cargo", "nextest", "run"),
+                  ("cargo", "clippy", "--", "-Dwarnings"), ("npx", "tsc", "--noEmit"), ("vitest", "run"),
+                  ("eslint", "."), ("dotnet", "test")]
+        not_checks = [("cargo", "build"), ("cargo", "doc"), ("cargo", "run"), ("cargo", "clippy", "--fix"),
+                      ("cargo", "test", "--no-run"), ("tsc",), ("tsc", "-w", "--noEmit"), ("vitest", "run", "-u"),
+                      ("vitest",), ("eslint", "--fix", "."), ("dotnet", "build"), ("pnpm", "test"),
+                      ("tsc", "--noEmit", "false"), ("eslint", "-o", "report.json", "."),
+                      ("vitest", "run", "--coverage"), ("vitest", "run", "--outputFile=junit.xml"),
+                      ("dotnet", "test", "--logger", "trx"), ("dotnet", "test", "-l", "trx"),
+                      ("vitest", "run", "--reporter", "html"), ("dotnet", "test", "--logger:trx"),
+                      ("vitest", "run", "--coverage.enabled"),
+                      ("pnpm", "run", "build:deploy"), ("sh", "run-tests.sh"), ("git", "push"), ("make", "test")]
+        for argv in checks:
+            self.assertTrue(buildqd.reusable_check(list(argv)), argv)
+        for argv in not_checks:
+            self.assertFalse(buildqd.reusable_check(list(argv)), argv)
+        for argv in (("cargo", "build"), ("cargo", "test"), ("dotnet", "build"), ("tsc",), ("ninja",),
+                     ("ninja", "-C", "build", "test")):
+            self.assertTrue(buildqd.restart_safe(list(argv)), argv)
+        for argv in (("sh", "run-tests.sh"), ("git", "push"), ("cargo", "run"), ("pnpm", "build"), ("make",),
+                     ("ninja", "install"), ("ninja", "deploy")):
+            self.assertFalse(buildqd.restart_safe(list(argv)), argv)
+
+    def test_the_environment_that_counts(self):
+        digest = buildqd.env_digest
+        self.assertEqual(digest({"PATH": "/bin", "PWD": "/a", "SHLVL": "1", "CLAUDE_CODE_SESSION_ID": "x"}),
+                         digest({"PATH": "/bin", "PWD": "/b", "SHLVL": "2", "CLAUDE_CODE_SESSION_ID": "y"}))
+        for name in ("DATABASE_URL", "API_TOKEN", "SESSION_BACKEND", "DB_PASSWORD"):
+            self.assertNotEqual(digest({name: "a"}), digest({name: "b"}), name)
+
+
+class SheddingMemory(DaemonCase):
+    """When other work takes the machine's memory, buildq pauses its newest build, then stops it
+    and queues it again (GNU parallel's --memsuspend and --memfree)."""
+
+    def falling_to(self, avail, at):
+        """Memory falls to `avail` at `at`, from plenty a few seconds before."""
+        self.machine.mem_available = 9 * GIB
+        self.daemon.shed_memory(at - 5)
+        self.machine.mem_available = avail
+
+    def running(self, n):
+        builds = []
+        for i in range(n):
+            t = self.submit(cores=2)
+            t.started = self.now + i  # started one after another
+            t.mem_now = 6 * GIB
+            builds.append(t)
+        return builds
+
+    def test_the_newest_build_is_paused_then_stopped_and_queued_again_at_the_front(self):
+        old, new = self.running(2)
+        self.falling_to(4 * GIB, self.now + 100)  # under half the 10G floor, and falling
+        self.daemon.shed_memory(self.now + 100)
+        self.assertEqual(self.runner.frozen, [(new.id, True)])
+        self.assertTrue(new.frozen)
+        self.daemon.shed_memory(self.now + 105)
+        self.assertEqual(len(self.runner.frozen), 1)  # one step every ten seconds
+        self.machine.mem_available = 2 * GIB  # under a quarter
+        self.daemon.shed_memory(self.now + 111)
+        self.assertIn(new.id, self.runner.forced)
+        self.assertTrue(new.requeue_pending)
+        self.runner.running.discard(new.id)  # it is gone
+        self.daemon.check(self.now + 112)
+        self.assertEqual((new.state, new.requeues, new.frozen, new.unit), ("queued", 1, False, None))
+        with open(os.path.join(new.dir, "env.json")) as f:
+            self.assertEqual(json.load(f)["BUILDQ_JOB"], new.id)  # ready to start again
+        with open(new.log) as f:
+            self.assertIn("ran short of memory", f.read())
+        waiting = self.submit(cores=1)
+        self.assertEqual(self.daemon.queue(self.now + 113)[0].id, new.id)  # it goes first
+        self.assertEqual(old.state, "running")
+        del waiting
+
+    def test_a_stop_isnt_held_up_by_a_pause_and_frees_enough(self):
+        old, new = self.running(2)
+        new.mem_now = 1 * GIB  # the newest is small; the old one holds what is needed
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertEqual(self.runner.frozen, [(new.id, True)])
+        self.machine.mem_available = 1 * GIB  # a second later, far worse
+        self.daemon.shed_memory(self.now + 101)
+        self.assertEqual(self.runner.forced, [old.id])  # at once, and the one whose memory covers the shortfall
+
+    def test_a_steady_shortage_pauses_nothing(self):
+        self.running(2)
+        self.machine.mem_available = 4 * GIB  # low, but not falling: pausing would free nothing
+        for i in range(6):
+            self.daemon.shed_memory(self.now + 100 + 10 * i)
+        self.assertEqual(self.runner.frozen, [])
+
+    def test_a_pause_lasts_five_minutes_then_the_build_is_stopped_if_memory_is_still_short(self):
+        (t,) = self.running(1)
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertTrue(t.frozen)
+        self.daemon.shed_memory(self.now + 100 + 301)
+        self.assertTrue(t.requeue_pending)  # stopped instead: that frees its memory
+
+    def test_a_pause_lasts_five_minutes_then_the_build_goes_on_if_memory_allows(self):
+        (t,) = self.running(1)
+        t.est_mem = 20 * GIB  # resuming before then needs the floor plus 14G of growth free
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertTrue(t.frozen)
+        self.machine.mem_available = 6 * GIB  # above half the floor
+        self.daemon.shed_memory(self.now + 200)
+        self.assertTrue(t.frozen)
+        self.daemon.shed_memory(self.now + 100 + 301)
+        self.assertFalse(t.frozen)
+
+    def test_a_build_paused_for_five_minutes_isnt_paused_again(self):
+        (t,) = self.running(1)
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.machine.mem_available = 6 * GIB
+        self.daemon.shed_memory(self.now + 401)  # at the cap, with half the floor free: it goes on
+        self.assertFalse(t.frozen)
+        self.falling_to(4 * GIB, self.now + 420)  # memory falls again
+        self.daemon.shed_memory(self.now + 420)
+        self.assertFalse(t.frozen)  # its five minutes are used up
+
+    def test_a_pause_adopted_from_the_cgroup_still_ends(self):
+        (t,) = self.running(1)
+        t.frozen, t.frozen_at = True, None  # found paused, start unknown
+        self.machine.mem_available = 6 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.assertEqual(t.frozen_at, self.now + 100)
+        self.daemon.shed_memory(self.now + 100 + 301)
+        self.assertFalse(t.frozen)
+
+    def test_paused_time_is_counted_per_attempt(self):
+        (t,) = self.running(1)
+        t.started = self.now
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)  # paused at 100
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 130)  # stopped at 130, paused for 30 of its 130 s
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 131)
+        self.assertEqual((t.state, round(t.attempts_wall), round(t.frozen_total), t.frozen_attempt),
+                         ("queued", 101, 30, 0.0))
+
+    def cgroup(self, t, frozen, own=None):
+        """The build's cgroup: frozen in effect, and its own freeze setting (as frozen, unless a
+        parent holds it)."""
+        t.cg = os.path.join(self.tmp.name, "cg", t.id)
+        os.makedirs(t.cg, exist_ok=True)
+        with open(os.path.join(t.cg, "cgroup.events"), "w") as f:
+            f.write(f"populated 1\nfrozen {1 if frozen else 0}\n")
+        with open(os.path.join(t.cg, "cgroup.freeze"), "w") as f:
+            f.write("1\n" if (frozen if own is None else own) else "0\n")
+
+    def test_a_thaw_that_cant_even_be_sent_still_ends_in_a_stop(self):
+        t = self.submit(("sh", "tests.sh"), cores=2)  # a script: stopped, it fails with the reason
+        t.mem_now = t.est_mem = 6 * GIB
+        self.cgroup(t, frozen=True)
+        self.daemon.shed_memory(self.now + 100)  # found paused
+        self.runner.freeze = lambda ticket, frozen: (_ for _ in ()).throw(OSError("no way to thaw"))
+        self.machine.mem_available = 100 * GIB
+        self.daemon.shed_memory(self.now + 120)  # asked to go on, but the request fails
+        self.daemon.shed_memory(self.now + 181)
+        self.assertTrue(t.requeue_pending)
+        self.assertIn("couldn't be resumed", t.shed_error or "")  # not "to free memory" with plenty free
+
+    def test_a_pause_that_ended_while_the_daemon_was_away_ends_on_load(self):
+        (t,) = self.running(1)
+        self.machine.mem_available = 8 * GIB  # short: buildq keeps it paused
+        self.cgroup(t, frozen=True)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertTrue(t.frozen)
+        self.daemon.save(t)
+        self.cgroup(t, frozen=False)  # resumed meanwhile
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again.load_tickets(self.now + 130)
+        loaded = again.tickets[t.id]
+        self.assertEqual((loaded.frozen, round(loaded.frozen_attempt)), (False, 30))
+        again.stop_memory_watch()
+        for x in again.tickets.values():
+            again.close_jobserver(x)
+
+    def test_a_slice_set_frozen_isnt_taken_for_buildqs_pause_on_older_systemd_either(self):
+        (t,) = self.running(1)
+        self.cgroup(t, frozen=True, own=True)  # older systemd sets each member's own setting too
+        with open(os.path.join(os.path.dirname(t.cg), "cgroup.freeze"), "w") as f:
+            f.write("1\n")  # ... and its slice's
+        self.machine.mem_available = 8 * GIB
+        for second in range(100, 500, 5):
+            self.daemon.shed_memory(self.now + second)
+        self.assertEqual((t.frozen, t.requeue_pending), (False, False))
+
+    def test_an_unconfirmed_thaw_keeps_its_minute_across_a_clean_restart(self):
+        t = self.submit(("sh", "tests.sh"), cores=2)
+        t.mem_now = t.est_mem = 6 * GIB
+        self.cgroup(t, frozen=True)
+        self.daemon.shed_memory(self.now + 100)  # found paused
+        self.machine.mem_available = 100 * GIB
+        self.daemon.shed_memory(self.now + 120)  # asked to go on; it doesn't (its own setting stays 1)
+        sent = len(self.runner.frozen)
+        self.daemon.thaw_all(self.now + 130)  # the daemon stops
+        self.assertEqual(self.runner.frozen[sent:], [(t.id, False)])  # one last thaw on the way out
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again.load_tickets(self.now + 140)
+        loaded = again.tickets[t.id]
+        self.assertEqual(loaded.freeze_asked[0], False)  # still asked for, sent again
+        again.shed_memory(self.now + 201)
+        self.assertTrue(loaded.requeue_pending)  # its minute ran out: stopped, not paused again
+        again.stop_memory_watch()
+        for x in again.tickets.values():
+            again.close_jobserver(x)
+
+    def test_the_undo_of_a_freeze_that_never_took_is_tracked_like_any_thaw(self):
+        t = self.submit(("sh", "tests.sh"), cores=2)
+        t.mem_now = 6 * GIB
+        self.cgroup(t, frozen=False)
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)  # asked to pause
+        self.cgroup(t, frozen=False, own=True)  # set, but never in effect (a task stuck in the kernel)
+        self.daemon.shed_memory(self.now + 161)  # gives up, undoes it; the undo doesn't take either
+        self.assertEqual(t.freeze_asked[0], False)
+        self.daemon.shed_memory(self.now + 222)
+        self.assertTrue(t.requeue_pending)
+
+    def test_with_shedding_off_a_thaw_that_never_takes_isnt_asked_again(self):
+        (t,) = self.running(1)
+        self.cgroup(t, frozen=True)
+        self.daemon.cfg.shed_memory = False
+        self.daemon.shed_memory(self.now + 100)  # adopted, then asked to go on: shedding is off
+        self.daemon.shed_memory(self.now + 161)  # it didn't: left paused
+        asks = len(self.runner.frozen)
+        for second in range(162, 400, 10):
+            self.daemon.shed_memory(self.now + second)
+        self.assertEqual(len(self.runner.frozen), asks)
+        self.assertTrue(t.thaw_failed)
+        self.cgroup(t, frozen=False)  # someone thawed it after all
+        self.daemon.shed_memory(self.now + 400)
+        self.assertEqual((t.frozen, t.thaw_failed), (False, False))
+        self.cgroup(t, frozen=True)  # paused again, by someone
+        self.daemon.shed_memory(self.now + 410)
+        self.assertEqual(self.runner.frozen[asks:], [(t.id, False)])  # this pause is asked to end
+
+    def test_a_thaw_that_failed_is_forgotten_once_a_restart_finds_the_build_running(self):
+        (t,) = self.running(1)
+        self.cgroup(t, frozen=True)
+        self.daemon.cfg.shed_memory = False
+        self.daemon.shed_memory(self.now + 100)
+        self.daemon.shed_memory(self.now + 161)
+        self.assertTrue(t.thaw_failed)
+        self.daemon.save(t)
+        self.cgroup(t, frozen=False)  # someone thawed it while the daemon was away
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again.load_tickets(self.now + 200)
+        loaded = again.tickets[t.id]
+        self.assertEqual((loaded.frozen, loaded.thaw_failed), (False, False))
+        again.stop_memory_watch()
+        for x in again.tickets.values():
+            again.close_jobserver(x)
+
+    def test_a_build_frozen_by_a_parent_isnt_buildqs_pause_and_isnt_stopped(self):
+        builds = self.running(2)
+        for t in builds:
+            self.cgroup(t, frozen=True, own=False)  # someone froze buildq.slice
+        self.machine.mem_available = 100 * GIB
+        for second in range(100, 400, 5):
+            self.daemon.shed_memory(self.now + second)
+        self.assertEqual([(t.frozen, t.requeue_pending) for t in builds], [(False, False), (False, False)])
+        self.assertEqual(self.runner.forced, [])
+
+    def test_a_pause_counts_only_once_the_cgroup_says_it_took(self):
+        (t,) = self.running(1)
+        self.cgroup(t, frozen=False)
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertTrue(t.frozen)
+        self.assertIsNone(t.frozen_at)  # asked, not yet seen
+        self.cgroup(t, frozen=True)
+        self.daemon.shed_memory(self.now + 102)
+        self.assertEqual(t.frozen_at, self.now + 102)
+
+    def test_a_freeze_that_never_takes_is_undone_and_not_tried_again(self):
+        (t,) = self.running(1)
+        self.cgroup(t, frozen=False)
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        for second in range(101, 159):  # every tick for most of a minute: one retry, not one a tick
+            self.daemon.shed_memory(self.now + second)
+        self.assertEqual(self.runner.frozen, [(t.id, True), (t.id, True)])
+        self.daemon.shed_memory(self.now + 161)  # a minute on, still running
+        self.assertEqual((t.frozen, t.freeze_failed, t.frozen_attempt), (False, True, 0.0))
+        self.assertEqual(self.runner.frozen[-1], (t.id, False))  # undone, so it can't land later
+        tries = len(self.runner.frozen)
+        self.falling_to(4 * GIB, self.now + 200)
+        self.daemon.shed_memory(self.now + 200)
+        self.assertEqual(len(self.runner.frozen), tries)
+
+    def test_a_build_frozen_or_running_against_its_ticket_is_taken_as_it_is(self):
+        (t,) = self.running(1)
+        self.machine.mem_available = 8 * GIB  # short (under the floor), so nothing resumes it
+        self.cgroup(t, frozen=True)  # a freeze that landed late, or one from before a restart
+        self.daemon.shed_memory(self.now + 100)
+        self.assertEqual((t.frozen, t.frozen_at), (True, self.now + 100))
+        self.cgroup(t, frozen=False)  # a thaw that landed after the restart
+        self.daemon.shed_memory(self.now + 130)
+        self.assertEqual((t.frozen, round(t.frozen_attempt)), (False, 30))
+
+    def test_a_thaw_ends_the_pause_when_it_takes_and_one_that_never_does_stops_the_build(self):
+        (t,) = self.running(1)
+        t.est_mem = t.mem_now
+        self.cgroup(t, frozen=True)
+        self.daemon.shed_memory(self.now + 100)  # found paused: from now
+        self.machine.mem_available = 100 * GIB
+        self.daemon.shed_memory(self.now + 120)  # asked to go on
+        self.assertEqual(self.runner.frozen[-1], (t.id, False))
+        self.assertTrue(t.frozen)  # not until the cgroup says so
+        self.cgroup(t, frozen=False)
+        self.daemon.shed_memory(self.now + 125)
+        self.assertEqual((t.frozen, round(t.frozen_attempt)), (False, 25))
+        (u,) = self.running(1)
+        u.est_mem = u.mem_now
+        self.cgroup(u, frozen=True)
+        self.machine.mem_available = 8 * GIB
+        self.daemon.shed_memory(self.now + 200)
+        self.machine.mem_available = 100 * GIB
+        self.daemon.last_freeze = -1e9
+        self.daemon.shed_memory(self.now + 220)  # asked to go on; it never does
+        self.daemon.shed_memory(self.now + 281)
+        self.assertTrue(u.requeue_pending)  # it can't go on, so it is stopped
+
+    def test_a_cancelled_build_is_killed_outright_when_memory_is_short(self):
+        (t,) = self.running(1)
+        self.daemon.cancel(t, self.now)  # SIGTERM: it has a minute to go
+        self.assertNotIn(t.id, self.runner.forced)
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 5)
+        self.assertIn(t.id, self.runner.forced)
+
+    def test_memory_being_freed_counts_so_one_shortfall_stops_one_build(self):
+        builds = self.running(3)
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.daemon.shed_memory(self.now + 103)  # the first one hasn't gone yet, but its 6G is on the way
+        self.assertEqual(len(self.runner.forced), 1)
+        del builds
+
+    def test_small_builds_are_left_alone(self):
+        (t,) = self.running(1)
+        t.mem_now = 100 * buildqd.MIB  # what holds the memory isn't buildq's
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.assertEqual(self.runner.forced, [])
+
+    def test_a_script_is_stopped_and_failed_not_run_again(self):
+        script = self.submit(("sh", "deploy-then-test.sh"), cores=2)
+        script.mem_now = 6 * GIB
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.runner.running.discard(script.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual(script.state, "failed")
+        self.assertIn("might repeat what it had done", script.error)
+        self.machine.mem_available = 100 * GIB
+        safe = self.submit(("sh", "only-tests.sh"), cores=2, restartable=True)
+        self.assertEqual(safe.state, "running")
+        safe.mem_now = 6 * GIB
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 110)
+        self.runner.running.discard(safe.id)
+        self.daemon.check(self.now + 111)
+        self.assertEqual((safe.state, safe.requeues), ("queued", 1))
+
+    def test_a_cancel_while_it_is_being_stopped_wins(self):
+        (t,) = self.running(1)
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.daemon.cancel(t, self.now + 100)
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual(t.state, "cancelled")
+
+    def test_each_attempt_has_a_service_name_of_its_own(self):
+        (t,) = self.running(1)
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual(t.requeues, 1)
+        buildqd.SystemdRunner(self.tmp.name).prepare(t, "buildq.slice")
+        self.assertTrue(t.unit.endswith(f"{t.id}-r1.service"))
+
+    def test_turning_it_off_lets_paused_builds_go_on(self):
+        (t,) = self.running(1)
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertTrue(t.frozen)
+        self.daemon.cfg.shed_memory = False
+        self.daemon.shed_memory(self.now + 101)
+        self.assertFalse(t.frozen)
+
+    def test_a_paused_build_goes_on_once_there_is_room_for_it(self):
+        (t,) = self.running(1)
+        t.est_mem = 10 * GIB
+        self.falling_to(4 * GIB, self.now + 100)
+        self.daemon.shed_memory(self.now + 100)
+        self.assertTrue(t.frozen)
+        self.machine.mem_available = 12 * GIB  # above the floor, but not with its growth (4G more)
+        self.daemon.shed_memory(self.now + 120)
+        self.assertTrue(t.frozen)
+        self.machine.mem_available = 16 * GIB
+        self.daemon.shed_memory(self.now + 140)
+        self.assertFalse(t.frozen)
+        self.assertEqual(self.runner.frozen[-1], (t.id, False))
+
+    def test_a_build_without_its_environment_is_stopped_and_fails_clearly(self):
+        (t,) = self.running(1)
+        t.env = None  # the daemon restarted since it was submitted
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual(t.state, "failed")
+        self.assertIn("stopped to free memory", t.error)
+        self.assertNotIn(t.key, self.daemon.history.by_key)  # a stopped run teaches nothing
+
+    def test_a_build_that_finished_first_is_kept_as_it_ended(self):
+        (t,) = self.running(1)
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        with open(os.path.join(t.dir, "result.json"), "w") as f:
+            json.dump({"exit": 0}, f)
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual(t.state, "succeeded")
+
+    def test_nothing_happens_with_memory_to_spare_or_when_turned_off(self):
+        self.running(2)
+        self.daemon.shed_memory(self.now + 100)
+        self.machine.mem_available = 1 * GIB
+        self.daemon.cfg.shed_memory = False
+        self.daemon.shed_memory(self.now + 200)
+        self.assertEqual((self.runner.frozen, self.runner.stopped), ([], []))
+
+
+class GitHubStatuses(DaemonCase):
+    def setUp(self):
+        super().setUp()
+        self.daemon.cfg.github_status = True
+        self.calls_file = os.path.join(self.tmp.name, "gh-calls")
+        self.daemon.gh = [sys.executable, "-c",
+                          f"import sys; open({self.calls_file!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')"]
+
+    def drain(self, now):
+        self.daemon.send_status_posts(now)
+        for proc, _, _ in list(self.daemon.status_procs):
+            proc.wait(10)
+        self.daemon.send_status_posts(now)
+
+    def calls(self):
+        try:
+            with open(self.calls_file) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
+
+    def test_a_check_that_passed_on_a_clean_commit_is_posted_and_nothing_else(self):
+        passed = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(passed, 0)
+        dirty = self.submit(("cargo", "check"), source={**SOURCE, "dirty": True})
+        self.finish(dirty, 0)
+        build = self.submit(("cargo", "build"), source=SOURCE)  # not a check, and not named
+        self.finish(build, 0)
+        failed = self.submit(("cargo", "clippy"), source=SOURCE)  # a failure with no pass before
+        self.finish(failed, 1)
+        self.settle()
+        self.drain(self.now + 60)
+        calls = self.calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn(f"repos/owner/project/statuses/{'a' * 40}", calls[0])
+        self.assertIn("state=success", calls[0])
+        self.assertIn("context=buildq/cargo test", calls[0])
+        self.assertEqual(self.daemon.status_posts, [])
+
+    def test_a_later_failure_of_the_same_check_turns_it_red(self):
+        first = self.submit(("cargo", "test"), source=SOURCE, name="tests")
+        self.finish(first, 0)
+        self.settle()
+        self.drain(self.now + 60)
+        again = self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE, name="tests", again=True)
+        self.finish(again, 101, after=60)  # ends after the first
+        self.settle()
+        self.drain(self.now + 61)
+        self.assertEqual([("state=success" in c, "state=failure" in c) for c in self.calls()],
+                         [(True, False), (False, True)])
+
+    def test_an_older_result_never_replaces_a_newer_one(self):
+        newer = self.submit(("cargo", "test"), source=SOURCE, name="tests")
+        self.finish(newer, 0, after=60)
+        older = self.submit(("cargo", "test"), cwd=newer.cwd, source=SOURCE, name="tests", again=True)
+        self.finish(older, 101, after=30)  # ended earlier, but its check comes back later
+        self.settle()
+        self.drain(self.now + 70)
+        self.assertEqual([("state=success" in c) for c in self.calls()], [True])
+
+    def test_a_newer_failure_holds_back_an_older_pass_even_when_nothing_is_posted(self):
+        first = self.submit(("cargo", "test"), source=SOURCE, name="tests")
+        self.finish(first, 101, after=60)  # the newest verdict: red, with nothing green to correct
+        self.settle()
+        older = self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE, name="tests", again=True)
+        self.finish(older, 0, after=30)  # ended before it; its check comes back after
+        self.settle()
+        self.drain(self.now + 70)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_kill_or_a_timeout_doesnt_turn_it_red(self):
+        first = self.submit(("cargo", "test"), source=SOURCE, name="tests")
+        self.finish(first, 0)
+        self.settle()
+        self.drain(self.now + 40)
+        killed = self.submit(("cargo", "test"), cwd=first.cwd, source=SOURCE, name="tests", again=True)
+        self.finish(killed, 137, after=60, oom_kills=1)
+        self.settle()
+        self.drain(self.now + 70)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_after_a_restart_only_the_newest_queued_result_is_sent(self):
+        posts = [{"repo": "owner/project", "sha": "a" * 40, "state": state, "context": "buildq/tests",
+                  "where": f"owner/project@{'a' * 40}@buildq/tests", "description": "x", "first": self.now,
+                  "next": self.now, "order": [self.now + i, 0, ""]} for i, state in enumerate(("success", "failure"))]
+        with open(os.path.join(self.state, "github-statuses.json"), "w") as f:
+            json.dump({"queue": posts, "posted": {}}, f)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        self.assertEqual([p["state"] for p in again.status_posts], ["failure"])
+        again.stop_memory_watch()
+
+    def test_a_commit_github_doesnt_have_yet_is_tried_again_after_a_push(self):
+        self.daemon.gh = [sys.executable, "-c", "import sys; sys.exit(1)"]  # not on GitHub yet
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        self.drain(self.now + 60)
+        (post,) = self.daemon.status_posts
+        self.assertGreater(post["next"], self.now + 600)
+        push = self.submit(("git", "push"), source=SOURCE)
+        self.finish(push, 0)
+        self.assertLessEqual(post["next"], self.now + 60)
+
+    def test_off_means_nothing_is_sent(self):
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        self.daemon.cfg.github_status = False  # turned off with a post still queued
+        self.drain(self.now + 60)
+        self.assertEqual(self.calls(), [])
 
 
 class Order(DaemonCase):
@@ -827,6 +1799,14 @@ class Turns(DaemonCase):
         restarted.load_tickets(self.now + 60)
         self.assertEqual(restarted.tickets[t.id].mem_high, 104492)
 
+    def test_history_records_the_wait_and_the_caller(self):
+        t = self.submit(caller="agent.scope")
+        t.measured, t.mem_peak = True, GIB
+        self.finish(t, 0)
+        record = list(self.daemon.history.by_key[t.key])[0]
+        self.assertEqual((record["caller"], record["requeues"]), ("agent.scope", 0))
+        self.assertGreaterEqual(record["waited"], 0)
+
     def test_bad_memory_waits_are_ignored(self):
         t = self.submit()
         self.finish(t, 0, mem_wait_some="lots", mem_wait_full=None, mem_high=10 ** 400)
@@ -1177,6 +2157,26 @@ class Supervisor(unittest.TestCase):
         code, _, output, _, _ = self.supervise(["no-such-command-buildq"])
         self.assertEqual(code, 127)
         self.assertIn(b"can't run", output)
+
+    def test_time_paused_doesnt_count_toward_the_timeout(self):
+        d = os.path.join(self.tmp.name, "paused")
+        os.makedirs(d)
+        with open(os.path.join(d, "ticket.json"), "w") as f:
+            json.dump({"argv": ["sleep", "7"], "cwd": self.tmp.name, "timeout": 5, "max_log": 0}, f)
+        with open(os.path.join(d, "env.json"), "w") as f:
+            json.dump({"PATH": os.environ["PATH"]}, f)
+        proc = subprocess.Popen([sys.executable, BUILDQD, "--supervise", d])
+        for _ in range(100):
+            if os.path.exists(os.path.join(d, "child.json")):
+                break
+            time.sleep(0.05)
+        time.sleep(0.5)
+        os.kill(proc.pid, signal.SIGSTOP)  # as if frozen (the sleep goes on: the build "runs" meanwhile)
+        time.sleep(6)
+        os.kill(proc.pid, signal.SIGCONT)
+        self.assertEqual(proc.wait(30), 0)  # not timed out at the 5 s mark, once it is resumed
+        with open(os.path.join(d, "result.json")) as f:
+            self.assertFalse(json.load(f)["timed_out"])
 
     def test_timeout(self):
         code, result, output, took, _ = self.supervise(["sleep", "30"], timeout=1)

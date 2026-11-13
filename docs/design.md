@@ -11,7 +11,7 @@ How buildq works inside. The README covers installing and using it.
 | `buildqd --supervise DIR` | The supervisor: one per build, inside its service. Runs the command, writes its output and exit status. |
 | `buildq-shim` | Optional: stands in for `cargo`, `pnpm`, ... on `PATH` and sends heavy invocations through `buildq run`. |
 | `buildq-rustc-guard` | Optional: cargo's rustc wrapper; refuses compiles outside a buildq build. |
-| `skills/buildq/SKILL.md` | Optional: a skill for coding agents on using the queue, installed with `install.sh --skill`, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end. |
+| `skills/buildq/SKILL.md` | The page for coding agents on using the queue, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end: always installed (`buildq help agents` prints it), and linked into the agents' skill directories with `install.sh --skill`. |
 | `buildq.socket` | Holds the Unix socket (`$XDG_RUNTIME_DIR/buildq.sock`, mode 0600) so it stays open while the daemon restarts. |
 | `buildq.service` | Runs the daemon. `KillMode=process`: stopping the daemon stops nothing else. |
 | `buildq.slice` | The parent of every build's service: one CPU and IO weight for all builds, and a memory backstop. |
@@ -127,10 +127,19 @@ subtracted for every ticket behind it, except tickets in lanes with `may_pass_he
 held for a ticket that couldn't fit even with every buildq build gone, so an oversized ticket can't
 stop the queue.
 
-**Order.** A ticket that has waited `starve_seconds` goes first (unless its lane may pass held
-room). Then tickets go by priority (lane plus ticket, highest first), then by expected duration (the
-median wall time of the command's successful runs, or of all its runs if none succeeded; shortest
-first, unknown last), then by submission.
+**Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped to
+free memory, goes first (unless its lane may pass held room). Then tickets go by priority (lane plus
+ticket, highest first), then by how many builds their caller has running (fewest first), then by
+expected duration (the median wall time of the command's successful runs, or of all its runs if
+none succeeded; shortest first, unknown last), then by submission.
+
+**Callers.** The client sends the name of the cgroup it runs in: an agent session's scope, a CI
+runner's service, a terminal's scope. That is the caller for fair shares, and it is kept in the
+ticket and its history record (`buildq report --by caller`).
+
+**Paused.** `buildq pause` writes `paused.json` in the state directory; while it is there, every
+queued ticket waits with the pause's reason and nothing starts. Running builds, the slice guard
+and the memory shedding carry on.
 
 **Memory follows cores.** A build's memory estimate was measured at some number of cores. Given more,
 it is assumed to need proportionally more, up to its lane's enforced `MemoryMax`. The cores a build
@@ -178,6 +187,172 @@ more, the furthest below their want first. If `spare ≤ −1`, builds above the
 back, the most above first. The daemon writes tokens into a build's FIFO to grow it, and reads
 free ones out to shrink it; tokens in use come back to the FIFO as their processes end, and the
 next rebalance takes them then.
+
+## Giving memory back
+
+Admission keeps memory for every running build's expected growth, but work outside the queue can
+grow into it. Every tick, with `shed_memory` on (the approach of GNU parallel's `--memsuspend` and
+`--memfree`, and of Slurm's preemption with requeue):
+
+"Available" here is `MemAvailable` plus what builds still being stopped hold, so one shortfall
+stops one build even when a stop takes a few seconds to land.
+
+1. Below `mem_floor / 4` available, at most every 2 seconds and never held up by a pause: stop a
+   build with SIGKILL, written to its cgroup's `cgroup.kill` (at once, frozen processes too;
+   `systemctl kill` where that file is missing): the newest of those whose memory covers the
+   shortfall back to `mem_floor / 2`, else the largest, never one under 512 MiB. Once
+   its service is empty, `requeue()`:
+   - if it was cancelled meanwhile, finalizes it as cancelled;
+   - if it isn't safe to start over (`restart_safe()`: a cargo build, check, test, clippy, doc,
+     nextest or bench, a dotnet build or test, tsc, eslint, vitest or ninja; or `--restartable`),
+     fails it with a reason, as a script might upload or push before it compiles;
+   - otherwise queues it again: the old service is unloaded in the background (the next attempt's
+     service is `buildq-<id>-r<n>.service`), its jobserver, `result.json`, `supervisor.json` and
+     `child.json` are removed, `env.json` is written again from the environment the daemon kept in
+     memory, a note is appended to `output.log` and `stderr.log` (opened for appending, so a client
+     following it carries on), the offsets where the next attempt's output starts are kept (a
+     reused result shows only the attempt that passed), and `requeues` is raised. It then counts as
+     starving: it goes first and its room is held.
+
+   A run that finished on its own before the kill landed keeps its result.
+2. Below `mem_floor / 2`, at most every 10 seconds, and only while memory is still falling (by
+   256 MiB or more over the last 10 s; freezing frees nothing, so it only helps against growth):
+   freeze the newest build holding at least 1 GiB, by writing its `cgroup.freeze` (`systemctl --user
+   freeze` where that can't be written), under the systemd runner (the direct runner has no cgroup
+   to freeze). A pause counts from when the cgroup's `cgroup.events` says it took (at once where
+   that can't be seen). A request not taken after 15 s is sent once more; after a minute a freeze
+   that never took is undone (so it can't land later), counts nothing, and that attempt isn't
+   paused again. Every tick, with no request pending, a build frozen or running against what its
+   ticket says (a freeze that landed late, a thaw sent before a restart) is taken as it is. The supervisor is frozen with it; it treats
+   a turn of its loop that took more than 5 s as paused time and moves the timeout's deadline on
+   by it. Paused time is also left out of the duration history learns.
+3. Otherwise, thaw the build paused longest ago once `MemAvailable` exceeds `mem_floor` plus what
+   that build may still grow into (its estimate less what it holds). An attempt paused for five
+   minutes in all (`FREEZE_MAX`, counted per attempt) is thawed if at least `mem_floor / 2` is
+   free, and then not paused again, or otherwise stopped as in step 1. A cancelled build still in
+   its grace period is killed outright when memory falls below a quarter of the floor, and only
+   then does its memory count as on its way back. Paused time is kept per attempt
+   (`frozen_attempt`): it comes off that attempt's learned duration and core use, and no cores
+   count as given while paused. With `shed_memory` off, paused builds are thawed at once; the daemon thaws them all
+   when it stops.
+
+A freeze or thaw is checked against the cgroup (see step 2): the build's own `cgroup.freeze` says
+whether buildq's pause is set, and `cgroup.events` whether it took. A frozen parent (someone froze
+`buildq.slice`) freezes builds too, but that isn't buildq's pause: it isn't taken for one, and never
+leads to a stop; nor is a build whose slice is set frozen (older systemd also sets each member's own
+setting). Below a quarter of the floor, a build frozen that way can still be stopped like any other. A pause ends when the build's own setting is seen cleared, not when a thaw is asked
+for; a build whose own setting is still frozen a minute after a thaw (even one that couldn't be
+sent) can't go on, so it is stopped as in step 1, saying so (queued again if it may start over), if
+`shed_memory` is on (with it off, it is left paused and not asked again). The undo of a freeze that
+never took is tracked the same way. A pending request is kept on disk; on load it is sent again with
+a full minute, as its sender went with the old daemon. When the daemon stops, it asks its paused
+builds to go on and ends their pauses then, for the record, while the thaws stay asked for until seen;
+a pause that ended while the daemon was away ends when it loads, and one found on load counts only
+once in effect. Cancelling a paused
+build stops it with SIGKILL rather than thawing it into short memory. The environment is kept in
+memory only, as on disk it would outlive the build's start (where the supervisor deletes
+`env.json`); queued builds read it back from `env.json` after a restart. A running build whose
+daemon restarted since it started is stopped anyway, and fails saying so; one stopped three times
+fails too.
+
+## The source of a build
+
+The idea of joining a repeat submission to the job already running is qex's `--dedupe-key`; buildq
+derives the key from the source instead of asking for one.
+
+The client (`source_of()`) fingerprints the worktree it submits from, hashing with SHA-256: the
+commit (`git rev-parse HEAD`); `git diff HEAD --binary --ignore-submodules=none` (tracked changes,
+staged or not); each untracked, not ignored file's name, mode and content (a regular file's) or
+link target; and the name, size, mode and time of each ignored `.env*` file outside ignored
+directories. Ignored directories and other ignored files are build output and
+caches, which a build rewrites. Every git call runs under one five-second deadline, its output read
+as it comes (`select` and `os.read`), its whole process group killed if it overruns; file counts and
+bytes are checked as they are read. Git runs with optional locks, the fsmonitor and the untracked
+cache off. There is no record when git can't show everything or would do more than read: an
+attributes file that applies to the tracked files (a `.gitattributes` in any directory holding
+tracked files or above it, tracked or not, ignored or not; `.git/info/attributes`; the global and
+system ones) that sets a
+`filter=` (LFS, git-crypt, nbstripout, which `git diff` would run on changed files, LFS's writing
+into `.git`); files marked skip-worktree or assume-unchanged (`git ls-files -v`), whose changes git
+doesn't show; a submodule (mode 160000: deciding whether it changed, git runs a status, and its
+filters, inside it); a tracked `.gitattributes` missing from the tree, or a symlink there (git then reads the index's
+copy; in-tree attributes files are opened without following links); attributes taken from a tree (`GIT_ATTR_SOURCE`, `attr.tree`); a repository or worktree inside that
+isn't ignored, which git lists as one entry (its changes aren't seen, and checking each one's
+status would cost seconds). The attributes are read before `git diff` runs, without blocking and only from
+plain files; any doubt means no record. The tracked files are listed as they stream, with no cap. Every git the
+client starts dies with it (`PR_SET_PDEATHSIG`). Nor when it would cost too much: more
+than 64 MiB of diff and untracked contents, more than 20,000 untracked or ignored files, five
+seconds; nor in a repository at `/` or the home directory. The GitHub remote (`origin`) is noted.
+
+The daemon's key for "the same build" hashes the commit, the fingerprint, the command, the real
+path of its directory, the lane, the environment less a fixed list of variables that only differ
+between sessions (`VOLATILE_ENV`: terminal, SSH, D-Bus, systemd, agent-session and buildq's own
+client settings; secrets are kept, inside the hash), and the settings that change what runs (its
+timeout, umask, limits, given cores and memory, and the daemon's `[env]`). A command whose
+arguments name a path outside the recorded tree (`--manifest-path ../other/Cargo.toml`) gets no
+key. A submission with a key joins a ticket that is queued, starting or running: its submission id
+is recorded against that ticket with how it was answered (a resend, even after a restart, gets the
+same answer), it is added to the ticket's interests (each submission waiting for it, followed by a
+`run` or dropped off), its priority is raised to the joiner's and its `--notify` added. A dropped-off
+joiner makes the ticket nobody's, so no client's departure cancels it. Those still waiting are the
+dropped-off submissions and the `run`s following it, or whose client followed it within
+`unwatched_seconds` (kept per submission, and counted from the daemon's start at the earliest:
+they may be reconnecting); each connection and reconnection says its submission. A `run` killed
+outright waits no more after that, and is dropped from the interests; following again (its
+submission recorded against this ticket) brings it back. The automatic cancel of a build nobody
+follows waits for the newest submission's grace too. Tickets saved by an earlier
+version get their own submission as their interest when loaded. An interrupted `run` sends its
+submission id with its cancel: while others still wait, that only removes its own (a repeat, or an
+unknown id, changes nothing), and the build carries on. A cancel that names no submission
+(`buildq cancel`) is refused while more than one waits, unless it says `--all`. A build being
+stopped to be queued again can be joined too. Failing that, a ticket that succeeded within `reuse_window` answers it if
+the command is a check (`reusable_check()`: cargo check, clippy, test or `nextest run`, dotnet
+test, `tsc --noEmit`, eslint, `vitest run`; none with `--fix`, `-u`, `--update*`, `--watch*`,
+`--allow-dirty` or `--no-run`) or the caller passed `--reuse`, and its source was verified.
+Otherwise it runs, and the client says it passed before. `--again` skips all of it.
+
+**Verified.** The build runs on whatever is on disk when it starts, which may have changed since it
+was submitted. So the daemon fingerprints the tree again, by running `buildq source DIR` in a
+process it doesn't wait on (with the submitter's `HOME`, `PATH`, `XDG_CONFIG_HOME` and git
+variables, so git reads the same configuration and ignore files), as the build starts and as it
+ends. At most three run at once, the rest wait their turn, and one past 30 s is killed with its
+process group. A check belongs to an attempt: one from an attempt since stopped for memory is
+dropped. Only a ticket whose tree matched its record both times answers a later submission or
+posts a GitHub status; one whose tree differed is marked `source_changed` and matches nothing. An
+edit made and undone between the two checks isn't seen.
+
+## GitHub statuses
+
+With `github_status` on, a verified ticket that succeeds with a clean source and a GitHub remote,
+and is a check or has a `--name`, queues a post to `repos/OWNER/REPO/statuses/SHA` (state
+`success`, context `buildq/<name or command>`). A later verified failure in a context that posted
+`success` on the same commit (sent or still queued) posts `failure`, if it is the check's own verdict
+(exit 1 to 127, not a kill, a timeout or a stop to free memory). Each result is ordered by when its
+build ended (then when it was submitted), not when its check came back: one older than the newest
+verdict seen (queued, posted, or not posted because there was nothing to correct) is dropped, a newer one replaces older ones not yet sent, one is sent at a
+time per commit and context, and after a restart only the newest queued result per commit and
+context is kept. The daemon sends at most two at once with `gh api`, in processes it doesn't wait on, and
+keeps the queue and what it has posted in
+`github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails (the
+commit isn't pushed yet, say) is logged with `gh`'s message the first time, tried again ten
+minutes later, at once after a `git push` run through buildq from the same repository succeeds, and
+dropped after a day. With `github_status` off, nothing queued is sent.
+
+## Fair shares and pausing
+
+Fair shares follow Slurm's fair-share priority, here between callers instead of users. Within a
+tier (starving or not, then priority), a caller's k-th waiting ticket counts as if k more of its
+builds were running, on top of those that are, so callers take turns: one session's burst is
+interleaved with the others' tickets. `buildq pause`, like pueue's, starts nothing until
+`buildq resume` and leaves running builds alone.
+
+## Outcomes
+
+Every finished ticket appends a line to `outcomes.jsonl` (kept to about 8 MiB plus one older
+file): its key, lane, caller, state, exit, whether it was killed or stopped for memory, how often it
+was queued again, its run and queue time, peak memory, memory waits and MemoryHigh breaches.
+`buildq report` reads it, as Slurm's `sacct` reads its accounting. The history (`history.jsonl`)
+keeps only the runs estimates learn from.
 
 ## Measurement
 
@@ -302,7 +477,7 @@ descriptor exits once it has the lock, and on btrfs its device number differs fr
 | A client is killed | A dropped-off build carries on under its ticket; a `buildq run` build is cancelled once nobody has followed it for `unwatched_seconds`. |
 | A build leaves processes behind | The supervisor stops its process group and anything carrying its `BUILDQ_JOB`; systemd stops the rest when the service ends; the turn lasts until the service is empty (killing what is left after 15 s). |
 | `systemd-run` hangs | It is killed after 60 s, and systemd is asked whether the service exists. |
-| Other work fills the machine | The slice guard shrinks the builds' limit with it; builds are slowed, then stopped inside their slice. The memory watch logs what is holding the memory every 30 seconds. |
+| Other work fills the machine | The slice guard shrinks the builds' limit with it; builds are slowed, then stopped inside their slice. Below half of `mem_floor` free, the newest build is paused; below a quarter, it is stopped and queued again. The memory watch logs what is holding the memory every 30 seconds. |
 | A build runs out of memory at its lane's cap | The kernel kills within that build only (`OOMPolicy=continue` keeps the supervisor alive to report it). The next estimate for that command is at least the cap. |
 | All builds together exceed the slice backstop | The kernel slows them, then kills within the slice, not elsewhere. |
 | `systemd-run` fails | The ticket fails with systemd's message. |

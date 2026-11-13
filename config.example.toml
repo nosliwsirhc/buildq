@@ -70,6 +70,22 @@ max_log = "64M"
 keep_finished = "7d"
 max_finished = 1000
 
+# When the machine has less than half of mem_floor available although no build may grow past its
+# estimate (other work grew), pause the newest build holding 1 GiB or more; below a quarter, stop a
+# build at once, and queue it again at the front if it can safely start over (a compile or test run,
+# or --restartable), else fail it, saying why.
+shed_memory = true
+
+# A check (cargo check/clippy/test, dotnet test, tsc --noEmit, eslint, vitest run) that passed on
+# the same source, in the same directory, lane, environment and settings, with its tree unchanged
+# while it ran, answers the same submission again within this long instead of running ("0" turns
+# that off). `--again` always runs.
+reuse_window = "2h"
+
+# Post a "success" commit status (context buildq/<name or command>) through `gh` when a check or a
+# named build passes on a commit with no changes on top, so pull requests show it was verified here.
+github_status = false
+
 # A shell command run when any build finishes, with BUILDQ_TICKET, BUILDQ_STATE, BUILDQ_EXIT,
 # BUILDQ_OOM, BUILDQ_LABEL, BUILDQ_NAME, BUILDQ_CWD and BUILDQ_LOG set. Example:
 # on_finish = 'notify-send "build $BUILDQ_STATE" "$BUILDQ_LABEL"'
@@ -128,7 +144,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # max_cores = 16
 # mem = "20G"
 # min_mem = "6G"
-# properties = { MemoryHigh = "24G", MemoryMax = "26G" }
+# properties = { MemoryHigh = "24G", MemoryMax = "26G", CPUWeight = 100, IOWeight = 100 }
 #
 # [lanes.dotnet]
 # cores = 6
@@ -136,7 +152,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # max_cores = 12
 # mem = "8G"
 # priority = 50
-# properties = { MemoryHigh = "14G", MemoryMax = "16G" }
+# properties = { MemoryHigh = "14G", MemoryMax = "16G", CPUWeight = 200, IOWeight = 200 }
 #
 # [lanes.web]
 # cores = 4
@@ -147,7 +163,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # may_pass_held = true
 # waits_for_cpu = false
 # exclusive = false
-# properties = { MemoryHigh = "10G", MemoryMax = "12G" }
+# properties = { MemoryHigh = "10G", MemoryMax = "12G", CPUWeight = 400, IOWeight = 400 }
 
 # Lane rules pick the lane for a build whose caller names none: the first whose pattern (a Python
 # regular expression) matches the command's key words, such as "cargo test -p api",
@@ -176,6 +192,17 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # [[lane_rules]]
 # match = "^(docker|podman) (build|buildx|compose)"
 # lane = "image"
+
+# CI steps that run through the queue (see "CI jobs" in the README) can have a lane of their own,
+# chosen with `buildq run --lane ci`:
+#
+# [lanes.ci]
+# cores = 8
+# min_cores = 2
+# max_cores = 16
+# mem = "20G"
+# priority = 25
+# properties = { MemoryHigh = "24G", MemoryMax = "26G" }
 
 # ---- Migrating from a flock-based slot script ----------------------------------------------------
 

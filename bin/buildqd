@@ -48,6 +48,7 @@ import asyncio
 import collections
 import fcntl
 import glob
+import hashlib
 import itertools
 import json
 import math
@@ -211,6 +212,15 @@ def number(value, what: str, low: float, high: float, integer: bool = False):
     return int(value) if integer else float(value)
 
 
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
 def fmt_size(n: float) -> str:
     if abs(n) >= 10 * GIB:
         return f"{n / GIB:.0f}G"
@@ -244,6 +254,9 @@ DEFAULTS = {
     "keep_finished": "7d",
     "max_finished": 1000,
     "on_finish": "",
+    "shed_memory": True,
+    "reuse_window": "2h",
+    "github_status": False,
     "env": {},
     "lanes": {"default": {"cores": 4, "mem": "4G", "properties": {"MemoryHigh": "40%", "MemoryMax": "50%"}}},
     "lane_rules": [],
@@ -349,6 +362,9 @@ class Config:
         self.keep_finished = parse_duration(d["keep_finished"])
         self.max_finished = number(d["max_finished"], "max_finished", 0, 1_000_000, integer=True)
         self.on_finish = str(d["on_finish"] or "")
+        self.shed_memory = boolean(d["shed_memory"], "shed_memory")
+        self.reuse_window = parse_duration(d["reuse_window"]) if d["reuse_window"] not in (0, "0", "", None) else 0.0
+        self.github_status = boolean(d["github_status"], "github_status")
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
@@ -400,7 +416,9 @@ class Config:
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "slice": self.slice,
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
-            "max_log": self.max_log, "lanes": {name: lane.summary() for name, lane in self.lanes.items()},
+            "max_log": self.max_log, "shed_memory": self.shed_memory, "reuse_window": self.reuse_window,
+            "github_status": self.github_status,
+            "lanes": {name: lane.summary() for name, lane in self.lanes.items()},
             "lane_rules": [[rule.pattern, lane] for rule, lane in self.lane_rules],
             "env": self.env,
         }
@@ -1100,6 +1118,196 @@ def command_words(argv: list[str]) -> list[str]:
             for w in words]
 
 
+WRITING_FLAG = re.compile(r"--(fix|fix-type|write|bless|update|update-snapshots|updateSnapshot|watch|watchAll|"
+                          r"allow-dirty|no-run)(=.*)?|-[uw]")
+# Options that write a file the caller may read next (a report, coverage, test results): a reused
+# pass wouldn't write it.
+REPORT_OPTIONS = {"-o", "--output-file", "--outputFile", "--coverage", "--logger", "--results-directory",
+                  "--collect", "--diag", "--junit", "--reporter-file"}
+VERIFY_CARGO = {"check", "c", "clippy", "test", "t", "nextest"}
+RESTART_CARGO = {"build", "b", "check", "c", "clippy", "test", "t", "doc", "d", "nextest", "bench"}
+
+
+def _tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
+    args = strip_wrappers(argv)
+    if args and os.path.basename(args[0]) in ("npx", "pnpx", "bunx"):
+        args = [a for a in args[1:] if a not in ("-y", "--yes", "--no-install")]
+    return (os.path.basename(args[0]) if args else ""), args[1:]
+
+
+def reusable_check(argv: list[str]) -> bool:
+    """A command whose only result is a verdict on the source: cargo check, clippy, test or nextest
+    run, dotnet test, `tsc --noEmit`, eslint, `vitest run`, with nothing that writes (--fix, -u,
+    --update-snapshots, watch modes, --no-run, which keeps the test binaries for later). A second
+    pass on the same source tells nothing the first didn't, so the first answers it. Commands that
+    produce files (builds, docs, bundles) and package scripts, which might do anything, never do."""
+    tool, args = _tool_and_args(argv)
+    if any(WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
+        return False
+    if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
+        return False  # `--reporter html`
+    if tool == "dotnet" and any(re.match(r"-[ld](:|$)", a) or re.search(r"CollectCoverage", a) for a in args):
+        return False  # dotnet test's short --logger and --diag, and coverage through MSBuild
+    if tool == "cargo":
+        words = command_words(["cargo", *args])
+        sub = words[1] if len(words) > 1 else ""
+        return sub in VERIFY_CARGO and (sub != "nextest" or "run" in args)
+    if tool == "dotnet":
+        return positionals(args)[:1] == ["test"]
+    if tool in ("tsc", "vue-tsc"):
+        return no_emit(args)
+    if tool == "eslint":
+        return True
+    if tool == "vitest":
+        return positionals(args)[:1] == ["run"]
+    return False
+
+
+def writes_report(arg: str) -> bool:
+    """An option that writes a file a reused pass wouldn't: a report, coverage, test results,
+    in any of its spellings (--logger:trx, --outputFile.junit=x, --coverage.enabled, --reporter=html)."""
+    name = re.split(r"[=:.]", arg, maxsplit=1)[0]
+    if name in REPORT_OPTIONS:
+        return True
+    return bool(re.fullmatch(r"--reporter(s)?[=:]?(html|junit|json|lcov|teamcity|blob).*", arg))
+
+
+def no_emit(args: list[str]) -> bool:
+    """Whether tsc's --noEmit is in effect at the end of its arguments (`--noEmit false` turns it off)."""
+    on, i = False, 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--noEmit":
+            on = True
+            if i + 1 < len(args) and args[i + 1] in ("true", "false"):
+                on, i = args[i + 1] == "true", i + 1
+        elif arg.startswith("--noEmit="):
+            on = arg.split("=", 1)[1] == "true"
+        i += 1
+    return on
+
+
+def restart_safe(argv: list[str]) -> bool:
+    """A command that can be stopped and started again from the beginning without doing anything
+    twice: a compile or a test run of cargo, dotnet, tsc, eslint or vitest. A script might upload
+    or push before it compiles, so it is stopped and failed instead (unless --restartable)."""
+    tool, args = _tool_and_args(argv)
+    if tool == "cargo":
+        words = command_words(["cargo", *args])
+        return (words[1] if len(words) > 1 else "") in RESTART_CARGO
+    if tool == "dotnet":
+        return positionals(args)[:1] in (["build"], ["test"])
+    if tool == "ninja":  # a custom target (install, deploy) might do anything
+        return set(positionals(args, {"-C", "-f", "-j", "-k", "-l", "-d", "-t", "-w"})) <= {"all", "test", "check"}
+    return tool in ("tsc", "vue-tsc", "eslint", "vitest")
+
+
+def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
+    """Every path the command names is inside the tree whose source was recorded: an argument (or
+    an option's value) with a slash or starting with . or ~, and any that names something that
+    exists (`-p external`, a symlink), resolved through links. A command pointed elsewhere
+    (`--manifest-path ../other/Cargo.toml`) builds source the record doesn't cover."""
+    root = os.path.realpath(top)
+    for arg in argv[1:]:
+        value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
+        if not value or value.startswith("-") or re.match(r"[a-z][a-z0-9+.-]*://", value):
+            continue  # an option, or a URL
+        candidate = os.path.join(cwd, os.path.expanduser(value))
+        looks = "/" in value or value.startswith((".", "~"))
+        if not looks and not os.path.lexists(candidate):
+            continue  # a word (a subcommand, a test name), not a path
+        path = os.path.realpath(candidate)
+        if path != root and not path.startswith(root + os.sep):
+            return False
+    return True
+
+
+# Variables that differ between sessions, terminals or runs but not in what a build does. Anything
+# else counts, secrets included (only a hash of the whole environment is kept).
+# What git reads to see a tree as its user does: where its configuration and ignore files are.
+GIT_ENV = re.compile(r"HOME|PATH|XDG_CONFIG_HOME|GIT_CONFIG(_GLOBAL|_SYSTEM|_NOSYSTEM|_COUNT|_KEY_\d+|_VALUE_\d+)?|"
+                     r"GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR|GIT_INDEX_FILE|GIT_CEILING_DIRECTORIES|"
+                     r"GIT_DISCOVERY_ACROSS_FILESYSTEM|GIT_ATTR_NOSYSTEM|GIT_OBJECT_DIRECTORY|"
+                     r"GIT_ALTERNATE_OBJECT_DIRECTORIES")
+
+VOLATILE_ENV = re.compile(
+    r"PWD|OLDPWD|SHLVL|_|COLUMNS|LINES|WINDOWID|STY|TMUX|TMUX_PANE|TERM_SESSION_ID|SSH_AUTH_SOCK|SSH_AGENT_PID|"
+    r"SSH_CLIENT|SSH_CONNECTION|SSH_TTY|GPG_TTY|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_ID|XDG_ACTIVATION_TOKEN|"
+    r"INVOCATION_ID|JOURNAL_STREAM|MANAGERPID|MANAGERPIDFDID|SYSTEMD_EXEC_PID|NOTIFY_SOCKET|LISTEN_(PID|FDS|FDNAMES)|"
+    r"CLAUDE_PID|CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|SESSION_ATTENDED|MESSAGING_SOCKET|MESSAGING_TOKEN)|"
+    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|KITTY_WINDOW_ID|WEZTERM_PANE|VSCODE_GIT_IPC_HANDLE|"
+    r"VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
+
+
+def env_digest(env: dict[str, str]) -> str:
+    kept = sorted((k, v) for k, v in env.items() if not VOLATILE_ENV.fullmatch(k))
+    return hashlib.sha256(json.dumps(kept).encode()).hexdigest()
+
+
+def dedupe_key(source: dict, argv: list[str], cwd: str, lane: str, env: dict[str, str], settings: list) -> str:
+    """The same command, on the same source, in the same directory, lane, environment and settings
+    (its timeout, umask, limits, given cores and memory, and the daemon's own [env])."""
+    parts = [source.get("commit"), source.get("fingerprint"), argv, os.path.realpath(cwd), lane, env_digest(env),
+             settings]
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def sane_source(raw) -> dict | None:
+    """The client's record of the source a build is of, if it is well formed."""
+    if not isinstance(raw, dict):
+        return None
+    commit, fingerprint, repo = raw.get("commit"), raw.get("fingerprint"), raw.get("repo")
+    if not (isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", commit)):
+        return None
+    if not (isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{16,64}", fingerprint)):
+        return None
+    remote = raw.get("remote")
+    if not (isinstance(remote, str) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", remote)):
+        remote = None
+    return {"repo": repo if isinstance(repo, str) and os.path.isabs(repo) else None, "commit": commit,
+            "dirty": bool(raw.get("dirty")), "fingerprint": fingerprint, "remote": remote}
+
+
+def valid_post(post) -> bool:
+    return (isinstance(post, dict) and all(isinstance(post.get(k), str) for k in ("repo", "sha", "state", "context",
+                                                                             "description"))
+            and all(isinstance(post.get(k), (int, float)) for k in ("first", "next")))
+
+
+def sane_caller(raw) -> str | None:
+    """Who submitted a build: the unit (a session's scope, a CI runner's service) its client ran in."""
+    if isinstance(raw, str) and 0 < len(raw) <= 200 and raw.isprintable():
+        return raw
+    return None
+
+
+def cgroup_freeze_set(path: str) -> bool | None:
+    """Whether this cgroup itself is set frozen (its own cgroup.freeze), whatever its parents are.
+    cgroup.events says whether it is frozen in effect, which a frozen parent also makes it."""
+    try:
+        with open(os.path.join(path, "cgroup.freeze")) as f:
+            return f.read().strip() == "1"
+    except (OSError, ValueError):
+        return None
+
+
+def parent_freeze_set(path: str) -> bool:
+    """Whether the cgroup's parent (its slice) is set frozen: someone froze buildq.slice, say."""
+    return bool(cgroup_freeze_set(os.path.dirname(path.rstrip("/"))))
+
+
+def cgroup_frozen(path: str) -> bool | None:
+    try:
+        with open(os.path.join(path, "cgroup.events")) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == "frozen":
+                    return value.strip() == "1"
+    except OSError:
+        pass
+    return None
+
+
 def command_key(argv: list[str], cwd: str, lane: str) -> str:
     return f"{repo_name(cwd)}|{lane}|{' '.join(command_words(argv))}"
 
@@ -1433,7 +1641,9 @@ class SystemdRunner:
     def prepare(self, ticket, slice_name: str) -> None:
         """Name the build's service before it is started, so a daemon that stops in between can
         still find it."""
-        ticket.unit = f"buildq-{ticket.id}.service"
+        # Each attempt of a build stopped to free memory gets a name of its own: the last one's
+        # service may still be loaded while systemd lets it go.
+        ticket.unit = f"buildq-{ticket.id}.service" if not ticket.requeues else f"buildq-{ticket.id}-r{ticket.requeues}.service"
         ticket.cg = os.path.join(self.cg_base, slice_path(slice_name), ticket.unit)
 
     def unit_state(self, ticket) -> str:
@@ -1484,9 +1694,34 @@ class SystemdRunner:
         return subprocess.Popen(["systemctl", "--user", "reset-failed", ticket.unit], stdin=DEVNULL,
                                 stdout=DEVNULL, stderr=DEVNULL)
 
+    can_freeze = True
+
+    def freeze(self, ticket, frozen: bool):
+        """Pause or resume the build's processes with the cgroup freezer: they stop where they are,
+        keeping their memory but asking for no more, until thawed. Written to its cgroup.freeze at
+        once (as cgroup.kill is), with `systemctl freeze`/`thaw` where that can't be written."""
+        if ticket.cg:
+            try:
+                with open(os.path.join(ticket.cg, "cgroup.freeze"), "w") as f:
+                    f.write("1" if frozen else "0")
+                return None
+            except OSError:
+                pass
+        if not ticket.unit:
+            return None
+        return subprocess.Popen(["systemctl", "--user", "freeze" if frozen else "thaw", ticket.unit], stdin=DEVNULL,
+                                stdout=DEVNULL, stderr=DEVNULL)
+
     def stop(self, ticket, force: bool = False):
         if not ticket.unit:
             return None
+        if force and ticket.cg:
+            try:  # every process of the build, frozen ones too, at once (Linux 5.14+)
+                with open(os.path.join(ticket.cg, "cgroup.kill"), "w") as f:
+                    f.write("1")
+                return None
+            except OSError:
+                pass
         command = ["systemctl", "--user", "kill", "--signal=SIGKILL", ticket.unit] if force else \
                   ["systemctl", "--user", "stop", "--no-block", ticket.unit]
         return subprocess.Popen(command, stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL)
@@ -1551,6 +1786,11 @@ class DirectRunner:
             return True
         return bool(tagged_processes(ticket.id))  # the supervisor is gone; is anything of the build left?
 
+    can_freeze = False  # no cgroup of its own to freeze
+
+    def freeze(self, ticket, frozen: bool):
+        return None
+
     def stop(self, ticket, force: bool = False):
         if proc_alive(ticket.pid, ticket.pid_start):
             try:
@@ -1582,6 +1822,7 @@ class Conn:
     def __init__(self, writer):
         self.writer = writer
         self.closed = False
+        self.submission = None  # the submission a `buildq run` on this connection made or joined
 
     def send(self, message: dict) -> bool:
         if self.closed or self.writer is None or self.writer.is_closing():
@@ -1601,7 +1842,12 @@ class Ticket:
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
                "need", "rigid", "est_mem", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
-               "mem_wait_full", "mem_high")
+               "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
+               "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
+               "extra_notify",
+               "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
+               "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
+               "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks")
 
     def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
                  directory: str | None):
@@ -1664,7 +1910,40 @@ class Ticket:
         self.mem_wait_some = 0.0  # seconds some of its tasks waited on memory (memory.pressure)
         self.mem_wait_full = 0.0  # seconds all of them did
         self.mem_high = 0  # times it went over its own MemoryHigh, where the kernel slows it
+        self.source = None  # the commit it is of, and whether its tree had changes ({repo, commit, dirty, ...})
+        self.dedupe = None  # same source, command, directory, lane and environment: the same build
+        self.caller = None  # the unit its client ran in: a session, a CI runner
+        self.frozen = False  # paused to give the machine its memory back
+        self.frozen_at = None
+        self.requeues = 0  # times it was stopped to free memory and queued again
+        self.requeue_pending = False  # being stopped, to be queued again
+        self.shed_error = None  # why it can't be queued again once stopped
+        self.restartable = False  # its caller says it can start over from the beginning safely
+        self.joiners = 0  # other submissions that joined it
+        self.answered: dict[str, str] = {}  # other submissions it answered: id -> "joined" or "reused"
+        self.interests: dict[str, str] = {}  # submissions waiting for it: id -> "run" (followed) or "submit"
+        self.followed: dict[str, float] = {}  # a run submission -> when a client of it last followed
+        self.frozen_total = 0.0  # seconds spent paused, over all its attempts
+        self.frozen_attempt = 0.0  # seconds this attempt spent paused, the current pause not included
+        self.attempts_cpu = 0.0  # CPU seconds of attempts stopped for memory
+        self.attempts_mem_high = 0
+        self.attempts_wall = 0.0  # run time, memory waits and peak of attempts stopped for memory
+        self.attempts_mem_wait = 0.0
+        self.attempts_peak = 0
+        self.git_env: dict[str, str] = {}  # what git needs to see the tree as its submitter did
+        self.extra_notify: list[str] = []  # joiners' --notify commands
+        self.source_verified = None  # its source was the same at its start and end (None: not known yet)
+        self.source_checks: dict = {}  # "start"/"end" -> whether the tree matched the record then
+        self.source_changed = False  # it wasn't: it built something else than its record says
+        self.attempt_offsets: dict = {}  # where the last attempt's output begins in stdout/stderr.log
+        self.queued_at = None  # when it last joined the queue
+        self.wait_total = 0.0  # time spent queued, over all its attempts
+        self.freeze_asked = None  # (frozen?, when) of the last freezer request not yet seen to take
+        self.force_sent = False  # SIGKILL sent: its memory is on its way back
+        self.freeze_failed = False  # this attempt's freeze never took: don't try again (kept on disk)
+        self.thaw_failed = False  # its thaw never took and it couldn't be stopped: don't ask again
         # Not kept on disk:
+        self.env: dict | None = None  # its environment, to queue it again (gone after a restart)
         self.js: Jobserver | None = None
         self.launcher = None
         self.running_since = None
@@ -1762,7 +2041,10 @@ class Ticket:
             "peak_cores": round(self.peak_cores, 2), "avg_cores": round(self.avg_cores, 2),
             "measured": self.measured, "exit": self.exit, "oom": self.oom, "timed_out": self.timed_out,
             "mem_wait_some": round(self.mem_wait_some, 1), "mem_wait_full": round(self.mem_wait_full, 1),
-            "mem_high": self.mem_high,
+            "mem_high": self.mem_high, "source": self.source, "caller": self.caller, "frozen": self.frozen,
+            "requeues": self.requeues, "source_changed": self.source_changed, "attempt_offsets": self.attempt_offsets,
+            "source_verified": self.source_verified,
+            "joiners": self.joiners,
             "error": self.error, "reason": self.reason if self.state == "queued" else None,
             "waiting_for": self.reason_cat if self.state == "queued" else None,
             "held": self.held if self.state == "queued" else False, "ahead": ahead,
@@ -1817,6 +2099,44 @@ class Daemon:
         self.memory_threads: dict[str, threading.Thread] = {}
         self.memory_thread_lock = threading.Lock()
         self.memory_thread_failed = False
+        self.last_freeze = self.last_kill = -1e9
+        self.started_at = time.time()
+        self.avail_seen: collections.deque = collections.deque()  # (time, memory available) of the last 10 s
+        self.submit_outcome: dict = {}  # how the last submission was answered: joined, reused, passed before
+        self.paused = read_json(os.path.join(state_dir, "paused.json"))  # {"reason", "since"} or None
+        if not isinstance(self.paused, dict):
+            self.paused = None
+        self.status_posts: list = read_json(os.path.join(state_dir, "github-statuses.json")) or []
+        if not isinstance(self.status_posts, list):
+            self.status_posts = []
+        self.status_procs: list[tuple[subprocess.Popen, dict, float]] = []
+        self.gh = ["gh"]  # tests put a stand-in here
+        self.source_command = [sys.executable, os.path.join(os.path.dirname(SELF), "buildq"), "source"]
+        self.source_checks: list[tuple[subprocess.Popen, str, str, float, int]] = []
+        self.source_wanted: collections.deque = collections.deque()  # (ticket, phase, attempt) waiting a turn
+        self.status_posted: dict[str, dict] = {}  # "repo@sha@context" -> {state, order} last posted
+        self.status_seen: dict[str, list] = {}  # "repo@sha@context" -> order of the newest verdict seen
+        statuses = read_json(os.path.join(state_dir, "github-statuses.json"))
+        if isinstance(statuses, dict):
+            self.status_posts = statuses.get("queue") or []
+            seen = statuses.get("seen")
+            self.status_seen = {str(k): list(v) for k, v in seen.items() if isinstance(v, list)} \
+                if isinstance(seen, dict) else {}
+            posted = statuses.get("posted")
+            self.status_posted = {}
+            for where, value in (posted.items() if isinstance(posted, dict) else ()):
+                if isinstance(value, str):
+                    value = {"state": value, "order": [0, ""]}
+                if isinstance(value, dict) and isinstance(value.get("state"), str):
+                    self.status_posted[str(where)] = {"state": value["state"], "order": list(value.get("order") or [0, ""])}
+        newest: dict[str, dict] = {}
+        for post in (p for p in self.status_posts if valid_post(p)):  # what was in flight is just queued now
+            where = post.get("where") or f"{post['repo']}@{post['sha']}@{post['context']}"
+            post["where"] = where
+            post["order"] = list(post.get("order") or [post["first"], ""])
+            if where not in newest or post["order"] > newest[where]["order"]:
+                newest[where] = post
+        self.status_posts = list(newest.values())
 
     # ---- configuration
 
@@ -1897,14 +2217,34 @@ class Daemon:
         finish soonest, then the oldest."""
         now = time.time() if now is None else now
 
-        def order(t: Ticket):
+        # Fair shares: at the same priority, a caller (a session, a CI runner) with fewer builds
+        # running goes first, so one agent's burst of builds doesn't keep everyone else waiting.
+        running = collections.Counter(t.caller for t in self.active())
+
+        def tier(t: Ticket):
             lane = self.cfg.lanes.get(t.lane)
             weight = t.priority + (lane.priority if lane else 0)
             # A build that has waited starve_seconds goes ahead of everything else, or a stream of
             # quicker or higher builds could keep it waiting for ever.
-            starving = now - t.submitted >= self.cfg.starve_seconds and not (lane and lane.may_pass_held)
-            return (not starving, -weight, t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
-        return sorted((t for t in self.tickets.values() if t.state == "queued"), key=order)
+            starving = self.starving(t, now) and not (lane and lane.may_pass_held)
+            return (not starving, -weight)
+
+        def own_order(t: Ticket):
+            return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
+
+        queued = sorted((t for t in self.tickets.values() if t.state == "queued"), key=own_order)
+        # Within a tier, a caller's k-th waiting build counts as if k more of its builds ran, so
+        # callers take turns: one session's burst of builds is interleaved with everyone else's.
+        share, seen = {}, collections.Counter()
+        for t in queued:
+            share[t.id] = running[t.caller] + seen[(tier(t), t.caller)]
+            seen[(tier(t), t.caller)] += 1
+        return sorted(queued, key=lambda t: (*tier(t), share[t.id], *own_order(t)[2:]))
+
+    def starving(self, t: Ticket, now: float) -> bool:
+        """It has waited starve_seconds, or it was stopped to free memory once already: it goes first,
+        and the room it needs is held for it."""
+        return now - t.submitted >= self.cfg.starve_seconds or t.requeues > 0
 
     def active(self) -> list[Ticket]:
         """Tickets that hold a turn: starting or running, including builds found in flock slots."""
@@ -1992,11 +2332,14 @@ class Daemon:
         env = msg.get("env")
         if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
             return None, "the environment must be a map of strings"
+        self.submit_outcome = {}
         submission = msg.get("submission")
         if isinstance(submission, str) and submission in self.submissions:
             earlier = self.tickets.get(self.submissions[submission])
-            if earlier is not None:
-                return earlier, None  # the client didn't get our answer and asked again
+            if earlier is not None:  # the client didn't get our answer and asked again: the same answer
+                how = earlier.answered.get(submission)
+                self.submit_outcome = {how: True} if how in ("joined", "reused") else {}
+                return earlier, None
         tid = str(uuid.uuid4())
         t = Ticket(tid, argv, cwd, lane_name, command_key(argv, cwd, lane_name), now,
                    os.path.join(self.tickets_dir, tid))
@@ -2013,6 +2356,7 @@ class Daemon:
         except (TypeError, ValueError, OverflowError) as e:
             return None, f"bad option: {e}"
         t.attached = bool(msg.get("attach"))
+        t.restartable = msg.get("restartable") is True
         umask = msg.get("umask")
         if isinstance(umask, int) and not isinstance(umask, bool) and 0 <= umask <= 0o777:
             t.umask = umask
@@ -2022,11 +2366,35 @@ class Daemon:
         name, notify = msg.get("name"), msg.get("notify")
         t.name = str(name)[:200] if name else None
         t.notify = str(notify) if notify else None
+        t.caller = sane_caller(msg.get("caller"))
+        source = sane_source(msg.get("source"))
+        if source and source.get("repo") and paths_inside(argv, cwd, source["repo"]):
+            settings = [t.timeout, t.umask, t.rlimits, t.cores_given, t.mem_given, self.cfg.env]
+            t.source, t.dedupe = source, dedupe_key(source, argv, cwd, lane_name, env, settings)
+        elif source:
+            t.source = source  # shown, but a command that reaches outside the tree matches nothing
+        if t.dedupe and msg.get("again") is not True:
+            earlier = self.same_build(t, msg, now)
+            if earlier is not None:
+                who = submission if isinstance(submission, str) and len(submission) <= 100 else f"anon-{tid}"
+                how = "joined" if self.submit_outcome.get("joined") else "reused"
+                earlier.answered[who] = how
+                self.submissions[who] = earlier.id  # a resend gets the same answer
+                if how == "joined":
+                    earlier.interests[who] = "run" if t.attached else "submit"
+                    if t.attached:
+                        earlier.followed[who] = now
+                self.save(earlier)
+                return earlier, None
         t.workspace = workspace_of(cwd, env)
         t.disk_paths = disk_paths_of(cwd, env)
         if isinstance(submission, str) and len(submission) <= 100:
             t.submission = submission
             self.submissions[submission] = tid
+        t.interests = {t.submission or f"anon-{tid}": "run" if t.attached else "submit"}
+        if t.attached:
+            t.followed = {t.submission or f"anon-{tid}": now}
+        t.git_env = {k: v for k, v in env.items() if GIT_ENV.fullmatch(k)}
         t.cold = cargo_cold(argv, cwd, env)
         t.max_log = self.cfg.max_log
         job_env = dict(env)
@@ -2041,6 +2409,8 @@ class Daemon:
         except OSError as e:
             shutil.rmtree(t.dir, ignore_errors=True)
             return None, f"can't create the ticket: {e}"
+        t.env = job_env
+        t.queued_at = now
         self.estimate(t, now)
         self.tickets[tid] = t
         self.save(t)
@@ -2049,6 +2419,49 @@ class Daemon:
         self.schedule(now)
         return t, None
 
+    def waiting(self, t: Ticket, now: float) -> list[str]:
+        """The submissions still waiting for a build: dropped-off ones, and those of `buildq run`s
+        following it, or whose client followed it within unwatched_seconds (it may be reconnecting,
+        after a daemon restart say: the time counts from the daemon's start at the earliest). A run
+        killed outright waits no more after that."""
+        following = {getattr(c, "submission", None) for c in self.watchers.get(t.id, ())}
+
+        def recent(who):
+            return now - max(t.followed.get(who, 0.0), self.started_at) <= self.cfg.unwatched_seconds
+        return [who for who, kind in t.interests.items() if kind == "submit" or who in following or recent(who)]
+
+    def same_build(self, t: Ticket, msg: dict, now: float) -> Ticket | None:
+        """An earlier ticket that answers this submission: the same build queued or running (it
+        joins it), or, for a plain check or with --reuse, one that passed on the same source within
+        reuse_window, with its source checked unchanged at its start and end."""
+        same = [x for x in self.tickets.values() if x.dedupe == t.dedupe and not x.source_changed]
+        live = [x for x in same if x.state not in FINISHED and not x.cancel_requested and not x.shed_error]
+        if live:
+            x = live[0]
+            if not t.attached:
+                x.attached = False  # a dropped-off submission depends on it now: no client owns it
+            x.joiners += 1
+            x.priority = max(x.priority, t.priority)
+            if t.notify:
+                x.extra_notify.append(t.notify)
+            self.save(x)
+            self.submit_outcome = {"joined": True}
+            log(f"{x.id} is already {x.state} for the same command on the same source; a new submission joins it")
+            return x
+        passed = [x for x in same if x.state == "succeeded" and x.source_verified and x.ended
+                  and now - x.ended <= self.cfg.reuse_window]
+        if not passed:
+            return None
+        last = max(passed, key=lambda x: x.ended)
+        reuse = msg.get("reuse")
+        if reuse is True or (reuse is None and reusable_check(t.argv)):
+            self.submit_outcome = {"reused": True}
+            log(f"{last.id} passed the same command on the same source {now - last.ended:.0f}s ago; "
+                "its result answers a new submission")
+            return last
+        self.submit_outcome = {"passed_before": {"id": last.id, "short": last.id[:8], "ended": last.ended}}
+        return None
+
     def cancel(self, t: Ticket, now: float) -> None:
         if t.state in FINISHED or t.flock:
             return
@@ -2056,19 +2469,535 @@ class Daemon:
         if t.state == "queued":
             self.finalize(t, now, None)
             return
-        self.stop(t, now)
+        self.stop(t, now, force=t.frozen)  # a frozen build can't act on SIGTERM; thawing it would let it grow
         self.save(t)
         self.broadcast(t, now)
         log(f"cancelling {t.id}")
 
     def stop(self, t: Ticket, now: float, force: bool = False) -> None:
         t.stop_sent = now
+        t.force_sent = t.force_sent or force
         try:
             proc = self.runner_of(t).stop(t, force)
             if proc is not None:
                 self.helpers.append((proc, now + 60))
         except OSError as e:
             log(f"can't stop {t.id}: {e}")
+
+    # ---- pausing the queue
+
+    def pause(self, reason: str | None, now: float) -> None:
+        """Start nothing new until resumed (before a reboot, say); running builds carry on."""
+        self.paused = {"reason": reason, "since": now}
+        write_json(os.path.join(self.state_dir, "paused.json"), self.paused)
+        log(f"paused the queue{f' ({reason})' if reason else ''}: running builds carry on, nothing new starts",
+            level=4)
+        self.schedule(now)
+
+    def resume(self, now: float) -> None:
+        if self.paused is None:
+            return
+        self.paused = None
+        try:
+            os.remove(os.path.join(self.state_dir, "paused.json"))
+        except OSError:
+            pass
+        log("resumed the queue")
+        self.schedule(now)
+
+    # ---- giving memory back when the machine runs short
+
+    FREEZE_SECONDS = 10  # between pauses, so the machine's memory can settle
+    KILL_SECONDS = 2  # between stops: a stop frees memory at once, and a pause must never hold one up
+    SHED_MIN = 512 * MIB  # a build holding less frees too little to be worth stopping
+
+    FREEZE_MAX = 300  # a pause lasts this long at most: then the build goes on, or is stopped
+
+    def shed_memory(self, now: float) -> None:
+        """When the machine runs short of memory although no build may grow past its estimate (other
+        work grew: CI, containers, sessions), give memory back before the machine stalls, as GNU
+        parallel's --memsuspend and --memfree do, and as Slurm requeues the jobs it preempts.
+
+        Memory still held by builds being stopped counts as free already, so one shortfall stops
+        one build. Below a quarter of mem_floor available, stop a build at once: the newest of those
+        whose memory covers the shortfall (back to half the floor), else the largest; never one
+        holding less than 512 MiB. A build that can start over safely (a compile or test run, or
+        --restartable) is queued again at the front; anything else fails, saying why, as running it
+        again might repeat what it did. Below half of mem_floor, while memory is still falling, pause
+        (freeze) the newest build holding at least 1 GiB: it stops growing and using CPU. A paused
+        build goes on once the machine has mem_floor free plus the room it may still grow into, at
+        once if shed_memory is off, and after FREEZE_MAX in any case: if memory is still below half
+        the floor then, it is stopped instead."""
+        cfg, m = self.cfg, self.machine
+        builds = [t for t in self.active() if not t.flock and t.state == "running" and not t.cancel_requested
+                  and not t.requeue_pending]
+        self.reconcile_freezes(builds, now)
+        builds = [t for t in builds if not t.requeue_pending]  # (reconciling may have stopped one)
+        frozen = [t for t in builds if t.frozen]
+        floor = cfg.mem_floor
+        if m.mem_available < floor / 4 and cfg.shed_memory:
+            for t in self.active():  # a cancelled build in its grace period is going anyway: now, then
+                if t.cancel_requested and not t.flock and not t.force_sent:
+                    self.stop(t, now, force=True)
+                    t.force_sent = True
+        stopping = sum(t.mem_now for t in self.active() if t.requeue_pending or t.force_sent)
+        avail = m.mem_available + stopping
+        self.avail_seen.append((now, avail))
+        while self.avail_seen and now - self.avail_seen[0][0] > 10:
+            self.avail_seen.popleft()
+        if not cfg.shed_memory or not floor:
+            for t in frozen:
+                if not (t.freeze_asked and not t.freeze_asked[0]) and not t.thaw_failed:
+                    self.freeze(t, False, now, "shed_memory is off")
+            return
+        thawing = {t.id for t in frozen if t.freeze_asked and not t.freeze_asked[0]}
+        for t in frozen:
+            if t.id in thawing:
+                continue  # asked to go on already
+            if self.paused_for(t, now) >= self.FREEZE_MAX:
+                if avail >= floor / 2:
+                    self.freeze(t, False, now, f"paused for {self.FREEZE_MAX // 60} minutes in all, the longest it "
+                                               "may be (it won't be paused again)")
+                    self.last_freeze = now
+                elif now - self.last_kill >= self.KILL_SECONDS:
+                    self.shed(t, now)  # memory stays short: its memory is what frees it
+                    self.last_kill = now
+                return
+        if avail < floor / 4:
+            if now - self.last_kill < self.KILL_SECONDS:
+                return
+            pool = sorted((t for t in builds if t.mem_now >= self.SHED_MIN), key=lambda t: t.started or 0,
+                          reverse=True)
+            if not pool:
+                return  # what holds the memory isn't ours to stop
+            shortfall = floor / 2 - avail
+            enough = [t for t in pool if t.mem_now >= shortfall]
+            self.shed(enough[0] if enough else max(pool, key=lambda t: t.mem_now), now)
+            self.last_kill = now
+        elif avail < floor / 2:
+            falling = self.avail_seen[0][1] - avail >= 256 * MIB  # pausing only helps while memory still goes
+            if now - self.last_freeze < self.FREEZE_SECONDS or not falling:
+                return
+            pool = [t for t in sorted(builds, key=lambda t: t.started or 0, reverse=True)
+                    if not t.frozen and not t.freeze_failed and t.mem_now >= GIB and self.runner_of(t).can_freeze
+                    and self.paused_for(t, now) < self.FREEZE_MAX]  # each attempt is paused for so long at most
+            if pool:
+                self.freeze(pool[0], True, now, f"only {fmt_size(m.mem_available)} of memory is free (half the floor "
+                                                f"is {fmt_size(floor / 2)}) and falling")
+                self.last_freeze = now
+        elif [t for t in frozen if t.id not in thawing] and now - self.last_freeze >= self.FREEZE_SECONDS:
+            t = min((t for t in frozen if t.id not in thawing), key=lambda t: t.frozen_at or 0)
+            if avail > floor + max(0, t.est_mem - t.mem_now):
+                self.freeze(t, False, now, f"{fmt_size(m.mem_available)} of memory is free again")
+                self.last_freeze = now
+
+    def paused_for(self, t: Ticket, now: float) -> float:
+        """How long this attempt has been paused, in all."""
+        return t.frozen_attempt + (max(0.0, now - t.frozen_at) if t.frozen and t.frozen_at else 0.0)
+
+    def freeze(self, t: Ticket, frozen: bool, now: float, why: str) -> None:
+        try:
+            proc = self.runner_of(t).freeze(t, frozen)
+            if proc is not None:
+                self.helpers.append((proc, now + 30))
+        except OSError as e:
+            log(f"can't {'pause' if frozen else 'resume'} {t.id}: {e}", level=4)
+            if frozen:
+                return
+            # A thaw that couldn't even be sent still has its minute: then the build is stopped.
+        observable = bool(t.cg) and cgroup_frozen(t.cg) is not None
+        # A pause begins, and ends, when the cgroup says so (reconcile_freezes); where that can't be
+        # seen, at once.
+        if frozen:
+            t.frozen, t.frozen_at, t.thaw_failed = True, (None if observable else now), False
+        elif not observable:
+            if t.frozen_at:
+                t.frozen_attempt += max(0.0, now - t.frozen_at)
+            t.frozen, t.frozen_at = False, None
+        t.freeze_asked = (frozen, now)
+        self.save(t)
+        self.broadcast(t, now)
+        log(f"asked {t.id} to {'pause' if frozen else 'go on'}: {why}", level=4)
+
+    def reconcile_freezes(self, builds: list[Ticket], now: float) -> None:
+        """The build's own cgroup.freeze says whether buildq's pause is set; cgroup.events whether
+        it took (a frozen parent, buildq.slice say, freezes a build too, but that isn't buildq's
+        pause, and isn't taken for one). A pause counts from when it is seen to take. A request that
+        hasn't taken after 15 s is sent once more; after a minute the daemon gives up: a freeze that
+        never took is undone (so it can't land later), and this attempt isn't paused again; a thaw
+        that never took (its own setting still frozen) means the build can't go on, so it is
+        stopped, if shed_memory is on. With no request pending, the ticket follows the build's own
+        setting (a freeze that landed late; a thaw from before a restart)."""
+        for t in builds:
+            own = cgroup_freeze_set(t.cg) if t.cg else None
+            took = cgroup_frozen(t.cg) if t.cg else None
+            if t.freeze_asked is None:
+                if own is None:
+                    if t.frozen and t.frozen_at is None:
+                        t.frozen_at = now  # can't be seen: paused, as far as is known, from now
+                elif own and not t.frozen and parent_freeze_set(t.cg):
+                    pass  # its slice is frozen (older systemd sets each member's own setting too): not buildq's
+                elif own and not t.frozen:
+                    t.frozen, t.frozen_at = True, (now if took else None)
+                    if not t.freeze_failed:  # (else it is buildq's own freeze, whose undo didn't take)
+                        log(f"{t.id} is set paused, though buildq didn't mean it to be; taking it so", level=4)
+                    self.save(t)
+                    self.broadcast(t, now)
+                elif not own and t.frozen:
+                    if t.frozen_at:
+                        t.frozen_attempt += max(0.0, now - t.frozen_at)
+                    t.frozen, t.frozen_at, t.thaw_failed = False, None, False  # (thawed by someone: it may be again)
+                    self.save(t)
+                    self.broadcast(t, now)
+                elif own and took and t.frozen_at is None:
+                    t.frozen_at = now
+                    self.save(t)
+                continue
+            wanted, asked, retried = (list(t.freeze_asked) + [False, False])[:3]
+            if own is None:
+                continue
+            done = (own and took) if wanted else not own  # a thaw is done once its own setting is clear
+            if done:
+                if wanted and t.frozen_at is None:
+                    t.frozen_at = now  # it took: the pause counts from here
+                elif not wanted:  # thawed (a parent may still hold it, but that isn't buildq's pause)
+                    if t.frozen_at:
+                        t.frozen_attempt += max(0.0, now - t.frozen_at)
+                    t.frozen, t.frozen_at, t.thaw_failed = False, None, False
+                    self.broadcast(t, now)
+                t.freeze_asked = None
+                self.save(t)
+                continue
+            if now - asked >= 60:
+                if wanted:  # a freeze that never took: undo it, so it can't land later; and no more tries
+                    log(f"{t.id} hadn't paused a minute after it was asked to; undoing it, and not pausing it "
+                        "again", level=4)
+                    t.frozen, t.frozen_at, t.freeze_failed = False, None, True
+                    try:
+                        proc = self.runner_of(t).freeze(t, False)
+                        if proc is not None:
+                            self.helpers.append((proc, now + 30))
+                    except OSError:
+                        pass
+                    t.freeze_asked = (False, now)  # tracked: if even the undo doesn't take, the build is stopped
+                elif self.cfg.shed_memory:  # a thaw that never took: it can't go on, so it is stopped
+                    undo = t.freeze_failed  # (the undo of a freeze that never took, rather than a pause)
+                    log(f"{t.id} hadn't {'had its pause undone' if undo else 'resumed'} a minute after it was asked "
+                        "to; stopping it", level=4)
+                    t.freeze_asked = None
+                    self.shed(t, now, why="its pause couldn't be undone" if undo
+                              else "it couldn't be resumed after a pause")
+                    continue
+                else:
+                    log(f"{t.id} hadn't resumed a minute after it was asked to, and shed_memory is off: "
+                        "leaving it paused", level=4)
+                    t.freeze_asked, t.thaw_failed = None, True  # not asked again: it would only fail again
+                self.save(t)
+                self.broadcast(t, now)
+            elif now - asked >= 15 and not retried:
+                t.freeze_asked = (wanted, asked, True)  # once more, not on every tick
+                try:
+                    proc = self.runner_of(t).freeze(t, wanted)
+                    if proc is not None:
+                        self.helpers.append((proc, now + 30))
+                except OSError:
+                    pass
+
+    def thaw_all(self, now: float) -> None:
+        """Before the daemon stops: nothing would resume a paused build while it is gone. Nothing
+        will see these thaws take either, so the pauses end, for the record, as they are sent."""
+        for t in self.active():
+            if t.frozen and not t.flock:
+                if not (t.freeze_asked and not t.freeze_asked[0]):
+                    self.freeze(t, False, now, "the daemon is stopping")
+                else:  # a thaw pending: send it once more, the last chance before the daemon goes; its minute stays
+                    try:
+                        proc = self.runner_of(t).freeze(t, False)
+                        if proc is not None:
+                            self.helpers.append((proc, now + 30))
+                    except OSError:
+                        pass
+                if t.frozen_at:
+                    t.frozen_attempt += max(0.0, now - t.frozen_at)
+                t.frozen_at = None  # the pause ends here for the record; the thaw stays asked for until seen
+                self.save(t)
+
+    def shed(self, t: Ticket, now: float, why: str | None = None) -> None:
+        """Stop a build (to free its memory, or `why`); check() queues it again once it is gone, if it may be."""
+        avail = fmt_size(self.machine.mem_available)
+        stopped = f"stopped ({why})" if why else f"stopped to free memory (only {avail} was free)"
+        if not (t.restartable or restart_safe(t.argv)):
+            t.shed_error = (f"{stopped}. It isn't started again by itself, as it might repeat what it had done (a "
+                            "script, a push): run it again once the machine has room, or submit it with "
+                            "--restartable if starting over is safe")
+        elif t.env is None:
+            t.shed_error = (f"{stopped}. Its environment is gone since the daemon restarted, so it isn't queued "
+                            "again: run it again")
+        elif t.requeues >= 3:
+            t.shed_error = f"{stopped} for the fourth time; run it again later"
+        if t.frozen and t.frozen_at:  # its pause ends here: it is being killed
+            t.frozen_attempt += max(0.0, now - t.frozen_at)
+        t.frozen, t.frozen_at, t.freeze_asked = False, None, None
+        t.requeue_pending = True
+        self.stop(t, now, force=True)  # SIGKILL reaches frozen processes too
+        self.save(t)
+        self.broadcast(t, now)
+        cause = why or (f"to free memory: only {avail} is free (a quarter of the floor is "
+                        f"{fmt_size(self.cfg.mem_floor / 4)})")
+        log(f"stopping {t.id} ({fmt_size(t.mem_now)}) {cause}{'' if t.shed_error else '; it will be queued again'}",
+            level=4)
+
+    def requeue(self, t: Ticket, now: float) -> None:
+        """A build stopped to free memory is gone: queue it again, at the front, or fail it."""
+        if t.cancel_requested:
+            self.finalize(t, now, None)  # cancelled while it was being stopped: it stays cancelled
+            return
+        if t.shed_error or t.env is None:
+            self.finalize(t, now, None, error=t.shed_error or "stopped to free memory; its environment is gone "
+                                                              "since the daemon restarted: run it again")
+            return
+        try:  # unload the old service; the next attempt has a name of its own
+            proc = self.runner_of(t).cleanup(t)
+            if proc is not None:
+                self.helpers.append((proc, now + 60))
+        except OSError:
+            pass
+        self.close_jobserver(t, remove=True)
+        try:
+            for name in ("result.json", "supervisor.json", "child.json"):
+                try:
+                    os.remove(os.path.join(t.dir, name))
+                except FileNotFoundError:
+                    pass
+            write_json(os.path.join(t.dir, "env.json"), t.env)
+            marker = (f"\nbuildq: stopped at {time.strftime('%H:%M:%S')} because the machine ran short of memory; "
+                      "it starts again from the beginning when there is room.\n").encode()
+            offsets = {}
+            for name in ("output.log", "stderr.log", "stdout.log"):
+                with open(os.path.join(t.dir, name), "a+b") as f:
+                    if name != "stdout.log":  # stdout may be parsed: keep the note out of it
+                        f.write(marker)
+                    elif f.tell():
+                        f.seek(-1, os.SEEK_END)
+                        if f.read(1) != b"\n":
+                            f.write(b"\n")  # end a line the stop cut, so the next attempt's first line is whole
+                    offsets[name] = f.tell()
+        except OSError as e:
+            self.finalize(t, now, None, error=f"stopped to free memory, and couldn't be queued again: {e}")
+            return
+        t.attempt_offsets = offsets
+        if t.frozen and t.frozen_at:
+            t.frozen_attempt += max(0.0, now - t.frozen_at)
+        t.attempts_wall += max(0.0, now - (t.started or now) - t.frozen_attempt)
+        t.frozen_total += t.frozen_attempt
+        t.frozen_attempt = 0.0
+        t.attempts_cpu += max(0, t.cpu_usec - (t.cpu_usec_base or 0)) / 1e6
+        t.attempts_mem_wait += t.mem_wait_some
+        t.attempts_mem_high += t.mem_high
+        t.attempts_peak = max(t.attempts_peak, t.mem_peak)
+        t.force_sent = t.freeze_failed = t.thaw_failed = False
+        t.state, t.started, t.running_since, t.result_seen, t.stop_sent = "queued", None, None, None, None
+        t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = None
+        t.granted = t.max_granted = t.tokens_out = 0
+        t.measured = t.elastic = t.frozen = t.requeue_pending = False
+        t.frozen_at = None
+        t.samples.clear()
+        t.cores_now, t.mem_now, t.cpu_usec, t.grant_area = 0.0, 0, 0, 0.0
+        t.mem_peak, t.peak_cores, t.peak_mem_cores = 0, 0.0, 0
+        t.mem_wait_some = t.mem_wait_full = 0.0
+        t.mem_high = 0
+        t.source_verified = None  # the next attempt is checked afresh
+        t.source_checks = {}
+        t.requeues += 1
+        t.queued_at = now
+        t.reason_cat, t.reason = "memory", "stopped to free memory; it goes first once there is room"
+        self.save(t)
+        self.broadcast(t, now)
+        log(f"queued {t.id} again: stopped to free memory ({t.requeues} time{'s' if t.requeues != 1 else ''})", level=4)
+
+    # ---- checking that a build built the source its record says
+
+    SOURCE_CHECKS_AT_ONCE = 3
+
+    def check_source(self, t: Ticket, phase: str, now: float) -> None:
+        """Fingerprint the build's tree again, in a process of its own (`buildq source DIR`, with the
+        submitter's git settings), as it starts and as it ends: the build uses what is on disk then,
+        which may no longer be what was recorded when it was submitted. Only a build whose tree
+        matched both times can answer a later submission, or tell GitHub it passed. At most three
+        checks run at once; the rest wait their turn."""
+        self.source_wanted.append((t.id, phase, t.requeues))
+        self.start_source_checks(now)
+
+    def start_source_checks(self, now: float) -> None:
+        while self.source_wanted and len(self.source_checks) < self.SOURCE_CHECKS_AT_ONCE:
+            tid, phase, attempt = self.source_wanted.popleft()
+            t = self.tickets.get(tid)
+            if t is None or t.requeues != attempt:
+                continue
+            env = {"LC_ALL": "C", **t.git_env} if t.git_env else None
+            try:
+                proc = subprocess.Popen([*self.source_command, t.cwd], stdin=DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=DEVNULL, start_new_session=True, env=env)
+            except OSError as e:
+                log(f"can't check {t.id}'s source: {e}")
+                t.source_checks[phase] = False
+                continue
+            self.source_checks.append((proc, tid, phase, now + 30, attempt))
+
+    def collect_source_checks(self, now: float) -> None:
+        for entry in list(self.source_checks):
+            proc, tid, phase, deadline, attempt = entry
+            if proc.poll() is None:
+                if now < deadline:
+                    continue
+                try:  # the helper and the git under it
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+            self.source_checks.remove(entry)
+            try:
+                seen = json.loads(proc.stdout.read() or b"null") if proc.returncode == 0 else None
+            except ValueError:
+                seen = None
+            proc.stdout.close()
+            t = self.tickets.get(tid)
+            if t is None or not t.source or t.requeues != attempt:
+                continue  # gone, or a check of an attempt since stopped: it says nothing of this one
+            same = isinstance(seen, dict) and seen.get("commit") == t.source["commit"] \
+                and seen.get("fingerprint") == t.source["fingerprint"]
+            t.source_checks[phase] = same
+            if isinstance(seen, dict) and not same:
+                t.source_changed = True
+                log(f"{t.id}'s source changed {'before it started' if phase == 'start' else 'while it ran'}: "
+                    "it answers no later submission")
+            if "start" in t.source_checks and "end" in t.source_checks and t.state in FINISHED:
+                t.source_verified = bool(t.source_checks["start"] and t.source_checks["end"]) and not t.source_changed
+                if t.source_verified:
+                    self.note_status(t, now)
+            self.save(t)
+        self.start_source_checks(now)
+
+    # ---- telling GitHub what passed
+
+    def note_status(self, t: Ticket, now: float) -> None:
+        """With github_status on, a check (see reusable_check) or a named build that passed on a
+        commit with no changes on top, its source the same at its start and end, says so on GitHub,
+        as a status of that commit, so its pull request shows it was verified here. A later failure of
+        the same check on the same commit, the check's own verdict (an exit of 1 to 127; not a kill,
+        a timeout or a stop to free memory), turns that status red; other failures aren't posted (a
+        local failure on the way to a fix is noise on a pull request). Results are ordered by when
+        their builds ended, not when their checks did: an older result never replaces a newer one.
+        A commit that isn't on GitHub yet is tried again after the next `git push` run through buildq
+        from that repository, and every ten minutes, for a day."""
+        src = t.source or {}
+        if not self.cfg.github_status or src.get("dirty") or not src.get("remote") or not src.get("commit") \
+                or t.source_changed or not t.source_verified or not (t.name or reusable_check(t.argv)) \
+                or t.state not in ("succeeded", "failed"):
+            return
+        if t.state == "failed" and not (isinstance(t.exit, int) and 1 <= t.exit <= 127 and not t.oom
+                                        and not t.timed_out and not t.shed_error):
+            return
+        context = ("buildq/" + (t.name or " ".join(command_words(t.argv))))[:100]
+        where = f"{src['remote']}@{src['commit']}@{context}"
+        order = [t.ended or now, t.submitted, t.id]  # ties go to the one submitted later
+        pending = [p for p in self.status_posts if p.get("where") == where]
+        latest = max([p.get("order") or [0, ""] for p in pending] + [self.status_posted.get(where, {}).get("order")
+                                                                      or [0, ""]])
+        latest = max(latest, self.status_seen.get(where) or [0, ""])
+        if order <= latest:
+            return  # a result of a build that ended later is already there
+        self.status_seen.pop(where, None)
+        self.status_seen[where] = order  # newer than anything seen: what came before can't win now
+        shown = (max(pending, key=lambda p: p.get("order") or [0, ""])["state"] if pending
+                 else self.status_posted.get(where, {}).get("state"))
+        if t.state == "failed" and shown != "success":
+            self.save_status_posts()
+            return  # nothing green to correct, but nothing older may turn it green now either
+        in_flight = {id(p) for _, p, _ in self.status_procs}
+        for p in pending:  # the newest result replaces older ones not yet sent
+            if id(p) not in in_flight:
+                self.status_posts.remove(p)
+        took = fmt_duration((t.ended or now) - (t.started or now))
+        self.status_posts.append({
+            "repo": src["remote"], "sha": src["commit"], "state": "success" if t.state == "succeeded" else "failure",
+            "context": context, "where": where, "order": order,
+            "description": (f"passed on the shared build machine in {took}" if t.state == "succeeded" else
+                            f"failed (exit {t.exit}) on the shared build machine")[:140],
+            "first": now, "next": now, "ticket": t.id})
+        self.save_status_posts()
+
+    def save_status_posts(self) -> None:
+        if len(self.status_posted) > 2000:  # (insertion order: the oldest go)
+            self.status_posted = dict(list(self.status_posted.items())[-1000:])
+        try:
+            if len(self.status_seen) > 2000:
+                self.status_seen = dict(list(self.status_seen.items())[-1000:])
+            write_json(os.path.join(self.state_dir, "github-statuses.json"),
+                       {"queue": self.status_posts, "posted": self.status_posted, "seen": self.status_seen})
+        except OSError as e:
+            log(f"can't save the GitHub statuses to send: {e}")
+
+    def send_status_posts(self, now: float) -> None:
+        changed = False
+        for entry in list(self.status_procs):
+            proc, post, deadline = entry
+            code = proc.poll()
+            if code is None and now < deadline:
+                continue
+            if code is None:
+                proc.kill()
+                proc.wait()
+            self.status_procs.remove(entry)
+            error = (proc.stderr.read() or b"").decode(errors="replace").strip() if proc.stderr else ""
+            if proc.stderr:
+                proc.stderr.close()
+            newer = any(p is not post and p.get("where") == post.get("where")
+                        and (p.get("order") or [0, ""]) > (post.get("order") or [0, ""]) for p in self.status_posts)
+            if proc.returncode == 0 or newer:
+                if post in self.status_posts:
+                    self.status_posts.remove(post)  # sent, or replaced by a newer result for the same check
+            if proc.returncode == 0:
+                where = post.get("where") or f"{post['repo']}@{post['sha']}@{post['context']}"
+                if (post.get("order") or [0, ""]) >= (self.status_posted.get(where, {}).get("order") or [0, ""]):
+                    self.status_posted.pop(where, None)
+                    self.status_posted[where] = {"state": post["state"], "order": post.get("order") or [0, ""]}
+            else:
+                post["next"] = now + 600
+                if not post.get("logged"):
+                    post["logged"] = True
+                    log(f"GitHub didn't take the status for {post['repo']}@{post['sha'][:8]} (trying again in ten "
+                        f"minutes, for a day): {error[:300] or f'gh exited {proc.returncode}'}", level=4)
+            changed = True
+        for post in list(self.status_posts):
+            if now - post["first"] > 86400:
+                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: it didn't take it for a day")
+                self.status_posts.remove(post)
+                changed = True
+        busy = {id(p) for _, p, _ in self.status_procs}
+        sending = {p.get("where") for _, p, _ in self.status_procs}
+        for post in self.status_posts if self.cfg.github_status else ():
+            if len(self.status_procs) >= 2:
+                break
+            if id(post) in busy or post["next"] > now or post.get("where") in sending:
+                continue  # one at a time per commit and check, so they land in order
+            if any(p.get("where") == post.get("where") and (p.get("order") or [0, ""]) > (post.get("order") or [0, ""])
+                   for p in self.status_posts):
+                continue  # a newer result for it is queued
+            command = [*self.gh, "api", "--method", "POST", f"repos/{post['repo']}/statuses/{post['sha']}",
+                       "-f", f"state={post['state']}", "-f", f"context={post['context']}",
+                       "-f", f"description={post['description']}"]
+            try:
+                proc = subprocess.Popen(command, stdin=DEVNULL, stdout=DEVNULL, stderr=subprocess.PIPE,
+                                        start_new_session=True)
+            except OSError as e:
+                log(f"can't run gh to tell GitHub a build's result: {e}")
+                post["next"] = now + 600
+                changed = True
+                continue
+            self.status_procs.append((proc, post, now + 60))
+        if changed:
+            self.save_status_posts()
 
     # ---- admission
 
@@ -2095,6 +3024,13 @@ class Daemon:
         per_lane = collections.Counter(t.lane for t in running)
         held_mem = held_cpu = 0.0
         busy_workspaces = {(t.lane, t.workspace) for t in running if t.workspace}
+        if self.paused is not None:
+            why = self.paused.get("reason") or "no reason given"
+            for t in self.queue(now):
+                t.held = False
+                t.reason_cat, t.reason = "paused", f"the queue is paused ({why}); `buildq resume` starts it again"
+            self.budget.update(held_mem=0, held_cores=0)
+            return
         for t in self.queue(now):
             self.estimate(t, now)  # history or the configuration may have changed since it was queued
             lane = self.lane(t.lane)
@@ -2168,7 +3104,7 @@ class Daemon:
                 busy_workspaces.add((t.lane, t.workspace))
                 continue
             t.reason_cat, t.reason = reason
-            if holds and not passes and now - t.submitted >= cfg.starve_seconds:
+            if holds and not passes and self.starving(t, now):
                 t.held = True
                 held_mem += t.est_mem
                 held_cpu += t.need if lane.waits_for_cpu else 0  # it would start without that room
@@ -2207,6 +3143,7 @@ class Daemon:
         lane = self.lane(t.lane)
         t.state = "starting"
         t.started = now
+        t.wait_total += max(0.0, now - (t.queued_at or t.submitted))
         t.runner = self.runner.name
         t.oom_base = 0
         t.reason = t.reason_cat = ""
@@ -2242,6 +3179,8 @@ class Daemon:
             t.running_since = now
         self.save(t)
         self.broadcast(t, now)
+        if t.dedupe:
+            self.check_source(t, "start", now)
         log(f"started {t.id} [{t.lane}] with {granted} core{'s' if granted != 1 else ''} (wants {t.want}"
             f"{', jobserver' if t.jobserver else ''}) after {now - t.submitted:.0f}s ({self.runner.name}): {t.label}")
 
@@ -2346,8 +3285,21 @@ class Daemon:
             if t.state == "starting" and not self.check_starting(t, now):
                 continue
             t.measure(now)
+            if t.requeue_pending:
+                if self.runner_of(t).alive(t):
+                    if t.stop_sent is None or now - t.stop_sent >= 30:
+                        self.stop(t, now, force=True)
+                    continue
+                result = read_json(os.path.join(t.dir, "result.json"))
+                if isinstance(result, dict) and isinstance(result.get("exit"), int) and result["exit"] < 128:
+                    t.requeue_pending, t.shed_error = False, None  # it finished on its own first
+                    self.finalize(t, now, result.get("exit"), oom=oom_of(result),
+                                  timed_out=bool(result.get("timed_out")), result=result)
+                else:
+                    self.requeue(t, now)
+                continue
             self.outgrown(t)
-            if t.last_grant_t is not None:
+            if t.last_grant_t is not None and not t.frozen:
                 t.grant_area += t.granted * max(0.0, now - t.last_grant_t)
             t.last_grant_t = now
             result = read_json(os.path.join(t.dir, "result.json"))
@@ -2474,6 +3426,7 @@ class Daemon:
                  error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
         if t.state in FINISHED:
             return
+        t.env = None
         if isinstance(result, dict):  # the supervisor's reading, taken as the build ended
             t.take_waits(result.get("mem_wait_some"), result.get("mem_wait_full"), result.get("mem_high"))
         exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
@@ -2493,7 +3446,15 @@ class Daemon:
             t.launcher.poll()
             t.launcher = None
         self.close_jobserver(t)
-        wall = max(now - (t.started or now), 0.0)
+        if t.frozen and t.frozen_at:  # ended while paused
+            t.frozen_attempt += max(0.0, now - t.frozen_at)
+            t.frozen, t.frozen_at = False, None
+        if not t.started and t.queued_at:
+            t.wait_total += max(0.0, now - t.queued_at)  # it ends without having run: all of it was waiting
+        # Time spent paused is neither how long it takes nor time its cores were used.
+        wall = max(now - (t.started or now) - (t.frozen_attempt if t.started else 0.0), 0.0)
+        t.frozen_total += t.frozen_attempt
+        t.frozen_attempt = 0.0
         used = t.cpu_usec - (t.cpu_usec_base or 0)
         t.avg_cores = used / 1e6 / wall if wall > 0 and t.measured else 0.0
         t.peak_cores = max(t.peak_cores, t.avg_cores)
@@ -2522,6 +3483,8 @@ class Daemon:
                     "granted": given, "mem_cores": t.peak_mem_cores or t.max_granted, "elastic": t.elastic,
                     "cold": t.cold, "oom": t.oom, "mem_wait_some": round(t.mem_wait_some, 1),
                     "mem_wait_full": round(t.mem_wait_full, 1), "mem_high": t.mem_high,
+                    "waited": round(t.wait_total, 1), "caller": t.caller,
+                    "requeues": t.requeues,
                 })
             except OSError as e:
                 log(f"can't record {t.id} in history: {e}")
@@ -2534,6 +3497,13 @@ class Daemon:
         self.save(t)
         self.broadcast(t, now)
         self.run_hooks(t, now)
+        if t.dedupe and t.state in ("succeeded", "failed") and not t.source_changed:
+            self.check_source(t, "end", now)
+        self.record_outcome(t, wall)
+        if t.state == "succeeded" and command_words(t.argv)[:2] == ["git", "push"] and t.source:
+            for post in self.status_posts:  # a push may have brought commits that were waiting
+                if post.get("repo") == t.source.get("remote"):
+                    post["next"] = now
         waits = ""
         if t.mem_wait_some >= 1 or t.mem_high:
             waits = (f"; waited on memory {t.mem_wait_some:.0f}s ({t.mem_wait_full:.0f}s with all of it waiting)"
@@ -2542,8 +3512,34 @@ class Daemon:
             f"{'; ' + t.error if t.error else ''}) after {wall:.0f}s: peak {fmt_size(t.mem_peak)}, "
             f"{t.peak_cores:.1f} cores at most, {t.avg_cores:.1f} on average, {t.max_granted} given{waits}")
 
+    def record_outcome(self, t: Ticket, wall: float) -> None:
+        """Every finished build, for `buildq report` (the history keeps only the runs that teach)."""
+        if t.flock:
+            return
+        path = os.path.join(self.state_dir, "outcomes.jsonl")
+        # What every attempt took, the ones stopped to free memory included.
+        record = {"t": round(time.time()), "key": t.key, "lane": t.lane, "caller": t.caller, "state": t.state,
+                  "exit": t.exit, "oom": t.oom, "timed_out": t.timed_out,
+                  "stopped_for_memory": bool(t.shed_error) or t.requeues > 0, "requeues": t.requeues,
+                  "wall": round(wall + t.attempts_wall, 1), "waited": round(t.wait_total, 1),
+                  "peak_mem": max(t.mem_peak, t.attempts_peak),
+                  "mem_wait_some": round(t.mem_wait_some + t.attempts_mem_wait, 1), "mem_high": t.mem_high,
+                  "avg_cores": round(t.avg_cores, 2), "paused": round(t.frozen_total, 1),
+                  "cpu_seconds": round(t.attempts_cpu + max(0, t.cpu_usec - (t.cpu_usec_base or 0)) / 1e6, 1),
+                  "mem_high_all": t.mem_high + t.attempts_mem_high}
+        try:
+            if os.path.getsize(path) > 8 << 20:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        try:
+            with open(path, "a") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError as e:
+            log(f"can't record {t.id}'s outcome: {e}")
+
     def run_hooks(self, t: Ticket, now: float) -> None:
-        for command in (t.notify, self.cfg.on_finish):
+        for command in (t.notify, *t.extra_notify, self.cfg.on_finish):
             if not command:
                 continue
             env = dict(os.environ, BUILDQ_TICKET=t.id, BUILDQ_STATE=t.state,
@@ -2637,12 +3633,24 @@ class Daemon:
             self.tickets[t.id] = t
             if t.submission:
                 self.submissions[t.submission] = t.id
+            if not isinstance(t.answered, dict):
+                t.answered = {}
+            if not isinstance(t.interests, dict):
+                t.interests = {}
+            if not isinstance(t.followed, dict):
+                t.followed = {}
+            if not t.interests and t.state not in FINISHED:  # saved before buildq kept interests
+                t.interests = {t.submission or f"anon-{t.id}": "run" if t.attached else "submit"}
+            for other in t.answered:
+                self.submissions[str(other)] = t.id
             if t.state in FINISHED:
                 continue
             if t.lane not in self.cfg.lanes:
                 t.lane = self.cfg.default_lane
             if t.state == "queued":
                 if os.path.exists(os.path.join(directory, "env.json")):
+                    env = read_json(os.path.join(directory, "env.json"))
+                    t.env = env if isinstance(env, dict) else None
                     log(f"kept {t.id} in the queue across the restart")
                 else:
                     self.finalize(t, now, None, error="its environment file is gone")
@@ -2654,12 +3662,34 @@ class Daemon:
                 except OSError:
                     t.js = None
             t.cpu_usec_base = None  # count CPU from here; the cgroup's counter started before
+            if isinstance(t.freeze_asked, list) and len(t.freeze_asked) >= 2 and t.cg:
+                wanted = bool(t.freeze_asked[0])
+                t.freeze_asked = (wanted, now)  # sent again, with a full minute: its sender went with the old daemon
+                try:
+                    proc = self.runner_of(t).freeze(t, wanted)
+                    if proc is not None:
+                        self.helpers.append((proc, now + 30))
+                except OSError:
+                    pass
+            else:
+                t.freeze_asked = None
+            if t.cg and t.freeze_asked is None:
+                own = cgroup_freeze_set(t.cg)
+                if own is not None:
+                    if not own and t.frozen:  # resumed while the daemon was away: the pause ends now
+                        if t.frozen_at:
+                            t.frozen_attempt += max(0.0, now - t.frozen_at)
+                        t.frozen, t.frozen_at, t.thaw_failed = False, None, False
+                    elif own and not t.frozen and not parent_freeze_set(t.cg):
+                        t.frozen, t.frozen_at = True, (now if cgroup_frozen(t.cg) else None)
+                    elif own and t.frozen and not t.frozen_at and cgroup_frozen(t.cg):
+                        t.frozen_at = now  # (a pause counts only once in effect)
             if t.state == "starting":
                 t.recheck_at = now + 10
             else:
                 t.running_since = now
             if t.cancel_requested:
-                self.stop(t, now)  # a cancel in progress when the daemon stopped goes on
+                self.stop(t, now, force=t.frozen)  # a cancel in progress when the daemon stopped goes on
             log(f"picked up {t.id} [{t.lane}] ({t.state}) from before the restart: {t.label}")
 
     def prune(self, now: float) -> None:
@@ -2672,6 +3702,8 @@ class Daemon:
                 self.tickets.pop(t.id, None)
                 if t.submission:
                     self.submissions.pop(t.submission, None)
+                for other in t.answered:
+                    self.submissions.pop(other, None)
 
     # ---- status
 
@@ -2681,7 +3713,7 @@ class Daemon:
         recent = sorted((t for t in self.tickets.values() if t.state in FINISHED), key=lambda t: t.ended or 0)[-10:]
         return {
             "version": VERSION, "now": now, "runner": self.runner.name, "machine": self.machine.summary(),
-            "budget": self.budget, "config": self.cfg.summary(),
+            "budget": self.budget, "config": self.cfg.summary(), "paused": self.paused,
             "running": [t.row(now) for t in running],
             "queued": [t.row(now, i) for i, t in enumerate(queue)],
             "recent": [t.row(now) for t in reversed(recent)],
@@ -2701,6 +3733,7 @@ class Daemon:
     def tick(self, now: float) -> None:
         self.machine.sample(time.monotonic())
         self.check(now)
+        self.shed_memory(now)
         self.drop_unwatched(now)
         self.scan_flock_slots(now)
         self.schedule(now)
@@ -2710,6 +3743,10 @@ class Daemon:
             self.rebalance(now)
             self.guard_slice()
         self.watch_memory(tick)
+        if self.source_checks or self.source_wanted:
+            self.collect_source_checks(now)
+        if self.status_posts or self.status_procs:
+            self.send_status_posts(now)
         self.send_waits(now)
         self.reap_helpers(now)
         if tick - self.last_prune >= 600:
@@ -2859,11 +3896,21 @@ class Daemon:
         for unwatched_seconds (its client was killed, by an editor or a tool timeout), cancel it rather than let
         it hold a turn for output nobody reads. Builds dropped off with `buildq submit` stay."""
         for t in list(self.tickets.values()):
+            if t.state not in FINISHED and t.interests:
+                for conn in self.watchers.get(t.id, ()):
+                    if getattr(conn, "submission", None) in t.interests:
+                        t.followed[conn.submission] = now
+                gone = [who for who, kind in t.interests.items() if kind == "run" and who not in self.waiting(t, now)]
+                if gone and len(gone) < len(t.interests):  # (the last one's going is the unwatched rule below)
+                    for who in gone:
+                        del t.interests[who]
+                        t.followed.pop(who, None)
+                    self.save(t)
             if not t.attached or t.state in FINISHED or t.cancel_requested or t.flock:
                 continue
             if self.watchers.get(t.id):
                 t.last_watched = now
-            elif now - t.last_watched > self.cfg.unwatched_seconds:
+            elif now - max([t.last_watched, *t.followed.values()]) > self.cfg.unwatched_seconds:
                 log(f"cancelling {t.id}: the `buildq run` that submitted it has gone")
                 self.cancel(t, now)
 
@@ -2892,8 +3939,9 @@ class Daemon:
                 return
             if msg.get("watch") and t.state not in FINISHED:
                 self.watchers[t.id].add(conn)
+                conn.submission = msg.get("submission")
                 t.sent_cat = None  # send the first reason on the next tick
-            conn.send({"type": "ticket", **t.row(now, self.position(t))})
+            conn.send({"type": "ticket", **t.row(now, self.position(t)), **self.submit_outcome})
         elif op in ("watch", "cancel"):
             t, error = self.resolve(msg.get("ticket"))
             if t is None:
@@ -2903,10 +3951,40 @@ class Daemon:
                 if t.flock:
                     conn.send({"type": "error", "error": f"{t.id} was started outside the queue; buildq can't cancel it"})
                     return
+                who = msg.get("submission") or msg.get("owner")
+                who = who if isinstance(who, str) and len(who) <= 100 else None
+                if not msg.get("all") and t.state not in FINISHED:
+                    if who is not None and t.interests and who not in t.interests:
+                        conn.send({"type": "ticket", **t.row(now, self.position(t)), "kept": True})
+                        return  # not one of its submissions (or one that went already): nothing to stop
+                    if who is not None and who in t.interests:
+                        # A `run` that made or joined it was interrupted: that submission stops
+                        # waiting. The build stops only when it was the last one waiting.
+                        del t.interests[who]
+                        if self.waiting(t, now):
+                            if "submit" in t.interests.values():
+                                t.attached = False  # a dropped-off submission waits: no client's going cancels it
+                            self.save(t)
+                            log(f"{t.id}: a submission that waited for it went; {len(self.waiting(t, now))} still wait")
+                            conn.send({"type": "ticket", **t.row(now, self.position(t)), "kept": True})
+                            return
+                    elif who is None and len(self.waiting(t, now)) > 1:
+                        conn.send({"type": "error", "error": (
+                            f"{t.id[:8]} is shared: {len(self.waiting(t, now))} submissions of the same build wait for it. "
+                            "`buildq cancel --all` stops it for all of them")})
+                        return
                 self.cancel(t, now)
                 self.schedule(now)
             elif t.state not in FINISHED:
                 self.watchers[t.id].add(conn)
+                if isinstance(msg.get("submission"), str):
+                    conn.submission = msg["submission"]  # a `run` following again after a reconnect
+                    if self.submissions.get(conn.submission) == t.id and conn.submission not in t.interests \
+                            and (conn.submission == t.submission or t.answered.get(conn.submission) == "joined"):
+                        t.interests[conn.submission] = "run"  # it had been given up for gone: it waits again
+                    if conn.submission in t.interests:
+                        t.followed[conn.submission] = now
+                        self.save(t)
                 t.sent_cat = None
             conn.send({"type": "ticket", **t.row(now, self.position(t))})
         elif op == "status":
@@ -2924,6 +4002,13 @@ class Daemon:
                 conn.send({"type": "status", **self.overview(now)})
         elif op == "list":
             conn.send({"type": "tickets", "tickets": self.listing(now, bool(msg.get("all"))), "errors": []})
+        elif op == "pause":
+            reason = msg.get("reason")
+            self.pause(str(reason)[:300] if reason else None, now)
+            conn.send({"type": "paused", "paused": self.paused})
+        elif op == "resume":
+            self.resume(now)
+            conn.send({"type": "paused", "paused": None})
         elif op == "ping":
             conn.send({"type": "pong", "version": VERSION, "runner": self.runner.name})
         else:
@@ -3162,8 +4247,15 @@ def supervise(directory: str) -> int:
                     combined.write(data)
                     streams[key.data].write(data)
 
+        last = time.monotonic()
         while child.poll() is None:
             pump(0.5)
+            tick = time.monotonic()
+            if deadline and tick - last > 5:
+                # A turn of this loop that took far longer than its half second: the build was paused
+                # (frozen to free memory) or the machine stalled. That time doesn't count.
+                deadline += tick - last - 0.5
+            last = tick
             if deadline and time.monotonic() > deadline and term_sent is None:
                 timed_out, term_sent = True, time.monotonic()
                 note(f"\nbuildq: timed out after {float(timeout):.0f}s; stopping it\n")
@@ -3226,7 +4318,8 @@ def supervise(directory: str) -> int:
             # Only a cgroup of the build's own says anything about the build: under the direct
             # runner the supervisor shares the daemon's (or a terminal's), with its whole history.
             ticket_id = os.path.basename(os.path.normpath(directory))
-            own = own if own and os.path.basename(own) == f"buildq-{ticket_id}.service" else None
+            own = own if own and re.fullmatch(rf"buildq-{re.escape(ticket_id)}(-r\d+)?\.service",
+                                              os.path.basename(own)) else None
             events = cgroup_events(own) if own else {}
             some, full, high = (cgroup_memory_waits(own) if own else None) or (None, None, None)
             try:
@@ -3302,6 +4395,7 @@ async def serve(args) -> None:
         f"{daemon.runner.name} runner; configuration {json.dumps(daemon.cfg.summary())}")
     await stop.wait()
     daemon.stopping = True  # from here on nothing new starts
+    daemon.thaw_all(time.time())
     daemon.guard_slice(stopping=True)
     ticker.cancel()
     daemon.stop_memory_watch()
