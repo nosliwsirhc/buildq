@@ -209,7 +209,7 @@ order and starts every build that fits:
 | Pressure | memory pressure (PSI `full avg10`) ≤ `mem_psi_block`; CPU pressure (`some avg10`) ≤ `cpu_psi_block` while a build runs (not for lanes with `waits_for_cpu = false`) |
 | Count | fewer than `max_jobs` builds run, not counting up to `extra_jobs` of its own lane |
 | Disk | its filesystem has at least `disk_floor` free (a size, or a percentage of that filesystem's size, such as `"20%"`). This gates starts only: builds already running can still write below it. |
-| Workspace | in an exclusive lane, no other build of that lane or of its `workspace_group` runs in its workspace (its `CARGO_TARGET_DIR`, or its git worktree), and none that has waited longest is held for it; they would only fight over the build directory |
+| Workspace | in an exclusive lane, no other build of that lane or of its `workspace_group` runs in its workspace (its `CARGO_TARGET_DIR`, or its git worktree), and the workspace isn't held for a build of the group that has waited longest; they would only fight over the build directory |
 
 **Order.** A build that has waited `starve_seconds`, or was stopped once to free memory, goes
 first, and the room it needs, its workspace included, is held for it, so later builds can't keep
@@ -354,7 +354,8 @@ has the room.
 An exclusive lane (the default) runs one build per workspace: its `CARGO_TARGET_DIR`, or its git
 worktree. Exclusive lanes with the same `workspace_group` share that rule. A lane's group is its
 own name unless it says otherwise, so `workspace_group = "heavy"` joins the heavy lane's group. A
-group must be shared with another lane, and every lane in it must be exclusive.
+group named with `workspace_group` must be shared with another lane (naming the lane itself is the
+default), and every lane in it must be exclusive.
 
 For example, a lane for `cargo check` and `cargo clippy`, smaller than a full build and ahead of
 it, should join the heavy lane's group. A check and a `cargo test` in one target folder then never

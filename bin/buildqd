@@ -2473,6 +2473,7 @@ class Ticket:
         # Its lane's workspace_group when it started, kept across reloads: "" for a non-exclusive
         # lane (no group); None when unknown (saved before groups were recorded).
         self.workspace_group: str | None = None
+        self.lane_reassigned = False  # its lane was gone at a restart and it was put in the default lane
         self.waited_by: dict[str, float] = {}  # seconds queued, by the reason it waited
         self.wait_mark: float | None = None  # when that was last added up
         self.peak_at = 0.0  # seconds into this attempt when it reached mem_peak (time paused not counted)
@@ -3884,7 +3885,7 @@ class Daemon:
             if not t.workspace:
                 continue
             groups = {t.workspace_group} if isinstance(t.workspace_group, str) and t.workspace_group else set()
-            if t.lane in cfg.lanes and cfg.lanes[t.lane].exclusive:  # (a lane removed since: its group at start)
+            if t.lane in cfg.lanes and cfg.lanes[t.lane].exclusive and not t.lane_reassigned:  # (a lane removed since: its group at start)
                 groups.add(cfg.lanes[t.lane].workspace_group)
             for group in groups:
                 busy_workspaces[(group, t.workspace)] = t
@@ -4588,8 +4589,10 @@ class Daemon:
             if t.state in ("starting", "running") and t.workspace_group is None and t.lane in self.cfg.lanes:
                 lane = self.cfg.lanes[t.lane]  # saved before groups were recorded: its group, while its lane is known
                 t.workspace_group = lane.workspace_group if lane.exclusive else ""
+                self.save(t)  # at once: a crash before the next save mustn't lose it
             if t.lane not in self.cfg.lanes:
                 t.lane = self.cfg.default_lane
+                t.lane_reassigned = True  # (its workspace stays held under the group it started with only)
             if t.state == "queued":
                 if os.path.exists(os.path.join(directory, "env.json")):
                     env = read_json(os.path.join(directory, "env.json"))

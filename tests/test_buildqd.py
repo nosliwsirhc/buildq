@@ -361,6 +361,8 @@ class Admission(DaemonCase):
         self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
         again.load_tickets(self.now + 10)
         self.assertEqual(again.tickets[check.id].workspace_group, "heavy")
+        with open(os.path.join(check.dir, "ticket.json")) as f:
+            self.assertEqual(json.load(f)["workspace_group"], "heavy")  # saved at once, not only in memory
 
     def test_a_running_build_keeps_its_workspace_when_its_lane_is_removed(self):
         self.with_check_lane()
@@ -402,7 +404,7 @@ class Admission(DaemonCase):
         self.now += 400  # past starve_seconds: it is held
         self.daemon.schedule(self.now)
         self.assertTrue(test.held)
-        check = self.submit(("cargo", "check"), lane="check", cwd=tree, mem="2G")  # it would fit
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree, mem="2G")  # (memory aside from the hold)
         self.daemon.schedule(self.now + 1)
         self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
         self.assertIn("waited longest", check.reason)
