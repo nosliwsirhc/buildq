@@ -351,6 +351,17 @@ class Admission(DaemonCase):
         self.assertEqual(sorted(self.states(test, check)), ["queued", "running"])
         self.assertEqual(check.state, "running")  # (the check lane comes first)
 
+    def test_a_build_from_before_groups_were_recorded_gets_its_group_when_picked_up(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)
+        check.workspace_group = None  # saved by an older daemon
+        self.daemon.save(check)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
+        again.load_tickets(self.now + 10)
+        self.assertEqual(again.tickets[check.id].workspace_group, "heavy")
+
     def test_a_running_build_keeps_its_workspace_when_its_lane_is_removed(self):
         self.with_check_lane()
         tree = self.workdir("tree")
@@ -363,14 +374,55 @@ class Admission(DaemonCase):
         self.assertEqual((test.state, test.reason_cat), ("queued", "workspace"))
 
     def test_workspace_groups_are_checked(self):
-        def config(extra):
-            return buildqd.Config(buildqd.tomllib.loads(BASE_CONFIG + extra), 128 * GIB, 32)
+        def config(extra, base=BASE_CONFIG):
+            return buildqd.Config(buildqd.tomllib.loads(base + extra), 128 * GIB, 32)
         cfg = config("[lanes.check]\n" + self.CHECK_LANE + "\n")
         self.assertEqual((cfg.lanes["check"].workspace_group, cfg.summary()["lanes"]["check"]["workspace_group"]),
                          ("heavy", "heavy"))
-        for bad in ('workspace_group = "carg"', 'workspace_group = ""', 'workspace_group = "web"'):
-            with self.assertRaises(ValueError, msg=bad):
-                config(f"[lanes.check]\ncores = 2\n{bad}\n")  # nobody else's; empty; a non-exclusive lane's
+        for bad, said in (('workspace_group = "carg"', "shared with no other lane"),
+                          ('workspace_group = ""', "must be a name"),
+                          ('workspace_group = "web"', "must be exclusive")):
+            with self.assertRaisesRegex(ValueError, said, msg=bad):
+                config(f"[lanes.check]\ncores = 2\n{bad}\n")
+        grouped = BASE_CONFIG.replace("[lanes.heavy]\n", '[lanes.heavy]\nworkspace_group = "cargo"\n')
+        with self.assertRaisesRegex(ValueError, "lane heavy's group is 'cargo'"):
+            config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
+
+    def test_a_build_held_for_waiting_longest_holds_its_workspace(self):
+        self.with_check_lane()
+        self.machine.mem_available = 35 * GIB  # 25G above the floor, of which a running build may grow into 20G
+        self.submit(cwd=self.workdir("elsewhere"))
+        tree = self.workdir("tree")
+        test = self.submit(("cargo", "test"), cwd=tree)  # 20G: fits once that build ends, not before
+        self.now += 400  # past starve_seconds: it is held
+        self.daemon.schedule(self.now)
+        self.assertTrue(test.held)
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree, mem="2G")  # it would fit
+        self.daemon.schedule(self.now + 1)
+        self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
+        self.assertIn("waited longest", check.reason)
+
+    def test_a_regroup_while_builds_run_keeps_the_running_ones_apart(self):
+        self.with_check_lane()
+        tree = self.workdir("tree")
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)
+        regrouped = (BASE_CONFIG.replace("[lanes.heavy]\n", '[lanes.heavy]\nworkspace_group = "cargo"\n')
+                     + "[lanes.check]\n" + self.CHECK_LANE.replace('"heavy"', '"cargo"') + "\n")
+        with open(self.config_path, "w") as f:
+            f.write(regrouped)
+        self.daemon.cfg = self.daemon.load_config()
+        test = self.submit(("cargo", "test"), cwd=tree)
+        self.assertEqual((test.state, test.reason_cat), ("queued", "workspace"))
+        self.finish(check)
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual(test.state, "running")
+
+    def test_a_non_exclusive_lane_blocks_nothing(self):
+        tree = self.workdir("tree")
+        web = self.submit(("pnpm", "build"), lane="web", cwd=tree)
+        self.assertEqual(web.workspace_group, None)
+        test = self.submit(("cargo", "test"), cwd=tree)
+        self.assertEqual(self.states(web, test), ["running", "running"])
 
     def test_a_shared_target_dir_is_one_workspace(self):
         target = os.path.join(self.tmp.name, "target")

@@ -99,7 +99,9 @@ and walks the queue in order, starting each ticket for which, in this order:
    runs in its workspace. A running build holds its workspace under the group it started with as
    well as its lane's group now, so a reload that changes or removes a lane doesn't free it.
    Non-exclusive lanes take no part, and a config whose group mixes them, or names no other lane,
-   is refused. The wait reason names the build holding the workspace;
+   is refused. A build that has waited `starve_seconds` and is held holds its workspace too, so
+   a quicker lane in its group can't keep taking it. The wait reason names the build holding the
+   workspace;
 5. memory pressure is at most `mem_psi_block`;
 6. it has a turn: its lane has a free `extra_jobs` turn, or fewer than `max_jobs` builds hold
    ordinary turns;

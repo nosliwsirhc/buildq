@@ -131,6 +131,8 @@ default_lane = "default"
 #                       needs, passing cores held for long-waiting builds, and take them back from
 #                       resizable builds (memory still decides)
 #   exclusive = true    one build at a time per workspace (CARGO_TARGET_DIR, or the git worktree)
+#   workspace_group = <the lane's name>   exclusive lanes with one group run one build per workspace
+#                       between them; name another lane (or its group) to join it
 #   jobserver = "tools" give builds a jobserver of their own, resized as the machine's load changes:
 #                       "tools" when the command is cargo, make or ninja; true for every build
 #                       (scripts that call them too; needs make 4.4+ inside); false for none

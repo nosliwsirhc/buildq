@@ -395,13 +395,17 @@ class Config:
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
-        for lane in self.lanes.values():
+        # (a lane whose group names another lane is checked first: its error says what to write)
+        for lane in sorted(self.lanes.values(), key=lambda l: l.workspace_group not in self.lanes):
             if not lane.group_given:
                 continue
             others = [o for o in self.lanes.values() if o is not lane and o.workspace_group == lane.workspace_group]
             if not others:
+                named = self.lanes.get(lane.workspace_group)
+                hint = (f"lane {named.name}'s group is {named.workspace_group!r}: use that" if named is not None
+                        else "to join a lane's group, name that lane's group")
                 raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r} is shared with no other "
-                                 "lane (to join a lane's group, name that lane)")
+                                 f"lane ({hint})")
             if any(not o.exclusive for o in [lane, *others]):
                 raise ValueError(f"lanes.{lane.name}.workspace_group {lane.workspace_group!r}: every lane in a group "
                                  "must be exclusive")
@@ -3912,7 +3916,8 @@ class Daemon:
                                          f"(disk_floor is {said})"), False
             elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces:
                 holder = busy_workspaces[(lane.workspace_group, t.workspace)]
-                reason, holds = ("workspace", f"another build in the same workspace is running ({holder.label[:60]}, "
+                what = "is running" if holder.state != "queued" else "has waited longest and is held"
+                reason, holds = ("workspace", f"another build in the same workspace {what} ({holder.label[:60]}, "
                                               f"{holder.lane} lane, {holder.id[:8]}); they would fight over its build "
                                               "directory"), False
             elif m.psi_mem > cfg.mem_psi_block:
@@ -3971,6 +3976,8 @@ class Daemon:
                 t.held = True
                 held_mem += t.est_mem
                 held_cpu += t.need if lane.waits_for_cpu else 0  # it would start without that room
+                if lane.exclusive and t.workspace:  # and its workspace: a quicker lane mustn't keep taking it
+                    busy_workspaces.setdefault((lane.workspace_group, t.workspace), t)
         self.budget.update(held_mem=held_mem, held_cores=held_cpu)
 
     def build_env(self, t: Ticket) -> dict:
@@ -4594,6 +4601,8 @@ class Daemon:
                     t.js = None
             t.cpu_usec_base = None  # count CPU from here; the cgroup's counter started before
             t.observed_gap = True  # it ran unwatched for a while: its peak and after may have been missed
+            if t.workspace_group is None and t.lane in self.cfg.lanes and self.cfg.lanes[t.lane].exclusive:
+                t.workspace_group = self.cfg.lanes[t.lane].workspace_group  # (saved before groups were recorded)
             t.release_stood_at_load = t.release_at is not None and not t.release_revoked
             t.release_open_at_gap = t.release_open_at_gap or t.release_stood_at_load
             if isinstance(t.freeze_asked, list) and len(t.freeze_asked) >= 2 and t.cg:
