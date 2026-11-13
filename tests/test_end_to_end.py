@@ -411,6 +411,38 @@ class Enforcement(Harness):
         self.assertEqual((inside.returncode, inside.stdout), (0, "compiled\n"), inside.stderr)
 
 
+class SocketActivation(unittest.TestCase):
+    """systemd hands the daemon its listening socket (fd 3, LISTEN_FDS=1). The socket belongs to
+    systemd: stopping the daemon must leave its file in place for the next daemon."""
+
+    def test_the_socket_outlives_the_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "q.sock")
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(path)
+            listener.listen(16)
+            fd = listener.fileno()
+            env = dict(clean_env(), LISTEN_FDS="1", BUILDQ_RUNNER="direct", PYTHONDONTWRITEBYTECODE="1")
+            script = f'exec 3<&{fd}; export LISTEN_PID=$$; exec "$0" "$@"'
+            with open(os.path.join(tmp, "config.toml"), "w") as f:
+                f.write(CONFIG)
+            proc = subprocess.Popen(["sh", "-c", script, sys.executable, BUILDQD, "--socket", path, "--state-dir",
+                                     os.path.join(tmp, "state"), "--config", os.path.join(tmp, "config.toml")],
+                                    env=env, pass_fds=[fd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                client = Daemon(tmp)
+                client.socket = path
+                deadline = time.time() + 20
+                while time.time() < deadline and client.request({"op": "ping"}) is None:
+                    time.sleep(0.1)
+                self.assertIsNotNone(client.request({"op": "ping"}), "the daemon didn't answer on the passed socket")
+            finally:
+                proc.terminate()
+                proc.wait(15)
+            self.assertTrue(os.path.exists(path), "stopping the daemon removed systemd's socket file")
+            listener.close()
+
+
 class Fallback(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

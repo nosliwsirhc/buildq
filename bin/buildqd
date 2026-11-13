@@ -2895,7 +2895,10 @@ async def serve(args) -> None:
     daemon.prune(now)
     daemon.scan_flock_slots(now)
     sock, owned = listening_socket(args.socket)
-    server = await asyncio.start_unix_server(daemon.handle, sock=sock, limit=16 << 20)
+    # Python 3.13+ removes a Unix server's socket file when the server closes. A socket systemd
+    # passed us belongs to systemd and must outlive this process; ours we remove ourselves.
+    keep = {"cleanup_socket": False} if sys.version_info >= (3, 13) else {}
+    server = await asyncio.start_unix_server(daemon.handle, sock=sock, limit=16 << 20, **keep)
     ticker = asyncio.create_task(daemon.ticker())
     m = daemon.machine
     log(f"buildqd {VERSION} on {args.socket}: {m.ncpu} cores, {fmt_size(m.mem_total)} memory, "

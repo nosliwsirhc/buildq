@@ -152,7 +152,14 @@ systemctl --user enable --now buildq.socket >/dev/null
 systemctl --user enable buildq.service >/dev/null
 # A restart loads the new code. Running builds carry on, and the new daemon picks them up.
 systemctl --user restart buildq.service
-for _ in $(seq 1 20); do
+# A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
+# file is gone, have systemd create it again.
+if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]]; then
+  systemctl --user stop buildq.service
+  systemctl --user restart buildq.socket
+  systemctl --user start buildq.service
+fi
+for _ in $(seq 1 40); do
   "$bindir/buildq" ping >/dev/null 2>&1 && break
   sleep 0.5
 done
