@@ -1341,6 +1341,36 @@ class GitHubStatuses(DaemonCase):
         (said,) = [c for c in log.call_args_list if "can't run gh" in str(c)]
         self.assertIn("isn't on PATH, in ~/.local/bin or in ~/bin", str(said))
 
+    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "fedora-kinflow-1"}
+
+    def test_a_pass_in_a_github_actions_job_posts_nothing(self):
+        t = self.submit(("cargo", "test"), source=SOURCE, env=self.CI)
+        self.finish(t, 0)
+        self.settle()
+        self.drain(self.now + 60)
+        self.assertTrue(t.source_verified)
+        self.assertEqual((self.calls(), self.daemon.status_posts), ([], []))
+        self.assertTrue(buildqd.Ticket.from_record(t.record(), t.dir).from_ci)  # kept across a restart
+
+    def test_github_actions_set_by_hand_isnt_a_ci_job(self):
+        t = self.submit(("cargo", "test"), source=SOURCE, env={"GITHUB_ACTIONS": "true"})  # (for annotations)
+        self.finish(t, 0)
+        self.settle()
+        self.drain(self.now + 60)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_a_failure_in_a_github_actions_job_turns_a_buildq_green_red(self):
+        first = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(first, 0)
+        self.settle()
+        self.drain(self.now + 60)
+        ci = self.submit(("cargo", "test"), source=SOURCE, env=self.CI)
+        self.finish(ci, 101, after=60)  # ends after the first
+        self.settle()
+        self.drain(self.now + 61)
+        self.assertEqual([("state=success" in c, "state=failure" in c) for c in self.calls()],
+                         [(True, False), (False, True)])
+
     def test_off_means_nothing_is_sent(self):
         t = self.submit(("cargo", "test"), source=SOURCE)
         self.finish(t, 0)

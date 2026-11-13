@@ -325,8 +325,12 @@ edit made and undone between the two checks isn't seen.
 
 With `github_status` on, a verified ticket that succeeds with a clean source and a GitHub remote,
 and is a check or has a `--name`, queues a post to `repos/OWNER/REPO/statuses/SHA` (state
-`success`, context `buildq/<name or command>`). A later verified failure in a context that posted
-`success` on the same commit (sent or still queued) posts `failure`, if it is the check's own verdict
+`success`, context `buildq/<name or command>`). A ticket submitted from a GitHub Actions job (its
+environment has `GITHUB_ACTIONS` and `RUNNER_NAME`, the shim's test) never posts `success`: the job
+reports its own result, and on a pull request its checkout is usually a merge commit the pull request
+doesn't show. Its failure may still correct a `success` on the same commit, as below. A later
+verified failure in a context that posted `success` on the same commit (sent or still queued) posts
+`failure`, if it is the check's own verdict
 (exit 1 to 127, not a kill, a timeout or a stop to free memory). Each result is ordered by when its
 build ended (then when it was submitted), not when its check came back: one older than the newest
 verdict seen (queued, posted, or not posted because there was nothing to correct) is dropped, a newer one replaces older ones not yet sent, one is sent at a
