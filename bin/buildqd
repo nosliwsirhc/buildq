@@ -3926,7 +3926,8 @@ class Daemon:
                 holder = busy_workspaces[(lane.workspace_group, t.workspace)]
                 what = "is running" if holder.state != "queued" else "has waited longest and is held"
                 reason, holds = ("workspace", f"another build in the same workspace {what} ({holder.label[:60]}, "
-                                              f"{holder.group_lane or holder.lane} lane, {holder.id[:8]}); they would "
+                                              f"{(holder.group_lane or holder.lane) if holder.state != 'queued' else self.lane(holder.lane).name} "
+                                              f"lane, {holder.id[:8]}); they would "
                                               "fight over its build directory"), False
             elif m.psi_mem > cfg.mem_psi_block:
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "

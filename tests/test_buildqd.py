@@ -473,6 +473,7 @@ class Admission(DaemonCase):
         self.daemon.schedule(self.now + 1)
         self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
         self.assertIn("waited longest", check.reason)
+        self.assertIn("heavy lane", check.reason)  # the lane it is handled under now
         self.daemon.cfg.lanes["check"].may_pass_held = True  # even a lane that may pass held room
         self.daemon.schedule(self.now + 2)
         self.assertEqual(check.reason_cat, "workspace")
