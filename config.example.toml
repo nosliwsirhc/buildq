@@ -23,7 +23,8 @@ cpu_target = 0.9
 # expected peak fits in MemAvailable - (what running builds may still grow into) - mem_floor.
 mem_floor = "10%"
 
-# No build starts where its working directory's filesystem has less free than this.
+# No build starts where its working directory's filesystem has less free than this: a size, or a
+# percentage of that filesystem's own size ("20%").
 disk_floor = "2G"
 
 # No new build while CPU pressure ("some", avg10, %) is above this and a build is running, or
