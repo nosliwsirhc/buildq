@@ -315,6 +315,23 @@ class Admission(DaemonCase):
         self.daemon.schedule(self.now + 31)
         self.assertEqual(second.state, "running")
 
+    def test_lanes_in_one_workspace_group_run_one_build_per_workspace(self):
+        self.daemon.cfg.lanes["check"] = buildqd.Lane("check", {"cores": 2, "mem": "4G", "workspace_group": "cargo"},
+                                                      128 * GIB, 32)
+        self.daemon.cfg.lanes["heavy"].workspace_group = "cargo"
+        tree = self.workdir("tree")
+        test = self.submit(("cargo", "test"), cwd=tree)
+        check = self.submit(("cargo", "check"), lane="check", cwd=tree)  # the same target folder
+        self.assertEqual(self.states(test, check), ["running", "queued"])
+        self.assertEqual(check.reason_cat, "workspace")
+        elsewhere = self.submit(("cargo", "check"), lane="check", cwd=self.workdir("other"))
+        self.assertEqual(elsewhere.state, "running")  # another workspace: no wait
+        self.finish(test)
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual(check.state, "running")
+        with self.assertRaises(ValueError):
+            buildqd.Lane("x", {"workspace_group": ""}, 128 * GIB, 32)
+
     def test_a_shared_target_dir_is_one_workspace(self):
         target = os.path.join(self.tmp.name, "target")
         self.submit(env={"CARGO_TARGET_DIR": target})

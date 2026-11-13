@@ -95,7 +95,8 @@ and walks the queue in order, starting each ticket for which, in this order:
    including a `TMPDIR` or `CARGO_TARGET_DIR` set by `[env]`).
    This gates starts only: builds that started in the same pass, or are running, can still write
    below it, so cleanup (old build directories) keeps the disk above it;
-4. in an exclusive lane, no build of the same lane runs in its workspace;
+4. in an exclusive lane, no build of the same lane, or of a lane with the same `workspace_group`,
+   runs in its workspace;
 5. memory pressure is at most `mem_psi_block`;
 6. it has a turn: its lane has a free `extra_jobs` turn, or fewer than `max_jobs` builds hold
    ordinary turns;

@@ -272,7 +272,7 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 class Lane:
     KEYS = {"cores", "min_cores", "max_cores", "mem", "min_mem", "properties", "may_pass_held", "jobserver",
             "exclusive", "timeout", "priority", "extra_jobs", "test_threads", "waits_for_cpu",
-            "release_after_peak"}
+            "release_after_peak", "workspace_group"}
 
     def __init__(self, name: str, raw, mem_total: int, ncpu: int):
         if not isinstance(raw, dict):
@@ -315,6 +315,12 @@ class Lane:
             raise ValueError(f"lanes.{name}.jobserver must be true, false or \"tools\"")
         self.jobserver = modes[mode]  # "tools": only for cargo, make and ninja, which are known to speak it
         self.exclusive = boolean(raw.get("exclusive", True), f"lanes.{name}.exclusive")
+        # Exclusive lanes with the same group run one build per workspace between them (a cargo
+        # check and a cargo test sharing a target folder would only wait on cargo's lock).
+        group = raw.get("workspace_group", name)
+        if not isinstance(group, str) or not group:
+            raise ValueError(f"lanes.{name}.workspace_group must be a name")
+        self.workspace_group = group
         # RUST_TEST_THREADS and NEXTEST_TEST_THREADS win over a project's own settings (a suite
         # pinned to one thread for a shared database, say), so they are set only where asked.
         self.test_threads = boolean(raw.get("test_threads", False), f"lanes.{name}.test_threads")
@@ -332,7 +338,7 @@ class Lane:
                 "min_mem": self.min_mem, "properties": self.properties, "may_pass_held": self.may_pass_held,
                 "jobserver": self.jobserver, "exclusive": self.exclusive, "timeout": self.timeout,
                 "priority": self.priority, "extra_jobs": self.extra_jobs, "waits_for_cpu": self.waits_for_cpu,
-                "release_after_peak": self.release_after_peak}
+                "release_after_peak": self.release_after_peak, "workspace_group": self.workspace_group}
 
 
 class Config:
@@ -3854,7 +3860,7 @@ class Daemon:
         count = len(running)
         per_lane = collections.Counter(t.lane for t in running)
         held_mem = held_cpu = 0.0
-        busy_workspaces = {(t.lane, t.workspace) for t in running if t.workspace}
+        busy_workspaces = {(self.lane(t.lane).workspace_group, t.workspace) for t in running if t.workspace}
         if self.paused is not None:
             why = self.paused.get("reason") or "no reason given"
             for t in self.queue(now):
@@ -3884,7 +3890,7 @@ class Daemon:
                         if floor > cfg.disk_floor else fmt_size(floor))
                 reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
                                          f"(disk_floor is {said})"), False
-            elif lane.exclusive and (t.lane, t.workspace) in busy_workspaces:
+            elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces:
                 reason, holds = ("workspace", "another build in the same workspace is running; they would "
                                               "fight over its build directory"), False
             elif m.psi_mem > cfg.mem_psi_block:
@@ -3935,7 +3941,7 @@ class Daemon:
                 shrinkable = max(0, shrinkable - taken_from_others)
                 count += 1
                 per_lane[t.lane] += 1
-                busy_workspaces.add((t.lane, t.workspace))
+                busy_workspaces.add((lane.workspace_group, t.workspace))
                 continue
             t.reason_cat, t.reason = reason
             if holds and not passes and self.starving(t, now):

@@ -350,6 +350,13 @@ and the journal say how long a build waited on memory and whether it went over i
 a command that keeps doing so is being slowed by its cap, which is worth raising if the machine
 has the room.
 
+An exclusive lane (the default) runs one build per workspace: its `CARGO_TARGET_DIR`, or its git
+worktree. Lanes with the same `workspace_group` share that rule. For example, a lane for
+`cargo check` and `cargo clippy`, smaller than a full build and ahead of it, should share a
+`workspace_group` with the cargo lane, so that a check and a `cargo test` in one target folder
+never start together. They would only wait on cargo's lock. [config.example.toml](config.example.toml)
+has such a lane.
+
 ## Keeping builds in the queue
 
 Telling agents to use the queue works most of the time. Two optional pieces make it the default:
