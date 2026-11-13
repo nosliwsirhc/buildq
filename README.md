@@ -23,8 +23,8 @@ buildq replaces the slot count with measurement:
   [jobserver](#cores) of their own, which buildq resizes while they run: they grow into idle cores
   and give cores back when another build needs them.
 - **Quick builds first.** Lanes have priorities, and within a lane the build expected to finish
-  soonest goes first. A lane of quick builds can have turns of its own, so a front-end build never
-  waits behind a long compile.
+  soonest goes first. A lane of quick builds can have turns of its own and can start even when the
+  CPU is busy, so a front-end build never waits behind a long compile.
 - **Caps.** Each lane can give its builds systemd limits (`MemoryHigh`, `MemoryMax`, ...). All
   builds share one slice whose memory limit buildq keeps at what the machine actually has free, so
   when other work grows, builds are slowed or stopped, not the machine.
@@ -65,6 +65,7 @@ cd buildq
 ./install.sh                  # the daemon and the client
 ./install.sh --shims          # optional: heavy commands go through the queue by themselves
 ./install.sh --rustc-guard=~/src   # optional: cargo under ~/src refuses to compile Rust outside the queue
+./install.sh --skill          # optional: a skill that teaches coding agents to use the queue
 ```
 
 `install.sh` puts `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` in `~/.local/bin`
@@ -137,6 +138,7 @@ the news without polling:
 | -------- | ------ |
 | `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock`) |
 | `BUILDQ_FALLBACK` | what `buildq run` does when the daemon can't be reached. Unset: wait for it. `fail`: exit 75. `run`: run the command unqueued. Anything else: a command prefix to run it through instead. |
+| `BUILDQ_AS` | the name of a wrapper in front of buildq. buildq's hints then name the wrapper's commands, so its users are told what they type (`wrapper --submit <command>`, not `buildq submit -- <command>`). The wrapper must take `--submit COMMAND...`, `--wait TICKET [--timeout D]`, `--status [TICKET]`, `--logs TICKET` and `--cancel TICKET` and pass them to buildq's commands of the same names; that is all the hints use. |
 | `BUILDQ_JOB`, `BUILDQ_TICKET` | set inside every build to its ticket. A `buildq run` inside a build runs its command directly, because the build already holds a turn. buildq checks that the build really is running. |
 | `BUILDQ_CORES` | set inside every build: the cores it was given |
 
@@ -148,8 +150,8 @@ order and starts every build that fits:
 | Test | A build starts only if |
 | ---- | ---------------------- |
 | Memory | its expected peak ≤ `MemAvailable` − what running builds may still grow into − `mem_floor`. Never skipped. |
-| Cores | its minimum cores fit in what is free: `cpu_target` × cores − busy cores − cores that builds just started haven't reached yet + cores that resizable builds could give back. Skipped when nothing is running, so outside load can slow the queue but never stall it. |
-| Pressure | memory pressure (PSI `full avg10`) ≤ `mem_psi_block`; CPU pressure (`some avg10`) ≤ `cpu_psi_block` while a build runs |
+| Cores | its minimum cores fit in what is free: `cpu_target` × cores − busy cores − cores that builds just started haven't reached yet + cores that resizable builds could give back. Skipped when nothing is running, so outside load can slow the queue but never stall it, and for lanes with `waits_for_cpu = false`. |
+| Pressure | memory pressure (PSI `full avg10`) ≤ `mem_psi_block`; CPU pressure (`some avg10`) ≤ `cpu_psi_block` while a build runs (not for lanes with `waits_for_cpu = false`) |
 | Count | fewer than `max_jobs` builds run, not counting up to `extra_jobs` of its own lane |
 | Disk | its filesystem has at least `disk_floor` free |
 | Workspace | in an exclusive lane, no other build of that lane runs in its workspace (its `CARGO_TARGET_DIR`, or its git worktree); they would only fight over the build directory |
@@ -194,6 +196,12 @@ the machine is over its target or a queued build needs them. A build whose histo
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to
 its lane's `max_cores`.
 
+A lane with `waits_for_cpu = false` doesn't wait for cores: when the CPU is at its target, its build
+starts anyway on the cores it needs (its `min_cores`, or what it was seen to use if it ignores the
+job count; more when they are free), and at the next resize the resizable builds give that much
+back. It also passes the cores held for a long-waiting build. Meant for quick builds that should
+never queue behind long ones; memory still decides when they start.
+
 ### Lanes
 
 A lane is a kind of build: its default size, its priority, its systemd limits.
@@ -206,7 +214,7 @@ cores = 8
 min_cores = 2
 max_cores = 16
 mem = "20G"
-properties = { MemoryHigh = "22G", MemoryMax = "26G" }
+properties = { MemoryHigh = "24G", MemoryMax = "26G" }
 
 [lanes.web]                        # front-end builds: quick, so first, with turns of their own
 cores = 4
@@ -215,6 +223,7 @@ mem = "6G"
 priority = 100
 extra_jobs = 3
 may_pass_held = true
+waits_for_cpu = false
 exclusive = false
 properties = { MemoryHigh = "10G", MemoryMax = "12G" }
 
@@ -226,7 +235,10 @@ lane = "web"
 [config.example.toml](config.example.toml) lists every key. `properties` are passed to
 `systemd-run --property`, so any service property works (`CPUWeight`, `IOWeight`, `TasksMax`,
 ...), and systemd checks them when the configuration loads. Past `MemoryHigh` the kernel slows a
-build and reclaims its memory; past `MemoryMax` it stops that build alone.
+build and reclaims its memory; past `MemoryMax` it stops that build alone. `buildq status <ticket>`
+and the journal say how long a build waited on memory and whether it went over its `MemoryHigh`:
+a command that keeps doing so is being slowed by its cap, which is worth raising if the machine
+has the room.
 
 ## Keeping builds in the queue
 
@@ -247,7 +259,8 @@ Telling agents to use the queue works most of the time. Two optional pieces make
   directories through `buildq-rustc-guard`, which refuses to compile unless the process is inside a
   buildq build. It checks the build's cgroup, which the kernel sets and an environment variable
   can't fake. It lets through version queries, GitHub Actions jobs, editors
-  (`rust-analyzer`), and anything listed in `~/.config/buildq/guard.env`. Prefer directories to the
+  (`rust-analyzer`), and anything listed in `~/.config/buildq/guard.env`, where `RUN_WITH` also sets
+  the command its refusal tells you to use (default `buildq run --`). Prefer directories to the
   bare `--rustc-guard`, which writes `$CARGO_HOME/config.toml`: that file is also read by CI jobs on
   the machine and by containers that mount `~/.cargo`, where the wrapper's path doesn't exist.
 
@@ -257,17 +270,36 @@ agents as a user that can't execute compilers and can only submit to the queue.
 
 ## Coding agents
 
-Coding agents are the case buildq was built for. What works well:
+Coding agents are the case buildq was built for. They learn to use it in three places, from least
+to most effort for them:
 
-- **Say which commands are heavy** in the instructions the agents read (`AGENTS.md`, `CLAUDE.md`), or
-  install the shims so it doesn't matter.
-- **Long builds: submit, then wait.** `T=$(buildq submit -- cargo test)`, then `buildq wait "$T"
-  --timeout 9m` as many times as needed, which fits a tool call's time limit. Or run `buildq wait
-  "$T"` as a background command if the harness reports when one ends. A build doesn't die when the
-  agent's tool call times out, and its output is in `buildq logs "$T" --tail 100`.
-- **Don't** wait on `uptime`, poll process lists, or set `-j` by hand; the queue sizes builds.
-- **Enforce it** with a pre-command hook where the harness has one (for example a Claude Code
-  `PreToolUse` hook on `Bash`). Inside a build, `BUILDQ_JOB` is set.
+- **Where they hit it.** With the shims and the Rust guard, an agent's plain `cargo test` goes
+  through the queue, or is refused with the command to use instead. buildq's own messages say what
+  to do next: `buildq run` prints the ticket and how to look at it, warns when the command's history
+  says it usually runs longer than a tool call may last (and how to drop it off instead), and
+  `buildq submit` says how to wait for its ticket. A wrapper sets `BUILDQ_AS` and the guard's
+  `RUN_WITH` so that all of these name the wrapper's commands.
+- **A skill.** `./install.sh --skill` links a `buildq` skill into `~/.claude/skills` (Claude Code),
+  `~/.codex/skills` (Codex) and `~/.agents/skills`, for whichever of those agents' directories exist.
+  An agent loads it only when it is about to build or meets a ticket or a refusal. It covers running
+  a command, dropping a long one off, what each wait message means and what to do about it, and
+  what not to do (set `-j`, wait on `uptime`, start a build again after a timeout). Notes for one
+  machine go in `~/.config/buildq/agents.md`, which `--skill` adds at the skill's end ("On this
+  machine"): a wrapper, local rules, where build output goes. Run `./install.sh --skill` again
+  after editing it. The skill's source is [skills/buildq/SKILL.md](skills/buildq/SKILL.md).
+- **Their standing instructions** (`AGENTS.md`, `CLAUDE.md`): one rule ("run heavy commands through
+  the queue") is enough once the skill has the details.
+
+Two more things help. A pre-command hook enforces it where the harness has one (for example a
+Claude Code `PreToolUse` hook on `Bash`; inside a build, `BUILDQ_JOB` is set). And long builds are
+submitted, then waited on: `T=$(buildq submit -- cargo test)`, then `buildq wait "$T" --timeout 9m`
+as many times as needed, which fits a tool call's time limit. Or run `buildq wait "$T"` as a
+background command if the harness reports when one ends.
+
+There is no MCP server, on purpose. A build has to start from the agent's shell, with that shell's
+working directory, environment and limits. An MCP tool runs in the harness's process instead, and
+would quietly build with the wrong ones. For watching the queue, `buildq status --json` and `buildq
+list --json` already give structured output.
 
 ## Migrating from a slot script
 
@@ -280,12 +312,20 @@ memory at the same moment, so don't run both as gates side by side for long.
 ## Operate
 
 - **Logs:** `journalctl --user -u buildq` has a line for each build queued, started, resized and
-  finished, with its estimate, wait, cores and peak memory.
+  finished, with its estimate, wait, cores, peak memory and time spent waiting on memory.
+- **When memory is tight** (less than twice `mem_floor` available, or every task on the machine
+  stalled on memory at once 5% of the time), buildq records every 30 seconds what is available, swap
+  and memory pressure, and the six cgroups holding the most memory, builds or not: Docker
+  containers, CI runners, editors, agent sessions. It stops once more than 2.5 times `mem_floor` is
+  free, with memory pressure under 1%, for half a minute. The lines go to the journal at warning priority (`journalctl --user -u
+  buildq -p warning`) and to `~/.local/state/buildq/memory.log`, which is synced to disk with each
+  entry: after a reset the journal can be missing its last minutes, and `memory.log` isn't.
 - **Restarts are safe.** systemd holds the socket, so clients connecting during a restart wait
   rather than fail. Builds run in services of their own and carry on; queued tickets are on disk.
   The next daemon picks both up.
 - **Files** are in `~/.local/state/buildq`: `tickets/<id>/` (the ticket, its output log, its
-  result), `history.jsonl` (one line per finished build; delete it to forget every estimate), and
+  result), `history.jsonl` (one line per finished build; delete it to forget every estimate),
+  `memory.log` (the memory watch, kept to about 1 MiB plus one older file), and
   `config.last-good.toml`. Everything is private to the user.
 - **A broken configuration** is reported in the journal; the daemon keeps the last good one.
 

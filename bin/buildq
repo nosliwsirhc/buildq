@@ -42,6 +42,8 @@ Environment:
                    (an older semaphore script, say).
   BUILDQ_JOB       set inside every build. A `buildq run` inside a build runs its command directly,
                    because the build already has a turn.
+  BUILDQ_AS        the name of a wrapper in front of buildq that takes --submit, --wait, --status,
+                   --logs and --cancel: buildq's hints then name the wrapper's commands.
 """
 
 from __future__ import annotations
@@ -210,6 +212,21 @@ def request(message: dict, timeout: float = 15) -> dict | None:
         channel.close()
 
 
+def command_for(verb: str, rest: str = "") -> str:
+    """How to type `buildq VERB REST` here. A wrapper in front of buildq that takes --VERB (such as
+    `wrapper --submit <command>`, `wrapper --wait <ticket>`) sets BUILDQ_AS to its name, so the
+    hints name what its users type."""
+    wrapper = os.environ.get("BUILDQ_AS", "").strip()
+    if wrapper:
+        return f"{wrapper} --{verb}{' ' + rest if rest else ''}"
+    if verb in ("submit", "run") and rest:
+        rest = "-- " + rest
+    return f"buildq {verb}{' ' + rest if rest else ''}"
+
+
+LONG_RUN = 8 * 60  # past this, a tool call that runs the command may well be cut off
+
+
 def unreachable() -> int:
     note(f"the queue daemon isn't answering at {socket_path()} "
          "(systemctl --user status buildq; journalctl --user -u buildq)")
@@ -276,6 +293,10 @@ def print_ticket(row: dict) -> None:
     elif row["state"] in FINISHED and row.get("measured"):
         print(f"  used      peak {fmt_size(row['mem_peak'])}, {row['peak_cores']:.1f} cores at most, "
               f"{row['avg_cores']:.1f} on average")
+    some, full = row.get("mem_wait_some") or 0, row.get("mem_wait_full") or 0
+    if some >= 1 or row.get("mem_high"):
+        over = "; it went over its MemoryHigh, where the kernel slows it" if row.get("mem_high") else ""
+        print(f"  memory    waited on memory {some:.0f}s ({full:.0f}s with all of it waiting){over}")
     if row.get("granted"):
         live = " (resized live through its jobserver)" if row.get("elastic") else ""
         print(f"  cores     {row['granted']} given{live}; it can use up to {row['want']}")
@@ -391,6 +412,7 @@ class Follower:
         self.last_file_check = time.monotonic()
         self.signals: list[int] = []
         self.last_category = None
+        self.hinted = False  # said once that a long wait is better dropped off
         self.last_note = 0.0
         self.daemon_lost_at = None
 
@@ -441,6 +463,11 @@ class Follower:
                 place = f"{ahead} ahead, " if ahead else ""
                 note(f"waiting ({place}{fmt_age(message.get('waited'))} so far): {message.get('reason')}")
                 self.last_category, self.last_note = message.get("category"), now
+                if self.cancel_on_signal and not self.hinted and (message.get("waited") or 0) >= 120:
+                    self.hinted = True
+                    note("if what runs this has a time limit (a tool call), waiting counts against it, and "
+                         "a cut-off cancels the build; drop a long wait off instead: "
+                         f"`{command_for('submit', '<command>')}` prints a ticket to wait on.")
         elif kind == "ticket":
             previous = self.row["state"]
             self.row = message
@@ -510,7 +537,8 @@ class Follower:
                     break
             self.copy_output()
             if deadline is not None and time.monotonic() > deadline and self.row["state"] not in FINISHED:
-                note(f"{self.row['short']} is still {self.row['state']}; `buildq wait {self.row['short']}` to keep waiting")
+                note(f"{self.row['short']} is still {self.row['state']}; "
+                     f"`{command_for('wait', self.row['short'] + ' --timeout 9m')}` to keep waiting")
                 return 124
         self.copy_output()
         if self.channel is not None:
@@ -622,7 +650,8 @@ def cmd_submit(args) -> int:
         channel.send(submit_message(args, command, watch=False, submission=str(uuid.uuid4())))
         reply = channel.recv(30)
     except Lost as e:
-        note(f"lost the daemon while submitting ({e}); check `buildq list` before submitting again")
+        note(f"lost the daemon while submitting ({e}): it may have queued the build. Check "
+             f"`{command_for('status')}` before submitting again")
         return 75
     finally:
         channel.close()
@@ -632,6 +661,17 @@ def cmd_submit(args) -> int:
     print(reply["id"])
     detail = f": {reply['reason']}" if reply["state"] == "queued" and reply.get("reason") else ""
     note(f"ticket {reply['id']} [{reply['lane']}] {state_text(reply)}{detail}")
+    waiting_for = reply.get("waiting_for")
+    if waiting_for == "too-big":
+        note(f"it can't fit on this machine as it is: cancel it (`{command_for('cancel', reply['short'])}`) "
+             "and run a smaller job.")
+    elif waiting_for == "disk":
+        note("it won't start until disk space is freed where it runs.")
+    else:
+        expected = f" (it usually takes {fmt_age(reply['expected'])})" if reply.get("expected") else ""
+        note(f"wait for it with `{command_for('wait', reply['short'] + ' --timeout 9m')}`{expected}; "
+             "exit 124 with \"still queued\" or \"still running\" means wait again (a build that ran out of "
+             "its own time limit also ends 124, but says \"timed out\").")
     return 0
 
 
@@ -687,7 +727,12 @@ def cmd_run(args) -> int:
         note(reply.get("error", "the daemon refused the build"))
         return 2
     note(f"ticket {reply['id']} [{reply['lane']}]; Ctrl-C cancels it, "
-         f"`buildq status {reply['short']}` shows it from anywhere.")
+         f"`{command_for('status', reply['short'])}` shows it from anywhere.")
+    if (reply.get("expected") or 0) >= LONG_RUN:
+        note(f"this command usually takes {fmt_age(reply['expected'])}. If what runs it has a shorter time "
+             "limit (a tool call), it is cut off and the build cancelled; drop a long build off instead: "
+             f"`{command_for('submit', '<command>')}` prints a ticket, then "
+             f"`{command_for('wait', '<ticket> --timeout 9m')}`.")
     follower = Follower(reply, channel, stream=True, cancel_on_signal=True)
     follower.split = True  # the build's stdout to stdout, its stderr to stderr
     follower.signals = pending  # an interrupt that already came cancels it straight away

@@ -197,6 +197,23 @@ class EndToEnd(Harness):
         self.assertEqual((rows[0]["state"], rows[0]["exit"]), ("failed", 3))
         self.assertIn(ticket[:8], self.q("list").stdout)
 
+    def test_a_build_that_can_never_fit_is_said_to_be_cancelled(self):
+        submitted = self.q("submit", "--mem", "100T", "--", "true")
+        self.assertIn("can't fit on this machine as it is: cancel it", submitted.stderr)
+        self.q("cancel", submitted.stdout.strip())
+
+    def test_hints_name_the_wrapper_in_front(self):
+        submitted = self.q("submit", "--", "true")
+        self.assertIn(f"buildq wait {submitted.stdout.strip()[:8]} --timeout 9m", submitted.stderr)
+        self.env["BUILDQ_AS"] = "~/bin/heavy"
+        try:
+            submitted = self.q("submit", "--", "true")
+            self.assertIn(f"~/bin/heavy --wait {submitted.stdout.strip()[:8]} --timeout 9m", submitted.stderr)
+            ran = self.q("run", "--", "true")
+            self.assertIn("`~/bin/heavy --status ", ran.stderr)
+        finally:
+            del self.env["BUILDQ_AS"]
+
     def test_run_streams_output_and_exits_with_the_build(self):
         result = self.q("run", "--", "sh", "-c", "echo out; echo err >&2; exit 7")
         self.assertEqual(result.returncode, 7, result.stderr)
@@ -409,6 +426,11 @@ class Enforcement(Harness):
         self.assertEqual(compile_({"BUILDQ_JOB": "00000000-0000-0000-0000-000000000000"}).returncode, 1)
         inside = self.q("run", "--", guard, rustc, "--crate-name", "demo", "src/lib.rs")  # inside a build
         self.assertEqual((inside.returncode, inside.stdout), (0, "compiled\n"), inside.stderr)
+        self.assertIn("    buildq run -- cargo ...", refused.stderr)
+        os.makedirs(os.path.join(self.tmp.name, "buildq"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "buildq", "guard.env"), "w") as f:
+            f.write('RUN_WITH="~/bin/heavy"\n')
+        self.assertIn("    ~/bin/heavy cargo ...", compile_().stderr)  # the machine's wrapper
 
 
 class SocketActivation(unittest.TestCase):

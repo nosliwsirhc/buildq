@@ -99,6 +99,9 @@ default_lane = "default"
 #   priority = 0        higher lanes go first when builds are waiting
 #   extra_jobs = 0      builds of this lane that may run on top of max_jobs
 #   may_pass_held = false   may use room held for a long-waiting build
+#   waits_for_cpu = true    false: start even when the CPU is at cpu_target, on the cores the build
+#                       needs, passing cores held for long-waiting builds, and take them back from
+#                       resizable builds (memory still decides)
 #   exclusive = true    one build at a time per workspace (CARGO_TARGET_DIR, or the git worktree)
 #   jobserver = "tools" give builds a jobserver of their own, resized as the machine's load changes:
 #                       "tools" when the command is cargo, make or ninja; true for every build
@@ -125,7 +128,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # max_cores = 16
 # mem = "20G"
 # min_mem = "6G"
-# properties = { MemoryHigh = "22G", MemoryMax = "26G" }
+# properties = { MemoryHigh = "24G", MemoryMax = "26G" }
 #
 # [lanes.dotnet]
 # cores = 6
@@ -142,6 +145,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # priority = 100
 # extra_jobs = 3
 # may_pass_held = true
+# waits_for_cpu = false
 # exclusive = false
 # properties = { MemoryHigh = "10G", MemoryMax = "12G" }
 

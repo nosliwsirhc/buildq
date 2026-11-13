@@ -13,6 +13,10 @@
 #                                in: CI runners' work trees and containers then never see it.
 #   ./install.sh --rustc-guard   the same for every cargo run by this user ($CARGO_HOME/config.toml),
 #                                CI jobs on this machine and containers that mount ~/.cargo included
+#   ./install.sh --skill         also give coding agents (Claude Code, Codex, and agents that read
+#                                ~/.agents/skills) a "buildq" skill on using the queue, with this
+#                                machine's own notes from ~/.config/buildq/agents.md added at its end;
+#                                run it again after changing those notes
 #   ./install.sh --uninstall     stop and remove it all (keeps ~/.config/buildq and ~/.local/state/buildq)
 #
 # PREFIX (default ~/.local) sets where the programs go.
@@ -24,14 +28,61 @@ config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 unitdir=$config_home/systemd/user
 confdir=$config_home/buildq
 shimdir=${XDG_DATA_HOME:-$HOME/.local/share}/buildq/shims
+skilldir=${XDG_DATA_HOME:-$HOME/.local/share}/buildq/skill/buildq
 cargo_config=${CARGO_HOME:-$HOME/.cargo}/config.toml
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # docker isn't among them: an image build's work runs in dockerd, outside the build's cgroup, so the
 # queue can't measure it (see the README).
 shim_tools=(cargo pnpm npm npx yarn make gmake ninja dotnet)
 guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
+skill_list=$confdir/skill-links    # every skill link made, for --uninstall
+# Where coding agents look for skills: each is used only if the agent's own directory exists.
+skill_homes=("${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" "$HOME/.agents")
 
 say() { printf 'install.sh: %s\n' "$*"; }
+
+# A link to buildq's skill: it points at the skill, or it is one this script made (listed with the
+# target it was given, which differs when XDG_DATA_HOME did).
+our_link() {
+  local link=$1 target
+  [[ -L "$link" ]] || return 1
+  target=$(readlink "$link")
+  [[ "$target" == "$skilldir" ]] && return 0
+  [[ -r "$skill_list" ]] && grep -qxF "$link"$'\t'"$target" "$skill_list"
+}
+
+# The skill for coding agents, with this machine's notes at its end, linked where agents look.
+install_skill() {
+  local home link
+  mkdir -p "$skilldir"
+  {
+    cat "$src/skills/buildq/SKILL.md"
+    if [[ -r "$confdir/agents.md" ]]; then
+      printf '\n## On this machine\n\n'
+      cat "$confdir/agents.md"
+    fi
+  } >"$skilldir/SKILL.md.new.$$"
+  mv -f "$skilldir/SKILL.md.new.$$" "$skilldir/SKILL.md"
+  for home in "${skill_homes[@]}"; do
+    [[ -d "$home" ]] || continue
+    link=$home/skills/buildq
+    if [[ -e "$link" || -L "$link" ]] && ! our_link "$link"; then
+      say "$link already exists and isn't buildq's; leaving it"
+      continue
+    fi
+    mkdir -p "$home/skills"
+    ln -sfn "$skilldir" "$link"
+    if [[ -r "$skill_list" ]]; then  # one line per link, with its current target
+      awk -F'\t' -v link="$link" '$1 != link' "$skill_list" >"$skill_list.new.$$"
+      mv -f "$skill_list.new.$$" "$skill_list"
+    fi
+    printf '%s\t%s\n' "$link" "$skilldir" >>"$skill_list"
+    say "agents reading $home/skills now have the buildq skill"
+  done
+  if [[ -r "$confdir/agents.md" ]]; then
+    say "the skill ends with this machine's notes from $confdir/agents.md"
+  fi
+}
 
 # Copies a file into place by renaming a temporary copy over it, so a program running from the
 # old file (a shell script reads its file as it goes) keeps the old one intact.
@@ -99,7 +150,17 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     fi
   done
   rm -f "$guard_list"
-  rm -rf "$shimdir"
+  if [[ -r "$skill_list" ]]; then
+    while IFS=$'\t' read -r link target; do
+      target=${target:-$skilldir}
+      if [[ -L "$link" && "$(readlink "$link")" == "$target" ]]; then
+        rm -f "$link"
+      fi
+      case $target in */buildq/skill/buildq) rm -rf "$(dirname "$target")" ;; esac
+    done < "$skill_list"
+  fi
+  rm -f "$skill_list"
+  rm -rf "$shimdir" "$(dirname "$skilldir")"
   rm -f "$bindir/buildq" "$bindir/buildqd" "$bindir/buildq-shim" \
         "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice"
   [[ $keep_guard == no ]] && rm -f "$bindir/buildq-rustc-guard"
@@ -128,7 +189,10 @@ fi
 
 
 for option in "$@"; do
-  case $option in --shims | --rustc-guard | --rustc-guard=*) ;; *) say "unknown option $option"; exit 2 ;; esac
+  case $option in --shims | --skill | --rustc-guard | --rustc-guard=*) ;; *) say "unknown option $option"; exit 2 ;; esac
+done
+for option in "$@"; do
+  if [[ $option == --skill ]]; then install_skill; fi
 done
 if ! have_systemd; then
   say "no systemd user session here. Start the daemon yourself ($bindir/buildqd &), then run install.sh again with any options."
@@ -173,6 +237,7 @@ for option in "$@"; do
       say "shims for ${shim_tools[*]} are in $shimdir. Put it first on PATH, at the end of ~/.bashrc:"
       say "    export PATH=\"$shimdir:\$PATH\""
       ;;
+    --skill) ;;  # done above: it needs neither systemd nor the daemon
     --rustc-guard | --rustc-guard=*)
       targets=()
       if [[ $option == --rustc-guard ]]; then
