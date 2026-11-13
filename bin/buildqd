@@ -52,6 +52,7 @@ import itertools
 import json
 import math
 import os
+import queue
 import re
 import selectors
 import shlex
@@ -62,6 +63,7 @@ import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 import traceback
 import uuid
@@ -101,8 +103,28 @@ def default_config() -> str:
     return os.path.expanduser(os.environ.get("BUILDQ_CONFIG") or os.path.join(base, "buildq", "config.toml"))
 
 
-def log(message: str) -> None:
-    print(message, flush=True)
+_log_lock = threading.Lock()
+
+
+def to_journal() -> bool:
+    """Whether stdout is the journal: JOURNAL_STREAM holds its device and inode (sd_journal's way of
+    telling; a shell in a terminal that systemd started inherits the variable, not the stream)."""
+    try:
+        device, inode = (int(x) for x in os.environ.get("JOURNAL_STREAM", "").split(":"))
+        st = os.fstat(sys.stdout.fileno())
+        return (st.st_dev, st.st_ino) == (device, inode)
+    except (ValueError, OSError, AttributeError):
+        return False
+
+
+def log(message: str, level: int | None = None) -> None:
+    """A line for the journal, written whole even with threads logging; `level` (syslog: 4 is
+    warning) is marked only when stdout really is the journal."""
+    if level is not None and to_journal():  # journald reads the level of each line by itself
+        message = "\n".join(f"<{level}>{line}" for line in message.split("\n"))
+    with _log_lock:
+        sys.stdout.write(message + "\n")
+        sys.stdout.flush()
 
 
 def write_json(path: str, data) -> None:
@@ -233,7 +255,7 @@ ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class Lane:
     KEYS = {"cores", "min_cores", "max_cores", "mem", "min_mem", "properties", "may_pass_held", "jobserver",
-            "exclusive", "timeout", "priority", "extra_jobs", "test_threads"}
+            "exclusive", "timeout", "priority", "extra_jobs", "test_threads", "waits_for_cpu"}
 
     def __init__(self, name: str, raw, mem_total: int, ncpu: int):
         if not isinstance(raw, dict):
@@ -265,6 +287,9 @@ class Lane:
                 raise ValueError(f"lanes.{name}.properties: bad property {key!r}")
             self.properties[str(key)] = str(value).lower() if isinstance(value, bool) else str(value)
         self.may_pass_held = boolean(raw.get("may_pass_held", False), f"lanes.{name}.may_pass_held")
+        # false: its builds start even when the CPU is at cpu_target, on the cores they need, and
+        # the rebalancer takes the difference back from resizable builds. Memory still decides.
+        self.waits_for_cpu = boolean(raw.get("waits_for_cpu", True), f"lanes.{name}.waits_for_cpu")
         mode = raw.get("jobserver", "tools")
         modes = {True: "all", "all": "all", "tools": "tools", False: "off", "off": "off"}
         if mode not in modes:
@@ -287,7 +312,7 @@ class Lane:
         return {"cores": self.cores, "min_cores": self.min_cores, "max_cores": self.max_cores, "mem": self.mem,
                 "min_mem": self.min_mem, "properties": self.properties, "may_pass_held": self.may_pass_held,
                 "jobserver": self.jobserver, "exclusive": self.exclusive, "timeout": self.timeout,
-                "priority": self.priority, "extra_jobs": self.extra_jobs}
+                "priority": self.priority, "extra_jobs": self.extra_jobs, "waits_for_cpu": self.waits_for_cpu}
 
 
 class Config:
@@ -454,7 +479,7 @@ class Machine:
         self.busy = 0.0
         self.busy_now = 0.0
         self.mem_total = self.mem_available = self.swap_used = 0
-        self.psi_cpu = self.psi_mem = 0.0
+        self.psi_cpu = self.psi_mem = self.psi_mem_some = 0.0
         self._prev = None
         self._primed = False
         self.sample(time.monotonic())
@@ -477,12 +502,14 @@ class Machine:
         self.swap_used = info.get("SwapTotal", 0) - info.get("SwapFree", 0)
         self.psi_cpu = pressure("cpu", "some")
         self.psi_mem = pressure("memory", "full")
+        self.psi_mem_some = pressure("memory", "some")
 
     def summary(self) -> dict:
         return {
             "cores": self.ncpu, "busy": round(self.busy, 2), "busy_now": round(self.busy_now, 2),
             "mem_total": self.mem_total, "mem_available": self.mem_available, "swap_used": self.swap_used,
             "psi_cpu_some_avg10": self.psi_cpu, "psi_mem_full_avg10": self.psi_mem,
+            "psi_mem_some_avg10": self.psi_mem_some,
         }
 
 
@@ -506,6 +533,22 @@ def slice_path(name: str) -> str:
     return "/".join("-".join(parts[: i + 1]) + ".slice" for i in range(len(parts)))
 
 
+def sane_count(value, limit: float = 1e12) -> float | None:
+    """A non-negative, finite number no larger than `limit` from a file another process wrote, or
+    None. (float() of a huge integer raises OverflowError; NaN fails every comparison.)"""
+    if isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if 0 <= value <= limit else None
+
+
+def unreclaimable(stat: dict[str, int]) -> int:
+    return stat.get("anon", 0) + stat.get("shmem", 0) + max(0, stat.get("kernel", 0) - stat.get("slab_reclaimable", 0))
+
+
 def cgroup_stats(path: str):
     """(cpu usage in usec, unreclaimable memory in bytes, oom kills) of a cgroup, or None if gone.
 
@@ -527,8 +570,7 @@ def cgroup_stats(path: str):
                 name, _, value = line.partition(" ")
                 if name in ("anon", "kernel", "shmem", "slab_reclaimable"):
                     stat[name] = int(value)
-        need = stat.get("anon", 0) + stat.get("shmem", 0) + max(0, stat.get("kernel", 0) - stat.get("slab_reclaimable", 0))
-        return usage, need, cgroup_oom_kills(path)
+        return usage, unreclaimable(stat), cgroup_oom_kills(path)
     except (OSError, ValueError):
         return None
 
@@ -543,6 +585,174 @@ def cgroup_events(path: str) -> dict[str, int]:
     except (OSError, ValueError):
         pass
     return out
+
+
+def cgroup_memory_waits(path: str) -> tuple[float, float, int] | None:
+    """(seconds in which some of the cgroup's tasks waited on memory, seconds in which all of them
+    did, times it went over its own MemoryHigh), or None if its memory.pressure can't be read.
+
+    The waits are reclaim and swap-in, whatever caused them: the cgroup's own MemoryHigh, or a
+    machine short of memory. Going over MemoryHigh says its own limit was one of the causes."""
+    some = full = 0.0
+    try:
+        with open(os.path.join(path, "memory.pressure")) as f:
+            for line in f:
+                parts = line.split()
+                total = next((int(p[6:]) for p in parts[1:] if p.startswith("total=")), 0) / 1e6
+                if parts and parts[0] == "some":
+                    some = total
+                elif parts and parts[0] == "full":
+                    full = total
+    except (OSError, ValueError):
+        return None
+    return some, full, cgroup_events(path).get("high", 0)
+
+
+def cgroup_held(path: str) -> tuple[int, int] | None:
+    """(unreclaimable memory, swap) a cgroup and its descendants hold, in bytes, or None if its
+    memory.stat can't be read (it has gone, say). Swap counts because with zram it is still RAM."""
+    stat = {}
+    try:
+        with open(os.path.join(path, "memory.stat")) as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name in ("anon", "kernel", "shmem", "slab_reclaimable"):
+                    stat[name] = int(value)
+    except (OSError, ValueError):
+        return None
+    swap = 0
+    try:
+        with open(os.path.join(path, "memory.swap.current")) as f:
+            swap = int(f.read())
+    except (OSError, ValueError):
+        pass
+    return unreclaimable(stat), swap
+
+
+class WalkBudget:
+    """How many more cgroup directories a walk may read, and until when."""
+
+    def __init__(self, dirs: int, deadline: float | None):
+        self.dirs, self.deadline, self.complete = dirs, deadline, True
+
+    def out(self) -> bool:
+        if self.dirs <= 0 or (self.deadline is not None and time.monotonic() > self.deadline):
+            self.complete = False
+            return True
+        return False
+
+
+def biggest_process(path: str, skip=(), budget: WalkBudget | None = None, limit: int = 500) -> str:
+    """The name of the largest process (by resident memory) in a cgroup or below it, leaving out the
+    subtrees in `skip`: best effort, looking at no more than `limit` processes and within `budget`."""
+    best, name, seen = -1, "", 0
+    for directory, children, _ in os.walk(path):
+        if budget is not None:
+            if budget.out():
+                return name
+            budget.dirs -= 1
+        children[:] = [c for c in children if os.path.join(directory, c) not in skip]
+        try:
+            with open(os.path.join(directory, "cgroup.procs")) as f:
+                pids = f.read().split()
+        except OSError:
+            continue
+        for pid in pids:
+            if seen >= limit:
+                if budget is not None:
+                    budget.complete = False  # the largest may be among those not looked at
+                return name
+            if budget is not None and budget.out():
+                return name
+            seen += 1
+            try:
+                with open(f"/proc/{pid}/statm") as f:
+                    rss = int(f.read().split()[1])
+                if rss > best:
+                    with open(f"/proc/{pid}/comm", errors="replace") as f:
+                        best, name = rss, f.read().strip()
+            except (OSError, ValueError, IndexError):
+                continue
+    return name
+
+
+def biggest_cgroups(root: str = "/sys/fs/cgroup", count: int = 6, at_least: int = 256 * MIB,
+                    max_dirs: int = 5000, deadline: float | None = None):
+    """Where the machine's memory is: the cgroups holding the most that the kernel can't simply drop
+    (as cgroup_stats counts it, plus swap), largest first, as a list of (memory, swap, path below
+    root, its largest process), and whether the walk finished.
+
+    It looks into a cgroup only if its memory.current plus its swap is at least `at_least`. A cgroup
+    none of whose children is that big is listed as a whole; one with big children is listed by
+    those, plus "(the rest)" for what its small children hold together, when that is big enough, so
+    many small services don't vanish. It reads at most `max_dirs` directories while walking, and
+    as many again looking for process names, and stops at `deadline`, listing what it has not looked
+    into yet as a whole."""
+    found = []
+    budget = WalkBudget(max_dirs, deadline)
+
+    def big_children(path: str) -> tuple[list[tuple[str, tuple[int, int]]], bool]:
+        """Its children big enough to look into, and whether the listing was cut off."""
+        big = []
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    if budget.out():
+                        return big, True
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    budget.dirs -= 1
+                    try:
+                        with open(os.path.join(entry.path, "memory.current")) as f:
+                            size = int(f.read())
+                    except (OSError, ValueError):
+                        continue
+                    if size < at_least:
+                        try:  # swapped out, it holds little RAM but may hold a lot of swap
+                            with open(os.path.join(entry.path, "memory.swap.current")) as f:
+                                size += int(f.read())
+                        except (OSError, ValueError):
+                            pass
+                        if size < at_least:
+                            continue
+                    held = cgroup_held(entry.path)
+                    if held is not None:  # one that has gone counts in its parent's rest
+                        big.append((entry.path, held))
+        except OSError:
+            pass
+        return big, False
+
+    def visit(path: str, depth: int, held: tuple[int, int] | None) -> None:
+        big, cut = big_children(path) if depth < 8 and not budget.out() else ([], False)
+        if cut and held is not None:  # its unread children would pass for "the rest": list it whole
+            found.append((held[0], held[1], path, ()))
+            return
+        if held is not None:  # not the root, which has no memory of its own to list
+            if not big:
+                found.append((held[0], held[1], path, ()))
+                return
+            rest = (max(0, held[0] - sum(h[0] for _, h in big)), max(0, held[1] - sum(h[1] for _, h in big)))
+            if sum(rest) >= at_least:
+                found.append((rest[0], rest[1], path + " (the rest)", tuple(c for c, _ in big)))
+        for child, child_held in big:
+            if budget.out():
+                found.append((child_held[0], child_held[1], child, ()))  # listed whole, not looked into
+            else:
+                visit(child, depth + 1, child_held)
+
+    visit(root, 0, None)
+    found.sort(key=lambda e: e[0] + e[1], reverse=True)
+    names = WalkBudget(max_dirs, None if deadline is None else max(deadline, time.monotonic()) + 5)
+    top = []
+    for memory, swap, path, skip in found[:count]:
+        directory = path[: -len(" (the rest)")] if path.endswith(" (the rest)") else path
+        top.append((memory, swap, os.path.relpath(path, root), biggest_process(directory, skip, names)))
+    return top, budget.complete and names.complete
+
+
+def short_cgroup(rel: str) -> str:
+    """The last part of a cgroup's path, with a container's 64-digit ID cut to Docker's 12."""
+    return re.sub(r"^docker-([0-9a-f]{12})[0-9a-f]{52}\.scope", r"docker-\1.scope", rel.rsplit("/", 1)[-1])
 
 
 def cgroup_oom_kills(path: str) -> int:
@@ -1149,7 +1359,8 @@ class History:
         if rigid:
             # It uses what it uses; plan for that, but never for more than the lane allows or the
             # CPU target could ever cover, or it could never start.
-            want = min(max(1, math.ceil(want)), lane.max_cores, max(1, math.floor(cfg.cpu_target * ncpu)))
+            ceiling = max(1, math.floor(cfg.cpu_target * ncpu)) if lane.waits_for_cpu else ncpu
+            want = min(max(1, math.ceil(want)), lane.max_cores, ceiling)
             need = want
             source += ", ignores the job count"
         else:
@@ -1389,7 +1600,8 @@ class Ticket:
                "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
                "need", "rigid", "est_mem", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
-               "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured")
+               "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
+               "mem_wait_full", "mem_high")
 
     def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
                  directory: str | None):
@@ -1449,6 +1661,9 @@ class Ticket:
         self.peak_cores = 0.0
         self.avg_cores = 0.0
         self.measured = False
+        self.mem_wait_some = 0.0  # seconds some of its tasks waited on memory (memory.pressure)
+        self.mem_wait_full = 0.0  # seconds all of them did
+        self.mem_high = 0  # times it went over its own MemoryHigh, where the kernel slows it
         # Not kept on disk:
         self.js: Jobserver | None = None
         self.launcher = None
@@ -1489,6 +1704,7 @@ class Ticket:
         for k in cls.PERSIST:
             if k in rec:
                 setattr(t, k, rec[k])
+        t.take_waits(0, 0, 0)  # numbers only, whatever the file said
         return t
 
     def measure(self, now: float) -> None:
@@ -1520,6 +1736,17 @@ class Ticket:
             self.mem_peak = need
             self.peak_mem_cores = self.granted
         self.oom_kills = max(0, oom - (self.oom_base or 0))
+        waits = cgroup_memory_waits(self.cg)
+        if waits is not None:
+            self.take_waits(*waits)
+
+    def take_waits(self, some, full, high) -> None:
+        """Keep the largest memory waits seen: the cgroup's counters only grow while it lives. A
+        value that isn't a sensible number (a damaged result.json or ticket.json) is ignored."""
+        for name, value in (("mem_wait_some", some), ("mem_wait_full", full), ("mem_high", high)):
+            value = sane_count(value)
+            best = max(sane_count(getattr(self, name)) or 0.0, value or 0.0)
+            setattr(self, name, int(best) if name == "mem_high" else best)
 
     def row(self, now: float, ahead: int | None = None) -> dict:
         elapsed = round((self.ended or now) - self.started, 1) if self.started else None
@@ -1534,7 +1761,10 @@ class Ticket:
             "cores_now": round(self.cores_now, 2), "mem_now": self.mem_now, "mem_peak": self.mem_peak,
             "peak_cores": round(self.peak_cores, 2), "avg_cores": round(self.avg_cores, 2),
             "measured": self.measured, "exit": self.exit, "oom": self.oom, "timed_out": self.timed_out,
+            "mem_wait_some": round(self.mem_wait_some, 1), "mem_wait_full": round(self.mem_wait_full, 1),
+            "mem_high": self.mem_high,
             "error": self.error, "reason": self.reason if self.state == "queued" else None,
+            "waiting_for": self.reason_cat if self.state == "queued" else None,
             "held": self.held if self.state == "queued" else False, "ahead": ahead,
             "log": self.log, "dir": self.dir, "outside": self.flock[0] if self.flock else None,
             "cancel_requested": self.cancel_requested, "runner": self.runner, "timeout": self.timeout,
@@ -1576,6 +1806,17 @@ class Daemon:
         self.submissions: dict[str, str] = {}  # the client's submission id -> its ticket
         self.slice_limit = None  # the slice's configured MemoryMax, read once systemd has the slice
         self.guard_failed = False
+        self.cg_root = "/sys/fs/cgroup"
+        self.memory_tight = False
+        self.memory_calm_since = None
+        self.last_memory_log = 0.0
+        self.memory_lines: queue.Queue = queue.Queue()
+        self.walk_wanted = threading.Event()
+        self.walking = False
+        self.memory_stopping = False
+        self.memory_threads: dict[str, threading.Thread] = {}
+        self.memory_thread_lock = threading.Lock()
+        self.memory_thread_failed = False
 
     # ---- configuration
 
@@ -1893,15 +2134,16 @@ class Daemon:
                     # stop everything else for nothing.
                     reason, holds = ("memory", f"needs {fmt_size(t.est_mem)} of memory; even with no builds "
                                                f"running only {fmt_size(m.mem_available + ours_now - cfg.mem_floor)} "
-                                               "would be free"), False
+                                               "would be free: other work holds the rest, and it starts "
+                                               "when that ends"), False
                 else:
                     reason = ("memory", f"needs {fmt_size(t.est_mem)} of memory; {fmt_size(max(free_mem, 0))} is "
                                         f"free after the {fmt_size(cfg.mem_floor)} floor and what running builds may "
                                         "still grow into")
-            elif count > 0 and m.psi_cpu > cfg.cpu_psi_block:
+            elif count > 0 and lane.waits_for_cpu and m.psi_cpu > cfg.cpu_psi_block:
                 reason = ("cpu-pressure", f"CPU pressure is {m.psi_cpu:.0f}% (no new build above "
                                           f"{cfg.cpu_psi_block:g}% while one runs)")
-            elif count > 0 and t.need > free_cpu + shrinkable - hc:
+            elif count > 0 and lane.waits_for_cpu and t.need > free_cpu + shrinkable - hc:
                 if t.need <= free_cpu + shrinkable:
                     reason = ("held", "the room it needs is held for a build that has waited longer")
                 else:
@@ -1929,7 +2171,8 @@ class Daemon:
             if holds and not passes and now - t.submitted >= cfg.starve_seconds:
                 t.held = True
                 held_mem += t.est_mem
-                held_cpu += t.need
+                held_cpu += t.need if lane.waits_for_cpu else 0  # it would start without that room
+        self.budget.update(held_mem=held_mem, held_cores=held_cpu)
 
     def build_env(self, t: Ticket) -> dict:
         """Parallelism for the build's tools, unless the caller chose its own."""
@@ -2120,7 +2363,7 @@ class Daemon:
                         self.stop(t, now, force=True)
                     continue
                 self.finalize(t, now, result.get("exit"), oom=oom_of(result),
-                              timed_out=bool(result.get("timed_out")))
+                              timed_out=bool(result.get("timed_out")), result=result)
                 continue
             if t.cancel_requested and t.stop_sent and now - t.stop_sent > 75:
                 self.stop(t, now, force=True)
@@ -2128,7 +2371,7 @@ class Daemon:
                 result = read_json(os.path.join(t.dir, "result.json"))
                 if isinstance(result, dict):
                     self.finalize(t, now, result.get("exit"), oom=oom_of(result),
-                                  timed_out=bool(result.get("timed_out")))
+                                  timed_out=bool(result.get("timed_out")), result=result)
                 else:
                     # Killed as a whole, supervisor and all: systemd-oomd, or SIGKILL from outside.
                     verdict = self.runner_of(t).result(t)
@@ -2228,9 +2471,11 @@ class Daemon:
             t.jobserver, t.tokens_out = None, 0
 
     def finalize(self, t: Ticket, now: float, exit_code, oom: bool = False, timed_out: bool = False,
-                 error: str | None = None, lost: bool = False) -> None:
+                 error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
         if t.state in FINISHED:
             return
+        if isinstance(result, dict):  # the supervisor's reading, taken as the build ended
+            t.take_waits(result.get("mem_wait_some"), result.get("mem_wait_full"), result.get("mem_high"))
         exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
         lane = self.lane(t.lane)
         t.exit = exit_code
@@ -2275,7 +2520,8 @@ class Daemon:
                     "key": t.key, "lane": t.lane, "t": round(time.time()), "wall": round(wall, 1), "exit": exit_code,
                     "peak_mem": t.mem_peak, "peak_cores": round(t.peak_cores, 2), "avg_cores": round(t.avg_cores, 2),
                     "granted": given, "mem_cores": t.peak_mem_cores or t.max_granted, "elastic": t.elastic,
-                    "cold": t.cold, "oom": t.oom,
+                    "cold": t.cold, "oom": t.oom, "mem_wait_some": round(t.mem_wait_some, 1),
+                    "mem_wait_full": round(t.mem_wait_full, 1), "mem_high": t.mem_high,
                 })
             except OSError as e:
                 log(f"can't record {t.id} in history: {e}")
@@ -2288,9 +2534,13 @@ class Daemon:
         self.save(t)
         self.broadcast(t, now)
         self.run_hooks(t, now)
+        waits = ""
+        if t.mem_wait_some >= 1 or t.mem_high:
+            waits = (f"; waited on memory {t.mem_wait_some:.0f}s ({t.mem_wait_full:.0f}s with all of it waiting)"
+                     f"{', and went over its MemoryHigh' if t.mem_high else ''}")
         log(f"{t.state} {t.id} (exit {t.exit}{', killed for memory' if t.oom else ''}"
             f"{'; ' + t.error if t.error else ''}) after {wall:.0f}s: peak {fmt_size(t.mem_peak)}, "
-            f"{t.peak_cores:.1f} cores at most, {t.avg_cores:.1f} on average, {t.max_granted} given")
+            f"{t.peak_cores:.1f} cores at most, {t.avg_cores:.1f} on average, {t.max_granted} given{waits}")
 
     def run_hooks(self, t: Ticket, now: float) -> None:
         for command in (t.notify, self.cfg.on_finish):
@@ -2459,11 +2709,150 @@ class Daemon:
             self.last_rebalance = tick
             self.rebalance(now)
             self.guard_slice()
+        self.watch_memory(tick)
         self.send_waits(now)
         self.reap_helpers(now)
         if tick - self.last_prune >= 600:
             self.last_prune = tick
             self.prune(now)
+
+    MEMORY_LOG_SECONDS = 30
+    MEMORY_LOG_BYTES = 1 << 20
+
+    def watch_memory(self, tick: float) -> None:
+        """While memory is tight, say every half minute how much is free and which cgroups hold the
+        most, builds or not, so that if the machine stalls and has to be reset, there is a record of
+        what filled it. Tight is less than twice mem_floor available, or every task on the machine
+        stalled on memory at once 5% of the time (memory "full"; "some" also counts one build slowed
+        at its own MemoryHigh, which is normal). It is no longer tight once more than 2.5 times
+        mem_floor is available and "full" is under 1% for half a minute.
+
+        Nothing slow happens here, on the daemon's loop: memory.log is written and synced by a
+        thread of its own, and the cgroups are walked by another."""
+        m, floor = self.machine, self.cfg.mem_floor
+        tight = m.mem_available < 2 * floor or m.psi_mem >= 5
+        calm = m.mem_available > 2.5 * floor and m.psi_mem < 1
+        if not tight and not self.memory_tight:
+            return
+        if calm:
+            self.memory_calm_since = self.memory_calm_since or tick
+            if tick - self.memory_calm_since >= self.MEMORY_LOG_SECONDS:
+                self.memory_tight, self.memory_calm_since = False, None
+                self.memory_note(f"memory is no longer tight: {fmt_size(m.mem_available)} available")
+            return
+        self.memory_calm_since = None
+        if self.memory_tight and tick - self.last_memory_log < self.MEMORY_LOG_SECONDS:
+            return
+        self.memory_tight, self.last_memory_log = True, tick
+        self.memory_note(f"memory is tight: {fmt_size(m.mem_available)} available (floor {fmt_size(floor)}), "
+                         f"{fmt_size(m.swap_used)} of swap used, every task waiting on memory {m.psi_mem:.0f}% "
+                         f"of the time (some task {m.psi_mem_some:.0f}%)")
+        self.walk_wanted.set()  # one walk at a time: a request while one runs is the next one
+        self.memory_thread("walker", self.memory_walker)
+
+    def memory_note(self, text: str) -> None:
+        """A memory-watch line: to the journal at warning priority, and queued for memory.log."""
+        if self.memory_stopping:
+            return
+        log(text, level=4)
+        self.memory_lines.put((time.strftime("%Y-%m-%dT%H:%M:%S%z"), text))
+        self.memory_thread("writer", self.memory_writer)
+
+    def memory_thread(self, name: str, target) -> None:
+        with self.memory_thread_lock:  # the walker logs too: only one of each thread, ever at once
+            thread = self.memory_threads.get(name)
+            if self.memory_stopping or (thread is not None and thread.is_alive()):
+                return
+            try:
+                thread = threading.Thread(target=target, name=f"memory-{name}", daemon=True)
+                thread.start()
+                self.memory_threads[name] = thread
+            except RuntimeError as e:  # no threads to be had (a pids limit, say): the journal still has it
+                if not self.memory_thread_failed:
+                    log(f"can't start the memory watch's {name}: {e}")
+                self.memory_thread_failed = True
+
+    def memory_walker(self) -> None:
+        while True:
+            self.walk_wanted.wait()
+            if self.memory_stopping:
+                return
+            self.walking = True  # before the request is cleared, so nobody sees it idle in between
+            self.walk_wanted.clear()
+            try:
+                top, complete = biggest_cgroups(self.cg_root, deadline=time.monotonic() + 20)
+                listed = ", ".join(f"{short_cgroup(rel)}{f' ({name})' if name else ''} {fmt_size(held)}"
+                                   f"{f' + {fmt_size(swap)} swap' if swap >= 256 * MIB else ''}"
+                                   for held, swap, rel, name in top)
+                self.memory_note(f"holding the most memory: {listed or 'nothing measurable'}"
+                                 f"{'' if complete else ' (the walk was cut short; partial)'}")
+            except Exception:
+                if not self.memory_stopping:
+                    log("the memory watch failed:\n" + traceback.format_exc(), level=4)
+            finally:
+                self.walking = False
+
+    def memory_writer(self) -> None:
+        """Append queued lines to memory.log in the state directory, syncing each batch: the journal
+        can lose its last minutes when a machine is reset, which is when this record matters."""
+        path = os.path.join(self.state_dir, "memory.log")
+        while True:
+            batch = [self.memory_lines.get()]
+            while True:
+                try:
+                    batch.append(self.memory_lines.get_nowait())
+                except queue.Empty:
+                    break
+            lines = [item for item in batch if item is not None]
+            try:
+                if lines:
+                    try:
+                        if os.path.getsize(path) > self.MEMORY_LOG_BYTES:
+                            os.replace(path, path + ".1")
+                    except OSError:
+                        pass
+                    new = not os.path.exists(path)
+                    data = "".join(f"{stamp} {text}\n" for stamp, text in lines).encode(errors="backslashreplace")
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    try:
+                        while data:  # a short write (a full disk) is retried, or raises
+                            data = data[os.write(fd, data):]
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    if new:  # a new file's name, after a rotation too, must survive a reset as well
+                        dirfd = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(dirfd)
+                        finally:
+                            os.close(dirfd)
+            except Exception as e:  # never lose the writer to one bad batch
+                if not self.memory_stopping:
+                    log(f"can't write {path}: {e!r}")
+            finally:
+                for _ in batch:
+                    self.memory_lines.task_done()
+            if len(lines) < len(batch):  # told to stop
+                return
+
+    def memory_idle(self, timeout: float = 10.0) -> bool:
+        """Wait until the memory watch has nothing left to do (for tests)."""
+        until = time.monotonic() + timeout
+        while time.monotonic() < until:
+            if not self.walk_wanted.is_set() and not self.walking and not self.memory_lines.unfinished_tasks:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def stop_memory_watch(self, timeout: float = 2.0) -> None:
+        """Stop the watch's threads before the interpreter goes, so none is caught writing."""
+        with self.memory_thread_lock:
+            self.memory_stopping = True
+            threads = list(self.memory_threads.values())
+        self.walk_wanted.set()
+        self.memory_lines.put(None)
+        for thread in threads:
+            thread.join(timeout)
 
     def drop_unwatched(self, now: float) -> None:
         """A build that `buildq run` submitted is meant to be followed. Once no one has followed it
@@ -2834,14 +3223,22 @@ def supervise(directory: str) -> int:
         if os.path.exists(os.path.join(directory, "supervisor.json")) and \
                 (read_json(os.path.join(directory, "supervisor.json")) or {}).get("pid") == os.getpid():
             own = proc_cgroup(os.getpid())
+            # Only a cgroup of the build's own says anything about the build: under the direct
+            # runner the supervisor shares the daemon's (or a terminal's), with its whole history.
+            ticket_id = os.path.basename(os.path.normpath(directory))
+            own = own if own and os.path.basename(own) == f"buildq-{ticket_id}.service" else None
             events = cgroup_events(own) if own else {}
+            some, full, high = (cgroup_memory_waits(own) if own else None) or (None, None, None)
             try:
                 write_json(os.path.join(directory, "result.json"),
                            {"exit": code, "ended": time.time(), "timed_out": timed_out,
                             "oom_kills": events.get("oom_kill", 0),
                             # "max" counts the times the build reached its own MemoryMax; a kill
                             # without it came from outside (the slice's limit, systemd-oomd).
-                            "hit_own_cap": events.get("max", 0) > 0})
+                            "hit_own_cap": events.get("max", 0) > 0,
+                            # None: not measured (no cgroup of its own)
+                            "mem_wait_some": None if some is None else round(some, 1),
+                            "mem_wait_full": None if full is None else round(full, 1), "mem_high": high})
             except OSError:
                 pass
 
@@ -2907,6 +3304,7 @@ async def serve(args) -> None:
     daemon.stopping = True  # from here on nothing new starts
     daemon.guard_slice(stopping=True)
     ticker.cancel()
+    daemon.stop_memory_watch()
     server.close()
     if owned:
         try:

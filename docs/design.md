@@ -11,6 +11,7 @@ How buildq works inside. The README covers installing and using it.
 | `buildqd --supervise DIR` | The supervisor: one per build, inside its service. Runs the command, writes its output and exit status. |
 | `buildq-shim` | Optional: stands in for `cargo`, `pnpm`, ... on `PATH` and sends heavy invocations through `buildq run`. |
 | `buildq-rustc-guard` | Optional: cargo's rustc wrapper; refuses compiles outside a buildq build. |
+| `skills/buildq/SKILL.md` | Optional: a skill for coding agents on using the queue, installed with `install.sh --skill`, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end. |
 | `buildq.socket` | Holds the Unix socket (`$XDG_RUNTIME_DIR/buildq.sock`, mode 0600) so it stays open while the daemon restarts. |
 | `buildq.service` | Runs the daemon. `KillMode=process`: stopping the daemon stops nothing else. |
 | `buildq.slice` | The parent of every build's service: one CPU and IO weight for all builds, and a memory backstop. |
@@ -97,6 +98,15 @@ and walks the queue in order, starting each ticket for which, in this order:
 7. its expected memory ≤ `free_mem`, less any room held for starving builds;
 8. no build runs, or CPU pressure is at most `cpu_psi_block`;
 9. no build runs, or its minimum cores ≤ `free_cpu + shrinkable`, less any held room.
+
+Tests 8 and 9 don't apply to lanes with `waits_for_cpu = false`: such a build starts on its `need`
+cores (its lane's `min_cores`, or for a build that ignores the job count what it uses, which is
+then not capped at the CPU target either), more if they are free, however busy the CPU is. It
+passes the cores held for starving builds, and when it starves itself it holds memory but no cores.
+Its cores come off `free_cpu` like any other's, so nothing that does wait for cores starts behind
+it, and the next resize takes the overshoot back from resizable builds (it cuts whoever is furthest
+above their minimum). CPU is the resource that can be overcommitted safely: too much of it slows
+builds down, where too much memory stops the machine.
 
 When a ticket starts, its memory and cores come off the budget for the rest of the pass. The first
 test that fails is the reason its client sees.
@@ -185,6 +195,40 @@ whether the kill came at the build's own `MemoryMax` (it needs more) or from out
 limit, systemd-oomd), which doesn't say the build needs more. A build that exits 137 with its peak
 near its lane's `MemoryMax` also counts as killed for memory.
 
+**Memory waits.** From the cgroup's `memory.pressure`, the total time some of its tasks, and all of
+them, were stalled on memory (reclaim, swap-in, `MemoryHigh` throttling), and from
+`memory.events.local` the number of times it went over its own `MemoryHigh`. The daemon reads them
+with each sample and the supervisor once more as the build ends, but only from a cgroup of the
+build's own (the direct runner has none, so it reports none). They are shown with the ticket,
+logged when it finishes, and kept in its history record (`mem_wait_some`, `mem_wait_full`,
+`mem_high`). A command whose peak sits at its lane's `MemoryHigh` with long waits is being held
+back by that cap. Numbers read back from `result.json` or `ticket.json` count only if they are
+finite, non-negative and not absurdly large; anything else is ignored.
+
+**Memory watch.** While `MemAvailable` is under twice `mem_floor`, or memory `full avg10` is 5% or
+more, the daemon records every 30 seconds the machine's memory, swap and pressure. Memory `some`
+doesn't count: one build slowed at its own `MemoryHigh` keeps it high on a machine with plenty
+free. Once more than 2.5 times `mem_floor` is available and `full` is under 1% for 30 seconds, it
+says memory is no longer tight. Going in and out of tight in between doesn't log more often.
+
+Nothing slow runs on the daemon's loop. The loop writes the machine's numbers to the journal at
+once (at warning priority) and puts them on a queue for `memory.log` in the state directory. A
+writer thread appends from that queue and fsyncs each batch, since the journal can lose its last
+minutes in a hard reset; it alone rotates the file at about 1 MiB, and each line carries the time
+it was recorded. A walker thread then walks `/sys/fs/cgroup`. One walk runs at a time, and a
+record that comes in while one runs only asks for the next. A walk reads at most 5,000
+directories, and as many again looking for process names, and stops after 20 seconds, saying so.
+
+The walk lists the six cgroups holding the most unreclaimable memory plus swap anywhere on the
+machine (swap counts: with zram it is still RAM). It looks only into cgroups whose memory plus
+swap is at least 256 MiB. It lists a cgroup whole when none of its children is that large, and
+otherwise lists the large children plus the parent's "(the rest)", what its small children hold
+together, so many small services don't vanish. Each entry names the largest process found in it,
+from a bounded look at up to 500 processes. If a thread can't be started, the journal still gets
+the machine's numbers. The daemon stops both threads before it exits. It is evidence, not control:
+buildq can't stop work it didn't start, but after a stall the record shows what the memory was
+doing up to it.
+
 ## History
 
 A finished build adds a line to `history.jsonl` unless it was cancelled, timed out, or ended by a
@@ -258,7 +302,7 @@ descriptor exits once it has the lock, and on btrfs its device number differs fr
 | A client is killed | A dropped-off build carries on under its ticket; a `buildq run` build is cancelled once nobody has followed it for `unwatched_seconds`. |
 | A build leaves processes behind | The supervisor stops its process group and anything carrying its `BUILDQ_JOB`; systemd stops the rest when the service ends; the turn lasts until the service is empty (killing what is left after 15 s). |
 | `systemd-run` hangs | It is killed after 60 s, and systemd is asked whether the service exists. |
-| Other work fills the machine | The slice guard shrinks the builds' limit with it; builds are slowed, then stopped inside their slice. |
+| Other work fills the machine | The slice guard shrinks the builds' limit with it; builds are slowed, then stopped inside their slice. The memory watch logs what is holding the memory every 30 seconds. |
 | A build runs out of memory at its lane's cap | The kernel kills within that build only (`OOMPolicy=continue` keeps the supervisor alive to report it). The next estimate for that command is at least the cap. |
 | All builds together exceed the slice backstop | The kernel slows them, then kills within the slice, not elsewhere. |
 | `systemd-run` fails | The ticket fails with systemd's message. |

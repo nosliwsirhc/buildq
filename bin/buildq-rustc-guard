@@ -24,6 +24,8 @@
 #   ALLOW_ENV="VAR1 VAR2"      more variables whose presence lets a compile through
 #   ALLOW_PARENTS="name ..."   more parent process names
 #   SLICE="other.slice"        the slice builds run in, if not buildq.slice
+#   RUN_WITH="prefix"          how the refusal tells you to run the command (default "buildq run --";
+#                              a machine whose agents use a wrapper names it here)
 #
 # This is a guardrail for well-meaning agents and scripts, not a security boundary: anyone can
 # point RUSTC_WRAPPER elsewhere.
@@ -53,7 +55,7 @@ done
 [ -n "${BUILDQ_FALLBACK_ACTIVE:-}" ] && pass "$@"
 
 # Extra settings, read line by line; a mistake in the file can't stop the checks above.
-allow_env= allow_parents=rust-analyzer slice=
+allow_env= allow_parents=rust-analyzer slice= run_with=
 config=${XDG_CONFIG_HOME:-$HOME/.config}/buildq/guard.env
 if [ -r "$config" ]; then
   while IFS= read -r line || [ -n "$line" ]; do
@@ -61,6 +63,7 @@ if [ -r "$config" ]; then
       ALLOW_ENV=*) value=${line#ALLOW_ENV=} ;;
       ALLOW_PARENTS=*) value=${line#ALLOW_PARENTS=} ;;
       SLICE=*) value=${line#SLICE=} ;;
+      RUN_WITH=*) value=${line#RUN_WITH=} ;;
       *) continue ;;
     esac
     value=${value#\"}; value=${value%\"}; value=${value#\'}; value=${value%\'}
@@ -68,6 +71,7 @@ if [ -r "$config" ]; then
       ALLOW_ENV=*) allow_env="$allow_env $value" ;;
       ALLOW_PARENTS=*) allow_parents="$allow_parents $value" ;;
       SLICE=*) slice=$value ;;
+      RUN_WITH=*) run_with=$value ;;
     esac
   done < "$config"
 fi
@@ -114,8 +118,8 @@ for arg in "$@"; do
 done
 cat >&2 <<EOF
 buildq: refusing to compile $crate outside the build queue on this machine.
-Run the cargo command through buildq, which waits for room and then runs it:
-    buildq run -- cargo ...
-(or the wrapper this machine's agents use). See buildq-rustc-guard for what it allows.
+Run the same cargo command through the queue, which waits for room and then runs it:
+    ${run_with:-buildq run --} cargo ...
+A long build is better dropped off, with a ticket to wait on (the buildq skill, or buildq --help).
 EOF
 exit 1

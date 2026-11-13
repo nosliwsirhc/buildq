@@ -36,7 +36,7 @@ class FakeMachine:
         self.mem_available = mem_available
         self.busy = self.busy_now = busy
         self.swap_used = 0
-        self.psi_cpu = self.psi_mem = 0.0
+        self.psi_cpu = self.psi_mem = self.psi_mem_some = 0.0
 
     def sample(self, now):
         pass
@@ -120,6 +120,7 @@ class DaemonCase(unittest.TestCase):
         self.dirs = 0
 
     def tearDown(self):
+        self.daemon.stop_memory_watch()
         for t in self.daemon.tickets.values():
             self.daemon.close_jobserver(t)
         self.tmp.cleanup()
@@ -256,6 +257,59 @@ class Admission(DaemonCase):
         self.daemon.schedule(self.now)
         self.assertEqual(t.state, "failed")
         self.assertIn("is gone", t.error)
+
+
+class QuickLanesDontWaitForCpu(DaemonCase):
+    config = BASE_CONFIG.replace("may_pass_held = true", "may_pass_held = true\nwaits_for_cpu = false")
+
+    def test_a_lane_that_doesnt_wait_for_cpu_starts_on_a_busy_machine(self):
+        self.machine.busy = self.machine.busy_now = 32.0
+        first = self.submit()
+        self.assertEqual(first.state, "running")  # alone: it ignores the load anyway
+        second = self.submit()
+        self.assertEqual((second.state, second.reason_cat), ("queued", "cpu"))
+        web = self.submit(("pnpm", "build"), lane="web")
+        self.assertEqual((web.state, web.granted), ("running", 1))  # its minimum, over the target
+        self.machine.psi_cpu = 80.0
+        again = self.submit(("pnpm", "test"), lane="web")
+        self.assertEqual(again.state, "running")  # CPU pressure doesn't hold it either
+        self.daemon.schedule(self.now)
+        self.assertEqual(second.state, "queued")  # the cores it took aren't handed to waiting builds
+
+    def test_memory_still_holds_it(self):
+        self.submit()
+        self.machine.mem_available = 12 * GIB
+        web = self.submit(("pnpm", "build"), lane="web")
+        self.assertEqual((web.state, web.reason_cat), ("queued", "memory"))
+
+    def test_a_rigid_build_needs_what_it_uses_even_above_the_cpu_target(self):
+        self.daemon.cfg.cpu_target = 0.05  # 1.6 of 32 cores
+        t = self.submit(("pnpm", "build"), lane="web")
+        self.daemon.history.add({"key": t.key, "t": self.now, "peak_mem": GIB, "peak_cores": 4.0,
+                                 "avg_cores": 4.0, "granted": 1})
+        self.daemon.estimate(t, self.now)
+        self.assertEqual((t.rigid, t.need), (True, 4))  # the lane's max_cores, not the target
+
+    def test_a_starving_build_of_such_a_lane_holds_no_cores(self):
+        self.daemon.cfg.lanes["web"].may_pass_held = False
+        self.machine.mem_available = 40 * GIB
+        self.submit()  # a heavy build: 20G of the 30G above the floor
+        web = self.submit(("pnpm", "build"), lane="web", mem="20G")
+        self.daemon.schedule(self.now + 400)  # past starve_seconds
+        self.assertTrue(web.held)
+        self.assertEqual((self.daemon.budget["held_mem"], self.daemon.budget["held_cores"]), (web.est_mem, 0))
+
+    def test_the_rebalancer_takes_its_cores_back_from_resizable_builds(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()  # a cold build: it wants 16
+        heavy = self.submit(cwd=project)
+        self.assertEqual(heavy.granted, 16)
+        heavy.elastic, heavy.cores_now = True, 16.0
+        self.machine.busy = self.machine.busy_now = 32.0  # the machine is full
+        web = self.submit(("pnpm", "build"), lane="web")
+        self.assertEqual((web.state, web.granted), ("running", 1))
+        self.daemon.rebalance(self.now + 1)
+        self.assertEqual(heavy.granted, 15)
 
 
 class Order(DaemonCase):
@@ -544,6 +598,125 @@ class SliceGuard(DaemonCase):
             self.assertEqual(int(f.read()), 40 * GIB)  # the configured limit back
 
 
+class MemoryWatch(DaemonCase):
+    def cgroup(self, rel, current, anon=0, procs=""):
+        path = os.path.join(self.tmp.name, "cg", rel)
+        os.makedirs(path, exist_ok=True)
+        for name, text in (("memory.current", str(current)), ("memory.stat", f"anon {anon}\nfile 0\n"),
+                           ("cpu.stat", "usage_usec 0\n"), ("cgroup.procs", procs)):
+            with open(os.path.join(path, name), "w") as f:
+                f.write(text)
+        return path
+
+    def test_memory_waits_are_read_from_the_cgroup(self):
+        path = self.cgroup("x.service", GIB)
+        self.assertIsNone(buildqd.cgroup_memory_waits(path))  # no memory.pressure
+        with open(os.path.join(path, "memory.pressure"), "w") as f:
+            f.write("some avg10=1.00 avg60=0.50 avg300=0.10 total=12500000\n"
+                    "full avg10=0.00 avg60=0.00 avg300=0.00 total=3000000\n")
+        with open(os.path.join(path, "memory.events.local"), "w") as f:
+            f.write("low 0\nhigh 5\nmax 0\noom 0\noom_kill 0\n")
+        self.assertEqual(buildqd.cgroup_memory_waits(path), (12.5, 3.0, 5))
+
+    def test_the_biggest_cgroups_are_found_where_the_memory_is(self):
+        root = os.path.join(self.tmp.name, "cg")
+        mib = buildqd.MIB
+        self.cgroup("a.slice", 10 * GIB, anon=9 * GIB)
+        self.cgroup("a.slice/x.service", 7 * GIB, anon=6 * GIB, procs=f"{os.getpid()}\n")
+        for i in range(10):  # many small ones beside the big one: 2G together
+            self.cgroup(f"a.slice/s{i}.scope", 200 * mib, anon=200 * mib)
+        self.cgroup("a.slice/gone.service", 2 * GIB)  # vanished mid-walk: no memory.stat
+        os.remove(os.path.join(root, "a.slice/gone.service/memory.stat"))
+        self.cgroup("b.slice", 4 * GIB, anon=3584 * mib)  # its children are all small: listed as one
+        self.cgroup("b.slice/small.scope", 10 * mib, anon=10 * mib, procs=f"{os.getpid()}\n")
+        self.cgroup("c.slice", 100 * mib, anon=100 * mib)
+        with open(os.path.join(root, "a.slice/x.service/memory.swap.current"), "w") as f:
+            f.write(str(GIB))
+        found, complete = buildqd.biggest_cgroups(root)
+        with open("/proc/self/comm") as f:
+            me = f.read().strip()
+        self.assertTrue(complete)
+        self.assertEqual(found, [(6 * GIB, GIB, "a.slice/x.service", me),
+                                 (3584 * mib, 0, "b.slice", me),  # its process, found below it
+                                 (3 * GIB, 0, "a.slice (the rest)", "")])  # 9 - 6 held by the small ones and the gone one
+
+    def test_the_walk_stops_at_its_limit_and_says_so(self):
+        root = os.path.join(self.tmp.name, "cg")
+        self.cgroup("a.slice", 10 * GIB, anon=9 * GIB)
+        self.cgroup("a.slice/x.service", 7 * GIB, anon=6 * GIB)
+        found, complete = buildqd.biggest_cgroups(root, max_dirs=1)
+        self.assertFalse(complete)
+        self.assertEqual([rel for _, _, rel, _ in found], ["a.slice"])  # listed whole, not looked into
+
+    def test_a_swapped_out_cgroup_is_still_found(self):
+        root = os.path.join(self.tmp.name, "cg")
+        path = self.cgroup("a.slice", 100 * buildqd.MIB, anon=100 * buildqd.MIB)
+        with open(os.path.join(path, "memory.swap.current"), "w") as f:
+            f.write(str(8 * GIB))
+        found, _ = buildqd.biggest_cgroups(root)
+        self.assertEqual(found, [(100 * buildqd.MIB, 8 * GIB, "a.slice", "")])
+
+    def test_looking_for_process_names_keeps_to_its_limits(self):
+        root = os.path.join(self.tmp.name, "cg")
+        self.cgroup("a.slice", 10 * GIB, anon=9 * GIB)
+        for i in range(30):  # many empty cgroups below it, none of them big
+            os.makedirs(os.path.join(root, "a.slice", f"e{i}.scope"))
+        budget = buildqd.WalkBudget(5, None)
+        buildqd.biggest_process(os.path.join(root, "a.slice"), budget=budget)
+        self.assertEqual((budget.dirs, budget.complete), (0, False))
+        expired = buildqd.WalkBudget(1000, time.monotonic() - 1)
+        buildqd.biggest_process(os.path.join(root, "a.slice"), budget=expired)
+        self.assertEqual(expired.dirs, 1000)  # a deadline that has passed reads nothing
+
+    def test_container_names_are_shortened(self):
+        long = "docker-" + "0123456789ab" + "c" * 52 + ".scope"
+        self.assertEqual(buildqd.short_cgroup("system.slice/" + long), "docker-0123456789ab.scope")
+
+    def watch(self, tick):
+        self.daemon.watch_memory(tick)
+        self.assertTrue(self.daemon.memory_idle())
+
+    def test_tight_memory_is_logged_every_half_minute(self):
+        lines = []
+        old_log, buildqd.log = buildqd.log, lambda message, level=None: lines.append(message)
+        self.addCleanup(setattr, buildqd, "log", old_log)
+        self.daemon.cg_root = os.path.join(self.tmp.name, "cg")
+        self.cgroup("system.slice", 31 * GIB, anon=30 * GIB)
+        self.cgroup("system.slice/docker-0123456789abcdef0123.scope", 30 * GIB, anon=29 * GIB)
+        self.watch(1000.0)
+        self.assertEqual(lines, [])  # 100G available: not tight
+        self.machine.psi_mem_some = 40.0  # one build slowed at its MemoryHigh: not a reason
+        self.watch(1000.5)
+        self.assertEqual(lines, [])
+        self.machine.mem_available = 15 * GIB  # under twice the 10G floor
+        self.watch(1001.0)
+        self.watch(1020.0)
+        self.assertEqual(len(lines), 2)
+        self.assertIn("memory is tight: 15G available", lines[0])
+        self.assertIn("holding the most memory: docker-0123456789abcdef0123.scope 29G", lines[1])
+        self.watch(1031.0)
+        self.assertEqual(len(lines), 4)
+        self.machine.mem_available = 22 * GIB  # above twice the floor, below 2.5 times: still tight
+        self.watch(1040.0)
+        self.watch(1062.0)
+        self.assertEqual(len(lines), 6)
+        self.machine.mem_available = 100 * GIB
+        self.watch(1063.0)
+        self.machine.mem_available = 15 * GIB  # flapping doesn't get round the half minute
+        self.watch(1064.0)
+        self.assertEqual(len(lines), 6)
+        self.machine.mem_available = 100 * GIB
+        self.watch(1065.0)
+        self.watch(1094.0)
+        self.assertEqual(len(lines), 6)
+        self.watch(1095.0)  # calm for half a minute
+        self.assertEqual(lines[-1], "memory is no longer tight: 100G available")
+        with open(os.path.join(self.state, "memory.log")) as f:
+            kept = f.read().splitlines()
+        self.assertEqual(len(kept), 7)
+        self.assertIn("memory is tight", kept[0])
+
+
 class Jobservers(DaemonCase):
     def test_tokens(self):
         js = buildqd.Jobserver(os.path.join(self.tmp.name, "fifo"), create=True)
@@ -638,6 +811,35 @@ class Turns(DaemonCase):
         self.assertEqual(t.state, "succeeded")
         records = list(self.daemon.history.by_key[t.key])
         self.assertEqual((records[0]["peak_mem"], records[0]["granted"]), (6 * GIB, 8))
+
+    def test_memory_waits_are_kept_shown_and_learned(self):
+        t = self.submit()
+        t.measured, t.mem_peak = True, 22 * GIB
+        t.take_waits(10.0, 2.0, 3)  # a reading while it ran
+        self.finish(t, 0, mem_wait_some=340.5, mem_wait_full=120.0, mem_high=104492)
+        self.assertEqual((t.mem_wait_some, t.mem_wait_full, t.mem_high), (340.5, 120.0, 104492))
+        row = t.row(self.now)
+        self.assertEqual((row["mem_wait_some"], row["mem_high"]), (340.5, 104492))
+        record = list(self.daemon.history.by_key[t.key])[0]
+        self.assertEqual((record["mem_wait_some"], record["mem_wait_full"], record["mem_high"]),
+                         (340.5, 120.0, 104492))
+        restarted = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        restarted.load_tickets(self.now + 60)
+        self.assertEqual(restarted.tickets[t.id].mem_high, 104492)
+
+    def test_bad_memory_waits_are_ignored(self):
+        t = self.submit()
+        self.finish(t, 0, mem_wait_some="lots", mem_wait_full=None, mem_high=10 ** 400)
+        self.assertEqual(t.state, "succeeded")  # a number too big for a float doesn't stop the daemon
+        self.assertEqual((t.mem_wait_some, t.mem_wait_full, t.mem_high), (0.0, 0.0, 0))
+        t.take_waits(float("nan"), -5, True)
+        self.assertEqual((t.mem_wait_some, t.mem_wait_full, t.mem_high), (0.0, 0.0, 0))
+        with open(os.path.join(t.dir, "ticket.json")) as f:
+            record = json.load(f)
+        record.update(mem_wait_some="x", mem_high=[1])  # a damaged ticket file
+        loaded = buildqd.Ticket.from_record(record, t.dir)
+        self.assertEqual((loaded.mem_wait_some, loaded.mem_high), (0.0, 0))
+        loaded.row(self.now)
 
     def test_a_signalled_or_timed_out_build_teaches_nothing(self):
         killed = self.submit()
@@ -889,7 +1091,8 @@ class Configuration(unittest.TestCase):
         for text in ('slice_guard = "false"', '[lanes.a]\nexclusive = "no"',
                      '[[lane_rules]]\nmatch = "x"\nlane = "default"\nmax_jobs = 2',"max_jobs = 0", "max_jobs = 2.5", "lanes = 1", 'env = "x"', 'flock_slots = ["x"]',
                      '[lanes.a]\nproperties = "x"', "[lanes.a]\nmin_cores = 9\nmax_cores = 4",
-                     'mem_floor = "200G"', "max_jobz = 3", 'runner = "docker"', "[lanes.a]\ncores = nan"):
+                     'mem_floor = "200G"', "max_jobz = 3", 'runner = "docker"', "[lanes.a]\ncores = nan",
+                     '[lanes.a]\nwaits_for_cpu = "no"'):
             if "lanes.a" in text:
                 text = 'default_lane = "a"\n' + text
             with self.assertRaises(ValueError, msg=text):
@@ -948,6 +1151,8 @@ class Supervisor(unittest.TestCase):
         with open(os.path.join(d, "stderr.log"), "rb") as f:
             self.assertEqual(f.read(), b"err\n")
         self.assertFalse(os.path.exists(os.path.join(d, "env.json")))  # secrets aren't kept
+        # Not in a cgroup of its own here, so its memory waits aren't measured.
+        self.assertEqual((result["mem_wait_some"], result["mem_wait_full"], result["mem_high"]), (None, None, None))
 
     def test_a_second_supervisor_runs_nothing(self):
         d = os.path.join(self.tmp.name, "t")
