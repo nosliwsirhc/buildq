@@ -242,6 +242,7 @@ DEFAULTS = {
     "mem_psi_block": 10.0,
     "ramp_seconds": 90,
     "starve_seconds": 600,
+    "ci_first": False,
     "unwatched_seconds": 30,
     "history_runs": 30,
     "history_days": 30,
@@ -370,6 +371,7 @@ class Config:
         self.mem_psi_block = number(d["mem_psi_block"], "mem_psi_block", 0, 1000)
         self.ramp_seconds = number(d["ramp_seconds"], "ramp_seconds", 0, 3600)
         self.starve_seconds = number(d["starve_seconds"], "starve_seconds", 1, 7 * 86400)
+        self.ci_first = boolean(d["ci_first"], "ci_first")
         self.unwatched_seconds = number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)
         self.history_runs = number(d["history_runs"], "history_runs", 1, 1000, integer=True)
         self.history_days = number(d["history_days"], "history_days", 1, 3650)
@@ -456,7 +458,8 @@ class Config:
             "max_jobs": self.max_jobs, "cpu_target": self.cpu_target, "mem_floor": self.mem_floor,
             "disk_floor": f"{self.disk_floor_share * 100:g}%" if self.disk_floor_share else self.disk_floor,
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
-            "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "slice": self.slice,
+            "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
+            "slice": self.slice,
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
             "max_log": self.max_log, "shed_memory": self.shed_memory, "reuse_window": self.reuse_window,
@@ -2874,9 +2877,10 @@ class Daemon:
     # ---- the ticket index
 
     def queue(self, now: float | None = None) -> list[Ticket]:
-        """Queued tickets in the order they get a turn: any that has waited starve_seconds first,
-        then the higher priority (the lane's plus the ticket's own), then the one expected to
-        finish soonest, then the oldest."""
+        """Queued tickets in the order they get a turn: any that has waited starve_seconds (or, with
+        ci_first, comes from a CI job) first, then the higher priority (the lane's plus the ticket's
+        own), CI jobs first at the same priority with ci_first, then the one expected to finish
+        soonest, then the oldest."""
         now = time.time() if now is None else now
 
         # Fair shares: at the same priority, a caller (a session, a CI runner) with fewer builds
@@ -2889,7 +2893,7 @@ class Daemon:
             # A build that has waited starve_seconds goes ahead of everything else, or a stream of
             # quicker or higher builds could keep it waiting for ever.
             starving = self.starving(t, now) and not (lane and lane.may_pass_held)
-            return (not starving, -weight)
+            return (not starving, -weight, not (self.cfg.ci_first and t.from_ci))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
@@ -2904,9 +2908,11 @@ class Daemon:
         return sorted(queued, key=lambda t: (*tier(t), share[t.id], *own_order(t)[2:]))
 
     def starving(self, t: Ticket, now: float) -> bool:
-        """It has waited starve_seconds, or it was stopped to free memory once already: it goes first,
-        and the room it needs is held for it."""
-        return now - t.submitted >= self.cfg.starve_seconds or t.requeues > 0
+        """It has waited starve_seconds, or it was stopped to free memory once already, or (with
+        ci_first) it comes from a CI job, which has a time limit of its own and holds up a release:
+        it goes first, and the room it needs is held for it."""
+        return (now - t.submitted >= self.cfg.starve_seconds or t.requeues > 0
+                or (self.cfg.ci_first and t.from_ci))
 
     def active(self) -> list[Ticket]:
         """Tickets that hold a turn: starting or running, including builds found in flock slots."""
@@ -3940,7 +3946,7 @@ class Daemon:
                                       f"allowed (max_jobs = {cfg.max_jobs})")
             elif t.est_mem > free_mem - hm:
                 if t.est_mem <= free_mem:
-                    reason = ("held", "the room it needs is held for a build that has waited longer")
+                    reason = ("held", "the room it needs is held for a build that goes first (it has waited longer, or is a CI job)")
                 elif t.est_mem > m.mem_available + ours_now - cfg.mem_floor:
                     # It wouldn't fit even with every build of ours gone: holding room for it would
                     # stop everything else for nothing.
@@ -3957,7 +3963,7 @@ class Daemon:
                                           f"{cfg.cpu_psi_block:g}% while one runs)")
             elif count > 0 and lane.waits_for_cpu and t.need > free_cpu + shrinkable - hc:
                 if t.need <= free_cpu + shrinkable:
-                    reason = ("held", "the room it needs is held for a build that has waited longer")
+                    reason = ("held", "the room it needs is held for a build that goes first (it has waited longer, or is a CI job)")
                 else:
                     reason = ("cpu", f"needs {t.need} core{'s' if t.need != 1 else ''}; "
                                      f"{max(free_cpu + shrinkable, 0):.1f} of {cpu_cap:.1f} are free "

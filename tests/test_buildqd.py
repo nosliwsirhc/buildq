@@ -2240,6 +2240,68 @@ class Order(DaemonCase):
         self.assertEqual(self.states(low, high), ["queued", "running"])
 
 
+class CIFirst(DaemonCase):
+    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "filedrop-runner-2"}
+
+    def setUp(self):
+        super().setUp()
+        self.daemon.cfg.lanes["heavy"].mem = GIB  # builds with no history count as 1G
+        self.daemon.cfg.lanes["web"].mem = GIB
+        self.machine.mem_available = 35 * GIB  # 25G free
+        self.running = self.submit(mem="24G")  # leaves 1G
+
+    def test_off_a_ci_build_waits_its_turn(self):
+        waiting = self.submit(mem="20G")
+        self.now += 301  # it starves
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [waiting.id, ci.id])
+        self.assertFalse(ci.held)
+
+    def test_a_ci_build_goes_first_and_gets_room_held_at_once(self):
+        self.daemon.cfg.ci_first = True
+        waiting = self.submit(mem="20G")
+        self.now += 301  # it starves, but at the same priority the CI build goes first
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, waiting.id])
+        self.assertTrue(ci.held)
+        small = self.submit(("cargo", "check"), cores=1)  # 1G would fit, but the room is held
+        self.assertEqual(self.states(ci, small), ["queued", "queued"])
+        self.assertEqual(small.reason_cat, "held")
+        web = self.submit(("pnpm", "build"), lane="web", cores=1)
+        self.assertEqual(web.state, "running")  # its lane may still pass held room
+        self.finish(self.running)
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual(self.states(ci, waiting), ["running", "queued"])
+
+    def test_a_ci_build_is_held_before_it_has_waited(self):
+        self.daemon.cfg.ci_first = True
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual(ci.state, "queued")
+        self.assertTrue(ci.held)
+
+    def test_github_actions_set_by_hand_doesnt_go_first(self):
+        self.daemon.cfg.ci_first = True
+        by_hand = self.submit(("cargo", "test"), mem="20G", env={"GITHUB_ACTIONS": "true"})
+        self.assertFalse(by_hand.held)
+
+    def test_a_higher_lane_still_goes_first(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.lanes["web"].priority = 100
+        self.daemon.cfg.lanes["web"].may_pass_held = False
+        web = self.submit(("pnpm", "build"), lane="web", mem="20G")
+        self.now += 301
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [web.id, ci.id])
+
+    def test_the_setting_is_read_and_shown(self):
+        cfg = buildqd.Config({"ci_first": True}, 64 * GIB, 16)
+        self.assertTrue(cfg.ci_first)
+        self.assertTrue(cfg.summary()["ci_first"])
+        self.assertFalse(buildqd.Config({}, 64 * GIB, 16).ci_first)
+        with self.assertRaises(ValueError):
+            buildqd.Config({"ci_first": "sometimes"}, 64 * GIB, 16)
+
+
 class Priorities(DaemonCase):
     config = BASE_CONFIG.replace('may_pass_held = true', 'may_pass_held = true\npriority = 100\nextra_jobs = 2') + """
 [lanes.dotnet]

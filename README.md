@@ -214,8 +214,11 @@ order and starts every build that fits:
 **Order.** A build that has waited `starve_seconds`, or was stopped once to free memory, goes
 first, and the room it needs, its workspace included, is held for it, so later builds can't keep
 passing it (the workspace binds every lane in its group; for the rest, lanes with
-`may_pass_held` still may). After that, the higher priority first (the lane's plus the ticket's
-own); within a priority, the build whose caller has the fewest builds running (a fair share: one
+`may_pass_held` still may). With `ci_first`, a build from a CI job is treated so from the moment it
+is queued, and goes before the others at the same priority: a CI step has a job time limit and
+holds up a merge or a release, while a session's build can wait. After that, the higher priority
+first (the lane's plus the ticket's own); within a priority, the build whose caller has the fewest
+builds running (a fair share: one
 session's burst of builds doesn't keep the others waiting), then the build expected to finish
 soonest (the median time of its command's runs), then the oldest. A build that doesn't fit doesn't
 block those behind it. While the queue is paused (`buildq pause`), nothing new starts.
@@ -548,9 +551,17 @@ steps:
   its own result.
 
 On a runner without buildq (GitHub-hosted, or another machine), the step warns and runs as before. While the queue is paused (`buildq pause`), such a step waits like any other build,
-up to the job's timeout. Cancelling the job cancels the build. CI jobs then share turns fairly with
-everything else (each runner is a caller of its own); a `ci` lane can give them a priority or caps
+up to the job's timeout. Cancelling the job cancels the build. CI jobs share turns fairly with
+everything else (each runner is a caller of its own), unless `ci_first = true`: then a CI job's
+build goes first in its turn and has its room held from the start, as if it had waited
+`starve_seconds` (front-end lanes with `may_pass_held` still pass it). Turn it on when CI steps
+wait out their jobs' time limits on a busy machine. A `ci` lane can give them a priority or caps
 of their own (see [config.example.toml](config.example.toml)).
+
+A step's first run is planned at its lane's default memory, since its command has no history, and a
+run cancelled with its job teaches the history nothing. If a new step keeps timing out in the
+queue, run it once by hand from the repository, with the same lane and command, so the history
+learns its real size.
 
 ## Limitations
 

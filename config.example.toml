@@ -40,6 +40,12 @@ ramp_seconds = 90
 # keep passing it. Lanes with may_pass_held = true still may.
 starve_seconds = 600
 
+# Builds from CI jobs (GitHub Actions on a self-hosted runner) go first, as if they had already
+# waited starve_seconds: room is held for them from the start, and at the same priority they go
+# before other waiting builds. A CI step has a job time limit and holds up a merge or a release;
+# a session's build can wait. Lanes with may_pass_held still pass. Off by default.
+ci_first = false
+
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its
 # client was killed); builds dropped off with `buildq submit` aren't.
 unwatched_seconds = 30
