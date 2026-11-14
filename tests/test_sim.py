@@ -201,6 +201,26 @@ class Replay(SimCase):
         (t,) = s.daemon.tickets.values()
         self.assertEqual((t.lane, t.state), ("check", "succeeded"))
 
+    def test_a_script_stopped_for_memory_fails_and_counts_as_a_stop(self):
+        jobs = [scenarios.build(i * 5, ("bash", f"build{i}.sh"), 22, 600, 4, shape=(0.2, 0.6, 1, 1, 1, 1, 1, 1, 1, 1),
+                                repo="app", caller=f"s{i}", workspace=f"w{i}", history=True, history_peak=3 * GIB)
+                for i in range(4)]
+        summary = self.run_sim(jobs, mem_total=80 * GIB, background_mem=0)
+        self.assertGreater(summary["stops_for_memory"], 0)  # it couldn't start over, so it failed: still a stop
+        self.assertGreater(summary["outcomes"].get("failed", 0), 0)
+
+    def test_hooks_never_run(self):
+        mark = os.path.join(self.tmp.name, "hook-ran")
+        summary = self.run_sim(agents(1, 1, 10), self.config(on_finish=json.dumps(f"touch {mark}")))
+        self.assertEqual(summary["outcomes"], {"succeeded": 1})
+        self.assertFalse(os.path.exists(mark))
+
+    def test_a_ci_build_that_ends_as_its_limit_comes_isnt_timed_out(self):
+        jobs = [scenarios.build(0, ("pnpm", "eslint"), 1, 60, 1, lane="heavy", ci=True, repo="app", caller="runner-1",
+                                timeout_s=60, history=True)]
+        summary = self.run_sim(jobs)
+        self.assertEqual((summary["ci_timed_out"], summary["outcomes"]), (0, {"succeeded": 1}))
+
     def test_the_built_in_scenarios_load(self):
         for name, make in scenarios.SCENARIOS.items():
             s = make()

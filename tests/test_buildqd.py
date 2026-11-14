@@ -1895,6 +1895,13 @@ class Analytics(DaemonCase):
                                  "peak_mem": 16 * GIB, "peak_cores": 4.0, "oom": True})
         self.assertEqual(self.settle_release(t, 900), (18 * GIB, 18 * GIB))
 
+    def test_a_requeued_build_s_row_keeps_its_last_attempt_apart(self):
+        t = self.submit()
+        t.attempts_wall, t.requeues = 100.0, 1  # as if it had been stopped once, 100 s in
+        self.finish(t, after=30)
+        row = self.db().execute("SELECT wall, attempt_wall FROM build WHERE id = ?", (t.id,)).fetchone()
+        self.assertEqual((row["wall"], row["attempt_wall"]), (130.0, 30.0))  # its profile is the 30 s one
+
     def test_a_ticket_too_big_to_ever_fit_isnt_waiting_on_memory(self):
         minute = int(self.now // 60) * 60
         self.submit(mem=200 * GIB)

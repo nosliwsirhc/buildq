@@ -685,8 +685,11 @@ def cmd_check(args) -> int:
         command = [sys.executable, os.path.abspath(__file__), "run", name, "--json", "--config", args.config,
                    "--buildqd", args.buildqd] + (["--seed-history"] if args.seed_history else [])
         seed = "0" if os.environ.get("PYTHONHASHSEED") != "0" else "1"
-        out = subprocess.run(command, env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True,
-                             check=True)
+        out = subprocess.run(command, env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True)
+        if out.returncode:
+            print(f"{name}: the second run failed:\n{out.stderr}", file=sys.stderr)
+            bad += 1
+            continue
         same = json.dumps(a, indent=1, sort_keys=True) == out.stdout.strip()
         print(f"{name}: {'same both times' if same else 'DIFFERENT between runs'}")
         bad += not same

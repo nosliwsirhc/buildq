@@ -91,6 +91,7 @@ A trace file works as a scenario too: one build per line, in JSON.
 | `workspace` | optional: a target folder it shares with other builds, which then take turns |
 | `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes), and whether cargo builds from scratch |
 | `history`, `history_peak` | optional: give its command a history of three earlier runs, of `history_peak` bytes |
+| `state`, `requeued` | written by `export`, for information only: how the build ended, and how often it was stopped and queued again. The replay decides both for itself |
 
 ## A trace from your own machine
 
