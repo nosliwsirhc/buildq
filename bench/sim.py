@@ -207,6 +207,9 @@ class Simulation:
         machine = scenario["machine"]
         self.background_mem = machine.get("background_mem", 0)
         self.background_cpu = machine.get("background_cpu", 0.0)
+        # Other work over time, as recorded (a step a minute): [[seconds from the start, bytes, cores], …]
+        self.background = sorted(machine.get("background") or [], key=lambda b: b[0])
+        self.background_next = 0
         self.machine = Machine(int(machine["ncpu"]), int(machine["mem_total"]))
         self.jobs: dict[str, Job] = {}  # live attempts by ticket id
         self.specs: dict[str, dict] = {}  # ticket id -> its trace entry
@@ -368,10 +371,19 @@ class Simulation:
 
     # ---- the clock
 
+    def follow_background(self):
+        """Other work's memory and cores at this second: the last recorded step at or before it."""
+        now = self.clock.now - EPOCH
+        while self.background_next < len(self.background) and self.background[self.background_next][0] <= now:
+            _, mem, cores = self.background[self.background_next]
+            self.background_mem, self.background_cpu = int(mem), float(cores)
+            self.background_next += 1
+
     def step(self):
         """One simulated second of the machine. Builds use cores and memory; then the kernel's limits
         (a build over its lane's MemoryMax, then the machine out of memory: the largest goes), the
         supervisor's time limit, and last, the builds whose work is done end."""
+        self.follow_background()
         live = [j for j in self.jobs.values() if j.alive]
         cap = max(self.machine.ncpu - self.background_cpu, 1.0)
         demand = sum(j.wanted_cores() for j in live)
@@ -643,16 +655,24 @@ def load_scenario(name: str, seed_history: bool = False) -> dict:
     lane's default) unless seed_history gives each command three earlier runs of its own size."""
     if name in builtin.SCENARIOS:
         return builtin.SCENARIOS[name]()
-    jobs = []
+    jobs, machine = [], dict(builtin.WORKSTATION)
     with open(name) as f:
         for line in f:
-            if line.strip():
-                jobs.append(json.loads(line))
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if "background" in entry or "machine" in entry:  # the machine the trace ran on (export's first line)
+                machine.update(entry.get("machine") or {})
+                if entry.get("background"):
+                    machine["background"] = entry["background"]
+                continue
+            jobs.append(entry)
     first = min((float(j["t"]) for j in jobs), default=0.0)
     for j in jobs:
         j["t"] = float(j["t"]) - first
-    return {"name": os.path.basename(name), "machine": dict(builtin.WORKSTATION), "jobs": jobs,
-            "seed_history": seed_history}
+    if machine.get("background"):
+        machine["background"] = [[float(t) - first, mem, cores] for t, mem, cores in machine["background"]]
+    return {"name": os.path.basename(name), "machine": machine, "jobs": jobs, "seed_history": seed_history}
 
 
 def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim", keep: str | None = None) -> tuple[dict, Simulation]:
@@ -887,10 +907,48 @@ def parse_when(value: str | None) -> float | None:
         return real_time.mktime(real_time.strptime(value, "%Y-%m-%dT%H:%M"))
 
 
+def export_machine(db: sqlite3.Connection, since: float | None, until: float | None, zero: float) -> dict | None:
+    """The machine a trace ran on, from the analytics' minute rows: its cores and memory, and other
+    work's (everything but buildq's builds: CI runners, containers, sessions) memory and cores each
+    minute, as [seconds from the trace's start, bytes, cores]. None without minute rows."""
+    cols = {r[1] for r in db.execute("PRAGMA table_info(minute)")}
+    if not {"t", "mem_total", "mem_available", "builds_mem", "cpu_busy", "builds_cores"} <= cols:
+        return None
+    query = "SELECT t, cores, mem_total, mem_available, builds_mem, cpu_busy, builds_cores FROM minute WHERE 1=1"
+    params: list = []
+    if since is not None:
+        query += " AND t >= ?"
+        params.append(since - 60)  # (the minute the first build came in)
+    if until is not None:
+        query += " AND t < ?"
+        params.append(until)
+    rows = db.execute(query + " ORDER BY t", params).fetchall()
+    if not rows:
+        return None
+    background = []
+    for t, cores, total, available, builds_mem, busy, builds_cores in rows:
+        if total is None or available is None:
+            continue
+        mem = max(0, int(total) - int(available) - int(builds_mem or 0))
+        cpu = max(0.0, float(busy or 0) - float(builds_cores or 0))
+        background.append([round(float(t) - zero, 1), mem, round(cpu, 2)])
+    last = rows[-1]
+    machine = {"ncpu": int(last[1] or builtin.WORKSTATION["ncpu"]), "mem_total": int(last[2])}
+    return {"machine": machine, "background": background}
+
+
 def cmd_export(args) -> int:
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     try:
-        for entry in export_rows(db, parse_when(args.since), parse_when(args.until), args.anonymize):
+        since, until = parse_when(args.since), parse_when(args.until)
+        rows = export_rows(db, since, until, args.anonymize)
+        zero = db.execute("SELECT MIN(submitted) FROM build WHERE (wall > 0 OR state = 'cancelled')"
+                          + (" AND submitted >= ?" if since is not None else ""),
+                          [since] if since is not None else []).fetchone()[0]
+        machine = export_machine(db, since, until, float(zero or 0)) if rows else None
+        if machine:
+            print(json.dumps(machine, sort_keys=True))
+        for entry in rows:
             print(json.dumps(entry, sort_keys=True))
     finally:
         db.close()

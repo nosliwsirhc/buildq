@@ -79,7 +79,10 @@ Every command in them starts with a history of three earlier runs of its size, a
 has built it before (`seed_history`): granted its lane's cores, with when each run peaked and what it
 used after, taken from its profile, so "past the peak" (`release_after_peak`) has the runs it reads.
 
-A trace file works as a scenario too: one build per line, in JSON.
+A trace file works as a scenario too: one build per line, in JSON. Its first line may instead
+describe the machine it ran on: `{"machine": {"ncpu": …, "mem_total": …}, "background": [[t, bytes,
+cores], …]}`, with other work's memory and cores at each time `t` (seconds from the first build,
+as a step that holds until the next).
 
 | Field | Meaning |
 |---|---|
@@ -108,7 +111,9 @@ each of its commands starts with three earlier runs of its own size. Without it,
 planned at its lane's default memory, as on a machine that has never run them.
 
 `export` reads finished builds from the analytics database (`metrics = true`) and writes them as a
-trace. Their memory profile, cores and run time are what the machine measured, for their last
+trace. Its first line is the machine (its cores and memory) and other work's memory and cores minute
+by minute (everything but buildq's builds: CI runners, containers, sessions), from the analytics'
+minute rows, so the replay has the pressure the machine really had. Their memory profile, cores and run time are what the machine measured, for their last
 attempt. A build that was stopped and queued again (`requeued`) has its last attempt's run time where
 the database keeps it (`attempt_wall`, since #39). In an older database it has every attempt's run time
 and no profile, so its memory rises to its peak in the first fifth; a build whose last attempt never
@@ -164,7 +169,8 @@ simulation, and that part is simplified:
   build keeps the crates it finished, so the simulation overstates what a stop costs.
 - **CI jobs** are cancelled at their time limit, as GitHub cancels them, whether queued or running.
   The limit counts from when the build was submitted to buildq, not from when the job started.
-- **Other work** (sessions, idle CI runners, containers) holds a fixed amount of memory and cores.
+- **Other work** (sessions, idle CI runners, containers) holds a fixed amount of memory and cores in
+  the built-in scenarios. An exported trace replays what the machine recorded each minute instead.
   There is no disk: every path has plenty of room, whatever `disk_floor` says.
 - **Jobservers** aren't modelled beyond the cores granted.
 

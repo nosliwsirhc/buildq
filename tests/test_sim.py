@@ -391,6 +391,33 @@ class Export(SimCase):
         self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
         self.assertAlmostEqual(summary["makespan_s"], 120, delta=5)
 
+    def test_other_work_s_memory_comes_from_the_minute_rows(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE minute (t INTEGER, cores INTEGER, mem_total INTEGER, mem_available INTEGER, "
+                   "builds_mem INTEGER, cpu_busy REAL, builds_cores REAL)")
+        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?)",
+                       [(960, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, 4.0),     # others: 20G, 2 cores
+                        (1020, 32, 125 * GIB, 60 * GIB, 15 * GIB, 20.0, 8.0)])  # others: 50G, 12 cores
+        out = sim.export_machine(db, 1000, None, 1000)
+        self.assertEqual(out["machine"], {"ncpu": 32, "mem_total": 125 * GIB})
+        self.assertEqual(out["background"], [[-40.0, 20 * GIB, 2.0], [20.0, 50 * GIB, 12.0]])
+        path = os.path.join(self.tmp.name, "with-machine.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps(out) + "\n")
+            f.write(json.dumps(scenarios.build(0, ("cargo", "build"), 1, 600, 1, repo="app")) + "\n")
+        loaded = sim.load_scenario(path)
+        self.assertEqual(loaded["machine"]["background"], out["background"])
+        state = os.path.join(self.tmp.name, "bg")
+        os.makedirs(state)
+        s = sim.Simulation(loaded, CONFIG, BUILDQD, state, name="buildqd_bg")
+        s.clock.now = sim.EPOCH + 10
+        s.step()
+        self.assertEqual((s.background_mem, s.background_cpu), (20 * GIB, 2.0))
+        s.clock.now = sim.EPOCH + 20
+        s.step()
+        self.assertEqual(s.machine.mem_available, 125 * GIB - 50 * GIB)  # it follows the recorded minute
+
     def test_an_exported_trace_replays(self):
         path = os.path.join(self.tmp.name, "trace.jsonl")
         with open(path, "w") as f:
