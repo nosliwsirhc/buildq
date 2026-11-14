@@ -4366,6 +4366,21 @@ class Top(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             buildq.curses_with_fallback(run, wrapper, {"TERM": "xterm-256color"})
         self.assertEqual(caught.exception.code, 129)
+        env, calls = {"TERM": "xterm-ghostty"}, []
+
+        def fallback_wrapper(run):  # the first try fails setupterm; the fallback runs, then hangs up
+            calls.append(env["TERM"])
+            if len(calls) == 1:
+                raise curses.error("setupterm: could not find terminal")
+            return wrapper(run)
+        with self.assertRaises(SystemExit) as caught:
+            buildq.curses_with_fallback(run, fallback_wrapper, env)
+        self.assertEqual((caught.exception.code, calls), (129, ["xterm-ghostty", "xterm-256color"]))
+
+        def interrupted(screen):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            buildq.curses_with_fallback(interrupted, wrapper, {"TERM": "xterm-256color"})
 
     def test_the_fetcher_survives_an_unexpected_error(self):
         answers = iter([{"overview": {}}, OSError(23, "too many open files"), {"overview": {"x": 1}}])
@@ -4382,6 +4397,7 @@ class Top(unittest.TestCase):
             time.sleep(0.01)
         self.assertGreaterEqual(fetcher.latest()[0], 3)  # it went on asking
         self.assertTrue(fetcher.thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()

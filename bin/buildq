@@ -2500,15 +2500,9 @@ def cmd_top(args) -> int:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:  # a locale named in the environment but not installed
         pass
-    if args.once or not sys.stdout.isatty():
-        if wants_ascii(locale.nl_langinfo(locale.CODESET)):
-            use_ascii()
-        sampler = TopSampler(DirSizes(background=False))
-        try:
-            return print_top_once(sampler)
-        finally:
-            sampler.sizes.stop()
-    if os.environ.get("TERM", "dumb") == "dumb":  # curses would start, and fill the screen with spaces
+    # One snapshot: when asked, into a pipe, or with no terminal to draw on (TERM unset, empty or dumb,
+    # where curses would start and fill the screen with spaces).
+    if args.once or not sys.stdout.isatty() or os.environ.get("TERM", "") in ("", "dumb"):
         if wants_ascii(locale.nl_langinfo(locale.CODESET)):
             use_ascii()
         sampler = TopSampler(DirSizes(background=False))
