@@ -96,7 +96,7 @@ as a step that holds until the next).
 | `cancel_at`, `unfinished` | optional: cancel it this many seconds after its submission, as it was (#40); and, with `unfinished`, it never ends by itself before that (only part of its run is known) |
 | `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes), and whether cargo builds from scratch |
 | `history`, `history_peak` | optional: give its command a history of three earlier runs, of `history_peak` bytes |
-| `warmup` | written by `export`: it was already queued or running when the window began. It replays like any other build, but isn't set beside what really happened |
+| `warmup`, `submitted_at` | written by `export`: it was already queued or running when the window began, and when it was really submitted (seconds from the first build, before its `t`). It replays like any other build, as old as it was, but isn't set beside what really happened |
 | `state`, `requeued`, `recorded_wait` | written by `export`: how the build ended, how often it was stopped and queued again, and how long it waited over all its attempts. The replay decides all three for itself; the summary sets its waits beside `recorded_wait` |
 
 ## A trace from your own machine
@@ -113,9 +113,16 @@ planned at its lane's default memory, as on a machine that has never run them.
 
 `export` reads finished builds from the analytics database (`metrics = true`) and writes them as a
 trace: the ones submitted from `--since` to `--until`, and the ones still queued or running as
-`--since` began (marked `warmup`), so a replay starts with the machine as full as it really was. A
-window of a busy night can begin with a dozen builds in flight, some submitted an hour or more
-before; without them, its replay would start on an empty machine. Its first line is the machine (its cores and memory) and other work's memory and cores (CI
+`--since` began (marked `warmup`). A window of a busy night can begin with a dozen builds in
+flight, some submitted an hour or more before; without them, its replay would start on an empty
+machine. The builds that held those up before the window aren't in the trace, so a warm-up build
+enters the replay as it really started if it was running when the window began, or as the window
+begins if it was still queued. Either way it keeps its real submission time (`submitted_at`), so it
+is as old as it was when the scheduler orders the queue, and is cancelled when it was. That brings
+the replay's start closer to the machine it had, not all the way: a warm-up build's own wait before
+the window isn't replayed.
+
+The trace's first line is the machine (its cores and memory) and other work's memory and cores (CI
 runners, containers, sessions: everything but buildq's builds), a step a minute from the analytics'
 minute rows, from the first build's minute to an hour after the last one ended. Other work's memory
 is the memory in use, averaged over the minute, less the builds' own over the same minute: their
@@ -125,7 +132,10 @@ minute is smoothed away; and they replay at the times they were recorded, even w
 a build that caused some of them (a CI job's own containers, say). A minute that can't say what the
 builds used (rows older than those columns, or the first after the daemon started) is left out and
 the minute before holds, as it does across a gap in the rows. Minute rows are kept 14 days and
-builds 180, so an older window has no rows and replays with the built-in fixed background. `export`
+builds 180, so an older window has no rows and replays with the built-in fixed background. Where
+buildq runs builds without systemd (the `direct` runner, used only when the daemon isn't a systemd
+service), it can't measure them: their memory counts as other work, and a replay of a trace from
+there counts it twice. `export`
 says on stderr when any of this happens. `run --no-background` replays a trace with the fixed
 background anyway, to see what the recorded minutes change.
 
@@ -145,9 +155,12 @@ it was.
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
 and who ran them. `--anonymize` hashes repository names, workspaces, callers, lanes other than the
 usual ones (`heavy`, `check`, `web` …), and every word of a command except a known tool (`cargo`,
-`pnpm`, `python3`, `make` …), option names, numbers and a short list of public subcommands (`build`,
-`test`, `vitest`, `unittest` …), and drops build names. An option's value is hashed too, whether it
-follows a `=` (`--manifest-path=…`) or runs on from a short option (`-C…`). A lane the bench configuration doesn't have falls to
+`pnpm`, `python3`, `make` …), option names and a short list of public subcommands (`build`, `test`,
+`vitest`, `unittest` …), and drops build names. An option's value is hashed too, whether it follows
+a `=` (`--manifest-path=…`), runs on from a short option (`-C…`), or is a word of its own; numbers
+and common words included, since a value can be a password whatever it looks like. The only values
+kept are counts (`-j 8`, `--jobs=8`, `--test-threads=4`) and cargo's built-in profiles
+(`--profile=test`). A lane the bench configuration doesn't have falls to
 the lane rules in the replay. That hides them from a casual reader, but a hash of a
 common word can be guessed. Keep traces on your machine; the scenarios in the repository are
 synthetic.

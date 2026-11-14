@@ -301,10 +301,44 @@ class Export(SimCase):
         self.assertNotIn("profile", out[2])
 
     def test_a_window_starts_with_the_builds_already_in_the_machine(self):
-        out = sim.export_rows(self.metrics(), 990, None, anonymize=False)  # 'a' (900-1000) and 'b' (960-2000) were in
-        self.assertEqual([e["t"] for e in out], [0.0, 60.0, 100.0, 110.0, 120.0])
+        # 'a' (900-1000) was running at 990: it enters as it started. 'b' (960, ran 1880-2000) was
+        # queued: it enters as the window begins. Both keep their real submission.
+        out = sim.export_rows(self.metrics(), 990, None, anonymize=False)
+        self.assertEqual([e["t"] for e in out], [0.0, 90.0, 100.0, 110.0, 120.0])
         self.assertEqual([e.get("warmup", False) for e in out], [True, True, False, False, False])
+        self.assertEqual([e.get("submitted_at") for e in out[:3]], [0.0, 60.0, None])
         self.assertEqual(len(sim.export_rows(self.metrics(), 1000, None, anonymize=False)), 4)  # 'a' had ended
+
+    def test_a_window_replays_the_wait_its_builds_had_behind_one_already_running(self):
+        # A (10000-11000) held workspace w; B, submitted at 10100, waited for it and ran 11000-12000;
+        # C came in at 11500 and waited 500s for B. From 11500, A is gone, but B enters as it really
+        # started, so C waits as long. D was cancelled while queued; the only whole run of its command
+        # (A) ended before the window, and is what it replays as.
+        buildqd = load("buildqd_for_window", BUILDQD)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        rows = [("a", 10000, 11000, 1000.0, "succeeded", "app|heavy|cargo test -p a", "w", 0.0),
+                ("b", 10100, 12000, 1000.0, "succeeded", "app|heavy|cargo test -p b", "w", 900.0),
+                ("c", 11500, 12100, 100.0, "succeeded", "app|heavy|cargo test -p c", "w", 500.0),
+                ("d", 11400, 11600, 0.0, "cancelled", "app|heavy|cargo test -p a", None, 200.0)]
+        db.executemany("INSERT INTO build (id, submitted, ended, wall, attempt_wall, state, key, lane, workspace, "
+                       "waited, mem_peak, avg_cores, exit) VALUES (?,?,?,?,?,?,?,'heavy',?,?,?,1.0,0)",
+                       [(i, s, e, w, w, st, k, ws, wt, GIB) for i, s, e, w, st, k, ws, wt in rows])
+        out = sim.export_rows(db, 11500, None, anonymize=False)
+        self.assertEqual([(e["t"], e.get("submitted_at"), e.get("warmup", False)) for e in out],
+                         [(0.0, -900.0, True), (500.0, 400.0, True), (500.0, None, False)])  # b, d, c
+        d = out[1]
+        self.assertEqual((d["wall"], d["cancel_at"]), (1000.0, 200.0))  # A's run, cancelled 200s after its submission
+        path = os.path.join(self.tmp.name, "window.jsonl")
+        with open(path, "w") as f:
+            for entry in out:
+                f.write(json.dumps(entry) + "\n")
+        summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_window")
+        agent = summary["against_recorded"]["agent"]
+        self.assertEqual(agent["builds"], 1)  # c alone: b and d are warm-up
+        self.assertAlmostEqual(agent["p50"][1], 500.0, delta=15)  # it waited for b, as it did
+        self.assertEqual(summary["cancelled_as_in_trace"], 1)
 
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
@@ -485,14 +519,18 @@ class Export(SimCase):
         self.assertEqual(err.getvalue(), "")
 
     def test_anonymizing_hashes_option_values(self):
-        argv = ["--manifest-path=/home/someone/client/Cargo.toml", "--token=hunter2", "-C/home/someone/fw",
-                "--profile=test", "--jobs=8", "-j8", "-p", "--release", "--", "-"]
-        words = [sim.anonymous_word(w) for w in argv]
-        for secret in ("someone", "client", "hunter2", "fw"):
+        argv = ["cargo", "--manifest-path=/home/someone/client/Cargo.toml", "--token=hunter2", "-C/home/someone/fw",
+                "--password=123456789", "-p123456789", "--token=test", "--token", "424242",
+                "--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release", "test", "--", "-"]
+        words = sim.anonymous_argv(argv)
+        for secret in ("someone", "client", "hunter2", "fw", "123456789", "424242", "--token=test"):
             self.assertNotIn(secret, json.dumps(words))
-        self.assertEqual(words[0].split("=")[0], "--manifest-path")
-        self.assertTrue(words[2].startswith("-C") and words[2] != argv[2])
-        self.assertEqual(words[3:], ["--profile=test", "--jobs=8", "-j8", "-p", "--release", "--", "-"])
+        self.assertEqual(words[1].split("=")[0], "--manifest-path")
+        self.assertTrue(words[3].startswith("-C") and words[3] != argv[3])
+        self.assertTrue(words[4].startswith("--password=") and words[5].startswith("-p") and words[5] != argv[5])
+        self.assertEqual(words[0], "cargo")
+        self.assertEqual(words[9:], ["--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release", "test", "--", "-"])
+        self.assertEqual(sim.rank_correlation([1, 1, 2, 3], [5, 5, 6, 7]), 1.0)  # ties share their ranks
 
     def test_a_replay_is_set_beside_what_really_happened(self):
         jobs = [dict(scenarios.build(i * 5, ("cargo", "test", f"-p{i}"), 4, 300, 2, repo="app"),

@@ -305,6 +305,8 @@ class Simulation:
             raise RuntimeError(f"submitting {spec.get('name') or spec['argv']}: {error}")
         self.specs.setdefault(t.id, spec)
         self.records.setdefault(t.id, record)["lane"] = t.lane
+        if spec.get("submitted_at") is not None:  # a warm-up build: as old as it really was
+            t.submitted = EPOCH + float(spec["submitted_at"])
         return t
 
     def launch(self, ticket):
@@ -734,6 +736,8 @@ def load_scenario(name: str, seed_history: bool = False, background: bool = True
     first = min((float(j["t"]) for j in jobs), default=0.0)
     for j in jobs:
         j["t"] = float(j["t"]) - first
+        if j.get("submitted_at") is not None:
+            j["submitted_at"] = float(j["submitted_at"]) - first
     if machine.get("background"):
         machine["background"] = [[float(t) - first, mem, cores] for t, mem, cores in machine["background"]]
     return {"name": os.path.basename(name), "machine": machine, "jobs": jobs, "seed_history": seed_history}
@@ -880,23 +884,48 @@ PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".
 PLAIN_OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # an option's name and nothing else
 
 
-def anonymous_word(word: str) -> str:
-    """A word of a command (not its first) as an anonymized trace keeps it: subcommands that are the
-    same everywhere, option names, and counts; any value an option carries is hashed with the rest
-    (--manifest-path=/a/b keeps "--manifest-path=", -C/a/b keeps "-C")."""
-    if word in PUBLIC_WORDS or word in ("-", "--") or re.fullmatch(r"\d+", word):
+# Option values an anonymized trace keeps: counts (cargo's and make's -j, a test runner's threads)
+# and cargo's built-in profiles. Any other value is hashed, numbers and common words too: a value
+# can be a password or a token, whatever it looks like.
+COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
+KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
+
+
+def option_value(name: str, value: str) -> str:
+    """An option's value as an anonymized trace keeps it: hashed unless it is a count of a count
+    option or one of the option's known values."""
+    if (name in COUNT_OPTIONS and value.isdigit()) or value in KNOWN_VALUES.get(name, ()):
+        return value
+    return hashed("w", value) if value else ""
+
+
+def anonymous_word(word: str, before: str = "") -> str:
+    """A word of a command (not its first) as an anonymized trace keeps it, `before` being the word
+    ahead of it: option names, a short list of subcommands that are the same everywhere, and the
+    values option_value keeps. Anything else is hashed: a value after "=" (--manifest-path=/a/b keeps
+    "--manifest-path="), one run on to a short option (-C/a/b keeps "-C"), and a number unless it
+    follows a count option (-j 8)."""
+    if word in ("-", "--"):
         return word
-    if word.startswith("--"):
-        name, eq, value = word.partition("=")
-        if not PLAIN_OPTION.fullmatch(name):
-            return hashed("w", word)
-        return name + eq + (anonymous_word(value) if value and not value.startswith("-") else hashed("w", value) if value else "")
     if word.startswith("-"):
-        if re.fullmatch(r"-[A-Za-z0-9]|-[A-Za-z]\d+", word):  # -p, -j8
-            return word
+        name, eq, value = word.partition("=")
+        if eq:
+            return name + "=" + option_value(name, value) if PLAIN_OPTION.fullmatch(name) else hashed("w", word)
+        if word.startswith("--") or len(word) == 2:
+            return word if PLAIN_OPTION.fullmatch(word) else hashed("w", word)
         if PLAIN_OPTION.fullmatch(word[:2]):
-            return word[:2] + hashed("w", word[2:])  # a value (or other options) run on to it
-    return hashed("w", word)
+            return word[:2] + option_value(word[:2], word[2:])  # -j8; -C/a/b, -xvf: the rest hashed
+        return hashed("w", word)
+    if word.isdigit():
+        return word if before in COUNT_OPTIONS else hashed("w", word)
+    return word if word in PUBLIC_WORDS else hashed("w", word)
+
+
+def anonymous_argv(argv: list[str]) -> list[str]:
+    """A command as an anonymized trace keeps it: its tool if it is a public one, then each word as
+    anonymous_word keeps it."""
+    return [(w if w in PUBLIC_TOOLS else hashed("w", w)) if i == 0 else anonymous_word(w, argv[i - 1])
+            for i, w in enumerate(argv)]
 
 
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
@@ -907,7 +936,10 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
                   anonymize: bool) -> tuple[list[dict], float | None, float | None]:
     """The trace's builds, and when (in the database's time) its first came in and its last ended.
     From `since`, these are the builds submitted then or later, and the ones still queued or running
-    as it began (marked warmup): a replay starts with the machine as full as it was."""
+    as it began (marked warmup). The builds that held those up before the window aren't in it, so a
+    warm-up build enters the replay as it really started if it was running then, else as the window
+    begins; either way with its real submission time (submitted_at), so its age and its cancel are
+    as they were."""
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
     query = "SELECT * FROM build WHERE (wall > 0 OR state = 'cancelled') AND submitted IS NOT NULL"
@@ -921,8 +953,17 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
     rows = [dict(r) for r in db.execute(query + " ORDER BY submitted, id", params)]
     if not rows:
         return [], None, None
-    first = rows[0]["submitted"]
-    out = []
+    def enters(r: dict) -> float:
+        """When a build comes into the replay (see above)."""
+        submitted = float(r["submitted"])
+        if since is None or submitted >= since:
+            return submitted
+        attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
+        ran = float(attempt or r.get("wall") or 0)  # (an older database: all its attempts, so it starts earlier)
+        start = float(r["ended"]) - ran if r.get("ended") is not None and ran > 0 else None
+        return max(submitted, start) if start is not None and start <= since else since
+
+    out: list[tuple[float, dict]] = []
     def shape(r: dict) -> dict | None:
         """What one whole run of a row's command looked like (wall, cores, peak, profile), or None if
         its last attempt never ran. wall counts every attempt; the profile and avg_cores describe the
@@ -945,6 +986,11 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
 
     # A whole run of each command that succeeded: what a cancelled build of it would have done (#40).
     whole = {r.get("key"): shape(r) for r in rows if r.get("state") == "succeeded" and shape(r)}
+    for key in {r.get("key") for r in rows if r.get("state") == "cancelled"} - set(whole):
+        before = db.execute("SELECT * FROM build WHERE key = ? AND state = 'succeeded' AND wall > 0 "
+                            "ORDER BY ended DESC LIMIT 1", (key,)).fetchone()  # (one from before the window)
+        if before is not None and shape(dict(before)):
+            whole[key] = shape(dict(before))
     for r in rows:
         repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
         argv = words.split() or ["build"]
@@ -962,7 +1008,7 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
         if cancelled and run is whole.get(r.get("key")):
             exit_code = 0  # it would have run as that whole run did; its cancel ends it (cancel_at)
         unfinished = cancelled and run is not whole.get(r.get("key"))  # only as far as it got: never ends by itself
-        entry = {"t": round(float(r["submitted"]) - first, 1), "repo": repo or "project", "lane": lane or None,
+        entry = {"t": enters(r), "repo": repo or "project", "lane": lane or None,
                  "argv": argv, "ci": bool(r.get("from_ci")), "caller": caller, "wall": round(wall, 1),
                  "avg_cores": round(float(avg), 2), "peak_mem": int(run["peak"]), "exit": exit_code,
                  "state": state or None}
@@ -982,19 +1028,26 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
             entry["recorded_wait"] = round(float(r["waited"]), 1)  # what it really waited (all its attempts)
         if since is not None and float(r["submitted"]) < since:
             entry["warmup"] = True  # in the machine before the window: there for the others, not compared
+            entry["submitted_at"] = float(r["submitted"])  # (its age, and when its cancel_at counts from)
         if anonymize:
             entry["repo"] = hashed("r", entry["repo"])
             entry["caller"] = hashed("c", caller)
-            entry["argv"] = [(w if w in PUBLIC_TOOLS else hashed("w", w)) if i == 0 else anonymous_word(w)
-                             for i, w in enumerate(argv)]
+            entry["argv"] = anonymous_argv(argv)
             if entry["lane"] and entry["lane"] not in PUBLIC_LANES:
                 entry["lane"] = hashed("l", entry["lane"])
             if "workspace" in entry:
                 entry["workspace"] = hashed("s", entry["workspace"])
             entry.pop("name", None)
-        out.append(entry)
+        out.append((entry["t"], entry))
+    if not out:
+        return [], None, None
+    first = min(at for at, _ in out)
+    for at, entry in out:
+        entry["t"] = round(at - first, 1)
+        if "submitted_at" in entry:
+            entry["submitted_at"] = round(entry["submitted_at"] - first, 1)
     ends = [float(r["ended"]) for r in rows if r.get("ended") is not None]
-    return out, float(first), max(ends, default=None)
+    return [entry for _, entry in out], float(first), max(ends, default=None)
 
 
 def parse_when(value: str | None) -> float | None:
