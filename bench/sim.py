@@ -887,11 +887,13 @@ def hashed(prefix: str, word: str) -> str:
 # everywhere, which the lane rules and restart_safe read. Anything else (a script, a package, a
 # test filter) is hashed.
 PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
-    vitest tsc typecheck unittest pytest discover buildx compose image make ninja""".split())
+    vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t""".split())
 # Tools an anonymized trace names (a command's first word); any other first word is hashed.
-PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node vite vitest tsc vue-tsc eslint
-    playwright storybook python python3 pytest uv dotnet make gmake ninja cmake docker podman buildah bash sh
-    git go gradle mvn java""".split())
+# (The daemon's shells and interpreters are among them: honors_grant and the lane rules read the tool.)
+PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
+    eslint playwright storybook python python3 pytest py.test uv dotnet msbuild make gmake ninja cmake docker
+    podman buildah bash sh zsh dash ksh fish ruby perl git go gradle mvn java""".split())
+PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?")  # versioned Pythons
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 
@@ -909,7 +911,8 @@ PLAIN_OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # an option's name a
 PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches --examples --all-targets
     --workspace --all-features --no-default-features --features --package --no-run --no-fail-fast --locked
     --offline --frozen --jobs --load-average --test-threads --filter --recursive --noEmit --watch --run
-    --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard""".split())
+    --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard
+    --doc""".split())
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
 KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
 TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test
@@ -952,7 +955,7 @@ def anonymous_argv(argv: list[str]) -> list[str]:
     if not argv:
         return []
     python = bool(re.fullmatch(r"python[0-9.]*", os.path.basename(argv[0])))
-    out = [argv[0] if argv[0] in PUBLIC_TOOLS else hashed("w", argv[0])]
+    out = [argv[0] if argv[0] in PUBLIC_TOOLS or PUBLIC_TOOL.fullmatch(argv[0]) else hashed("w", argv[0])]
     leading = True  # still among the subcommands it starts with
     for before, word in zip(argv, argv[1:]):
         if leading and (word in TOOLCHAINS or (python and word == "-m")):

@@ -400,6 +400,23 @@ class Export(SimCase):
             self.assertEqual(sim.cmd_export(args), 2)  # a lead-in needs a window to lead into
         self.assertIn("--since", err.getvalue())
 
+    def test_anonymizing_keeps_everything_the_replay_reads(self):
+        # Kept in step with the daemon, so the lists can't drift apart: the flags command_words keeps
+        # in a history key, the tools honors_grant and the lane rules read, the subcommands
+        # restart_safe reads (cargo's short forms too).
+        buildqd = load("buildqd_for_public", BUILDQD)
+        for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
+                     "--filter", "-p", "-F"):
+            self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
+        tools = buildqd.SHELLS | buildqd.INTERPRETERS | sim.Simulation.GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        for tool in sorted(tools):
+            self.assertEqual(sim.anonymous_argv([tool])[0], tool)
+        for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):
+            self.assertEqual(sim.anonymous_argv(argv), argv)
+            self.assertEqual(buildqd.restart_safe(sim.anonymous_argv(argv)), buildqd.restart_safe(argv))
+        key = lambda argv: buildqd.command_words(sim.anonymous_argv(argv))  # noqa: E731
+        self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
+
     def test_an_option_like_value_doesn_t_survive_from_the_database_to_the_trace(self):
         # pnpm --filter=--internal-client test, as its history key keeps it (#46 round 4)
         db = self.metrics()
