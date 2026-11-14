@@ -200,12 +200,13 @@ if sys.prefix != sys.base_prefix:  # a virtualenv: the Python it was made from
 else:
     print(sys.executable)  # itself, or what a shim ran
 EOF
-) || { say "buildq needs Python 3.11 or newer ($python is older; PYTHON=... names another)."; exit 1; }
+) || { say "buildq needs Python 3.11 or newer, and $python isn't one that runs (too old, or its version manager couldn't run it); PYTHON=... names another."; exit 1; }
 case $chosen in
   *[[:space:]]*) say "the Python to use ($chosen) has a space in its path, which a script's first line can't hold; PYTHON=... names another."; exit 1 ;;
 esac
-# (in bytes, as the kernel counts them: a non-ASCII path is longer than its characters)
-(( $(printf '%s' "$chosen" | LC_ALL=C wc -c) < 250 )) ||
+# (in bytes, as the kernel counts them: a non-ASCII path is longer than its characters; 127 fits
+# the 128-byte first-line buffer of kernels before 5.1 as well as the 256 of later ones)
+(( $(printf '%s' "$chosen" | LC_ALL=C wc -c) <= 127 )) ||
   { say "the Python to use ($chosen) has too long a path for a script's first line; PYTHON=... names another."; exit 1; }
 [[ -x "$chosen" ]] && "$chosen" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
   { say "buildq needs Python 3.11 or newer, and $python stands for $chosen, which isn't; PYTHON=... names another."; exit 1; }

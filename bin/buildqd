@@ -5484,6 +5484,10 @@ def main(argv=None) -> None:
                 problem = SystemdRunner.check_lane(lane)
                 if problem:
                     sys.exit(f"systemd refuses lanes.{lane.name}.properties: {problem}")
+        if cfg.gh and not (os.path.isfile(cfg.gh) and os.access(cfg.gh, os.X_OK)):
+            # (a warning, not a refusal: the configuration loads, and statuses are tried when sent)
+            print(f"buildqd: warning: gh = {cfg.gh!r} isn't an executable file; commit statuses can't be "
+                  "sent until it is", file=sys.stderr)
         print(json.dumps(cfg.summary(), indent=2))
         return
     asyncio.run(serve(args))
