@@ -1047,6 +1047,12 @@ class SameSource(DaemonCase):
         os.symlink(self.tmp.name, os.path.join(repo, "external"))  # a one-word path that leads outside
         self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "-p", "external"], repo, repo))
         self.assertTrue(buildqd.paths_inside(["cargo", "test", "test_name"], repo, repo))
+        # a wrapper's option and a value run on to a short option count too
+        self.assertFalse(buildqd.paths_inside(["env", "-C../other", "cargo", "test"], "/r", "/r"))
+        self.assertFalse(buildqd.paths_inside(["env", "-C", "../other", "cargo", "test"], "/r", "/r"))
+        self.assertFalse(buildqd.paths_inside(["env", "--chdir=../other", "cargo", "test"], "/r", "/r"))
+        self.assertFalse(buildqd.paths_inside(["make", "-C/elsewhere", "test"], "/r", "/r"))
+        self.assertTrue(buildqd.paths_inside(["env", "-Csub", "cargo", "test", "-j8", "--", "-Dwarnings"], "/r", "/r"))
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
         failed = self.submit(("cargo", "test"), source=SOURCE)
@@ -1486,6 +1492,17 @@ class SheddingMemory(DaemonCase):
         self.assertTrue(safe(["env", "-u", "RUSTFLAGS", "cargo", "test"]))  # env's exact forms are read for certain
         self.assertTrue(safe(["env", "-i", "PATH=/usr/bin", "cargo", "check"]))
         self.assertTrue(safe(["timeout", "1h", "cargo", "test"]))
+        for argv in (["env", "--chdir=", "-C", ".", "cargo", "test"], ["env", "--unset=", "-i", "cargo", "test"]):
+            self.assertTrue(safe(argv), argv)  # an empty value fails or is overridden: the command is the same
+        # A command is run, not read by a shell: a word with "=" is an assignment only where sudo or
+        # env takes one. Before the command or after another wrapper, it is a path (the folder "X=.").
+        for argv in (["X=./deploy.sh", "cargo", "test"], ["nice", "X=./deploy.sh", "cargo", "test"],
+                     ["timeout", "1h", "X=./deploy.sh", "cargo", "test"]):
+            self.assertFalse(safe(argv), argv)
+            self.assertFalse(buildqd.reusable_check(argv), argv)
+        for argv in (["sudo", "X=1", "cargo", "test"], ["env", "PATH=/usr/bin", "cargo", "test"]):
+            self.assertTrue(safe(argv), argv)
+            self.assertTrue(buildqd.reusable_check(argv), argv)
         # history keys and lanes still read env's exact forms (a decision to restart or reuse never does)
         words = buildqd.command_words
         self.assertEqual(words(["env", "-u", "CI", "pnpm", "test"]), words(["pnpm", "test"]))

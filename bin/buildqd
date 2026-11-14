@@ -1230,7 +1230,7 @@ def env_command(args: list[str]) -> list[str] | None:
     """What `env ARGS` runs, read as GNU env reads it: its options first (up to `--` or the first
     word that isn't one), then assignments (any word with "="), then the command. Only options whose
     reading is exact are read: -i, -0, -v (grouped too), --ignore-environment, --null, --debug, a lone
-    `-`, and -u/-C with their value apart or attached (--unset=, --chdir=). None for any other
+    `-`, and -u/-C with their value apart or attached (-uX, --unset=, --chdir=). None for any other
     (grouped with a value, abbreviated, -a, -S/--split-string, even with "=" in it): the command can't
     be told for certain."""
     rest = list(args)
@@ -1243,8 +1243,8 @@ def env_command(args: list[str]) -> list[str] | None:
         if option in ("-u", "--unset", "-C", "--chdir") and rest:
             rest.pop(0)  # its value, written apart
             continue
-        if re.fullmatch(r"(-u|-C|--unset=|--chdir=).+", option):
-            continue  # its value, written with it
+        if re.fullmatch(r"(-u|-C).+|(--unset|--chdir)=.*", option):
+            continue  # its value, written with it (an empty one fails, or a later -C wins: the command is the same)
         return None
     if rest[:1] == ["-"]:  # (env - …: the same as -i)
         rest = rest[1:]
@@ -1492,17 +1492,17 @@ def sure_tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
 
 
 def plainly(argv: list[str]) -> list[str] | None:
-    """The command, if it can be read for certain: past leading assignments, `env` with nothing but
-    assignments, `timeout DURATION` and the wrappers in SURE_WRAPPERS, none of them given an
-    option. None for anything else, whose options might take a value that could be read as the
-    command (`env -iu wrap.sh bash deploy.sh` runs deploy.sh)."""
+    """The command, if it can be read for certain: past `env` (as env_command reads it),
+    `timeout DURATION`, and the wrappers in SURE_WRAPPERS given no option, with the assignments
+    `sudo` takes before its command. None for anything else: a wrapper's options might take a value
+    that could be read as the command (`env -iu wrap.sh bash deploy.sh` runs deploy.sh), and a
+    command is run, not read by a shell, so a word with "=" anywhere else is a program's path
+    (`X=./deploy.sh cargo test` runs ./deploy.sh in the folder "X=.")."""
     t = list(argv)
     while t:
         head = os.path.basename(t[0])
-        if ASSIGNMENT.match(t[0]):
-            t = t[1:]
-        elif "=" in t[0]:
-            return None  # not a shell assignment, and no command is named so: sudo 'X-Y=./wrap.sh' …
+        if "=" in t[0]:
+            return None  # not an assignment here: a path, or sudo 'X-Y=./wrap.sh' (not one sudo takes)
         elif head == "env":
             t = env_command(t[1:])  # (options first, as env reads them: `--split-string=…` is one)
             if t is None:
@@ -1515,6 +1515,9 @@ def plainly(argv: list[str]) -> list[str] | None:
             if head not in SURE_WRAPPERS or (t[1:2] and t[1].startswith("-")):
                 return None
             t = t[1:]
+            if head == "sudo":
+                while t and ASSIGNMENT.match(t[0]):  # sudo VAR=value … sets them for the command
+                    t = t[1:]
         else:
             return t
     return None
@@ -1575,11 +1578,17 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
 def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     """Every path the command names is inside the tree whose source was recorded: an argument (or
     an option's value) with a slash or starting with . or ~, and any that names something that
-    exists (`-p external`, a symlink), resolved through links. A command pointed elsewhere
-    (`--manifest-path ../other/Cargo.toml`) builds source the record doesn't cover."""
+    exists (`-p external`, a symlink), resolved through links, from wrappers' options too. A value
+    run on to a short option counts (`env -C../other`, `make -C../other`). A command pointed
+    elsewhere (`--manifest-path ../other/Cargo.toml`) builds source the record doesn't cover."""
     root = os.path.realpath(top)
     for arg in argv[1:]:
-        value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
+        if arg.startswith("-") and "=" in arg:
+            value = arg.split("=", 1)[1]
+        elif re.match(r"-[A-Za-z0-9].", arg):
+            value = arg[2:]  # -C../other: what it runs on to (-j8 and -Dwarnings are no paths)
+        else:
+            value = arg
         if not value or value.startswith("-") or re.match(r"[a-z][a-z0-9+.-]*://", value):
             continue  # an option, or a URL
         candidate = os.path.join(cwd, os.path.expanduser(value))
