@@ -2659,6 +2659,21 @@ class Cores(DaemonCase):
     def test_an_empty_inherited_variable_is_no_choice_of_the_callers(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=3,4", "CARGO_MAKEFLAGS": ""})
         self.assertIsNotNone(t.jobserver)
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            self.assertIn(f"--jobserver-auth=fifo:{t.jobserver}", json.load(f)["CARGO_MAKEFLAGS"])  # it reaches cargo
+        # a make recipe exports MAKEFLAGS= and MFLAGS=: a make -j8 it runs still gets buildq's jobserver
+        m = self.submit(("make", "-j8", "all"), env={"MAKEFLAGS": "", "MFLAGS": ""})
+        self.assertIsNotNone(m.jobserver)
+        with open(os.path.join(m.dir, "parallel.json")) as f:
+            self.assertIn(f"--jobserver-auth=fifo:{m.jobserver}", json.load(f)["MAKEFLAGS"])
+        self.assertEqual(m.exec_argv, ["make", "all"])
+
+    def test_assignments_after_a_double_dash_are_kept_as_written(self):
+        flags = "s -j4 --jobserver-auth=3,4 -- SUBMAKE=make\\ -j4 TAB=a\\\tb"
+        self.assertEqual(buildqd.without_fd_jobserver(flags), "s -- SUBMAKE=make\\ -j4 TAB=a\\\tb")
+        self.assertEqual(buildqd.with_make_flags("s -- X=make\\ -j4", "-j2"), "s -j2 -- X=make\\ -j4")
+        self.assertEqual(buildqd.with_make_flags("-- X=1", "-j2"), "-j2 -- X=1")
+        self.assertIsNone(buildqd.without_fd_jobserver("-- X=--jobserver-auth=3,4"))  # a value, not an option
 
     def test_a_fifo_jobserver_from_the_caller_is_kept(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})
@@ -3356,6 +3371,24 @@ class QueriesBelongToTheirAttempt(DaemonCase):
         self.daemon.requeue(t, self.now + 11)  # (stopped for memory meanwhile: a new attempt)
         self.assertEqual(self.daemon.pending_queries, {})  # the old attempt's question is dropped
         gate.set()
+
+    def test_the_direct_runners_state_is_read_inline_on_the_ticket(self):
+        t = self.submit()
+
+        class Direct:
+            name = "direct"
+
+            def unit_state(self, ticket):
+                ticket.pid = 4242  # (as the direct runner records the supervisor it found)
+                return "pending"
+
+            def result(self, ticket):
+                return ""
+        self.daemon.queries = mock.Mock(submit=mock.Mock(side_effect=AssertionError("not through the pool")))
+        with mock.patch.object(self.daemon, "runner_of", return_value=Direct()):
+            self.assertEqual(self.daemon.unit_state_of(t), "pending")
+            self.assertEqual(self.daemon.result_of(t), "")
+        self.assertEqual(t.pid, 4242)  # on the ticket itself, not a copy
 
     def test_unreadable_container_storage_is_said_once(self):
         self.daemon.cfg.container_storage = ["/root/no-access"]

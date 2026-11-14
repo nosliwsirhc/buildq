@@ -1032,26 +1032,36 @@ MAKE_FLAG_VARS = ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")
 FD_JOBSERVER = re.compile(r"--jobserver-(?:auth|fds)=-?\d+,-?\d+")
 
 
+def split_make_flags(flags: str) -> tuple[str, str | None]:
+    """Make flags split at their first `--`: the options before it, and the variable assignments
+    after it, kept exactly as written (escaped spaces and all), or None if there is no `--`."""
+    m = re.search(r"(?:^|\s)--(?:\s|$)", flags)
+    if not m:
+        return flags, None
+    return flags[:m.start()], flags[m.end():]
+
+
 def without_fd_jobserver(flags: str) -> str | None:
     """The make flags without an inherited jobserver passed by file descriptor
     (--jobserver-auth=R,W, or the older --jobserver-fds=R,W) and the -j that came with it, or None
     if they have none (#4). Those descriptors belong to the make that ran the caller and don't reach
     the build's service: make would warn and run serially, so the build gets buildq's jobserver
-    instead. A fifo jobserver (fifo:PATH) can still be opened there, so it is left alone."""
-    words = flags.split()
+    instead. A fifo jobserver (fifo:PATH) can still be opened there, so it is left alone. Only the
+    options before a `--` are looked at; the assignments after it are kept as they are."""
+    options, assignments = split_make_flags(flags)
+    words = options.split()
     if not any(FD_JOBSERVER.fullmatch(w) for w in words):
         return None
-    return " ".join(w for w in words if not FD_JOBSERVER.fullmatch(w) and not re.fullmatch(r"-j\d*", w))
+    kept = " ".join(w for w in words if not FD_JOBSERVER.fullmatch(w) and not re.fullmatch(r"-j\d*", w))
+    return kept if assignments is None else f"{kept} -- {assignments}".lstrip()
 
 
 def with_make_flags(flags: str, more: str) -> str:
-    """Make flags with more options added: before a `--` and the variable assignments after it,
-    or make would take the options for targets."""
-    words = flags.split()
-    if "--" in words:
-        i = words.index("--")
-        return " ".join([*words[:i], *more.split(), *words[i:]])
-    return " ".join([*words, *more.split()])
+    """Make flags with more options added: before a `--` and the variable assignments after it
+    (kept exactly as written), or make would take the options for targets."""
+    options, assignments = split_make_flags(flags)
+    head = " ".join(x for x in (options.strip(), more.strip()) if x)
+    return head if assignments is None else f"{head} -- {assignments}".lstrip()
 
 
 def fs_device(path: str) -> int | None:
@@ -4291,7 +4301,10 @@ class Daemon:
             # The caller's own settings win; the rest go in a file of their own, so a build that
             # is queued again after a restart gets fresh ones.
             ours = self.build_env(t)
-            parallel = {k: v for k, v in ours.items() if k not in env}
+            # The caller's own settings win; an empty make variable is no setting (a make recipe
+            # exports MAKEFLAGS= and MFLAGS=), so buildq's flags go in its place.
+            given = {k for k in env if k not in MAKE_FLAG_VARS or str(env[k]).strip()}
+            parallel = {k: v for k, v in ours.items() if k not in given}
             for k, rest in cleaned.items():
                 # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
                 # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)

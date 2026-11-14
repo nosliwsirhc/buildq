@@ -122,11 +122,13 @@ and a `make -j`, in `MAKEFLAGS`, with the command's own `-j` removed, since make
 when given `-j` on its command line. A lane's `jobserver` setting says for
 which builds: `"tools"` (the default) when the command is cargo, make or ninja, `true` for every
 build (scripts that call them too), `false` for none. A build gets none when its caller set `MAKEFLAGS`,
-`CARGO_MAKEFLAGS` or `MFLAGS` (that jobserver is the caller's), or when its history shows it ignores
-the job count. A jobserver an outer make passed by file descriptor (`--jobserver-auth=R,W`) doesn't
+`CARGO_MAKEFLAGS` or `MFLAGS` to something (that jobserver is the caller's; an empty one, as a make
+recipe exports, is no setting), or when its history shows it ignores the job count. A jobserver an outer make passed by file descriptor (`--jobserver-auth=R,W`) doesn't
 count: those descriptors don't reach the build, so buildq drops it, with its `-j`, keeps the
-caller's other make flags, and gives the build its own, unless a `-j` or jobserver of the caller's
-is still left in them. Every five seconds buildq hands idle cores to
+caller's other make flags (and any variable assignments after their `--`, as written), and gives the
+build its own, unless a `-j` or jobserver of the caller's is still left in them. A make or ninja build
+whose caller's make ran in parallel that way gets buildq's jobserver in `MAKEFLAGS`, with or without
+a `-j` of its own. Every five seconds buildq hands idle cores to
 builds that are using all of theirs, if the memory more cores need is free, and takes cores back when
 the machine is over its target or a queued build needs them. A build whose history shows it keeps
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to
