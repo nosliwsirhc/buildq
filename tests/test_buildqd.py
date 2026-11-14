@@ -4254,5 +4254,150 @@ class Top(unittest.TestCase):
             with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
                 buildq.interval_arg(bad)
 
+    def test_which_encodings_want_ascii(self):
+        self.assertTrue(buildq.wants_ascii("ANSI_X3.4-1968"))  # LC_ALL=C, as nl_langinfo and curses say
+        self.assertTrue(buildq.wants_ascii("ascii"))
+        self.assertTrue(buildq.wants_ascii(None))
+        self.assertFalse(buildq.wants_ascii("UTF-8"))
+        self.assertFalse(buildq.wants_ascii("utf_8"))
+
+    def test_no_color_turns_colour_off(self):
+        self.assertTrue(buildq.colour_wanted({}))
+        self.assertFalse(buildq.colour_wanted({"NO_COLOR": "1"}))
+        self.assertTrue(buildq.colour_wanted({"NO_COLOR": ""}))  # set but empty: no-color.org says ignore it
+
+    def test_a_terminal_this_machine_has_no_terminfo_for_falls_back(self):
+        import curses
+        env, tried = {"TERM": "xterm-ghostty"}, []
+
+        def wrapper(run):
+            tried.append(env["TERM"])
+            if env["TERM"] == "xterm-ghostty":
+                raise curses.error("setupterm: could not find terminal")
+            return run(None)
+        code, why = buildq.curses_with_fallback(lambda screen: 7, wrapper, env)
+        self.assertEqual((code, tried), (7, ["xterm-ghostty", "xterm-256color"]))
+        self.assertIn("no terminfo for TERM=xterm-ghostty", why)
+        self.assertIn("infocmp -x xterm-ghostty", why)
+
+    def test_no_terminal_at_all_is_one_snapshot_and_says_why(self):
+        import curses
+
+        def wrapper(run):
+            raise curses.error("setupterm: could not find terminal")
+        code, why = buildq.curses_with_fallback(lambda screen: 0, wrapper, {"TERM": "dumb"})
+        self.assertIsNone(code)
+        self.assertIn("one snapshot instead", why)
+
+    def test_a_curses_error_once_running_isnt_taken_for_the_terminal(self):
+        import curses
+
+        def run(screen):
+            raise curses.error("addwstr() returned ERR")
+        with self.assertRaises(curses.error):
+            buildq.curses_with_fallback(run, lambda r: r(None), {"TERM": "xterm-ghostty"})
+
+    def test_the_screen_never_waits_on_the_daemon(self):
+        import threading
+        release = threading.Event()
+
+        def slow():
+            release.wait(5)
+            return {"overview": {}}
+        fetcher = buildq.StatusFetcher(0.05, ask=slow).start()
+        self.addCleanup(fetcher.stop)
+        self.addCleanup(release.set)
+        started = time.monotonic()
+        self.assertEqual(fetcher.latest(), (0, None))  # at once, while the daemon is still answering
+        self.assertLess(time.monotonic() - started, 0.5)
+        release.set()
+        self.assertTrue(fetcher.answered.wait(5))
+        version, status = fetcher.latest()
+        self.assertEqual((version >= 1, status), (True, {"overview": {}}))
+
+    def test_sigterm_and_sighup_end_it_as_an_exception(self):
+        import signal as signals
+        saved = {s: signals.getsignal(s) for s in (signals.SIGTERM, signals.SIGHUP)}
+        self.addCleanup(lambda: [signals.signal(s, h) for s, h in saved.items()])
+        buildq.exit_on_signals()
+        for sig in (signals.SIGTERM, signals.SIGHUP):
+            with self.assertRaises(SystemExit) as caught:
+                os.kill(os.getpid(), sig)
+                time.sleep(1)  # (the handler runs at the next bytecode)
+            self.assertEqual(caught.exception.code, 128 + sig)
+
+    def test_no_color_keeps_the_terminal_s_own_colours(self):
+        calls = []
+
+        class Curses:
+            A_BOLD, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE = 1 << 21, 6, 2, 3, 1, 4
+            error = Exception
+
+            def has_colors(self):
+                return True
+
+            def use_default_colors(self):
+                calls.append("default")
+
+            def init_pair(self, *a):
+                calls.append("pair")
+
+            def color_pair(self, i):
+                return i << 8
+        plain = buildq.init_colours(Curses(), wanted=False)
+        self.assertEqual(calls, ["default"])  # the terminal's own colours, not white on black
+        self.assertEqual((plain[""], plain["head"]), (0, Curses.A_BOLD))  # headings keep their bold
+        calls.clear()
+        coloured = buildq.init_colours(Curses(), wanted=True)
+        self.assertEqual(calls.count("pair"), 5)
+        self.assertNotEqual(coloured["ok"], 0)
+
+    def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
+        import curses
+
+        def wrapper(run):
+            try:
+                run(None)
+            finally:  # as curses.wrapper's teardown fails on a hung-up terminal
+                raise curses.error("nocbreak() returned ERR")
+
+        def run(screen):
+            raise SystemExit(129)
+        with self.assertRaises(SystemExit) as caught:
+            buildq.curses_with_fallback(run, wrapper, {"TERM": "xterm-256color"})
+        self.assertEqual(caught.exception.code, 129)
+        env, calls = {"TERM": "xterm-ghostty"}, []
+
+        def fallback_wrapper(run):  # the first try fails setupterm; the fallback runs, then hangs up
+            calls.append(env["TERM"])
+            if len(calls) == 1:
+                raise curses.error("setupterm: could not find terminal")
+            return wrapper(run)
+        with self.assertRaises(SystemExit) as caught:
+            buildq.curses_with_fallback(run, fallback_wrapper, env)
+        self.assertEqual((caught.exception.code, calls), (129, ["xterm-ghostty", "xterm-256color"]))
+
+        def interrupted(screen):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            buildq.curses_with_fallback(interrupted, wrapper, {"TERM": "xterm-256color"})
+
+    def test_the_fetcher_survives_an_unexpected_error(self):
+        answers = iter([{"overview": {}}, OSError(23, "too many open files"), {"overview": {"x": 1}}])
+
+        def ask():
+            a = next(answers, {"overview": {"x": 1}})
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fetcher = buildq.StatusFetcher(0.01, ask=ask).start()
+        self.addCleanup(fetcher.stop)
+        deadline = time.monotonic() + 5
+        while fetcher.latest()[0] < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(fetcher.latest()[0], 3)  # it went on asking
+        self.assertTrue(fetcher.thread.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main()

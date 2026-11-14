@@ -78,6 +78,15 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   - Enter shows its plan, pressure, waits and folders;
   - `l` shows the end of its output;
   - `q` quits.
+- **Terminals:**
+  - it draws with ASCII when the terminal isn't UTF-8 (`LC_ALL=C`), as curses itself writes;
+  - `NO_COLOR` turns colour off;
+  - a terminal this machine has no terminfo entry for (Ghostty or kitty over SSH, say) is drawn as
+    `xterm-256color`, and on exit it says how to install the real entry;
+  - with no usable terminal at all (`TERM` unset or `dumb`, or `--once`, or output to a pipe) it
+    prints one snapshot.
+- **The daemon** is asked on a thread of its own, so keys never wait on it; while it doesn't
+  answer, the screen says so. `SIGTERM` and a closed terminal end it cleanly.
 
 `--once` prints one snapshot, measuring folders first for up to 20 seconds. It's also what you
 get without a terminal. `top` reads the cgroups and `/proc` itself, so watching costs the daemon
