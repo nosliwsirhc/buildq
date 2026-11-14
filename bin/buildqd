@@ -4964,8 +4964,10 @@ class Daemon:
         place is the time it waited, so the retry doesn't go to the back of the queue, where under load
         it could cycle without ever running (#7). A build that was running leaves none: it had its
         turn, and one that can't finish within the tool's time limit mustn't come back first for ever."""
-        if t.state != "queued" or not t.attached or not t.caller:
-            return  # (with no caller to tell whose retry it is, no place: anyone could take it)
+        if t.state != "queued" or not t.attached or not t.caller or t.requeues:
+            # (with no caller to tell whose retry it is, anyone could take it; and a build queued again
+            # after a memory stop had its turn: its "wait" would count the time it ran)
+            return
         key = (t.cwd, tuple(t.argv), t.lane, t.caller)
         waited = max(0.0, now - t.submitted)
         earlier = self.vacated.get(key)

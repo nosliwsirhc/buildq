@@ -838,6 +838,13 @@ class SameSource(DaemonCase):
         stranger = self.submit(("cargo", "test"), cwd=work, attach=True, submission="s", caller="someone-else")
         self.assertEqual(stranger.submitted, self.now)
 
+    def test_a_build_queued_again_after_a_memory_stop_leaves_no_place(self):
+        self.machine.mem_available = 15 * GIB
+        t = self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="first", caller="agent")
+        t.requeues = 1  # it ran, was stopped to free memory, and waits again
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertEqual(self.daemon.vacated, {})
+
     def test_a_build_with_no_caller_leaves_no_place(self):
         self.machine.mem_available = 15 * GIB
         self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="first")  # no caller
