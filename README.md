@@ -55,7 +55,7 @@ whenever a build arrives or ends.
 | **Learned sizes** | Peak memory, peak cores and time are recorded per command, and the next run is planned with them. [Estimates](docs/scheduling.md#estimates) |
 | **Cores that follow the load** | Each build starts with the cores that are free and memory allows, between its lane's minimum and what its history says it can use. Cargo, `make -j` and Ninja builds get a jobserver of their own, which buildq resizes with the load. [Cores](docs/scheduling.md#cores) has the conditions. |
 | **Quick builds first** | Lanes have priorities; at the same priority, after fair shares, the build expected to finish soonest goes first. A build that has waited `starve_seconds` goes ahead of them all, so slow builds aren't passed for ever. A front-end lane can have turns of its own and never wait for CPU. [Order](docs/scheduling.md#order) |
-| **CI first, if you want** | With `ci_first`, a GitHub Actions step gets a head start and holds the room it needs from builds of its priority or lower, which keeps a release from timing out in the queue. A build that has waited three times `starve_seconds` or was stopped to free memory still goes ahead of it. [CI jobs](docs/ci.md) |
+| **CI first, if you want** | With `ci_first`, a GitHub Actions step gets a head start and holds the room it needs from builds of its priority or lower, so a release is less likely to time out in the queue. A build that has waited three times `starve_seconds` or was stopped to free memory still goes ahead of it. [CI jobs](docs/ci.md) |
 | **Caps** | Lanes give their builds systemd limits (`MemoryHigh`, `MemoryMax`, CPU and IO weights). All builds share one slice, whose memory limit the daemon keeps in line with what the machine has free, so when other work grows, builds are slowed or stopped, not the machine. |
 | **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build in place while memory is low and falling, and stops one when it gets critically low, before the machine can stall. A compile or test run (cargo, dotnet, ninja, tsc, eslint, vitest) or a build submitted with `--restartable` is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
 | **One build per source** | A repeat submission (the same command on the same source, in the same directory, lane, environment and settings) joins the build already queued or running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
@@ -68,7 +68,8 @@ whenever a build arrives or ends.
 
 You need Linux with cgroup v2, Python 3.11 or newer, and a systemd user session. Without one,
 `install.sh` installs no units, shims or guard and doesn't start the daemon (start `buildqd`
-yourself), and builds still queue, but run without limits, unmeasured, and can't be paused.
+yourself), and builds still queue, but run without limits, unmeasured, and are never paused or
+stopped to free memory.
 
 ```sh
 git clone https://github.com/nosliwsirhc/buildq.git
@@ -85,8 +86,8 @@ cd buildq
 - installs `buildq.socket`, `buildq.service` and `buildq.slice` into `~/.config/systemd/user`, with a fixed memory backstop for all builds together (75%/85% of memory, in `buildq.slice.d`);
 - starts the daemon.
 
-While the daemon runs, it keeps that limit in line with the memory the machine has free, never
-above the backstop. To upgrade, run `install.sh` again: running builds carry on,
+While the daemon runs, it lowers the slice's limit below that backstop to what builds hold plus
+what the machine has free. To upgrade, run `install.sh` again: running builds carry on,
 and queued ones keep their place.
 
 On a build server, keep the daemon running while you're logged out with `loginctl enable-linger "$USER"`.
@@ -187,7 +188,7 @@ buildq takes ideas, and no code, from these projects. Thank you to their authors
 - **[GNU parallel](https://www.gnu.org/software/parallel/):**
   - With [`--memsuspend`](https://www.gnu.org/software/parallel/parallel.html), jobs are suspended when memory runs low.
   - With [`--memfree`](https://www.gnu.org/software/parallel/parallel.html), the youngest job is killed and put back on the queue.
-  - buildq's memory shedding pauses its newest build first, then stops one, and queues it again if it can safely start over.
+  - buildq's memory shedding pauses its newest build while memory is low and falling, or stops one when memory is critically low, and queues it again if it can safely start over.
 - **[Slurm](https://slurm.schedmd.com/):**
   - [Preemption that requeues](https://slurm.schedmd.com/preempt.html) a stopped job instead of failing it.
   - [Fair-share](https://slurm.schedmd.com/classic_fair_share.html) priority, here between sessions rather than users.

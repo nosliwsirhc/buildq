@@ -35,7 +35,7 @@ On a runner without buildq (GitHub-hosted, or another machine), the step warns a
 While the queue is paused (`buildq pause`), a queued step waits like any other build,
 up to the job's timeout. Cancelling the job cancels the build. CI jobs share turns fairly with
 everything else (each runner is a caller of its own), unless `ci_first = true`: then a CI job's
-build goes first, with its room held from builds of its priority or lower from the start (see
+build gets a head start (not in a lane that may pass held room), with its room held from builds of its priority or lower from the start (see
 [Order](scheduling.md#order)). Turn it on when CI steps wait out their jobs' time limits on a
 busy machine. A `ci` lane can give them a priority or caps
 of their own (see [config.example.toml](../config.example.toml)).

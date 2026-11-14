@@ -709,7 +709,7 @@ descriptor exits once it has the lock, and on btrfs its device number differs fr
 | A client is killed | A dropped-off build carries on under its ticket; a `buildq run` build is cancelled once nobody has followed it for `unwatched_seconds`. |
 | A build leaves processes behind | The supervisor stops its process group and anything carrying its `BUILDQ_JOB`; systemd stops the rest when the service ends; the turn lasts until the service is empty (killing what is left after 15 s). |
 | `systemd-run` hangs | It is killed after 60 s, and systemd is asked whether the service exists. |
-| Other work fills the machine | The slice guard shrinks the builds' limit with it; builds are slowed, then stopped inside their slice. Below half of `mem_floor` free, the newest build is paused; below a quarter, it is stopped and queued again. The memory watch logs what is holding the memory every 30 seconds. |
+| Other work fills the machine | The slice guard shrinks the builds' limit with it; builds are slowed, then stopped inside their slice. Below half of `mem_floor` free and falling, the newest build is paused; below a quarter, one build is stopped at once, and queued again if it can safely start over. The memory watch logs what is holding the memory every 30 seconds. |
 | A build runs out of memory at its lane's cap | The kernel kills within that build only (`OOMPolicy=continue` keeps the supervisor alive to report it). The next estimate for that command is at least the cap. |
 | All builds together exceed the slice backstop | The kernel slows them, then kills within the slice, not elsewhere. |
 | `systemd-run` fails | The ticket fails with systemd's message. |

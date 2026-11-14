@@ -99,7 +99,7 @@ outside it, your toolchain, or ignored files other than `.env*`. After changing 
 | `buildq: refusing to compile <crate> outside the build queue` | cargo ran outside a queued build, here where Rust compiles must be queued. | Run the same cargo command through the queue. |
 | `the queue daemon isn't answering …` | The daemon is down. A `run` waits for it. | Check `systemctl --user status buildq`. Tell the owner if it stays down. |
 | `the queue is paused (…)` | The owner paused it (a reboot, maintenance). Running builds carry on. | Wait, or drop the build off and check back later. Don't resume it yourself. |
-| `paused: the machine is short of memory` | Other work took the memory. Your build is frozen where it was. | Wait. It goes on by itself. |
+| `paused: the machine is short of memory` | Other work took the memory. Your build is frozen where it was. | Wait. It goes on by itself once memory is back; if memory stays short, it may be stopped (and queued again if it can safely start over). |
 | `stopped to free memory, and queued again at the front` | The machine ran very short. Your build was stopped, and starts over from the beginning once there is room. | Keep waiting on the same ticket. Don't submit it again. |
 | `stopped to free memory … It isn't started again by itself` | The machine ran very short. It was a script or a push, and starting it over might repeat what it did. | Check what it had done, then run it again. If it only builds and tests, submit it with `--restartable` next time. |
 | `the same command on the same source is already running as ticket …` | Someone (maybe you, before a timeout) started this exact build. | Wait on that ticket. |
