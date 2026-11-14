@@ -152,6 +152,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | [Coding agents](docs/agents.md) | shims, the Rust guard, the agents' skill, migrating from a slot script |
 | [CI jobs](docs/ci.md) | queueing a workflow step on a self-hosted runner, `ci_first`, a new step's first run |
 | [Operating buildq](docs/operations.md) | logs, the memory watch, restarts, files, analytics, `buildq top`, configuration errors, reboots, reports, GitHub statuses |
+| [Benchmarking](docs/benchmark.md) | replaying builds against the scheduler: scenarios, comparing two versions or configurations, a trace from your machine |
 | [Design](docs/design.md) | the internals: the daemon, the protocol, the analytics schema |
 | [config.example.toml](config.example.toml) | every setting, with what it does |
 

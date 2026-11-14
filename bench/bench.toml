@@ -1,0 +1,99 @@
+# The configuration the replay scenarios run with: one busy 32-core, 125 GB workstation that agents
+# and CI share. Copy it and change one thing to compare policies:
+#   bench/sim.py compare --base-config bench/bench.toml --config my.toml
+max_jobs = 8
+cpu_target = 0.9
+mem_floor = "16G"
+disk_floor = "0"            # (no disk in the simulation)
+ramp_seconds = 90
+starve_seconds = 600
+default_lane = "heavy"
+ci_first = true
+make_room_for_ci = "5m"
+script_labels = ["persistent-cargo-target.sh"]
+metrics = false
+github_status = false
+release_after_peak = true
+keep_finished = "7d"
+
+[lanes.heavy]
+workspace_group = "cargo"
+cores = 8
+min_cores = 2
+max_cores = 16
+mem = "20G"
+min_mem = "10G"
+jobserver = true
+timeout = "3h"
+properties = { MemoryHigh = "24G", MemoryMax = "26G" }
+
+[lanes.check]
+workspace_group = "cargo"
+cores = 2
+min_cores = 2
+max_cores = 4
+mem = "12G"
+priority = 40
+extra_jobs = 1
+timeout = "1h"
+properties = { MemoryHigh = "16G", MemoryMax = "20G" }
+
+[lanes.dotnet]
+cores = 6
+min_cores = 2
+max_cores = 12
+mem = "8G"
+priority = 50
+timeout = "2h"
+properties = { MemoryHigh = "14G", MemoryMax = "16G" }
+
+[lanes.python-tests]
+cores = 2
+min_cores = 1
+max_cores = 8
+mem = "2G"
+priority = 50
+timeout = "1h"
+properties = { MemoryHigh = "10G", MemoryMax = "12G" }
+
+[lanes.web]
+cores = 4
+min_cores = 1
+max_cores = 8
+mem = "6G"
+priority = 100
+extra_jobs = 3
+may_pass_held = true
+waits_for_cpu = false
+exclusive = false
+timeout = "45m"
+properties = { MemoryHigh = "10G", MemoryMax = "12G" }
+
+[lanes.image]
+release_after_peak = false
+cores = 8
+min_cores = 2
+max_cores = 8
+mem = "16G"
+min_mem = "16G"
+timeout = "2h"
+
+[[lane_rules]]
+match = "^cargo (check|clippy)\\b"
+lane = "check"
+
+[[lane_rules]]
+match = "^(pnpm|npm|npx|pnpx|yarn|bun|bunx|vite|vitest|tsc|vue-tsc|eslint|node|playwright|storybook) "
+lane = "web"
+
+[[lane_rules]]
+match = "^dotnet "
+lane = "dotnet"
+
+[[lane_rules]]
+match = "^(python[0-9.]*( .*)? (unittest|pytest)\\b|(pytest|py\\.test)\\b|uv run pytest\\b)"
+lane = "python-tests"
+
+[[lane_rules]]
+match = "^(docker|podman) (build|buildx|compose|image)"
+lane = "image"
