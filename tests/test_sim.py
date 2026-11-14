@@ -35,8 +35,8 @@ def agents(n, peak, wall, start=0, step=10, **extra):
             for i in range(n)]
 
 
-def ci_step(t, peak, wall, name="lint", **extra):
-    return scenarios.build(t, ("pnpm", "eslint"), peak, wall, 4, shape=scenarios.EARLY, lane="heavy", ci=True,
+def ci_step(t, peak, wall, name="lint", shape=scenarios.EARLY, **extra):
+    return scenarios.build(t, ("pnpm", "eslint"), peak, wall, 4, shape=shape, lane="heavy", ci=True,
                            repo="app", caller="runner-1", name=name, history=True, **extra)
 
 
@@ -244,7 +244,9 @@ class Replay(SimCase):
         self.assertGreater(s.machine.busy, 0.0)
 
     def test_a_cut_off_run_is_flagged_in_a_comparison(self):
-        done = {"complete": True, "makespan_s": 600.0, "wait": {"ci": {"p50": None, "p95": None, "max": None},
+        done = {"complete": True, "makespan_s": 600.0,
+                "turnaround": {"agent": {"p50": 60.0, "p95": 60.0, "max": 60.0}},
+                "wait": {"ci": {"p50": None, "p95": None, "max": None},
                 "agent": {"p50": 0.0, "p95": 0.0, "max": 0.0}}, "ci_timed_out": 0, "stops_for_memory": 0,
                 "stops_for_ci": 0, "stopped_run_s": 0.0, "cancelled_run_s": 0.0,
                 "oom_kills": {"own_cap": 0, "machine": 0}, "below_floor_s": 0, "idle_core_s_while_waiting": 0.0}
@@ -363,6 +365,25 @@ class Export(SimCase):
             honors.append((t.jobserver is not None, s.honors_grant(t)))
         self.assertEqual(honors[0], (True, False))  # vitest ignores the jobserver it was handed
         self.assertEqual([h for _, h in honors[1:]], [True, True])  # CMAKE_BUILD_PARALLEL_LEVEL, DOTNET_PROCESSOR_COUNT
+
+    def test_a_cancel_frees_its_memory_in_the_same_second(self):
+        # Room for two of these 25G builds (29G planned, 69G above the floor); the CI build waits until
+        # the first is cancelled.
+        jobs = [dict(scenarios.build(0, ("cargo", "test", "-p", "a"), 25, 900, 2, shape=(1.0,) * 10, repo="app",
+                                     caller="a", workspace="wa", history=True), cancel_at=200),
+                scenarios.build(1, ("cargo", "test", "-p", "b"), 25, 900, 2, shape=(1.0,) * 10, repo="app", caller="b",
+                                workspace="wb", history=True),
+                ci_step(5, 25, 60, shape=(1.0,) * 10)]
+        summary, s = sim.simulate(scenario(jobs, background_mem=40 * GIB), CONFIG, BUILDQD, name="buildqd_refresh")
+        ci = next(r for r in s.records.values() if r["ci"])
+        self.assertEqual(ci["first_start"], 200.0)  # in the second of the cancel, not the one after
+        self.assertEqual(summary["stops_for_ci"], 0)
+
+    def test_turnaround_counts_a_stopped_build_s_second_wait(self):
+        records = [{"ci": False, "submitted": 0.0, "first_start": 0.0, "ended": 900.0},
+                   {"ci": False, "submitted": 0.0, "first_start": 10.0, "ended": 100.0}]
+        self.assertEqual(sim.turnaround_stats(records, 1000)["max"], 900.0)  # started at once, ended late
+        self.assertEqual(sim.wait_stats(records, 1000)["max"], 10.0)
 
     def test_a_replayed_build_is_cancelled_when_the_trace_says(self):
         job = dict(scenarios.build(0, ("cargo", "test"), 2, 600, 2, repo="app"), cancel_at=120)

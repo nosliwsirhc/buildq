@@ -2917,6 +2917,7 @@ class Daemon:
         self.memory_thread_failed = False
         self.last_freeze = self.last_kill = -1e9
         self.room_made: dict[str, float] = {}  # a CI job's build -> when builds were last stopped for it
+        self.last_end = -1e9  # when a build last ended: its memory may not show as free in that tick's reading
         self.started_at = time.time()
         self.avail_seen: collections.deque = collections.deque()  # (time, memory available) of the last 10 s
         self.submit_outcome: dict = {}  # how the last submission was answered: joined, reused, passed before
@@ -3697,6 +3698,8 @@ class Daemon:
             return  # builds stopped for a CI job's build are still going: their memory isn't free yet
         if any(now - made < self.ROOM_PAUSE for made in self.room_made.values()):
             return  # room was just made for one that is still queued: it starts first (what it frees may lag)
+        if now - self.last_end < 1.0:
+            return  # a build ended this tick, after free memory was read: what it held isn't counted free yet
         if any(t.cancel_requested and not t.flock for t in self.active()):
             return  # a cancelled build (a CI job past its time limit, say) is giving its memory back: wait for it
         running = self.active()
@@ -4774,6 +4777,7 @@ class Daemon:
                  error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
         if t.state in FINISHED:
             return
+        self.last_end = now
         self.drop_queries(t)  # its attempt's answers are no use to anyone now
         t.env = None
         if isinstance(result, dict):  # the supervisor's reading, taken as the build ended

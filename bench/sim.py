@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import importlib.machinery
 import importlib.util
 import json
@@ -318,16 +319,19 @@ class Simulation:
     # Tools that hold to the cores buildq grants them: a jobserver's tokens or CARGO_BUILD_JOBS (cargo,
     # make, ninja), DOTNET_PROCESSOR_COUNT, CMAKE_BUILD_PARALLEL_LEVEL. JS tools and test runners
     # (vitest, eslint, node) start a worker per core the machine has, jobserver or not.
-    GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake"})
-    FREE_TOOLS = frozenset({"vitest", "eslint", "tsc", "vue-tsc", "node", "deno", "bun", "playwright", "jest"})
+    GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"})
 
     def honors_grant(self, ticket) -> bool:
+        """cargo, make, ninja, dotnet, cmake and go hold to their grant; a script (a shell or an
+        interpreter running one) does under a jobserver, through the cargo or make it runs; anything
+        else (vitest, eslint, vite, storybook, node, a JS package script) runs at its own pace."""
         tool, _ = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
         if tool in self.GRANT_TOOLS:
             return True
-        if tool in self.FREE_TOOLS or tool in self.mod.JS_TOOLS:
-            return False
-        return bool(ticket.jobserver)  # a script: under a jobserver, the cargo or make it runs holds to it
+        if tool in self.mod.SHELLS or tool in self.mod.INTERPRETERS - {"node", "deno", "bun"} \
+                or re.fullmatch(r"python3(\.\d+)?", tool):
+            return bool(ticket.jobserver)
+        return False
 
     def end(self, job: Job, result: dict | None, discarded: str | None = None):
         job.alive = False
@@ -537,6 +541,14 @@ def waits(records: list[dict], end: float) -> list[float]:
     return out
 
 
+def turnaround_stats(records: list[dict], end: float) -> dict:
+    """From submission to the end, whatever happened between: a build stopped and queued again
+    waits twice, which the wait (to first start) doesn't count."""
+    t = [max(0.0, (r["ended"] if r["ended"] is not None else end) - r["submitted"]) for r in records]
+    r = lambda v: None if v is None else round(v, 1)  # noqa: E731
+    return {"builds": len(records), "p50": r(percentile(t, 0.5)), "p95": r(percentile(t, 0.95)), "max": r(max(t, default=None))}
+
+
 def wait_stats(records: list[dict], end: float) -> dict:
     w = waits(records, end)
     r = lambda v: None if v is None else round(v, 1)  # noqa: E731
@@ -562,6 +574,8 @@ def summarize(sim: Simulation, seconds: int) -> dict:
         "complete": complete,  # False: the horizon came first, and makespan is the time simulated
         "makespan_s": round((max(ends) if ends and complete else end) - first, 1),
         "outcomes": dict(sorted(outcomes.items())),
+        "turnaround": {"ci": turnaround_stats([r for r in records if r["ci"]], end),
+                       "agent": turnaround_stats([r for r in records if not r["ci"]], end)},
         "wait": {"all": wait_stats(records, end),
                  "ci": wait_stats([r for r in records if r["ci"]], end),
                  "agent": wait_stats([r for r in records if not r["ci"]], end),
@@ -590,6 +604,10 @@ def table(summary: dict) -> str:
     for group, w in summary["wait"].items():
         if w["builds"]:
             rows.append((f"wait {group} p50 / p95 / max ({w['builds']})",
+                         f"{fmt_s(w['p50'])} / {fmt_s(w['p95'])} / {fmt_s(w['max'])}"))
+    for group, w in summary["turnaround"].items():
+        if w["builds"]:
+            rows.append((f"turnaround {group} p50 / p95 / max",
                          f"{fmt_s(w['p50'])} / {fmt_s(w['p95'])} / {fmt_s(w['max'])}"))
     rows += [("CI timed out (in the queue)", f"{summary['ci_timed_out']} ({summary['ci_timed_out_in_queue']})"),
              ("stops for memory / for CI", f"{summary['stops_for_memory']} / {summary['stops_for_ci']}"),
@@ -671,6 +689,8 @@ COMPARED = [  # (label, how to read it from a summary, lower is better)
     ("CI wait max", lambda s: s["wait"]["ci"]["max"], fmt_s),
     ("agent wait p50", lambda s: s["wait"]["agent"]["p50"], fmt_s),
     ("agent wait p95", lambda s: s["wait"]["agent"]["p95"], fmt_s),
+    ("agent turnaround p50", lambda s: s["turnaround"]["agent"]["p50"], fmt_s),
+    ("agent turnaround p95", lambda s: s["turnaround"]["agent"]["p95"], fmt_s),
     ("CI timed out", lambda s: s["ci_timed_out"], str),
     ("stops (memory + CI)", lambda s: s["stops_for_memory"] + s["stops_for_ci"], str),
     ("running time lost to stops", lambda s: s["stopped_run_s"], fmt_s),

@@ -2902,6 +2902,13 @@ class MakeRoomForCI(DaemonCase):
         self.daemon.cancel(old, self.now + 300)  # a CI job past its time limit, say: its build is stopping
         self.tick(301)
         self.assertNotIn(new.id, self.runner.forced)  # what the cancelled build frees may be enough
+        self.runner.running.discard(old.id)  # it is gone, but the CI build still doesn't fit
+        self.daemon.check(self.now + 302)
+        self.assertEqual(old.state, "cancelled")
+        self.daemon.make_room_for_ci(self.now + 302)
+        self.assertNotIn(new.id, self.runner.forced)  # not in the tick it ended: its memory may not show yet
+        self.tick(304)
+        self.assertIn(new.id, self.runner.forced)  # then the guard opens again
 
     def test_a_build_that_waited_three_turns_is_protected_once_it_runs(self):
         self.daemon.cfg.make_room_behind_agents = False
