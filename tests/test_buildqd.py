@@ -2133,6 +2133,16 @@ class GitHubStatuses(DaemonCase):
             with self.assertRaises(ValueError, msg=bad):
                 buildqd.Config({"gh": bad}, 64 * GIB, 16)
 
+    def test_check_config_warns_of_a_gh_that_cant_run_and_still_passes(self):
+        config = os.path.join(self.tmp.name, "check.toml")
+        with open(config, "w") as f:
+            f.write(f'gh = "{os.path.join(self.tmp.name, "no-such-gh")}"\n')
+        result = subprocess.run([sys.executable, os.path.join(os.path.dirname(buildqd.__file__), "buildqd"),
+                                 "--check-config", "--config", config], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("isn't an executable file", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["gh"], os.path.join(self.tmp.name, "no-such-gh"))
+
     def test_gh_that_cant_run_is_logged_once_and_tried_again_later(self):
         self.daemon.gh = [os.path.join(self.tmp.name, "no-such-gh")]
         for argv in (("cargo", "test"), ("cargo", "check")):
