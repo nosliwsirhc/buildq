@@ -2402,6 +2402,14 @@ class CIFirst(DaemonCase):
         self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
         self.assertIn("has waited longest", check.reason)
 
+    def test_a_build_that_could_never_fit_holds_nothing_behind_a_ci_workspace_hold(self):
+        self.daemon.cfg.ci_first = True
+        tree = self.workdir("tree")
+        huge = self.submit(("cargo", "test", "-p", "a"), mem="100G", cwd=tree)
+        self.now += 301
+        self.submit(("cargo", "test", "-p", "b"), mem="20G", env=self.CI, cwd=tree)
+        self.assertFalse(huge.held)
+
     def test_a_build_stopped_to_free_memory_goes_before_ci(self):
         self.daemon.cfg.ci_first = True
         stopped = self.submit(mem="20G")

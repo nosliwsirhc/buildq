@@ -3968,7 +3968,10 @@ class Daemon:
                                               "fight over its build directory"), False
                 # Kept out only by a CI job's weak hold, a build that has waited out its turn still
                 # holds its own room and workspace, so builds behind it can't pass it there.
-                holds = holder.state == "queued" and not self.waited_out(holder, now) and self.waited_out(t, now)
+                # (Not one that couldn't fit even with every build of ours gone: that would stop
+                # everything else for nothing.)
+                holds = (holder.state == "queued" and not self.waited_out(holder, now) and self.waited_out(t, now)
+                         and t.est_mem <= m.mem_available + ours_now - cfg.mem_floor)
             elif m.psi_mem > cfg.mem_psi_block:
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
                                              f"{cfg.mem_psi_block:g}%)")
