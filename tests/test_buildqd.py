@@ -2905,10 +2905,28 @@ class MakeRoomForCI(DaemonCase):
         self.runner.running.discard(old.id)  # it is gone, but the CI build still doesn't fit
         self.daemon.check(self.now + 302)
         self.assertEqual(old.state, "cancelled")
-        self.daemon.make_room_for_ci(self.now + 302)
-        self.assertNotIn(new.id, self.runner.forced)  # not in the tick it ended: its memory may not show yet
-        self.tick(304)
-        self.assertIn(new.id, self.runner.forced)  # then the guard opens again
+        self.tick(303)
+        self.assertIn(new.id, self.runner.forced)  # the guard opens again
+
+    def test_memory_is_read_again_before_making_room(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.daemon.schedule(self.now + 301)  # (the tick's own reading: the CI build doesn't fit)
+        self.machine.read_available = lambda: 45 * GIB  # a build ended since: its memory is back
+        self.daemon.make_room_for_ci(self.now + 301)
+        self.assertEqual(self.runner.forced, [])  # so nothing is stopped for it
+        self.assertEqual(ci.state, "queued")  # (it starts on the next pass)
+
+    def test_builds_ending_every_second_dont_hold_making_room_back(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        quick = [self.submit(("vitest", "run", f"q{i}"), lane="web", mem="1G", cores=1, caller=f"q{i}",
+                             cwd=self.workdir()) for i in range(5)]  # (a lane that may pass the CI build's held room)
+        self.assertEqual({q.state for q in quick}, {"running"})
+        for i, q in enumerate(quick):  # one ends in each tick, just before room would be made
+            self.finish(q, after=301 + i)
+            self.tick(301 + i)
+        self.assertEqual(self.runner.forced, [new.id])  # made all the same, in the first of those ticks
 
     def test_a_build_that_waited_three_turns_is_protected_once_it_runs(self):
         self.daemon.cfg.make_room_behind_agents = False

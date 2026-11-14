@@ -609,6 +609,13 @@ class Machine:
         self.psi_mem = pressure("memory", "full")
         self.psi_mem_some = pressure("memory", "some")
 
+    def read_available(self) -> int:
+        """MemAvailable now, read again: a build that ended since this tick's sample has given its
+        memory back by now (see make_room_for_ci)."""
+        info = meminfo()
+        self.mem_available = info.get("MemAvailable", info.get("MemFree", self.mem_available))
+        return self.mem_available
+
     def summary(self) -> dict:
         return {
             "cores": self.ncpu, "busy": round(self.busy, 2), "busy_now": round(self.busy_now, 2),
@@ -2917,7 +2924,6 @@ class Daemon:
         self.memory_thread_failed = False
         self.last_freeze = self.last_kill = -1e9
         self.room_made: dict[str, float] = {}  # a CI job's build -> when builds were last stopped for it
-        self.last_end = -1e9  # when a build last ended: its memory may not show as free in that tick's reading
         self.started_at = time.time()
         self.avail_seen: collections.deque = collections.deque()  # (time, memory available) of the last 10 s
         self.submit_outcome: dict = {}  # how the last submission was answered: joined, reused, passed before
@@ -3698,12 +3704,14 @@ class Daemon:
             return  # builds stopped for a CI job's build are still going: their memory isn't free yet
         if any(now - made < self.ROOM_PAUSE for made in self.room_made.values()):
             return  # room was just made for one that is still queued: it starts first (what it frees may lag)
-        if now - self.last_end < 1.0:
-            return  # a build ended this tick, after free memory was read: what it held isn't counted free yet
         if any(t.cancel_requested and not t.flock for t in self.active()):
             return  # a cancelled build (a CI job past its time limit, say) is giving its memory back: wait for it
         running = self.active()
-        free_now = self.machine.mem_available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
+        # Read again rather than this tick's sample: a build that ended in check() since has given its
+        # memory back, and stopping one for it would be for nothing.
+        read = getattr(self.machine, "read_available", None)
+        available = read() if read is not None else self.machine.mem_available
+        free_now = available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
         for ci in self.queue(now):
             if not (ci.from_ci and ci.short_by > 0 and now - ci.submitted >= wait
                     and not self.lane(ci.lane).may_pass_held  # it holds no room: what is freed could go elsewhere
@@ -4777,7 +4785,6 @@ class Daemon:
                  error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
         if t.state in FINISHED:
             return
-        self.last_end = now
         self.drop_queries(t)  # its attempt's answers are no use to anyone now
         t.env = None
         if isinstance(result, dict):  # the supervisor's reading, taken as the build ended
