@@ -94,7 +94,7 @@ as a step that holds until the next).
 | `peak_mem`, `profile` | its peak memory in bytes, and the most memory in each tenth of its run in MiB |
 | `workspace` | optional: a target folder it shares with other builds, which then take turns |
 | `cancel_at`, `unfinished` | optional: cancel it this many seconds after its submission, as it was (#40); and, with `unfinished`, it never ends by itself before that (only part of its run is known) |
-| `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes), and whether cargo builds from scratch |
+| `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes; `export` writes a longer one for a CI build that really ran to its end past that), and whether cargo builds from scratch |
 | `history`, `history_peak` | optional: give its command a history of three earlier runs, of `history_peak` bytes |
 | `warmup`, `submitted_at` | written by `export`: it was already queued or running when the window began, and when it was really submitted (seconds from the first build, before its `t`). It replays like any other build, as old as it was, but isn't set beside what really happened |
 | `state`, `requeued`, `recorded_wait` | written by `export`: how the build ended, how often it was stopped and queued again, and how long it waited over all its attempts. The replay decides all three for itself; the summary sets its waits beside `recorded_wait` |
@@ -122,7 +122,7 @@ is as old as it was when the scheduler orders the queue, and is cancelled when i
 the replay's start closer to the machine it had, not all the way: a warm-up build's own wait before
 the window isn't replayed.
 
-`--lead-in 1h` is the usual way to warm a replay up instead: the trace starts an hour before
+`--lead-in 1h` (with `--since`) is the usual way to warm a replay up instead: the trace starts an hour before
 `--since`, every build of that hour replays as it came in (marked `warmup` too, so not compared),
 and the queue the window begins with is the one the replay built. Only builds in flight as the
 lead-in begins are placed as above, and an hour later their effect has mostly worked through.
@@ -150,22 +150,26 @@ and no profile, so its memory rises to its peak in the first fifth; a build whos
 ran (stopped, then cancelled while queued again) is left out. Each build's workspace comes along
 where the database keeps it (`workspace`, since #39), so builds that shared a target folder take
 turns in the replay as they did; from an older database they don't. A build that was
-cancelled replays as a whole run of its command did (the latest one in the trace that succeeded),
-cancelled the same time after its submission as it was (`cancel_at`), whether it was still queued
-or running then; with no such run in the trace, it runs as far as it got and then holds there until
+cancelled replays as a whole run of its command did (the latest one in the trace that succeeded,
+or failing that, the latest from before the trace starts), cancelled the same time after its
+submission as it was (`cancel_at`), whether it was still queued or running then; with no such run,
+it runs as far as it got and then holds there until
 its cancel (`unfinished`), or is left out if it never ran. Runs are matched by their history key, the
 command's words, so two builds of one crate with different feature flags count as the same command. A build that was lost has no exit code, and replays as a failure; its `state` says what
 it was.
 
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
-and who ran them. `--anonymize` hashes repository names, workspaces, callers, lanes other than the
-usual ones (`heavy`, `check`, `web` …), and every word of a command except a known tool (`cargo`,
-`pnpm`, `python3`, `make` …), option names and a short list of public subcommands (`build`, `test`,
-`vitest`, `unittest` …), and drops build names. An option's value is hashed too, whether it follows
-a `=` (`--manifest-path=…`), runs on from a short option (`-C…`), or is a word of its own; numbers
-and common words included, since a value can be a password whatever it looks like. The only values
-kept are counts (`-j 8`, `--jobs=8`, `--test-threads=4`) and cargo's built-in profiles
-(`--profile=test`). A lane the bench configuration doesn't have falls to
+and who ran them. `--anonymize` hashes repository names, workspaces, callers and lanes other than
+the usual ones (`heavy`, `check`, `web` …), and drops build names. Of each command it keeps what
+the replay needs and no more: a known tool (`cargo`, `pnpm`, `python3`, `make` …), the public
+subcommands the command starts with (`cargo test`, `pnpm exec vitest run`,
+`python3 -m unittest discover`), option names, counts (`-j 8`, `--jobs=8`) and cargo's built-in
+profiles (`--profile test`). Every other word is hashed: an option's value, whether after `=`, run
+on to a short option (`-C…`) or a word of its own, and any word after the first option, numbers and
+common words included, since a value can be a password or a package called `test`. (The Parallel
+Workloads Archive's [Standard Workload
+Format](https://www.cs.huji.ac.il/labs/parallel/workload/swf.html) keeps even less: a number per
+application.) A lane the bench configuration doesn't have falls to
 the lane rules in the replay. That hides them from a casual reader, but a hash of a
 common word can be guessed. Keep traces on your machine; the scenarios in the repository are
 synthetic.

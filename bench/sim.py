@@ -299,14 +299,28 @@ class Simulation:
         record = {"name": msg["name"], "lane": None, "ci": bool(spec.get("ci")), "submitted": self.clock.now - EPOCH,
                   "first_start": None, "ended": None, "attempts": 0, "outcome": None, "peak": 0, "planned": 0}
         self.submitting = (spec, record)  # (the daemon may start it before submit returns)
-        t, error = self.daemon.submit(msg, self.clock.now)
-        self.submitting = None
+        aging = spec.get("submitted_at") is not None
+        if aging:
+            # A warm-up build is as old as it really was, from the daemon's first pass over it (the
+            # one in submit), as the daemon's own retry of a build is (`vacated`).
+            schedule = self.daemon.schedule
+            def aged(now, *args, **kwargs):
+                newest = next(reversed(self.daemon.tickets.values()))  # the one being submitted
+                newest.submitted = EPOCH + float(spec["submitted_at"])
+                return schedule(now, *args, **kwargs)
+            self.daemon.schedule = aged
+        try:
+            t, error = self.daemon.submit(msg, self.clock.now)
+        finally:
+            if aging:
+                self.daemon.schedule = schedule  # (the bound method: as it was)
+                if getattr(type(self.daemon), "schedule", None) is getattr(schedule, "__func__", None):
+                    del self.daemon.schedule
+            self.submitting = None
         if error:
             raise RuntimeError(f"submitting {spec.get('name') or spec['argv']}: {error}")
         self.specs.setdefault(t.id, spec)
         self.records.setdefault(t.id, record)["lane"] = t.lane
-        if spec.get("submitted_at") is not None:  # a warm-up build: as old as it really was
-            t.submitted = EPOCH + float(spec["submitted_at"])
         return t
 
     def launch(self, ticket):
@@ -884,11 +898,15 @@ PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".
 PLAIN_OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # an option's name and nothing else
 
 
-# Option values an anonymized trace keeps: counts (cargo's and make's -j, a test runner's threads)
-# and cargo's built-in profiles. Any other value is hashed, numbers and common words too: a value
-# can be a password or a token, whatever it looks like.
+# What an anonymized trace keeps of a command is what the replay needs, and no more: the tool if it
+# is a public one, the subcommands it starts with (the lane rules and restart_safe read them), option
+# names, counts and cargo's built-in profiles. Every other word is hashed: any option's value and any
+# word after the first option, numbers and common words too, since a value can be a password or a
+# package called "test" whatever it looks like. (The Parallel Workloads Archive's format keeps even
+# less: a number per application.)
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
 KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
+TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test
 
 
 def option_value(name: str, value: str) -> str:
@@ -899,33 +917,42 @@ def option_value(name: str, value: str) -> str:
     return hashed("w", value) if value else ""
 
 
-def anonymous_word(word: str, before: str = "") -> str:
-    """A word of a command (not its first) as an anonymized trace keeps it, `before` being the word
-    ahead of it: option names, a short list of subcommands that are the same everywhere, and the
-    values option_value keeps. Anything else is hashed: a value after "=" (--manifest-path=/a/b keeps
-    "--manifest-path="), one run on to a short option (-C/a/b keeps "-C"), and a number unless it
-    follows a count option (-j 8)."""
+def anonymous_option(word: str) -> str:
+    """An option as an anonymized trace keeps it: its name, and its value (after "=", or run on to a
+    short option) as option_value keeps it."""
     if word in ("-", "--"):
         return word
-    if word.startswith("-"):
-        name, eq, value = word.partition("=")
-        if eq:
-            return name + "=" + option_value(name, value) if PLAIN_OPTION.fullmatch(name) else hashed("w", word)
-        if word.startswith("--") or len(word) == 2:
-            return word if PLAIN_OPTION.fullmatch(word) else hashed("w", word)
-        if PLAIN_OPTION.fullmatch(word[:2]):
-            return word[:2] + option_value(word[:2], word[2:])  # -j8; -C/a/b, -xvf: the rest hashed
-        return hashed("w", word)
-    if word.isdigit():
-        return word if before in COUNT_OPTIONS else hashed("w", word)
-    return word if word in PUBLIC_WORDS else hashed("w", word)
+    name, eq, value = word.partition("=")
+    if eq:
+        return name + "=" + option_value(name, value) if PLAIN_OPTION.fullmatch(name) else hashed("w", word)
+    if word.startswith("--") or len(word) == 2:
+        return word if PLAIN_OPTION.fullmatch(word) else hashed("w", word)
+    if PLAIN_OPTION.fullmatch(word[:2]):
+        return word[:2] + option_value(word[:2], word[2:])  # -j8; -C/a/b, -xvf: the rest hashed
+    return hashed("w", word)
 
 
 def anonymous_argv(argv: list[str]) -> list[str]:
-    """A command as an anonymized trace keeps it: its tool if it is a public one, then each word as
-    anonymous_word keeps it."""
-    return [(w if w in PUBLIC_TOOLS else hashed("w", w)) if i == 0 else anonymous_word(w, argv[i - 1])
-            for i, w in enumerate(argv)]
+    """A command as an anonymized trace keeps it (see above): `cargo test -p test` becomes
+    `cargo test -p w9f86d0`; `python3 -m unittest discover -s tests` keeps all but `tests`."""
+    if not argv:
+        return []
+    python = bool(re.fullmatch(r"python[0-9.]*", os.path.basename(argv[0])))
+    out = [argv[0] if argv[0] in PUBLIC_TOOLS else hashed("w", argv[0])]
+    leading = True  # still among the subcommands it starts with
+    for before, word in zip(argv, argv[1:]):
+        if leading and (word in TOOLCHAINS or (python and word == "-m")):
+            out.append(word)
+        elif word.startswith("-"):
+            leading = False
+            out.append(anonymous_option(word))
+        elif leading and word in PUBLIC_WORDS:
+            out.append(word)
+        else:
+            leading = False
+            keep = (before in COUNT_OPTIONS and word.isdigit()) or word in KNOWN_VALUES.get(before, ())
+            out.append(word if keep else hashed("w", word))
+    return out
 
 
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool,
@@ -963,7 +990,9 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
         if begins is None or submitted >= begins:
             return submitted
         attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
-        ran = float(attempt or r.get("wall") or 0)  # (an older database: all its attempts, so it starts earlier)
+        # A last attempt that never ran (0) stays 0; an older database without the column has every
+        # attempt's time, so the build starts earlier than it did.
+        ran = float(attempt) if attempt is not None else float(r.get("wall") or 0)
         start = float(r["ended"]) - ran if r.get("ended") is not None and ran > 0 else None
         return max(submitted, start) if start is not None and start <= begins else begins
 
@@ -991,8 +1020,9 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
     # A whole run of each command that succeeded: what a cancelled build of it would have done (#40).
     whole = {r.get("key"): shape(r) for r in rows if r.get("state") == "succeeded" and shape(r)}
     for key in {r.get("key") for r in rows if r.get("state") == "cancelled"} - set(whole):
-        before = db.execute("SELECT * FROM build WHERE key = ? AND state = 'succeeded' AND wall > 0 "
-                            "ORDER BY ended DESC LIMIT 1", (key,)).fetchone()  # (one from before the window)
+        before = db.execute("SELECT * FROM build WHERE key = ? AND state = 'succeeded' AND wall > 0"
+                            + (" AND ended <= ?" if begins is not None else "") + " ORDER BY ended DESC LIMIT 1",
+                            (key, begins) if begins is not None else (key,)).fetchone()  # (from before the trace)
         if before is not None and shape(dict(before)):
             whole[key] = shape(dict(before))
     for r in rows:
@@ -1030,6 +1060,10 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
             entry["name"] = r["name"]
         if r.get("waited") is not None:
             entry["recorded_wait"] = round(float(r["waited"]), 1)  # what it really waited (all its attempts)
+        if r.get("from_ci") and state in ("succeeded", "failed") and r.get("ended") is not None:
+            took = float(r["ended"]) - float(r["submitted"])
+            if took + 60 > DEFAULT_TIMEOUT:  # it ran to its end past the default: its job's limit was longer
+                entry["timeout_s"] = round(took + 60)
         if since is not None and float(r["submitted"]) < since:
             entry["warmup"] = True  # in the machine before the window: there for the others, not compared
             if float(r["submitted"]) < begins:
@@ -1132,6 +1166,9 @@ def export_machine(db: sqlite3.Connection, since: float | None, until: float | N
 
 
 def cmd_export(args) -> int:
+    if args.lead_in and args.since is None:
+        print("sim.py export: --lead-in starts the trace before --since; give --since too", file=sys.stderr)
+        return 2
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     try:
         since, until = parse_when(args.since), parse_when(args.until)

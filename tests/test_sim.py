@@ -321,15 +321,16 @@ class Export(SimCase):
         rows = [("a", 10000, 11000, 1000.0, "succeeded", "app|heavy|cargo test -p a", "w", 0.0),
                 ("b", 10100, 12000, 1000.0, "succeeded", "app|heavy|cargo test -p b", "w", 900.0),
                 ("c", 11500, 12100, 100.0, "succeeded", "app|heavy|cargo test -p c", "w", 500.0),
-                ("d", 11400, 11600, 0.0, "cancelled", "app|heavy|cargo test -p a", None, 200.0)]
+                ("d", 11400, 11600, 0.0, "cancelled", "app|heavy|cargo test -p a", None, 200.0),
+                ("e", 19000, 22000, 3000.0, "succeeded", "app|heavy|cargo test -p a", None, 0.0)]  # after --until
         db.executemany("INSERT INTO build (id, submitted, ended, wall, attempt_wall, state, key, lane, workspace, "
                        "waited, mem_peak, avg_cores, exit) VALUES (?,?,?,?,?,?,?,'heavy',?,?,?,1.0,0)",
                        [(i, s, e, w, w, st, k, ws, wt, GIB) for i, s, e, w, st, k, ws, wt in rows])
-        out = sim.export_rows(db, 11500, None, anonymize=False)
+        out = sim.export_rows(db, 11500, 13000, anonymize=False)
         self.assertEqual([(e["t"], e.get("submitted_at"), e.get("warmup", False)) for e in out],
                          [(0.0, -900.0, True), (500.0, 400.0, True), (500.0, None, False)])  # b, d, c
         d = out[1]
-        self.assertEqual((d["wall"], d["cancel_at"]), (1000.0, 200.0))  # A's run, cancelled 200s after its submission
+        self.assertEqual((d["wall"], d["cancel_at"]), (1000.0, 200.0))  # A's run (not e's, after), cancelled 200s in
         path = os.path.join(self.tmp.name, "window.jsonl")
         with open(path, "w") as f:
             for entry in out:
@@ -340,7 +341,7 @@ class Export(SimCase):
         self.assertAlmostEqual(agent["p50"][1], 500.0, delta=15)  # it waited for b, as it did
         self.assertEqual(summary["cancelled_as_in_trace"], 1)
         # With a lead-in, A replays too and B waits for it in the replay: C still waits 500s.
-        out = sim.export_rows(db, 11500, None, anonymize=False, lead_in=1000)
+        out = sim.export_rows(db, 11500, 13000, anonymize=False, lead_in=1000)
         self.assertEqual([(e["t"], e.get("submitted_at"), e.get("warmup", False)) for e in out],
                          [(0.0, 0.0, True), (500.0, 100.0, True), (1400.0, None, True), (1500.0, None, False)])
         with open(path, "w") as f:
@@ -348,6 +349,56 @@ class Export(SimCase):
                 f.write(json.dumps(entry) + "\n")
         summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_lead_in")
         self.assertAlmostEqual(summary["against_recorded"]["agent"]["p50"][1], 500.0, delta=15)
+
+    def test_a_last_attempt_that_never_ran_is_placed_as_queued(self):
+        # Requeued, then cancelled while queued again (attempt_wall 0): it was queued when the window
+        # began, whatever its earlier attempts took, so it enters then and holds w as its whole run
+        # does; the build submitted at 5000 waits for it, as it did.
+        buildqd = load("buildqd_for_attempt", BUILDQD)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.executemany("INSERT INTO build (id, submitted, ended, wall, attempt_wall, state, key, lane, workspace, "
+                       "waited, requeues, mem_peak, avg_cores, exit) VALUES (?,?,?,?,?,?,?,'heavy','w',?,?,?,1.0,?)",
+                       [("run", 0, 1000, 1000.0, 1000.0, "succeeded", "app|heavy|cargo test", 0.0, 0, GIB, 0),
+                        ("x", 1000, 6000, 3000.0, 0.0, "cancelled", "app|heavy|cargo test", 2000.0, 1, GIB, None),
+                        ("m", 5000, 7100, 100.0, 100.0, "succeeded", "app|heavy|cargo check", 1000.0, 0, GIB, 0)])
+        out = sim.export_rows(db, 5000, None, anonymize=False)
+        self.assertEqual([(e["t"], e.get("submitted_at")) for e in out], [(0.0, -4000.0), (0.0, None)])
+        path = os.path.join(self.tmp.name, "attempt.jsonl")
+        with open(path, "w") as f:
+            for entry in out:
+                f.write(json.dumps(entry) + "\n")
+        summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_attempt")
+        self.assertAlmostEqual(summary["against_recorded"]["agent"]["p50"][1], 1000.0, delta=15)
+
+    def test_a_warm_up_build_is_as_old_as_it_was_from_the_daemon_s_first_pass(self):
+        state = os.path.join(self.tmp.name, "aged")
+        os.makedirs(state)
+        s = sim.Simulation(scenario([]), CONFIG, BUILDQD, state, name="buildqd_aged")
+        seen = []
+        schedule = s.daemon.schedule
+        s.daemon.schedule = lambda now, *a, **k: (seen.append(next(reversed(s.daemon.tickets.values())).submitted),
+                                                  schedule(now, *a, **k))[1]
+        s.submit(dict(scenarios.build(0, ("cargo", "test"), 1, 60, 1, repo="app"), submitted_at=-2000.0), 0)
+        self.assertEqual(seen, [sim.EPOCH - 2000])  # the pass in submit saw its real age
+        self.assertEqual(s.daemon.schedule.__name__, "<lambda>")  # (what was there before is back)
+
+    def test_a_ci_build_that_ran_past_the_default_limit_keeps_its_longer_one(self):
+        buildqd = load("buildqd_for_limit", BUILDQD)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.executemany("INSERT INTO build (id, submitted, ended, wall, state, key, lane, from_ci, mem_peak, exit) "
+                       "VALUES (?,?,?,?,?,'app|heavy|cargo test','heavy',1,?,0)",
+                       [("long", 0, 4000, 1000.0, "succeeded", GIB), ("short", 100, 700, 600.0, "succeeded", GIB)])
+        out = sim.export_rows(db, None, None, anonymize=False)
+        self.assertEqual([e.get("timeout_s") for e in out], [4060, None])
+        args = sim.argparse.Namespace(db=":memory:", since=None, until=None, anonymize=False, lead_in="1h")
+        err = io.StringIO()
+        with unittest.mock.patch("sys.stderr", err):
+            self.assertEqual(sim.cmd_export(args), 2)  # a lead-in needs a window to lead into
+        self.assertIn("--since", err.getvalue())
 
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
@@ -538,7 +589,19 @@ class Export(SimCase):
         self.assertTrue(words[3].startswith("-C") and words[3] != argv[3])
         self.assertTrue(words[4].startswith("--password=") and words[5].startswith("-p") and words[5] != argv[5])
         self.assertEqual(words[0], "cargo")
-        self.assertEqual(words[9:], ["--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release", "test", "--", "-"])
+        self.assertEqual(words[9:16], ["--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release"])
+        self.assertNotEqual(words[16], "test")  # after an option, a common word may be its value
+        self.assertEqual(words[17:], ["--", "-"])
+        hashed = lambda argv: [w != a for w, a in zip(sim.anonymous_argv(argv), argv)]  # noqa: E731
+        # Only the subcommands a command starts with keep their names; any word after an option doesn't.
+        self.assertEqual(hashed(["cargo", "test", "-p", "test"]), [False, False, False, True])
+        self.assertEqual(hashed(["pnpm", "--filter", "build", "test"]), [False, False, True, True])
+        self.assertEqual(hashed(["cargo", "test", "--token", "test"]), [False, False, False, True])
+        self.assertEqual(hashed(["git", "commit", "-m", "test"]), [False, True, False, True])  # (commit: not a public word)
+        self.assertEqual(hashed(["python3", "-m", "unittest", "discover", "-s", "tests"]), [False] * 5 + [True])
+        self.assertEqual(hashed(["cargo", "+nightly", "check"]), [False, False, False])
+        self.assertEqual(hashed(["pnpm", "exec", "vitest", "run", "--shard", "1"]), [False] * 5 + [True])
+        self.assertEqual(hashed(["cargo", "build", "--profile", "release"]), [False] * 4)  # (as command keys write it)
         self.assertEqual(sim.rank_correlation([1, 1, 2, 3], [5, 5, 6, 7]), 1.0)  # ties share their ranks
 
     def test_a_replay_is_set_beside_what_really_happened(self):
