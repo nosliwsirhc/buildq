@@ -214,11 +214,14 @@ order and starts every build that fits:
 **Order.** A build that has waited `starve_seconds`, or was stopped once to free memory, goes
 first, and the room it needs, its workspace included, is held for it, so later builds can't keep
 passing it (the workspace binds every lane in its group; for the rest, lanes with
-`may_pass_held` still may). With `ci_first`, a build from a CI job goes first from the moment it is
-queued, before the others at the same priority, and its room is held from builds of its priority
-or lower (a higher lane may still start in room that is free): a CI step has a job time limit and
-holds up a merge or a release, while a session's build can wait. A session's build that has waited
-three times `starve_seconds`, or was stopped to free memory, still goes before it. After that, the higher priority
+`may_pass_held` still may). With `ci_first`, a build from a CI job counts as having waited from the
+moment it is queued: a CI step has a job time limit and holds up a merge or a release, while a
+session's build can wait. It goes ahead of every build that hasn't waited `starve_seconds`,
+whatever its lane, and of the others at its priority, so when room frees up it gets it first. While
+it waits, the room it needs is held only from builds of its priority or lower: a higher lane may
+still start in room that is free (until the CI build has really waited `starve_seconds`). A
+session's build that has waited three times `starve_seconds`, or was stopped to free memory, goes
+before CI builds. After that, the higher priority
 first (the lane's plus the ticket's own); within a priority, the build whose caller has the fewest
 builds running (a fair share: one
 session's burst of builds doesn't keep the others waiting), then the build expected to finish
@@ -555,8 +558,8 @@ steps:
 On a runner without buildq (GitHub-hosted, or another machine), the step warns and runs as before. While the queue is paused (`buildq pause`), such a step waits like any other build,
 up to the job's timeout. Cancelling the job cancels the build. CI jobs share turns fairly with
 everything else (each runner is a caller of its own), unless `ci_first = true`: then a CI job's
-build goes before the waiting builds of its lane and lower lanes, with its room held from them
-from the start (see Order, above). Turn it on when CI steps wait out their jobs' time limits on a
+build goes first, with its room held from builds of its priority or lower from the start (see
+Order, above). Turn it on when CI steps wait out their jobs' time limits on a
 busy machine. A `ci` lane can give them a priority or caps
 of their own (see [config.example.toml](config.example.toml)).
 

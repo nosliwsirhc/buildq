@@ -2901,7 +2901,7 @@ class Daemon:
                        and (now - t.submitted >= 3 * self.cfg.starve_seconds or t.requeues > 0))
             # ...and a CI job's build that has waited out its turn goes before newer CI builds, or a
             # stream of quicker CI builds could keep it waiting past its job's time limit.
-            return (not overdue, not starving, -self.weight(t), not ci, not self.waited_out(t, now))
+            return (not overdue, not starving, -self.weight(t), not ci, not (ci and self.waited_out(t, now)))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
@@ -3949,8 +3949,10 @@ class Daemon:
                         if floor > cfg.disk_floor else fmt_size(floor))
                 reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
                                          f"(disk_floor is {said})"), False
-            elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces:
-                holder = busy_workspaces[(lane.workspace_group, t.workspace)]
+            elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces and not (
+                    # a CI job's build held by ci_first binds only builds of its priority or lower
+                    (holder := busy_workspaces[(lane.workspace_group, t.workspace)]).state == "queued"
+                    and not self.waited_out(holder, now) and weight > self.weight(holder)):
                 what = ("is running" if holder.state != "queued" else
                         "is a CI job's, which goes first, and is held" if not self.waited_out(holder, now)
                         else "has waited longest and is held")

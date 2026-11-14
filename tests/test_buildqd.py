@@ -2252,10 +2252,20 @@ class CIFirst(DaemonCase):
 
     def test_off_a_ci_build_waits_its_turn(self):
         waiting = self.submit(mem="20G")
-        self.now += 301  # it starves
+        self.now += 301  # past starve_seconds (300 here): it starves
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [waiting.id, ci.id])
         self.assertFalse(ci.held)
+
+    def test_off_the_order_is_as_before_for_a_lane_that_passes_held_room(self):
+        older = self.submit(("pnpm", "test", "--long"), lane="web", mem="20G")
+        self.daemon.history.add({"key": older.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
+                                 "wall": 600, "exit": 0})
+        self.now += 301  # past starve_seconds, but a lane that passes held room never starves
+        newer = self.submit(("pnpm", "test", "--short"), lane="web", mem="20G")
+        self.daemon.history.add({"key": newer.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
+                                 "wall": 10, "exit": 0})
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [newer.id, older.id])
 
     def test_a_ci_build_goes_first_and_gets_room_held_at_once(self):
         self.daemon.cfg.ci_first = True
@@ -2291,6 +2301,7 @@ class CIFirst(DaemonCase):
 
     def test_a_higher_lane_may_use_a_ci_jobs_held_room(self):
         self.daemon.cfg.ci_first = True
+        self.machine.mem_available = 36 * GIB  # 2G free beside the running build
         self.higher_lane()
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
         self.assertTrue(ci.held)
@@ -2304,7 +2315,7 @@ class CIFirst(DaemonCase):
         self.daemon.cfg.ci_first = True
         self.higher_lane()
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
-        self.now += 601  # starve_seconds: now it is starving like any other build
+        self.now += 301  # past starve_seconds (300 here): now it starves like any other build
         higher = self.submit(("dotnet", "build"), lane="web", cores=1)
         self.assertTrue(ci.held)
         self.assertEqual((higher.state, higher.reason),
@@ -2313,17 +2324,37 @@ class CIFirst(DaemonCase):
     def test_a_higher_lane_still_goes_first_when_both_have_waited(self):
         self.daemon.cfg.ci_first = True
         self.higher_lane()
-        higher = self.submit(("dotnet", "build"), lane="web", mem="20G")
-        self.now += 601
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        higher = self.submit(("dotnet", "build"), lane="web", mem="20G")
+        self.now += 301
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [higher.id, ci.id])
 
-    def test_a_session_build_that_has_waited_much_longer_goes_before_ci(self):
+    def test_a_fresh_ci_build_goes_before_a_fresh_higher_lane_build(self):
+        self.daemon.cfg.ci_first = True
+        self.higher_lane()
+        higher = self.submit(("dotnet", "build"), lane="web", mem="20G")
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, higher.id])
+
+    def test_a_higher_lane_build_isnt_kept_out_of_a_ci_jobs_held_workspace(self):
+        self.daemon.cfg.ci_first = True
+        lane = self.higher_lane()
+        lane.exclusive, lane.workspace_group = True, "heavy"  # one build per workspace with heavy
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI, cwd=self.workdir("runner"))
+        self.machine.mem_available = 36 * GIB
+        higher = self.submit(("dotnet", "build"), lane="web", cores=1, cwd=self.workdir("runner"))
+        self.assertTrue(ci.held)
+        self.assertEqual(higher.state, "running")
+
+    def test_a_session_build_that_has_waited_three_turns_goes_before_ci(self):
         self.daemon.cfg.ci_first = True
         session = self.submit(mem="20G")
-        self.now += 3 * 600  # three times starve_seconds
+        self.now += 3 * 300 - 1  # just under three times starve_seconds (300 here)
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, session.id])
+        self.now += 1
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+        self.daemon.schedule(self.now)
         self.assertTrue(session.held)
 
     def test_a_build_stopped_to_free_memory_goes_before_ci(self):
