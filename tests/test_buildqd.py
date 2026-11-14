@@ -1050,6 +1050,19 @@ class SameSource(DaemonCase):
         os.symlink(self.tmp.name, os.path.join(repo, "ext deps"))  # a name with a space in it, leading outside
         self.assertFalse(buildqd.paths_inside(["cargo", "test", "--manifest-path", "ext deps/Cargo.toml"], repo, repo))
         self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "--project=ext deps/tsconfig.json"], repo, repo))
+        outside_file = os.path.join(self.tmp.name, "lint-me.js")
+        open(outside_file, "w").close()
+        os.symlink(outside_file, os.path.join(repo, "--external.js"))
+        for argv in (["env", "CFLAGS=-isystemexternal", "cargo", "check"],  # -isystem + external: where it splits can't be told
+                     ["eslint", "--", "--external.js"],  # after --, a name, whatever it starts with
+                     ["cargo", "clippy", "--", "-Lext deps/lib"],  # a name with a space, run on to its option
+                     ["env", "CARGO_ENCODED_RUSTFLAGS=--sysroot\x1fext deps", "cargo", "check"],  # cargo splits at \x1f
+                     ["vitest", "run", "-r=..", "--config", "x.ts"], ["vitest", "run", "-sr", ".."],
+                     ["../other/check.sh"]):  # the command's own path (with --reuse)
+            self.assertFalse(buildqd.paths_inside(argv, repo, repo), argv)
+        for argv in (["cargo", "test", "--", "--test-threads=1"], ["cargo", "clippy", "--", "-D", "warnings"],
+                     ["/usr/bin/env", "cargo", "test"], ["cargo", "test", "-F", "Cli"]):
+            self.assertTrue(buildqd.paths_inside(argv, repo, repo), argv)
         inside = buildqd.paths_inside
         # A command that moves to another folder matches nothing, whatever it names after: what
         # `env -Csub env -Cexternal` or `--manifest-path external/…` finds there can't be told from here.

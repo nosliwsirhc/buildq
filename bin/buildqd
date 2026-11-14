@@ -1606,29 +1606,32 @@ OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, no
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
-UNREADABLE = re.compile(r"""[\\"'`$\[\]{}]|://""")
+UNREADABLE = re.compile(r"""[\x00-\x1f\\"'`$\[\]{}]|://""")  # (and control characters: cargo splits at \x1f)
 
 
-def path_pieces(arg: str, tool: str = "") -> list[str]:
+def path_pieces(arg: str, tool: str = "", operand: bool = False) -> list[str]:
     """Every part of a plain word (see UNREADABLE) that might name a path: the word itself (a name
     with a space in it, `external project/x`), what follows each "=" in it, and each part between
-    the separators a value may hold (spaces, ",", ";", ":", "="). A part that runs on from an option
-    counts from its first / . or ~ (-L../x, -isystem/x); a response file's @ is taken off. For
-    dotnet, an MSBuild switch (/p:…) is an option."""
+    the separators a value may hold (spaces, ",", ";", ":", "="). Where a short option's name ends
+    and its value begins can't be told (-Lvendor, -isystemvendor, -isystem/x), so every place the
+    value might begin counts. An operand (after `--`) is a name even if it starts with "-". A
+    response file's @ is taken off. For dotnet, an MSBuild switch (/p:…) is an option."""
     if tool in ("dotnet", "msbuild"):
         arg = re.sub(r"^/[A-Za-z]+:", "", arg)
-    out = [] if arg.startswith("-") else [arg]
+    out = [arg] if operand or not arg.startswith("-") else []
     out += [arg[i + 1:] for i, c in enumerate(arg) if c == "="]
-    for piece in re.split(r"[\s,;:=]+", arg):
+    pieces = re.split(r"[\s,;:=]+", arg)
+    if re.match(r"-[^-]", arg):
+        pieces.append(arg)  # whole, too: `-Lext deps/lib`
+    for piece in pieces:
         piece = piece.lstrip("@")
         if piece.startswith("--"):
             continue  # an option's name (its value, after "=", is a piece of its own)
         if piece.startswith("-"):
-            rest = piece[2:]
-            found = re.search(r"[/.~]", rest)
-            piece = rest[found.start():] if found else rest
-        out.append(piece)
-    return [p.lstrip("@") for p in out if p and not p.startswith("-")]
+            out += [piece[i:] for i in range(2, len(piece))]
+        else:
+            out.append(piece)
+    return [p.lstrip("@") for p in out if p and (operand or not p.startswith("-"))]
 
 
 def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
@@ -1654,21 +1657,25 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
         return False  # what it names can't be read for certain
     if any(CHANGES_FOLDER.fullmatch(a) for a in words):
         return False
-    if "-r" in words and "vitest" in (os.path.basename(a) for a in argv):
-        return False  # vitest's short --root
+    if "vitest" in (os.path.basename(a) for a in argv) and any(re.fullmatch(r"-[A-Za-z]*r(=.*)?", a) for a in words):
+        return False  # vitest's short --root, grouped (-sr) or with its value (-r=..) too
     if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
         return False  # sudo's options include -D, its own --chdir
-    skip = False
-    for arg in words:
+    skip = operands = False
+    named = [argv[0]] if "/" in argv[0] and not argv[0].startswith("/") else []  # ../other/check.sh
+    for arg in named + words:
         if skip:
             skip = False
+            continue
+        if arg == "--" and not operands:
+            operands = True  # what follows are names, whatever they start with (eslint -- --x.js)
             continue
         if arg in OUTPUT_OPTIONS:
             skip = True
             continue
         if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES):
             continue
-        for value in path_pieces(arg, tool):
+        for value in path_pieces(arg, tool, operands):
             candidate = os.path.join(cwd, os.path.expanduser(value))
             looks = "/" in value or value.startswith((".", "~"))
             if not looks and not os.path.lexists(candidate):
