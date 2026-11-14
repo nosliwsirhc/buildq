@@ -3966,6 +3966,9 @@ class Daemon:
                                               f"{(holder.group_lane or holder.lane) if holder.state != 'queued' else self.lane(holder.lane).name} "
                                               f"lane, {holder.id[:8]}); they would "
                                               "fight over its build directory"), False
+                # Kept out only by a CI job's weak hold, a build that has waited out its turn still
+                # holds its own room and workspace, so builds behind it can't pass it there.
+                holds = holder.state == "queued" and not self.waited_out(holder, now) and self.waited_out(t, now)
             elif m.psi_mem > cfg.mem_psi_block:
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
                                              f"{cfg.mem_psi_block:g}%)")
@@ -4031,7 +4034,11 @@ class Daemon:
                 else:  # a CI job's build, first by ci_first: a higher lane may still use the room
                     ci_holds.append((weight, t.est_mem, cores))
                 if lane.exclusive and t.workspace:  # and its workspace: a quicker lane mustn't keep taking it
-                    busy_workspaces.setdefault((lane.workspace_group, t.workspace), t)
+                    key = (lane.workspace_group, t.workspace)
+                    current = busy_workspaces.get(key)
+                    if current is None or (current.state == "queued" and not self.waited_out(current, now)
+                                           and self.waited_out(t, now)):  # a full hold over a CI job's weak one
+                        busy_workspaces[key] = t
         self.budget.update(held_mem=held_mem + sum(mem for _, mem, _ in ci_holds),
                            held_cores=held_cpu + sum(cores for _, _, cores in ci_holds))
 

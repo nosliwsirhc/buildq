@@ -2388,6 +2388,20 @@ class CIFirst(DaemonCase):
         ci = self.submit(("pnpm", "test"), lane="web", env=self.CI, caller="runner")
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
 
+    def test_a_ci_jobs_weak_workspace_hold_doesnt_replace_a_waited_out_builds(self):
+        self.daemon.cfg.ci_first = True
+        lane = self.higher_lane()  # as a cargo check lane: priority above heavy, in heavy's group
+        lane.exclusive, lane.workspace_group = True, "heavy"
+        tree = self.workdir("tree")
+        session = self.submit(("cargo", "test", "-p", "a"), mem="20G", cwd=tree)
+        self.now += 301  # it has waited out its turn
+        ci = self.submit(("cargo", "test", "-p", "b"), mem="20G", env=self.CI, cwd=tree)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, session.id])
+        self.assertTrue(session.held)  # kept out of the worktree by the CI job, it still holds
+        check = self.submit(("cargo", "check"), lane="web", cores=1, cwd=tree)
+        self.assertEqual((check.state, check.reason_cat), ("queued", "workspace"))
+        self.assertIn("has waited longest", check.reason)
+
     def test_a_build_stopped_to_free_memory_goes_before_ci(self):
         self.daemon.cfg.ci_first = True
         stopped = self.submit(mem="20G")
