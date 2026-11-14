@@ -569,7 +569,10 @@ run cancelled with its job teaches the history nothing. If a new step keeps timi
 queue, run it once by hand so the history learns its real size. The history is kept per
 repository, lane and command (`<repository>|<lane>|<command words>`, where the repository is the
 name of its main checkout's folder, `filedrop` for a runner's `_work/filedrop/filedrop`), so run it
-from a checkout whose folder has the same name, with the same `--lane` and the same command.
+from a checkout whose folder has the same name, with the same `--lane` and the same command. The
+command words are the tool and what it runs: cargo's subcommand and packages, a JS tool's script, a
+script's name and its first argument when that is a plain lowercase word (`bash
+persistent-cargo-target.sh architecture`), never a path or a value.
 
 ## Limitations
 

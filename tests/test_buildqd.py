@@ -3152,6 +3152,19 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
         self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 pytest")
 
+    def test_a_scripts_first_word_tells_its_builds_apart(self):
+        wrapper = ("bash", "scripts/ci/persistent-cargo-target.sh")
+        self.assertEqual(self.words(*wrapper, "architecture", "2G", "--", "cargo", "run", "--release"),
+                         "bash persistent-cargo-target.sh architecture")
+        self.assertEqual(self.words(*wrapper, "rust-tests", "60G", "--", "bash", "scripts/ci/rust-unit-tests.sh"),
+                         "bash persistent-cargo-target.sh rust-tests")
+        self.assertEqual(self.words("python3", "tools/gen.py", "wire_types"), "python3 gen.py wire_types")
+        # not a path (a script run per worktree would never have a history), a value, or a token
+        for arg in ("/home/u/.t3/worktrees/x", "./tree", "60G", "Ab3dE9fGh2", "ghp_0123456789abcdefABCDEF",
+                    "a-very-long-argument-of-thirty-chars"):
+            self.assertEqual(self.words("bash", "run.sh", arg, "x"), "bash run.sh", arg)
+        self.assertEqual(self.words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")  # a module: as before
+
     def test_keys_hold_no_urls_but_keep_npm_scopes(self):
         self.assertNotIn("token", self.words("wget", "https://files.example/private-access-token"))
         self.assertEqual(self.words("pnpm", "--filter", "@scope/web", "build"), "pnpm --filter @scope/web build")

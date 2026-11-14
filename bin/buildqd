@@ -1142,6 +1142,9 @@ def repo_name(cwd: str) -> str:
         return os.path.basename(top)
 
 
+SCRIPT_WORD = re.compile(r"[a-z][a-z_-]{0,23}")
+
+
 def command_words(argv: list[str]) -> list[str]:
     t = strip_wrappers(argv)
     if "--" in t:
@@ -1177,8 +1180,15 @@ def command_words(argv: list[str]) -> list[str]:
                 script = [w for w in rest[i + 1].split() if not ASSIGNMENT.match(w)]
                 words += [os.path.basename(w) for w in script[:2]]
         else:
-            words += [os.path.basename(p) for p in positionals(rest, {"-m"} if "python" in tool else set())[:1]]
-            words += option_values(rest, {"-m"})[:1]
+            pos = positionals(rest, {"-m"} if "python" in tool else set())
+            module = option_values(rest, {"-m"})[:1]
+            words += [os.path.basename(p) for p in pos[:1]] + module
+            # A script's first argument, when it is a plain word, often names what it runs
+            # (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are different builds
+            # of different sizes). Not a path or a value: a session's script run per worktree would
+            # never have a history, and nothing that could be a secret may reach a key.
+            if not module and pos[1:2] and SCRIPT_WORD.fullmatch(pos[1]):
+                words.append(pos[1])
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
     else:
