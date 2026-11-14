@@ -205,9 +205,10 @@ done
 if ! have_systemd; then
   # buildq is built on systemd: each build is a service of its own, which is what measures it, caps
   # its memory and lets the queue pause it. Without a user session there is nothing to install the
-  # units, the shims or the guard into, and running install.sh again won't change that.
+  # units into, and without a daemon that answers, the shims and the guard would only hold builds up
+  # (see below). Running install.sh again won't change that.
   say "no systemd user session here, and buildq needs one: each build runs as a systemd service, which is what measures it, caps its memory and lets the queue pause it."
-  say "installed only the programs, in $bindir: no units, shims or Rust guard, and the daemon isn't running. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
+  say "installed the programs in $bindir (and anything listed above), but nothing that needs systemd: no units, --shims and --rustc-guard weren't set up, and install.sh didn't start the daemon. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
   exit 0
 fi
 
