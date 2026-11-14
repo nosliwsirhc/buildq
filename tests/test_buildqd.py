@@ -1479,6 +1479,12 @@ class SheddingMemory(DaemonCase):
         self.assertFalse(safe(["/usr/bin/time", "-f", "eslint", "bash", "deploy.sh"], scripts))  # -f's value isn't the tool
         self.assertFalse(buildqd.reusable_check(["/usr/bin/time", "-f", "eslint", "bash", "deploy.sh"]))
         self.assertFalse(safe(["nice", "-n", "5", "cargo", "test"]))  # (a wrapper given options: not read for certain)
+        for argv in (["env", "--split-string=bash deploy.sh", "cargo", "test"], ["env", "-Sbash deploy.sh", "cargo", "test"],
+                     ["env", "--split-string=bash deploy.sh", "bash", "wrap.sh"], ["sudo", "X-Y=./wrap.sh", "bash", "deploy.sh"]):
+            self.assertFalse(safe(argv, scripts), argv)  # an option with "=" in it isn't an assignment
+            self.assertFalse(buildqd.reusable_check(argv), argv)
+        self.assertTrue(safe(["env", "-u", "RUSTFLAGS", "cargo", "test"]))  # env's exact forms are read for certain
+        self.assertTrue(safe(["env", "-i", "PATH=/usr/bin", "cargo", "check"]))
         self.assertTrue(safe(["timeout", "1h", "cargo", "test"]))
         # history keys and lanes still read env's exact forms (a decision to restart or reuse never does)
         words = buildqd.command_words
@@ -3138,6 +3144,11 @@ class Cores(DaemonCase):
         with open(os.path.join(t.dir, "parallel.json")) as f:
             flags = json.load(f)["MAKEFLAGS"]
         self.assertEqual(flags, f"s -I a\\ -jx -j{t.want} --jobserver-auth=fifo:{t.jobserver}")
+
+    def test_a_wrapper_s_own_words_are_never_rewritten(self):
+        t = self.submit(("env", "-u", "-j", "make", "-j8"))  # unset a variable called -j, then run make -j8
+        self.assertIsNotNone(t.jobserver)
+        self.assertEqual(t.exec_argv, ["env", "-u", "-j", "make"])  # only make's own -j8 goes
 
     def test_a_fifo_jobserver_from_the_caller_is_kept(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})

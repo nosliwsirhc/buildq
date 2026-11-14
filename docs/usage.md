@@ -77,7 +77,9 @@ arguments name no path outside the tree:
   joiner's `--notify` runs when it ends;
 - is answered by an earlier pass within `reuse_window` (2 hours) if the command is a check: cargo
   check, clippy, test or `nextest run`, dotnet test, `tsc --noEmit`, eslint, `vitest run`, with no
-  `--fix`, `-u`, `--update-snapshots`, watch mode or `--no-run`. `run` prints that run's output
+  `--fix`, `-u`, `--update-snapshots`, watch mode or `--no-run`, run directly or behind a wrapper
+  buildq can read for certain (`env` with exact options, `timeout DURATION`, `nice`/`time` with no
+  options: behind `ionice -c3` or `nice -n 5`, say, it isn't). `run` prints that run's output
   and exits 0, and nothing runs. A build that makes files (cargo build, a bundle, docs) or a
   script runs again, with a note that it passed before: its output may have changed or gone since,
   and a script might do anything. `--reuse` takes the earlier pass for those too;

@@ -1226,6 +1226,33 @@ JOBSERVER_TOOLS = {"cargo", "make", "gmake", "ninja"}
 SAFE_WORD = re.compile(r"^@?[A-Za-z0-9_.,+:%/-]{1,64}$")  # "@scope/pkg" is an npm package, not an address
 
 
+def env_command(args: list[str]) -> list[str] | None:
+    """What `env ARGS` runs, read as GNU env reads it: its options first (up to `--` or the first
+    word that isn't one), then assignments (any word with "="), then the command. Only options whose
+    reading is exact are read: -i, -0, -v (grouped too), --ignore-environment, --null, --debug, a lone
+    `-`, and -u/-C with their value apart or attached (--unset=, --chdir=). None for any other
+    (grouped with a value, abbreviated, -a, -S/--split-string, even with "=" in it): the command can't
+    be told for certain."""
+    rest = list(args)
+    while rest and rest[0].startswith("-") and rest[0] != "-":
+        option = rest.pop(0)
+        if option == "--":
+            break
+        if option in ("--ignore-environment", "--null", "--debug") or re.fullmatch(r"-[i0v]+", option):
+            continue
+        if option in ("-u", "--unset", "-C", "--chdir") and rest:
+            rest.pop(0)  # its value, written apart
+            continue
+        if re.fullmatch(r"(-u|-C|--unset=|--chdir=).+", option):
+            continue  # its value, written with it
+        return None
+    if rest[:1] == ["-"]:  # (env - …: the same as -i)
+        rest = rest[1:]
+    while rest and "=" in rest[0]:  # GNU env takes any word with "=" for an assignment
+        rest = rest[1:]
+    return rest
+
+
 def strip_wrappers(argv: list[str]) -> list[str]:
     t = list(argv)
     while t:
@@ -1233,27 +1260,9 @@ def strip_wrappers(argv: list[str]) -> list[str]:
         if ASSIGNMENT.match(t[0]):
             t = t[1:]
         elif head == "env":
-            # As GNU env reads it: options up to `--` or the first word that isn't one, then
-            # assignments, then the command. Only options without a value are read through; any
-            # other (-u NAME, -C DIR, -a NAME, -S STRING, grouped or abbreviated) leaves env as the
-            # command, unread, rather than risk taking an option's value for it.
-            rest = t[1:]
-            while rest and rest[0].startswith("-") and rest[0] != "-":
-                option = rest.pop(0)
-                if option == "--":
-                    break
-                if option in ("--ignore-environment", "--null", "--debug") or re.fullmatch(r"-[i0v]+", option):
-                    continue
-                if option in ("-u", "--unset", "-C", "--chdir") and rest:
-                    rest.pop(0)  # its value, written apart
-                    continue
-                if re.fullmatch(r"(-u|-C|--unset=|--chdir=).+", option):
-                    continue  # its value, written with it
-                return t  # grouped (-iu), abbreviated (--un), -a, -S: leave env as the command, unread
-            if rest[:1] == ["-"]:  # (env - …: the same as -i)
-                rest = rest[1:]
-            while rest and "=" in rest[0]:  # GNU env takes any word with "=" for an assignment
-                rest = rest[1:]
+            rest = env_command(t[1:])
+            if rest is None:
+                return t  # env's command can't be told for certain: leave env as the command, unread
             t = rest
         elif head == "timeout":
             t = t[1:]
@@ -1492,11 +1501,11 @@ def plainly(argv: list[str]) -> list[str] | None:
         head = os.path.basename(t[0])
         if ASSIGNMENT.match(t[0]):
             t = t[1:]
+        elif "=" in t[0]:
+            return None  # not a shell assignment, and no command is named so: sudo 'X-Y=./wrap.sh' …
         elif head == "env":
-            t = t[1:]
-            while t and "=" in t[0]:  # GNU env takes any word with "=" for an assignment (X-Y=./wrap.sh)
-                t = t[1:]
-            if t[:1] and t[0].startswith("-"):
+            t = env_command(t[1:])  # (options first, as env reads them: `--split-string=…` is one)
+            if t is None:
                 return None
         elif head == "timeout":
             if len(t) < 3 or t[1].startswith("-"):
@@ -4616,7 +4625,8 @@ class Daemon:
                 t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
                 t.tokens_out = t.js.out
             if t.jobserver and tool in ("make", "gmake", "ninja") and asks_for_jobs(t.argv[1:]):
-                t.exec_argv = without_jobs(t.argv)  # its -j would make it ignore the jobserver
+                tool_at = len(t.argv) - len(strip_wrappers(t.argv))  # (a wrapper's own words stay: env -u -j make)
+                t.exec_argv = t.argv[:tool_at] + without_jobs(t.argv[tool_at:])  # its -j would make it ignore the jobserver
             # buildq's settings go in a file of their own, so a build that is queued again after a
             # restart gets fresh ones.
             ours = self.build_env(t)

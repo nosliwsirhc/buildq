@@ -54,7 +54,8 @@ build starts: CI jobs, containers, a session. With `shed_memory` on (the default
   512 MiB (if what holds the memory isn't buildq's, stopping small builds frees nothing). Memory
   held by builds still being stopped counts as freed, so one shortfall stops one build. A
   compile or test run (cargo, dotnet, tsc, eslint, vitest, ninja) or a build submitted with
-  `--restartable` (or run by a script listed in `restartable_scripts`) is queued again at the front and starts from the beginning once there is room;
+  `--restartable` (or run by a script listed in `restartable_scripts`; either way read for certain,
+  not behind a wrapper given options such as `ionice -c3`) is queued again at the front and starts from the beginning once there is room;
   a client following it keeps waiting and is told why. Anything else (a script, a push) fails,
   saying so, as starting it over might repeat what it had done.
 
