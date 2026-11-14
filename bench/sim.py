@@ -10,7 +10,7 @@ simplifications.
 
     sim.py run SCENARIO [--config FILE] [--buildqd FILE] [--json] [--jobs FILE]
     sim.py compare SCENARIO... [--base FILE] [--head FILE] [--base-config FILE] [--config FILE]
-    sim.py export --db metrics.db [--since T] [--until T] [--anonymize] > trace.jsonl
+    sim.py export --db metrics.db [--since T] [--until T] [--lead-in D] [--anonymize] > trace.jsonl
     sim.py scenarios
 
 A SCENARIO is a built-in name (bench/scenarios.py) or a trace file (.jsonl, one build per line).
@@ -207,6 +207,9 @@ class Simulation:
         machine = scenario["machine"]
         self.background_mem = machine.get("background_mem", 0)
         self.background_cpu = machine.get("background_cpu", 0.0)
+        # Other work over time, as recorded (a step a minute): [[seconds from the start, bytes, cores], …]
+        self.background = sorted(machine.get("background") or [], key=lambda b: b[0])
+        self.background_next = 0
         self.machine = Machine(int(machine["ncpu"]), int(machine["mem_total"]))
         self.jobs: dict[str, Job] = {}  # live attempts by ticket id
         self.specs: dict[str, dict] = {}  # ticket id -> its trace entry
@@ -296,8 +299,24 @@ class Simulation:
         record = {"name": msg["name"], "lane": None, "ci": bool(spec.get("ci")), "submitted": self.clock.now - EPOCH,
                   "first_start": None, "ended": None, "attempts": 0, "outcome": None, "peak": 0, "planned": 0}
         self.submitting = (spec, record)  # (the daemon may start it before submit returns)
-        t, error = self.daemon.submit(msg, self.clock.now)
-        self.submitting = None
+        aging = spec.get("submitted_at") is not None
+        if aging:
+            # A warm-up build is as old as it really was, from the daemon's first pass over it (the
+            # one in submit), as the daemon's own retry of a build is (`vacated`).
+            schedule = self.daemon.schedule
+            def aged(now, *args, **kwargs):
+                newest = next(reversed(self.daemon.tickets.values()))  # the one being submitted
+                newest.submitted = EPOCH + float(spec["submitted_at"])
+                return schedule(now, *args, **kwargs)
+            self.daemon.schedule = aged
+        try:
+            t, error = self.daemon.submit(msg, self.clock.now)
+        finally:
+            if aging:
+                self.daemon.schedule = schedule  # (the bound method: as it was)
+                if getattr(type(self.daemon), "schedule", None) is getattr(schedule, "__func__", None):
+                    del self.daemon.schedule
+            self.submitting = None
         if error:
             raise RuntimeError(f"submitting {spec.get('name') or spec['argv']}: {error}")
         self.specs.setdefault(t.id, spec)
@@ -368,10 +387,19 @@ class Simulation:
 
     # ---- the clock
 
+    def follow_background(self):
+        """Other work's memory and cores at this second: the last recorded step at or before it."""
+        now = self.clock.now - EPOCH
+        while self.background_next < len(self.background) and self.background[self.background_next][0] <= now:
+            _, mem, cores = self.background[self.background_next]
+            self.background_mem, self.background_cpu = int(mem), float(cores)
+            self.background_next += 1
+
     def step(self):
         """One simulated second of the machine. Builds use cores and memory; then the kernel's limits
         (a build over its lane's MemoryMax, then the machine out of memory: the largest goes), the
         supervisor's time limit, and last, the builds whose work is done end."""
+        self.follow_background()
         live = [j for j in self.jobs.values() if j.alive]
         cap = max(self.machine.ncpu - self.background_cpu, 1.0)
         demand = sum(j.wanted_cores() for j in live)
@@ -491,6 +519,10 @@ class Simulation:
                 continue
             rec["ended"] = (t.ended - EPOCH) if t.ended else None
             rec["outcome"] = t.state
+            queued_now = max(0.0, now - (t.queued_at or t.submitted)) if t.state == "queued" else 0.0
+            rec["waited"] = round(float(t.wait_total) + queued_now, 1)  # over all its attempts, as the database counts it
+            rec["recorded_wait"] = self.specs.get(t.id, {}).get("recorded_wait")  # what it really waited (a trace)
+            rec["warmup"] = bool(self.specs.get(t.id, {}).get("warmup"))  # in the machine before the window
             rec["requeues"] = t.requeues
             rec["ci_stops"] = getattr(t, "ci_stops", 0)
             rec["failed_stop"] = bool(t.shed_error)  # stopped for memory, and failed: it couldn't start over
@@ -555,6 +587,57 @@ def wait_stats(records: list[dict], end: float) -> dict:
     return {"builds": len(records), "p50": r(percentile(w, 0.5)), "p95": r(percentile(w, 0.95)), "max": r(max(w, default=None))}
 
 
+def ranks(values: list[float]) -> list[float]:
+    """Each value's rank (1 = the smallest), ties sharing the mean of theirs."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    out = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            out[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return out
+
+
+def rank_correlation(a: list[float], b: list[float]) -> float | None:
+    """Spearman's: 1 when the replay puts the builds in the order of their real waits, 0 when it
+    says nothing about it. None for fewer than three, or when either side is all the same."""
+    if len(a) < 3:
+        return None
+    ra, rb = ranks(a), ranks(b)
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va, vb = sum((x - ma) ** 2 for x in ra), sum((y - mb) ** 2 for y in rb)
+    return round(cov / math.sqrt(va * vb), 2) if va and vb else None
+
+
+def against_recorded(records: list[dict]) -> dict:
+    """A trace's replay beside what really happened to the same builds: their waits (over all their
+    attempts) in total, at the median and the 90th percentile, how far off the replay is per build
+    on average, and whether it puts them in the same order. Built-in scenarios have no record, and
+    the builds already in the machine as the window began (warmup) aren't compared: what they had
+    waited before it was the night before's doing."""
+    out = {}
+    for group, pick in (("ci", lambda r: r["ci"]), ("agent", lambda r: not r["ci"])):
+        pairs = [(float(r["recorded_wait"]), float(r["waited"])) for r in records
+                 if pick(r) and not r.get("warmup") and r.get("recorded_wait") is not None
+                 and r.get("waited") is not None]
+        if not pairs:
+            continue
+        real, replay = [p[0] for p in pairs], [p[1] for p in pairs]
+        r = lambda v: None if v is None else round(v, 1)  # noqa: E731
+        out[group] = {"builds": len(pairs),
+                      "total_min": [r(sum(real) / 60), r(sum(replay) / 60)],
+                      "p50": [r(percentile(real, 0.5)), r(percentile(replay, 0.5))],
+                      "p90": [r(percentile(real, 0.9)), r(percentile(replay, 0.9))],
+                      "mean_error_s": r(sum(abs(x - y) for x, y in pairs) / len(pairs)),
+                      "rank_correlation": rank_correlation(real, replay)}
+    return out
+
+
 def summarize(sim: Simulation, seconds: int) -> dict:
     records = list(sim.records.values())
     end = float(seconds)
@@ -595,6 +678,7 @@ def summarize(sim: Simulation, seconds: int) -> dict:
         "released_after_peak": sum(1 for r in records if r.get("released")),
         "planned_over_peak": {"median": None if not ratios else round(percentile(ratios, 0.5), 2),
                               "under_planned": len(under)},
+        "against_recorded": against_recorded(records),  # (recorded, replayed) pairs; empty for a built-in scenario
     }
 
 
@@ -621,6 +705,12 @@ def table(summary: dict) -> str:
              ("planned / peak (median), under-planned", f"{summary['planned_over_peak']['median']}, "
                                                         f"{summary['planned_over_peak']['under_planned']}"),
              ("outcomes", ", ".join(f"{k} {v}" for k, v in summary["outcomes"].items()))]
+    for group, a in summary.get("against_recorded", {}).items():
+        rows.append((f"{group} wait, recorded / replayed ({a['builds']})",
+                     f"total {fmt_s(a['total_min'][0] * 60)} / {fmt_s(a['total_min'][1] * 60)}, "
+                     f"p50 {fmt_s(a['p50'][0])} / {fmt_s(a['p50'][1])}, p90 {fmt_s(a['p90'][0])} / {fmt_s(a['p90'][1])}"))
+        rows.append((f"{group} wait, off per build / rank correlation",
+                     f"{fmt_s(a['mean_error_s'])} / {'-' if a['rank_correlation'] is None else a['rank_correlation']}"))
     width = max(len(k) for k, _ in rows)
     return "\n".join(f"{k:<{width}}  {v}" for k, v in rows)
 
@@ -638,21 +728,33 @@ def fmt_s(seconds) -> str:
 
 # ---- running
 
-def load_scenario(name: str, seed_history: bool = False) -> dict:
+def load_scenario(name: str, seed_history: bool = False, background: bool = True) -> dict:
     """A built-in scenario, or a trace file. A trace starts with no history (every build planned at its
-    lane's default) unless seed_history gives each command three earlier runs of its own size."""
+    lane's default) unless seed_history gives each command three earlier runs of its own size; and
+    replays the other work its machine recorded each minute, or with background=False, the built-in
+    scenarios' fixed amount (to see what the recorded minutes change)."""
     if name in builtin.SCENARIOS:
         return builtin.SCENARIOS[name]()
-    jobs = []
+    jobs, machine = [], dict(builtin.WORKSTATION)
     with open(name) as f:
         for line in f:
-            if line.strip():
-                jobs.append(json.loads(line))
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if "background" in entry or "machine" in entry:  # the machine the trace ran on (export's first line)
+                machine.update(entry.get("machine") or {})
+                if entry.get("background") and background:
+                    machine["background"] = entry["background"]
+                continue
+            jobs.append(entry)
     first = min((float(j["t"]) for j in jobs), default=0.0)
     for j in jobs:
         j["t"] = float(j["t"]) - first
-    return {"name": os.path.basename(name), "machine": dict(builtin.WORKSTATION), "jobs": jobs,
-            "seed_history": seed_history}
+        if j.get("submitted_at") is not None:
+            j["submitted_at"] = float(j["submitted_at"]) - first
+    if machine.get("background"):
+        machine["background"] = [[float(t) - first, mem, cores] for t, mem, cores in machine["background"]]
+    return {"name": os.path.basename(name), "machine": machine, "jobs": jobs, "seed_history": seed_history}
 
 
 def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim", keep: str | None = None) -> tuple[dict, Simulation]:
@@ -669,7 +771,7 @@ def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim
 
 
 def cmd_run(args) -> int:
-    scenario = load_scenario(args.scenario, args.seed_history)
+    scenario = load_scenario(args.scenario, args.seed_history, background=not args.no_background)
     summary, sim = simulate(scenario, args.config, args.buildqd)
     if args.jobs:
         with open(args.jobs, "w") as f:
@@ -785,30 +887,133 @@ def hashed(prefix: str, word: str) -> str:
 # everywhere, which the lane rules and restart_safe read. Anything else (a script, a package, a
 # test filter) is hashed.
 PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
-    vitest tsc typecheck unittest pytest discover buildx compose image make ninja""".split())
+    vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t""".split())
 # Tools an anonymized trace names (a command's first word); any other first word is hashed.
-PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node vite vitest tsc vue-tsc eslint
-    playwright storybook python python3 pytest uv dotnet make gmake ninja cmake docker podman buildah bash sh
-    git go gradle mvn java""".split())
+# (The daemon's shells and interpreters are among them: honors_grant and the lane rules read the tool.)
+PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
+    eslint playwright storybook python python3 pytest py.test uv dotnet msbuild make gmake ninja cmake docker
+    podman buildah bash sh zsh dash ksh fish ruby perl git go gradle mvn java""".split())
+PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?")  # versioned Pythons
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 
-def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
+PLAIN_OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # an option's name and nothing else
+
+
+# What an anonymized trace keeps of a command is what the replay needs, and no more: the tool if it
+# is a public one, the subcommands it starts with (the lane rules and restart_safe read them), short
+# options and the long ones below (common build and test flags), counts and cargo's built-in
+# profiles. Every other word is hashed: any other option's name (keeping its dashes, so it still reads
+# as an option), any option's value and any word after the first option, numbers and common words
+# too, since a value can be a password or a package called "test" whatever it looks like, and a value
+# can look like an option (pnpm --filter --internal-client). (The Parallel Workloads Archive's format
+# keeps even less: a number per application.)
+PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches --examples --all-targets
+    --workspace --all-features --no-default-features --features --package --no-run --no-fail-fast --locked
+    --offline --frozen --jobs --load-average --test-threads --filter --recursive --noEmit --watch --run
+    --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard
+    --doc""".split())
+COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
+KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
+TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test
+
+
+def option_value(name: str, value: str) -> str:
+    """An option's value as an anonymized trace keeps it: hashed unless it is a count of a count
+    option or one of the option's known values."""
+    if (name in COUNT_OPTIONS and value.isdigit()) or value in KNOWN_VALUES.get(name, ()):
+        return value
+    return hashed("w", value) if value else ""
+
+
+def option_name(name: str) -> str:
+    """An option's name as an anonymized trace keeps it: a short one (-p) or a public long one as it
+    is; any other hashed behind its dashes (--o3f2a1b), so it still reads as an option."""
+    if (len(name) == 2 and PLAIN_OPTION.fullmatch(name)) or name in PUBLIC_OPTIONS:
+        return name
+    return ("--" if name.startswith("--") else "-") + hashed("o", name)
+
+
+def anonymous_option(word: str) -> str:
+    """An option as an anonymized trace keeps it: its name as option_name keeps it, and its value
+    (after "=", or run on to a short option) as option_value keeps it."""
+    if word in ("-", "--"):
+        return word
+    name, eq, value = word.partition("=")
+    if eq:
+        return option_name(name) + "=" + option_value(name, value) if PLAIN_OPTION.fullmatch(name) else hashed("w", word)
+    if word.startswith("--") or len(word) == 2:
+        return option_name(word) if PLAIN_OPTION.fullmatch(word) else hashed("w", word)
+    if PLAIN_OPTION.fullmatch(word[:2]):
+        return word[:2] + option_value(word[:2], word[2:])  # -j8; -C/a/b, -xvf: the rest hashed
+    return hashed("w", word)
+
+
+def anonymous_argv(argv: list[str]) -> list[str]:
+    """A command as an anonymized trace keeps it (see above): `cargo test -p test` becomes
+    `cargo test -p w9f86d0`; `python3 -m unittest discover -s tests` keeps all but `tests`."""
+    if not argv:
+        return []
+    python = bool(re.fullmatch(r"python[0-9.]*", os.path.basename(argv[0])))
+    out = [argv[0] if argv[0] in PUBLIC_TOOLS or PUBLIC_TOOL.fullmatch(argv[0]) else hashed("w", argv[0])]
+    leading = True  # still among the subcommands it starts with
+    for before, word in zip(argv, argv[1:]):
+        if leading and (word in TOOLCHAINS or (python and word == "-m")):
+            out.append(word)
+        elif word.startswith("-"):
+            leading = False
+            out.append(anonymous_option(word))
+        elif leading and word in PUBLIC_WORDS:
+            out.append(word)
+        else:
+            leading = False
+            keep = (before in COUNT_OPTIONS and word.isdigit()) or word in KNOWN_VALUES.get(before, ())
+            out.append(word if keep else hashed("w", word))
+    return out
+
+
+def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool,
+                lead_in: float = 0.0) -> list[dict]:
+    return export_builds(db, since, until, anonymize, lead_in)[0]
+
+
+def export_builds(db: sqlite3.Connection, since: float | None, until: float | None,
+                  anonymize: bool, lead_in: float = 0.0) -> tuple[list[dict], float | None, float | None]:
+    """The trace's builds, and when (in the database's time) its first came in and its last ended.
+    From `since`, these are the builds submitted then or later, and the ones still queued or running
+    as it began (marked warmup). The builds that held those up before the window aren't in it, so a
+    warm-up build enters the replay as it really started if it was running then, else as the window
+    begins; either way with its real submission time (submitted_at), so its age and its cancel are
+    as they were. A lead-in (seconds) starts the trace that much earlier, the usual way to warm a
+    replay up: the builds submitted in it replay as they came in, marked warmup too, and the queue
+    the window begins with is the replay's own."""
+    begins = since - lead_in if since is not None else None  # where the trace starts
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
     query = "SELECT * FROM build WHERE (wall > 0 OR state = 'cancelled') AND submitted IS NOT NULL"
     params: list = []
-    if since is not None:
-        query += " AND submitted >= ?"
-        params.append(since)
+    if begins is not None:
+        query += " AND (submitted >= ? OR ended > ?)"
+        params += [begins, begins]
     if until is not None:
         query += " AND submitted < ?"
         params.append(until)
     rows = [dict(r) for r in db.execute(query + " ORDER BY submitted, id", params)]
     if not rows:
-        return []
-    first = rows[0]["submitted"]
-    out = []
+        return [], None, None
+    def enters(r: dict) -> float:
+        """When a build comes into the replay (see above)."""
+        submitted = float(r["submitted"])
+        if begins is None or submitted >= begins:
+            return submitted
+        attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
+        # A last attempt that never ran (0) stays 0; an older database without the column has every
+        # attempt's time, so the build starts earlier than it did.
+        ran = float(attempt) if attempt is not None else float(r.get("wall") or 0)
+        start = float(r["ended"]) - ran if r.get("ended") is not None and ran > 0 else None
+        return max(submitted, start) if start is not None and start <= begins else begins
+
+    out: list[tuple[float, dict]] = []
     def shape(r: dict) -> dict | None:
         """What one whole run of a row's command looked like (wall, cores, peak, profile), or None if
         its last attempt never ran. wall counts every attempt; the profile and avg_cores describe the
@@ -831,6 +1036,12 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
 
     # A whole run of each command that succeeded: what a cancelled build of it would have done (#40).
     whole = {r.get("key"): shape(r) for r in rows if r.get("state") == "succeeded" and shape(r)}
+    starts = begins if begins is not None else float(rows[0]["submitted"])  # the trace's start
+    for key in {r.get("key") for r in rows if r.get("state") == "cancelled"} - set(whole):
+        before = db.execute("SELECT * FROM build WHERE key = ? AND state = 'succeeded' AND wall > 0 AND ended <= ? "
+                            "ORDER BY ended DESC LIMIT 1", (key, starts)).fetchone()  # (from before the trace)
+        if before is not None and shape(dict(before)):
+            whole[key] = shape(dict(before))
     for r in rows:
         repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
         argv = words.split() or ["build"]
@@ -848,7 +1059,7 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
         if cancelled and run is whole.get(r.get("key")):
             exit_code = 0  # it would have run as that whole run did; its cancel ends it (cancel_at)
         unfinished = cancelled and run is not whole.get(r.get("key"))  # only as far as it got: never ends by itself
-        entry = {"t": round(float(r["submitted"]) - first, 1), "repo": repo or "project", "lane": lane or None,
+        entry = {"t": enters(r), "repo": repo or "project", "lane": lane or None,
                  "argv": argv, "ci": bool(r.get("from_ci")), "caller": caller, "wall": round(wall, 1),
                  "avg_cores": round(float(avg), 2), "peak_mem": int(run["peak"]), "exit": exit_code,
                  "state": state or None}
@@ -864,18 +1075,35 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
             entry["workspace"] = str(r["workspace"])  # (older databases don't say; repo may be its source, not it)
         if r.get("name"):
             entry["name"] = r["name"]
+        if r.get("waited") is not None:
+            entry["recorded_wait"] = round(float(r["waited"]), 1)  # what it really waited (all its attempts)
+        if r.get("from_ci") and state in ("succeeded", "failed") and r.get("ended") is not None:
+            took = float(r["ended"]) - float(r["submitted"])
+            if took + 60 > DEFAULT_TIMEOUT:  # it ran to its end past the default: its job's limit was longer
+                entry["timeout_s"] = round(took + 60)
+        if since is not None and float(r["submitted"]) < since:
+            entry["warmup"] = True  # in the machine before the window: there for the others, not compared
+            if float(r["submitted"]) < begins:
+                entry["submitted_at"] = float(r["submitted"])  # (its age, and when its cancel_at counts from)
         if anonymize:
             entry["repo"] = hashed("r", entry["repo"])
             entry["caller"] = hashed("c", caller)
-            entry["argv"] = [w if (w in PUBLIC_TOOLS if i == 0 else w.startswith("-") or w in PUBLIC_WORDS)
-                             else hashed("w", w) for i, w in enumerate(argv)]
+            entry["argv"] = anonymous_argv(argv)
             if entry["lane"] and entry["lane"] not in PUBLIC_LANES:
                 entry["lane"] = hashed("l", entry["lane"])
             if "workspace" in entry:
                 entry["workspace"] = hashed("s", entry["workspace"])
             entry.pop("name", None)
-        out.append(entry)
-    return out
+        out.append((entry["t"], entry))
+    if not out:
+        return [], None, None
+    first = min(at for at, _ in out)
+    for at, entry in out:
+        entry["t"] = round(at - first, 1)
+        if "submitted_at" in entry:
+            entry["submitted_at"] = round(entry["submitted_at"] - first, 1)
+    ends = [float(r["ended"]) for r in rows if r.get("ended") is not None]
+    return [entry for _, entry in out], float(first), max(ends, default=None)
 
 
 def parse_when(value: str | None) -> float | None:
@@ -887,10 +1115,93 @@ def parse_when(value: str | None) -> float | None:
         return real_time.mktime(real_time.strptime(value, "%Y-%m-%dT%H:%M"))
 
 
+def export_machine(db: sqlite3.Connection, since: float | None, until: float | None, zero: float,
+                   notes: list[str] | None = None) -> dict | None:
+    """The machine a trace ran on, from the analytics' minute rows: its cores and memory, and other
+    work's (everything but buildq's builds: CI runners, containers, sessions) memory and cores each
+    minute, as [seconds from the trace's start, bytes, cores]. None without minute rows.
+
+    Other work's memory is the memory in use, on average over the minute, less the builds' own over
+    the same minute: their average where the database has it (builds_mem_avg), otherwise the mean of
+    the readings as the minute began and as it ended (builds_mem is one reading, taken as a minute
+    ends: the one as it began is the row before's). A minute that can't say what the builds used
+    (rows from before the builds' columns, the first after a restart) is left out, and the one before
+    it holds; so is a gap in the rows. Each of these, and a window the rows don't reach, adds a line
+    to notes."""
+    notes = notes if notes is not None else []
+    cols = {r[1] for r in db.execute("PRAGMA table_info(minute)")}
+    if not {"t", "mem_total", "mem_available", "builds_mem", "cpu_busy", "builds_cores"} <= cols:
+        notes.append("the analytics' minute rows don't say what the builds used: the replay has the built-in background")
+        return None
+    average = "builds_mem_avg" if "builds_mem_avg" in cols else "NULL"
+    query = (f"SELECT t, cores, mem_total, mem_available, builds_mem, {average}, cpu_busy, builds_cores "
+             "FROM minute WHERE 1=1")
+    params: list = []
+    if since is not None:
+        query += " AND t >= ?"
+        params.append(since - 120)  # the minute holding `since` and the row before it (its reading starts it)
+    if until is not None:
+        query += " AND t < ?"
+        params.append(until)
+    rows = db.execute(query + " ORDER BY t", params).fetchall()
+    background, before, unknown, gaps, machine = [], None, 0, 0, None
+    for t, cores, total, available, end_mem, avg_mem, busy, builds_cores in rows:
+        t = float(t)
+        previous, before = before, (t, end_mem)
+        if since is not None and t < since - 60:
+            continue  # (only the reading it ended with is wanted, for the next minute)
+        if total is not None and cores is not None:
+            machine = {"ncpu": int(cores), "mem_total": int(total)}
+        if avg_mem is not None:
+            builds = float(avg_mem)
+        elif end_mem is not None and previous is not None and previous[0] == t - 60 and previous[1] is not None:
+            builds = (float(previous[1]) + float(end_mem)) / 2
+        else:
+            builds = None
+        if None in (total, available, busy, builds_cores) or builds is None:
+            unknown += 1
+            continue
+        if background and t - zero - background[-1][0] > 300:
+            gaps += 1
+        mem = max(0, int(total) - int(available) - int(builds))
+        cpu = max(0.0, float(busy) - float(builds_cores))
+        background.append([round(t - zero, 1), mem, round(cpu, 2)])
+    if not background or machine is None:
+        notes.append("no minute rows say what other work used in this window (they are kept 14 days): "
+                     "the replay has the built-in background")
+        return None
+    if unknown:
+        notes.append(f"{unknown} minute(s) don't say what the builds used (from before the database had "
+                     "the columns, or just after a restart): the minute before each holds")
+    if gaps:
+        notes.append(f"{gaps} gap(s) of more than five minutes in the minute rows (the daemon was down?): "
+                     "the minute before each holds")
+    if background[0][0] > 120:
+        notes.append(f"the minute rows begin {fmt_s(background[0][0])} after the first build: until then "
+                     "the replay has the built-in background")
+    return {"machine": machine, "background": background}
+
+
 def cmd_export(args) -> int:
+    if args.lead_in and args.since is None:
+        print("sim.py export: --lead-in starts the trace before --since; give --since too", file=sys.stderr)
+        return 2
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     try:
-        for entry in export_rows(db, parse_when(args.since), parse_when(args.until), args.anonymize):
+        since, until = parse_when(args.since), parse_when(args.until)
+        lead_in = load_buildqd(DEFAULT_BUILDQD, "buildqd_durations").parse_duration(args.lead_in) if args.lead_in else 0.0
+        rows, first, last_end = export_builds(db, since, until, args.anonymize, lead_in)
+        notes: list[str] = []
+        machine = None
+        if rows:
+            # Other work from the first build's minute to an hour after the last ended: a replay
+            # that runs longer than the night did still has what came next.
+            machine = export_machine(db, first, last_end + 3600 if last_end is not None else None, first, notes)
+        for note in notes:
+            print(f"sim.py export: {note}", file=sys.stderr)
+        if machine:
+            print(json.dumps(machine, sort_keys=True))
+        for entry in rows:
             print(json.dumps(entry, sort_keys=True))
     finally:
         db.close()
@@ -908,6 +1219,8 @@ def main(argv=None) -> int:
     r.add_argument("--jobs", help="write what happened to each build here (JSONL)")
     r.add_argument("--log", help="write the daemon's log here")
     r.add_argument("--seed-history", action="store_true", help="a trace's commands start with a history of their size")
+    r.add_argument("--no-background", action="store_true",
+                   help="replay a trace with the built-in fixed background, not the minutes it recorded")
     c = sub.add_parser("compare", help="replay scenarios with two daemons (or two configs) and compare")
     c.add_argument("scenario", nargs="*")
     c.add_argument("--base", default=DEFAULT_BUILDQD)
@@ -925,7 +1238,10 @@ def main(argv=None) -> int:
     e.add_argument("--db", required=True)
     e.add_argument("--since", help="epoch seconds, or YYYY-MM-DDTHH:MM local time")
     e.add_argument("--until")
-    e.add_argument("--anonymize", action="store_true", help="hash repository names, callers and package words")
+    e.add_argument("--anonymize", action="store_true",
+                   help="hash names (repositories, callers, workspaces) and every word of a command the replay doesn't need")
+    e.add_argument("--lead-in", help="start the trace this long before --since (1h, 30m), its builds marked "
+                                     "warmup: the replay builds the queue the window begins with")
     sub.add_parser("scenarios", help="list the built-in scenarios")
     args = p.parse_args(argv)
     return {"run": cmd_run, "compare": cmd_compare, "check": cmd_check, "export": cmd_export,

@@ -2126,6 +2126,7 @@ METRIC_COLUMNS = [
     ("running", "REAL", "AVG"), ("running_max", "INTEGER", "MAX"),
     ("queued", "REAL", "AVG"), ("queued_max", "INTEGER", "MAX"),
     ("reserved", "INTEGER", "AVG"),  # the running builds' expected peaks, together
+    ("builds_mem_avg", "INTEGER", "AVG"),  # what they used, read each second (builds_mem: once, as the minute ends)
     ("growth", "INTEGER", "AVG"),  # what is held for them to grow into
     ("free_mem", "INTEGER", "AVG"), ("free_mem_min", "INTEGER", "MIN"),  # room for new builds
     ("free_cpu", "REAL", "AVG"),
@@ -2137,7 +2138,8 @@ METRIC_COLUMNS = [
     ("free_mem_mem_wait", "INTEGER", "WAVG:mem_wait_seconds"),  # memory above the floor
     ("growth_mem_wait", "INTEGER", "WAVG:mem_wait_seconds"),  # held for running builds to grow into
     # Who used the machine: buildq's builds, CI runners, containers, the user's apps (sessions,
-    # editors; CI runners in app.slice not counted twice), and the rest. Cores are averages.
+    # editors; CI runners in app.slice not counted twice), and the rest. Cores are averages; memory
+    # is one reading, taken as the minute ends (builds_mem_avg above is the builds' average).
     ("builds_cores", "REAL", "AVG"), ("builds_mem", "INTEGER", "AVG"),
     ("ci_cores", "REAL", "AVG"), ("ci_mem", "INTEGER", "AVG"),
     ("containers_cores", "REAL", "AVG"), ("containers_mem", "INTEGER", "AVG"),
@@ -5219,7 +5221,8 @@ class Daemon:
             "mem_total": m.mem_total, "mem_floor": cfg.mem_floor, "mem_available": m.mem_available,
             "swap_used": m.swap_used, "psi_cpu": m.psi_cpu, "psi_mem": m.psi_mem,
             "running": len(self.active()), "queued": len(queued),
-            "reserved": sum(t.est_mem for t in running), "growth": budget.get("growth_reserved", 0),
+            "reserved": sum(t.est_mem for t in running), "builds_mem_avg": sum(t.mem_now for t in running),
+            "growth": budget.get("growth_reserved", 0),
             "free_mem": budget.get("free_mem", 0), "free_cpu": budget.get("free_cores", 0),
         }
         values.update({name: waits.get(name, 0) for name in WAIT_COLUMNS})

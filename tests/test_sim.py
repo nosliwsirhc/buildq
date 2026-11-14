@@ -300,6 +300,142 @@ class Export(SimCase):
         self.assertEqual((out[2]["exit"], out[2]["state"], out[2]["requeued"]), (1, "cancelled", 2))
         self.assertNotIn("profile", out[2])
 
+    def test_a_window_starts_with_the_builds_already_in_the_machine(self):
+        # 'a' (900-1000) was running at 990: it enters as it started. 'b' (960, ran 1880-2000) was
+        # queued: it enters as the window begins. Both keep their real submission.
+        out = sim.export_rows(self.metrics(), 990, None, anonymize=False)
+        self.assertEqual([e["t"] for e in out], [0.0, 90.0, 100.0, 110.0, 120.0])
+        self.assertEqual([e.get("warmup", False) for e in out], [True, True, False, False, False])
+        self.assertEqual([e.get("submitted_at") for e in out[:3]], [0.0, 60.0, None])
+        self.assertEqual(len(sim.export_rows(self.metrics(), 1000, None, anonymize=False)), 4)  # 'a' had ended
+
+    def test_a_window_replays_the_wait_its_builds_had_behind_one_already_running(self):
+        # A (10000-11000) held workspace w; B, submitted at 10100, waited for it and ran 11000-12000;
+        # C came in at 11500 and waited 500s for B. From 11500, A is gone, but B enters as it really
+        # started, so C waits as long. D was cancelled while queued; the only whole run of its command
+        # (A) ended before the window, and is what it replays as.
+        buildqd = load("buildqd_for_window", BUILDQD)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        rows = [("a", 10000, 11000, 1000.0, "succeeded", "app|heavy|cargo test -p a", "w", 0.0),
+                ("b", 10100, 12000, 1000.0, "succeeded", "app|heavy|cargo test -p b", "w", 900.0),
+                ("c", 11500, 12100, 100.0, "succeeded", "app|heavy|cargo test -p c", "w", 500.0),
+                ("d", 11400, 11600, 0.0, "cancelled", "app|heavy|cargo test -p a", None, 200.0),
+                ("e", 19000, 22000, 3000.0, "succeeded", "app|heavy|cargo test -p a", None, 0.0)]  # after --until
+        db.executemany("INSERT INTO build (id, submitted, ended, wall, attempt_wall, state, key, lane, workspace, "
+                       "waited, mem_peak, avg_cores, exit) VALUES (?,?,?,?,?,?,?,'heavy',?,?,?,1.0,0)",
+                       [(i, s, e, w, w, st, k, ws, wt, GIB) for i, s, e, w, st, k, ws, wt in rows])
+        out = sim.export_rows(db, 11500, 13000, anonymize=False)
+        self.assertEqual([(e["t"], e.get("submitted_at"), e.get("warmup", False)) for e in out],
+                         [(0.0, -900.0, True), (500.0, 400.0, True), (500.0, None, False)])  # b, d, c
+        d = out[1]
+        self.assertEqual((d["wall"], d["cancel_at"]), (1000.0, 200.0))  # A's run (not e's, after), cancelled 200s in
+        path = os.path.join(self.tmp.name, "window.jsonl")
+        with open(path, "w") as f:
+            for entry in out:
+                f.write(json.dumps(entry) + "\n")
+        summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_window")
+        agent = summary["against_recorded"]["agent"]
+        self.assertEqual(agent["builds"], 1)  # c alone: b and d are warm-up
+        self.assertAlmostEqual(agent["p50"][1], 500.0, delta=15)  # it waited for b, as it did
+        self.assertEqual(summary["cancelled_as_in_trace"], 1)
+        # With a lead-in, A replays too and B waits for it in the replay: C still waits 500s.
+        out = sim.export_rows(db, 11500, 13000, anonymize=False, lead_in=1000)
+        self.assertEqual([(e["t"], e.get("submitted_at"), e.get("warmup", False)) for e in out],
+                         [(0.0, 0.0, True), (500.0, 100.0, True), (1400.0, None, True), (1500.0, None, False)])
+        with open(path, "w") as f:
+            for entry in out:
+                f.write(json.dumps(entry) + "\n")
+        summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_lead_in")
+        self.assertAlmostEqual(summary["against_recorded"]["agent"]["p50"][1], 500.0, delta=15)
+
+    def test_a_last_attempt_that_never_ran_is_placed_as_queued(self):
+        # Requeued, then cancelled while queued again (attempt_wall 0): it was queued when the window
+        # began, whatever its earlier attempts took, so it enters then and holds w as its whole run
+        # does; the build submitted at 5000 waits for it, as it did.
+        buildqd = load("buildqd_for_attempt", BUILDQD)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.executemany("INSERT INTO build (id, submitted, ended, wall, attempt_wall, state, key, lane, workspace, "
+                       "waited, requeues, mem_peak, avg_cores, exit) VALUES (?,?,?,?,?,?,?,'heavy','w',?,?,?,1.0,?)",
+                       [("run", 0, 1000, 1000.0, 1000.0, "succeeded", "app|heavy|cargo test", 0.0, 0, GIB, 0),
+                        ("x", 1000, 6000, 3000.0, 0.0, "cancelled", "app|heavy|cargo test", 2000.0, 1, GIB, None),
+                        ("m", 5000, 7100, 100.0, 100.0, "succeeded", "app|heavy|cargo check", 1000.0, 0, GIB, 0)])
+        out = sim.export_rows(db, 5000, None, anonymize=False)
+        self.assertEqual([(e["t"], e.get("submitted_at")) for e in out], [(0.0, -4000.0), (0.0, None)])
+        path = os.path.join(self.tmp.name, "attempt.jsonl")
+        with open(path, "w") as f:
+            for entry in out:
+                f.write(json.dumps(entry) + "\n")
+        summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_attempt")
+        self.assertAlmostEqual(summary["against_recorded"]["agent"]["p50"][1], 1000.0, delta=15)
+
+    def test_a_warm_up_build_is_as_old_as_it_was_from_the_daemon_s_first_pass(self):
+        state = os.path.join(self.tmp.name, "aged")
+        os.makedirs(state)
+        s = sim.Simulation(scenario([]), CONFIG, BUILDQD, state, name="buildqd_aged")
+        seen = []
+        schedule = s.daemon.schedule
+        s.daemon.schedule = lambda now, *a, **k: (seen.append(next(reversed(s.daemon.tickets.values())).submitted),
+                                                  schedule(now, *a, **k))[1]
+        s.submit(dict(scenarios.build(0, ("cargo", "test"), 1, 60, 1, repo="app"), submitted_at=-2000.0), 0)
+        self.assertEqual(seen, [sim.EPOCH - 2000])  # the pass in submit saw its real age
+        self.assertEqual(s.daemon.schedule.__name__, "<lambda>")  # (what was there before is back)
+
+    def test_a_ci_build_that_ran_past_the_default_limit_keeps_its_longer_one(self):
+        buildqd = load("buildqd_for_limit", BUILDQD)
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.executemany("INSERT INTO build (id, submitted, ended, wall, state, key, lane, from_ci, mem_peak, exit) "
+                       "VALUES (?,?,?,?,?,'app|heavy|cargo test','heavy',1,?,0)",
+                       [("long", 0, 4000, 1000.0, "succeeded", GIB), ("short", 100, 700, 600.0, "succeeded", GIB)])
+        out = sim.export_rows(db, None, None, anonymize=False)
+        self.assertEqual([e.get("timeout_s") for e in out], [4060, None])
+        args = sim.argparse.Namespace(db=":memory:", since=None, until=None, anonymize=False, lead_in="1h")
+        err = io.StringIO()
+        with unittest.mock.patch("sys.stderr", err):
+            self.assertEqual(sim.cmd_export(args), 2)  # a lead-in needs a window to lead into
+        self.assertIn("--since", err.getvalue())
+
+    def test_anonymizing_keeps_everything_the_replay_reads(self):
+        # Kept in step with the daemon, so the lists can't drift apart: the flags command_words keeps
+        # in a history key, the tools honors_grant and the lane rules read, the subcommands
+        # restart_safe reads (cargo's short forms too).
+        buildqd = load("buildqd_for_public", BUILDQD)
+        for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
+                     "--filter", "-p", "-F"):
+            self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
+        tools = buildqd.SHELLS | buildqd.INTERPRETERS | sim.Simulation.GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        for tool in sorted(tools):
+            self.assertEqual(sim.anonymous_argv([tool])[0], tool)
+        for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):
+            self.assertEqual(sim.anonymous_argv(argv), argv)
+            self.assertEqual(buildqd.restart_safe(sim.anonymous_argv(argv)), buildqd.restart_safe(argv))
+        key = lambda argv: buildqd.command_words(sim.anonymous_argv(argv))  # noqa: E731
+        self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
+
+    def test_an_option_like_value_doesn_t_survive_from_the_database_to_the_trace(self):
+        # pnpm --filter=--internal-client test, as its history key keeps it (#46 round 4)
+        db = self.metrics()
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, mem_peak, state, exit, requeues) "
+                   "VALUES ('f', 1500, 1400, 'secretrepo|web|pnpm --filter --internal-client test', 'web', "
+                   "60.0, 1, 'succeeded', 0, 0)")
+        out = sim.export_rows(db, None, None, anonymize=True)
+        self.assertNotIn("internal-client", json.dumps(out))
+        f = next(e for e in out if e["t"] == 500.0)
+        self.assertEqual(f["argv"][:2], ["pnpm", "--filter"])
+
+    def test_a_cancelled_build_never_takes_a_run_from_after_the_trace(self):
+        db = self.metrics()  # 'c' (submitted 1000, cancelled) has no other run of its command
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, attempt_wall, mem_peak, state, exit) "
+                   "VALUES ('late', 9000, 5000, 'secretrepo|heavy|python3 private_script.py', 'heavy', 4000.0, "
+                   "4000.0, 1, 'succeeded', 0)")
+        c = next(e for e in sim.export_rows(db, None, 1050, anonymize=False) if e["t"] == 100.0)
+        self.assertNotEqual(c["wall"], 4000.0)  # not the run after --until
+
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
         text = json.dumps(out)
@@ -390,6 +526,140 @@ class Export(SimCase):
         summary, s = sim.simulate(scenario([job]), CONFIG, BUILDQD, name="buildqd_cancel")
         self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
         self.assertAlmostEqual(summary["makespan_s"], 120, delta=5)
+
+    def minutes(self, rows, average=False):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.execute("CREATE TABLE minute (t INTEGER, cores INTEGER, mem_total INTEGER, mem_available INTEGER, "
+                   "builds_mem INTEGER, cpu_busy REAL, builds_cores REAL"
+                   + (", builds_mem_avg INTEGER)" if average else ")"))
+        width = 8 if average else 7
+        db.executemany(f"INSERT INTO minute VALUES ({','.join('?' * width)})", rows)
+        return db
+
+    def test_other_work_s_memory_comes_from_the_minute_rows(self):
+        # builds_mem_avg: the builds' own average over the minute, set against the machine's
+        db = self.minutes([(960, 32, 125 * GIB, 100 * GIB, 0, 6.0, 4.0, 5 * GIB),       # others: 20G, 2 cores
+                           (1020, 32, 125 * GIB, 60 * GIB, 0, 20.0, 8.0, 15 * GIB)],    # others: 50G, 12 cores
+                          average=True)
+        out = sim.export_machine(db, 1000, None, 1000)
+        self.assertEqual(out["machine"], {"ncpu": 32, "mem_total": 125 * GIB})
+        self.assertEqual(out["background"], [[-40.0, 20 * GIB, 2.0], [20.0, 50 * GIB, 12.0]])
+        path = os.path.join(self.tmp.name, "with-machine.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps(out) + "\n")
+            f.write(json.dumps(scenarios.build(0, ("cargo", "build"), 1, 600, 1, repo="app")) + "\n")
+        loaded = sim.load_scenario(path)
+        self.assertEqual(loaded["machine"]["background"], out["background"])
+        self.assertNotIn("background", sim.load_scenario(path, background=False)["machine"])  # --no-background
+        state = os.path.join(self.tmp.name, "bg")
+        os.makedirs(state)
+        s = sim.Simulation(loaded, CONFIG, BUILDQD, state, name="buildqd_bg")
+        s.clock.now = sim.EPOCH + 10
+        s.step()
+        self.assertEqual((s.background_mem, s.background_cpu), (20 * GIB, 2.0))
+        s.clock.now = sim.EPOCH + 20
+        s.step()
+        self.assertEqual(s.machine.mem_available, 125 * GIB - 50 * GIB)  # it follows the recorded minute
+
+    def test_without_the_builds_average_their_readings_either_side_of_the_minute_are_taken(self):
+        # builds_mem is one reading as a minute ends. A 30G build that ended mid-minute 1020 left
+        # 15G in that minute's average memory; the readings either side (30G, 0) average 15G too.
+        db = self.minutes([(900, 32, 125 * GIB, 75 * GIB, 30 * GIB, 6.0, 4.0),    # before the window: its reading only
+                           (960, 32, 125 * GIB, 75 * GIB, 30 * GIB, 6.0, 4.0),    # others: 20G
+                           (1020, 32, 125 * GIB, 90 * GIB, 0, 6.0, 4.0)])         # others: still 20G
+        out = sim.export_machine(db, 1000, None, 1000)
+        self.assertEqual([b[:2] for b in out["background"]], [[-40.0, 20 * GIB], [20.0, 20 * GIB]])
+
+    def test_minutes_that_can_t_say_what_the_builds_used_are_left_out_and_noted(self):
+        db = self.minutes([(960, 32, 125 * GIB, 100 * GIB, None, 6.0, 4.0),     # before the builds' columns
+                           (1020, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, 4.0),  # no reading before it
+                           (1080, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, None),  # first after a restart
+                           (1140, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, 4.0),
+                           (1800, 32, 125 * GIB, 90 * GIB, 5 * GIB, 6.0, 4.0),   # after a gap: no reading before
+                           (1860, 32, 125 * GIB, 90 * GIB, 5 * GIB, 6.0, 4.0)])
+        notes: list[str] = []
+        out = sim.export_machine(db, 960, None, 960, notes)
+        self.assertEqual([b[:2] for b in out["background"]], [[180.0, 20 * GIB], [900.0, 30 * GIB]])
+        text = " ".join(notes)
+        self.assertIn("4 minute(s)", text)
+        self.assertIn("gap", text)
+        self.assertIn("begin 3.0m after the first build", text)
+        notes.clear()
+        self.assertIsNone(sim.export_machine(db, 99_000, None, 99_000, notes))  # no rows that far on
+        self.assertIn("built-in background", notes[0])
+
+    def test_export_writes_the_machine_from_the_first_build_to_after_the_last_ended(self):
+        db = self.metrics()  # the builds before --until (1015) came in from 900, and ended by 3100
+        db.execute("CREATE TABLE minute (t INTEGER, cores INTEGER, mem_total INTEGER, mem_available INTEGER, "
+                   "builds_mem INTEGER, cpu_busy REAL, builds_cores REAL, builds_mem_avg INTEGER)")
+        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?,?)",
+                       [(t, 32, 125 * GIB, 100 * GIB, 0, 6.0, 4.0, 0) for t in range(600, 8000, 60)])
+        db.execute("UPDATE minute SET mem_available = ? WHERE t = 3000", (80 * GIB,))  # after --until's end
+        path = os.path.join(self.tmp.name, "metrics.db")
+        db.commit()  # (a backup waits for the source's open write to end)
+        disk = sqlite3.connect(path)
+        db.backup(disk)
+        disk.close()
+        args = sim.argparse.Namespace(db=path, since="900", until="1015", anonymize=True, lead_in=None)
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", err):
+            sim.cmd_export(args)
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        machine, jobs = lines[0], lines[1:]
+        self.assertEqual(jobs[0]["t"], 0.0)  # the machine's steps and the builds share their zero
+        steps = {b[0]: b[1] for b in machine["background"]}
+        self.assertEqual(min(steps), -60.0)  # the minute the first build came in (900 is in 840's)
+        self.assertEqual(steps[3000 - 900], 45 * GIB)  # past --until: builds still running then had it
+        self.assertLess(max(steps), 3200 + 3600 - 900)  # an hour past the last end, no more
+        self.assertEqual(err.getvalue(), "")
+
+    def test_anonymizing_hashes_option_values(self):
+        argv = ["cargo", "--manifest-path=/home/someone/client/Cargo.toml", "--token=hunter2", "-C/home/someone/fw",
+                "--password=123456789", "-p123456789", "--token=test", "--token", "424242",
+                "--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release", "test", "--", "-"]
+        words = sim.anonymous_argv(argv)
+        for secret in ("someone", "client", "hunter2", "fw", "123456789", "424242", "--token=test"):
+            self.assertNotIn(secret, json.dumps(words))
+        self.assertEqual(words[1].split("=")[0], "--manifest-path")
+        self.assertTrue(words[3].startswith("-C") and words[3] != argv[3])
+        self.assertTrue(words[4].startswith("--o") and words[5].startswith("-p") and words[5] != argv[5])
+        self.assertNotIn("password", json.dumps(words))  # (a private option's name is hashed too)
+        self.assertEqual(words[0], "cargo")
+        self.assertEqual(words[9:16], ["--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release"])
+        self.assertNotEqual(words[16], "test")  # after an option, a common word may be its value
+        self.assertEqual(words[17:], ["--", "-"])
+        hashed = lambda argv: [w != a for w, a in zip(sim.anonymous_argv(argv), argv)]  # noqa: E731
+        # Only the subcommands a command starts with keep their names; any word after an option doesn't.
+        self.assertEqual(hashed(["cargo", "test", "-p", "test"]), [False, False, False, True])
+        self.assertEqual(hashed(["pnpm", "--filter", "build", "test"]), [False, False, True, True])
+        self.assertEqual(hashed(["cargo", "test", "--token", "test"]), [False, False, True, True])  # (--token: not a public option)
+        self.assertEqual(hashed(["git", "commit", "-m", "test"]), [False, True, False, True])  # (commit: not a public word)
+        self.assertEqual(hashed(["python3", "-m", "unittest", "discover", "-s", "tests"]), [False] * 5 + [True])
+        self.assertEqual(hashed(["cargo", "+nightly", "check"]), [False, False, False])
+        self.assertEqual(hashed(["pnpm", "exec", "vitest", "run", "--shard", "1"]), [False] * 5 + [True])
+        self.assertEqual(hashed(["cargo", "build", "--profile", "release"]), [False] * 4)  # (as command keys write it)
+        # A long option's name is kept only if it is a common public one: any other is hashed behind
+        # its dashes, a private tool's (through a -c script) or a value that looks like one.
+        self.assertEqual(hashed(["bash", "-c", "acme-deploy", "--acme-prod-eu"]), [False, False, True, True])
+        self.assertTrue(sim.anonymous_argv(["bash", "-c", "x", "--acme-prod-eu"])[3].startswith("--o"))
+        self.assertEqual(hashed(["cargo", "test", "--release", "--all-features", "-p"]), [False] * 5)
+        self.assertEqual(sim.rank_correlation([1, 1, 2, 3], [5, 5, 6, 7]), 1.0)  # ties share their ranks
+
+    def test_a_replay_is_set_beside_what_really_happened(self):
+        jobs = [dict(scenarios.build(i * 5, ("cargo", "test", f"-p{i}"), 4, 300, 2, repo="app"),
+                     recorded_wait=float(i * 100)) for i in range(4)]
+        jobs.append(dict(scenarios.build(0, ("cargo", "test", "-pw"), 4, 300, 2, repo="app"),
+                         recorded_wait=5000.0, warmup=True))  # in the machine before the window: not compared
+        summary, _ = sim.simulate(scenario(jobs), CONFIG, BUILDQD, name="buildqd_recorded")
+        agent = summary["against_recorded"]["agent"]
+        self.assertEqual(agent["builds"], 4)
+        self.assertEqual(agent["total_min"][0], 10.0)  # 0 + 100 + 200 + 300 seconds
+        self.assertIn("agent wait, recorded / replayed (4)", sim.table(summary))
+        self.assertEqual(sim.rank_correlation([1, 2, 3, 4], [10, 20, 30, 40]), 1.0)
+        self.assertEqual(sim.rank_correlation([1, 2, 3, 4], [40, 30, 20, 10]), -1.0)
+        self.assertIsNone(sim.rank_correlation([1, 2, 3], [5, 5, 5]))
+        self.assertEqual(sim.ranks([3.0, 1.0, 3.0]), [2.5, 1.0, 2.5])
 
     def test_an_exported_trace_replays(self):
         path = os.path.join(self.tmp.name, "trace.jsonl")

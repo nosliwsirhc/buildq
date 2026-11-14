@@ -79,7 +79,10 @@ Every command in them starts with a history of three earlier runs of its size, a
 has built it before (`seed_history`): granted its lane's cores, with when each run peaked and what it
 used after, taken from its profile, so "past the peak" (`release_after_peak`) has the runs it reads.
 
-A trace file works as a scenario too: one build per line, in JSON.
+A trace file works as a scenario too: one build per line, in JSON. Its first line may instead
+describe the machine it ran on: `{"machine": {"ncpu": …, "mem_total": …}, "background": [[t, bytes,
+cores], …]}`, with other work's memory and cores at each time `t` (seconds from the first build,
+as a step that holds until the next).
 
 | Field | Meaning |
 |---|---|
@@ -91,15 +94,16 @@ A trace file works as a scenario too: one build per line, in JSON.
 | `peak_mem`, `profile` | its peak memory in bytes, and the most memory in each tenth of its run in MiB |
 | `workspace` | optional: a target folder it shares with other builds, which then take turns |
 | `cancel_at`, `unfinished` | optional: cancel it this many seconds after its submission, as it was (#40); and, with `unfinished`, it never ends by itself before that (only part of its run is known) |
-| `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes), and whether cargo builds from scratch |
+| `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes; `export` writes a longer one for a CI build that really ran to its end past that), and whether cargo builds from scratch |
 | `history`, `history_peak` | optional: give its command a history of three earlier runs, of `history_peak` bytes |
-| `state`, `requeued` | written by `export`, for information only: how the build ended, and how often it was stopped and queued again. The replay decides both for itself |
+| `warmup`, `submitted_at` | written by `export`: it was already queued or running when the window began, and when it was really submitted (seconds from the first build, before its `t`). It replays like any other build, as old as it was, but isn't set beside what really happened |
+| `state`, `requeued`, `recorded_wait` | written by `export`: how the build ended, how often it was stopped and queued again, and how long it waited over all its attempts. The replay decides all three for itself; the summary sets its waits beside `recorded_wait` |
 
 ## A trace from your own machine
 
 ```sh
 python3 bench/sim.py export --db ~/.local/state/buildq/metrics.db \
-    --since 2026-11-14T06:00 --until 2026-11-14T08:00 --anonymize > ~/morning.jsonl
+    --since 2026-11-14T06:00 --until 2026-11-14T08:00 --lead-in 1h --anonymize > ~/morning.jsonl
 python3 bench/sim.py run ~/morning.jsonl
 ```
 
@@ -108,25 +112,67 @@ each of its commands starts with three earlier runs of its own size. Without it,
 planned at its lane's default memory, as on a machine that has never run them.
 
 `export` reads finished builds from the analytics database (`metrics = true`) and writes them as a
-trace. Their memory profile, cores and run time are what the machine measured, for their last
-attempt. A build that was stopped and queued again (`requeued`) has its last attempt's run time where
+trace: the ones submitted from `--since` to `--until`, and the ones still queued or running as
+`--since` began (marked `warmup`). A window of a busy night can begin with a dozen builds in
+flight, some submitted an hour or more before; without them, its replay would start on an empty
+machine. The builds that held those up before the window aren't in the trace, so a warm-up build
+enters the replay as it really started if it was running when the window began, or as the window
+begins if it was still queued. Either way it keeps its real submission time (`submitted_at`), so it
+is as old as it was when the scheduler orders the queue, and is cancelled when it was. That brings
+the replay's start closer to the machine it had, not all the way: a warm-up build's own wait before
+the window isn't replayed.
+
+`--lead-in 1h` (with `--since`) is the usual way to warm a replay up instead: the trace starts an hour before
+`--since`, every build of that hour replays as it came in (marked `warmup` too, so not compared),
+and the queue the window begins with is the one the replay built. Only builds in flight as the
+lead-in begins are placed as above, and an hour later their effect has mostly worked through.
+
+The trace's first line is the machine (its cores and memory) and other work's memory and cores (CI
+runners, containers, sessions: everything but buildq's builds), a step a minute from the analytics'
+minute rows, from the first build's minute to an hour after the last one ended. Other work's memory
+is the memory in use, averaged over the minute, less the builds' own over the same minute: their
+average, where the database records it (`builds_mem_avg`, since #46), or else the mean of the
+readings as the minute began and as it ended. These are one-minute averages, so a spike inside a
+minute is smoothed away; and they replay at the times they were recorded, even when the replay moves
+a build that caused some of them (a CI job's own containers, say). A minute that can't say what the
+builds used (rows older than those columns, or the first after the daemon started) is left out and
+the minute before holds, as it does across a gap in the rows. Minute rows are kept 14 days and
+builds 180, so an older window has no rows and replays with the built-in fixed background. Where
+buildq runs builds without systemd (the `direct` runner, used only when the daemon isn't a systemd
+service), it can't measure them: their memory counts as other work, and a replay of a trace from
+there counts it twice. `export`
+says on stderr when any of this happens. `run --no-background` replays a trace with the fixed
+background anyway, to see what the recorded minutes change.
+
+Each build's memory profile, cores and run time are what the machine measured, for its last attempt. A build that was stopped and queued again (`requeued`) has its last attempt's run time where
 the database keeps it (`attempt_wall`, since #39). In an older database it has every attempt's run time
 and no profile, so its memory rises to its peak in the first fifth; a build whose last attempt never
 ran (stopped, then cancelled while queued again) is left out. Each build's workspace comes along
 where the database keeps it (`workspace`, since #39), so builds that shared a target folder take
 turns in the replay as they did; from an older database they don't. A build that was
-cancelled replays as a whole run of its command did (the latest one in the trace that succeeded),
-cancelled the same time after its submission as it was (`cancel_at`), whether it was still queued
-or running then; with no such run in the trace, it runs as far as it got and then holds there until
+cancelled replays as a whole run of its command did (the latest one in the trace that succeeded,
+or failing that, the latest from before the trace starts), cancelled the same time after its
+submission as it was (`cancel_at`), whether it was still queued or running then; with no such run,
+it runs as far as it got and then holds there until
 its cancel (`unfinished`), or is left out if it never ran. Runs are matched by their history key, the
 command's words, so two builds of one crate with different feature flags count as the same command. A build that was lost has no exit code, and replays as a failure; its `state` says what
 it was.
 
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
-and who ran them. `--anonymize` hashes repository names, workspaces, callers, lanes other than the
-usual ones (`heavy`, `check`, `web` …), and every word of a command except a known tool (`cargo`,
-`pnpm`, `python3`, `make` …), its options and a short list of public subcommands (`build`, `test`,
-`vitest`, `unittest` …), and drops build names. A lane the bench configuration doesn't have falls to
+and who ran them. `--anonymize` hashes repository names, workspaces, callers and lanes other than
+the usual ones (`heavy`, `check`, `web` …), and drops build names. Of each command it keeps what
+the replay needs and no more: a known tool (`cargo`, `pnpm`, `python3`, `make` …), the public
+subcommands the command starts with (`cargo test`, `pnpm exec vitest run`,
+`python3 -m unittest discover`), short options and common public long ones (`--release`,
+`--all-features`, `--filter` …), counts (`-j 8`, `--jobs=8`) and cargo's built-in profiles
+(`--profile test`). Every other word is hashed: any other option's name (behind its dashes, so it
+still reads as an option), an option's value, whether after `=`, run on to a short option (`-C…`) or
+a word of its own, and any word after the first option, numbers and common words included, since a
+value can be a password, a package called `test`, or look like an option
+(`pnpm --filter --internal-client`). (The Parallel
+Workloads Archive's [Standard Workload
+Format](https://www.cs.huji.ac.il/labs/parallel/workload/swf.html) keeps even less: a number per
+application.) A lane the bench configuration doesn't have falls to
 the lane rules in the replay. That hides them from a casual reader, but a hash of a
 common word can be guessed. Keep traces on your machine; the scenarios in the repository are
 synthetic.
@@ -164,7 +210,9 @@ simulation, and that part is simplified:
   build keeps the crates it finished, so the simulation overstates what a stop costs.
 - **CI jobs** are cancelled at their time limit, as GitHub cancels them, whether queued or running.
   The limit counts from when the build was submitted to buildq, not from when the job started.
-- **Other work** (sessions, idle CI runners, containers) holds a fixed amount of memory and cores.
+- **Other work** (sessions, idle CI runners, containers) holds a fixed amount of memory and cores in
+  the built-in scenarios. An exported trace replays what the machine recorded, as one-minute
+  averages at the times they were recorded (see "A trace from your own machine").
   There is no disk: every path has plenty of room, whatever `disk_floor` says.
 - **Jobservers** aren't modelled beyond the cores granted.
 
@@ -183,3 +231,5 @@ simulation, and that part is simplified:
 | least memory free, time below the floor | the lowest free memory seen, and the seconds spent with less than `mem_floor` free (what admission keeps free for everything else) |
 | holds let go past the peak | builds whose held memory `release_after_peak` let go |
 | planned / peak | what builds were planned at against what they used: the median ratio, and how many used more than planned |
+| ci / agent wait, recorded / replayed | an exported trace only: the same builds' waits (over all their attempts) as they really were and as replayed, in total, at the median and at the 90th percentile; not counting the `warmup` builds (the other lines do) |
+| off per build / rank correlation | how far the replay's wait is from the real one per build, on average, and whether it puts the builds in the same order (Spearman's: 1 the same, 0 unrelated). The way to see how well a replay matches a night, rather than one build's longest wait |

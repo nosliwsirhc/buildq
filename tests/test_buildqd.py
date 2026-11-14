@@ -1684,6 +1684,9 @@ class Analytics(DaemonCase):
         builds = [self.submit() for _ in range(3)]  # 20G each: one runs, two wait on memory
         for second in range(0, 60, 2):
             self.daemon.schedule(minute + second)
+            for t in builds:
+                if t.state == "running":
+                    t.mem_now = 6 * GIB if second < 30 else 0  # (as cgroup_stats would read it)
             self.daemon.observe_metrics(minute + second)
         self.daemon.observe_metrics(minute + 61)  # the next minute: the last one is written
         row = self.db().execute("SELECT * FROM minute WHERE t = ?", (minute,)).fetchone()
@@ -1693,6 +1696,7 @@ class Analytics(DaemonCase):
         self.assertEqual(row["running_max"], 1)
         self.assertEqual(row["mem_available_min"], 30 * GIB)
         self.assertGreater(row["reserved"], 0)
+        self.assertAlmostEqual(row["builds_mem_avg"] / GIB, 3.0, delta=0.25)  # 6G for half the minute
         self.assertGreater(row["sampled"], 55)
         self.assertGreater(row["mem_wait_seconds"], 55)
         self.assertEqual(row["free_mem_mem_wait"], 20 * GIB)  # 30G available, 10G floor

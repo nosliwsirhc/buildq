@@ -578,13 +578,14 @@ and `mem_wait_seconds`, weights its averages by `sampled`, and weights the `*_me
 | `psi_cpu`, `psi_mem` | CPU "some" and memory "full" pressure, avg10 |
 | `running`, `running_max`, `queued`, `queued_max` | builds |
 | `reserved` | the running builds' expected peaks, together (bytes) |
+| `builds_mem_avg` | what the running builds used, together, read each second (bytes; since #46) |
 | `growth` | what was held for them to grow into, as admission saw it |
 | `free_mem`, `free_mem_min`, `free_cpu` | admission's room for new builds |
 | `wait_memory`, `wait_cpu`, `wait_held`, `wait_turn`, `wait_workspace`, `wait_other` | builds waiting, by reason: memory (with memory pressure), cores (with CPU pressure), room held for a starving build, `max_jobs`, a busy workspace, anything else (too big ever to fit, disk, paused, not yet looked at). |
 | `mem_wait_seconds` | seconds in which at least one build waited on memory |
 | `idle_cores_mem_wait`, `free_mem_mem_wait`, `growth_mem_wait` | over those seconds: cores under the CPU target, memory above the floor, and what was held for running builds to grow into |
 | `builds_cores`, `builds_mem`, `ci_cores`, `ci_mem`, `containers_cores`, `containers_mem`, `apps_cores`, `apps_mem`, `other_cores` | who used the machine: the build slice; CI runner services (`actions.runner.*`, `gha-*`, `*-runner-*`, `gitlab-runner*`, under the user
-manager, in its `app.slice`, or system services); Docker and containerd scopes and rootless podman; the user's `app.slice` less any CI runners in it; and the rest of the busy cores. Memory is what `cgroup_stats` counts (not page cache). The first minute after a start has no cores; a cgroup new since the last reading, or started again under the same name, counts all its time in this minute; one that can't be read keeps its baseline; no group counts more than the machine's cores. |
+manager, in its `app.slice`, or system services); Docker and containerd scopes and rootless podman; the user's `app.slice` less any CI runners in it; and the rest of the busy cores. Memory is what `cgroup_stats` counts (not page cache), read once as the minute ends (`builds_mem_avg` is the builds' average over it). The first minute after a start has no cores; a cgroup new since the last reading, or started again under the same name, counts all its time in this minute; one that can't be read keeps its baseline; no group counts more than the machine's cores. |
 
 **`build`** (kept 180 days), one row per finished ticket: `id`, `ended`, `submitted`, `key`,
 `label`, `name`, `lane`, `caller`, `repo`, `state`, `exit`, `from_ci`, `wall` (all attempts),
