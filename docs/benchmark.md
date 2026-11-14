@@ -163,10 +163,13 @@ and who ran them. `--anonymize` hashes repository names, workspaces, callers and
 the usual ones (`heavy`, `check`, `web` …), and drops build names. Of each command it keeps what
 the replay needs and no more: a known tool (`cargo`, `pnpm`, `python3`, `make` …), the public
 subcommands the command starts with (`cargo test`, `pnpm exec vitest run`,
-`python3 -m unittest discover`), option names, counts (`-j 8`, `--jobs=8`) and cargo's built-in
-profiles (`--profile test`). Every other word is hashed: an option's value, whether after `=`, run
-on to a short option (`-C…`) or a word of its own, and any word after the first option, numbers and
-common words included, since a value can be a password or a package called `test`. (The Parallel
+`python3 -m unittest discover`), short options and common public long ones (`--release`,
+`--all-features`, `--filter` …), counts (`-j 8`, `--jobs=8`) and cargo's built-in profiles
+(`--profile test`). Every other word is hashed: any other option's name (behind its dashes, so it
+still reads as an option), an option's value, whether after `=`, run on to a short option (`-C…`) or
+a word of its own, and any word after the first option, numbers and common words included, since a
+value can be a password, a package called `test`, or look like an option
+(`pnpm --filter --internal-client`). (The Parallel
 Workloads Archive's [Standard Workload
 Format](https://www.cs.huji.ac.il/labs/parallel/workload/swf.html) keeps even less: a number per
 application.) A lane the bench configuration doesn't have falls to

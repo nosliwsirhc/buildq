@@ -10,7 +10,7 @@ simplifications.
 
     sim.py run SCENARIO [--config FILE] [--buildqd FILE] [--json] [--jobs FILE]
     sim.py compare SCENARIO... [--base FILE] [--head FILE] [--base-config FILE] [--config FILE]
-    sim.py export --db metrics.db [--since T] [--until T] [--anonymize] > trace.jsonl
+    sim.py export --db metrics.db [--since T] [--until T] [--lead-in D] [--anonymize] > trace.jsonl
     sim.py scenarios
 
 A SCENARIO is a built-in name (bench/scenarios.py) or a trace file (.jsonl, one build per line).
@@ -899,11 +899,17 @@ PLAIN_OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # an option's name a
 
 
 # What an anonymized trace keeps of a command is what the replay needs, and no more: the tool if it
-# is a public one, the subcommands it starts with (the lane rules and restart_safe read them), option
-# names, counts and cargo's built-in profiles. Every other word is hashed: any option's value and any
-# word after the first option, numbers and common words too, since a value can be a password or a
-# package called "test" whatever it looks like. (The Parallel Workloads Archive's format keeps even
-# less: a number per application.)
+# is a public one, the subcommands it starts with (the lane rules and restart_safe read them), short
+# options and the long ones below (common build and test flags), counts and cargo's built-in
+# profiles. Every other word is hashed: any other option's name (keeping its dashes, so it still reads
+# as an option), any option's value and any word after the first option, numbers and common words
+# too, since a value can be a password or a package called "test" whatever it looks like, and a value
+# can look like an option (pnpm --filter --internal-client). (The Parallel Workloads Archive's format
+# keeps even less: a number per application.)
+PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches --examples --all-targets
+    --workspace --all-features --no-default-features --features --package --no-run --no-fail-fast --locked
+    --offline --frozen --jobs --load-average --test-threads --filter --recursive --noEmit --watch --run
+    --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard""".split())
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
 KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
 TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test
@@ -917,16 +923,24 @@ def option_value(name: str, value: str) -> str:
     return hashed("w", value) if value else ""
 
 
+def option_name(name: str) -> str:
+    """An option's name as an anonymized trace keeps it: a short one (-p) or a public long one as it
+    is; any other hashed behind its dashes (--o3f2a1b), so it still reads as an option."""
+    if (len(name) == 2 and PLAIN_OPTION.fullmatch(name)) or name in PUBLIC_OPTIONS:
+        return name
+    return ("--" if name.startswith("--") else "-") + hashed("o", name)
+
+
 def anonymous_option(word: str) -> str:
-    """An option as an anonymized trace keeps it: its name, and its value (after "=", or run on to a
-    short option) as option_value keeps it."""
+    """An option as an anonymized trace keeps it: its name as option_name keeps it, and its value
+    (after "=", or run on to a short option) as option_value keeps it."""
     if word in ("-", "--"):
         return word
     name, eq, value = word.partition("=")
     if eq:
-        return name + "=" + option_value(name, value) if PLAIN_OPTION.fullmatch(name) else hashed("w", word)
+        return option_name(name) + "=" + option_value(name, value) if PLAIN_OPTION.fullmatch(name) else hashed("w", word)
     if word.startswith("--") or len(word) == 2:
-        return word if PLAIN_OPTION.fullmatch(word) else hashed("w", word)
+        return option_name(word) if PLAIN_OPTION.fullmatch(word) else hashed("w", word)
     if PLAIN_OPTION.fullmatch(word[:2]):
         return word[:2] + option_value(word[:2], word[2:])  # -j8; -C/a/b, -xvf: the rest hashed
     return hashed("w", word)
@@ -1019,10 +1033,10 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
 
     # A whole run of each command that succeeded: what a cancelled build of it would have done (#40).
     whole = {r.get("key"): shape(r) for r in rows if r.get("state") == "succeeded" and shape(r)}
+    starts = begins if begins is not None else float(rows[0]["submitted"])  # the trace's start
     for key in {r.get("key") for r in rows if r.get("state") == "cancelled"} - set(whole):
-        before = db.execute("SELECT * FROM build WHERE key = ? AND state = 'succeeded' AND wall > 0"
-                            + (" AND ended <= ?" if begins is not None else "") + " ORDER BY ended DESC LIMIT 1",
-                            (key, begins) if begins is not None else (key,)).fetchone()  # (from before the trace)
+        before = db.execute("SELECT * FROM build WHERE key = ? AND state = 'succeeded' AND wall > 0 AND ended <= ? "
+                            "ORDER BY ended DESC LIMIT 1", (key, starts)).fetchone()  # (from before the trace)
         if before is not None and shape(dict(before)):
             whole[key] = shape(dict(before))
     for r in rows:
@@ -1221,7 +1235,8 @@ def main(argv=None) -> int:
     e.add_argument("--db", required=True)
     e.add_argument("--since", help="epoch seconds, or YYYY-MM-DDTHH:MM local time")
     e.add_argument("--until")
-    e.add_argument("--anonymize", action="store_true", help="hash repository names, callers and package words")
+    e.add_argument("--anonymize", action="store_true",
+                   help="hash names (repositories, callers, workspaces) and every word of a command the replay doesn't need")
     e.add_argument("--lead-in", help="start the trace this long before --since (1h, 30m), its builds marked "
                                      "warmup: the replay builds the queue the window begins with")
     sub.add_parser("scenarios", help="list the built-in scenarios")

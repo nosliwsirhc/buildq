@@ -400,6 +400,25 @@ class Export(SimCase):
             self.assertEqual(sim.cmd_export(args), 2)  # a lead-in needs a window to lead into
         self.assertIn("--since", err.getvalue())
 
+    def test_an_option_like_value_doesn_t_survive_from_the_database_to_the_trace(self):
+        # pnpm --filter=--internal-client test, as its history key keeps it (#46 round 4)
+        db = self.metrics()
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, mem_peak, state, exit, requeues) "
+                   "VALUES ('f', 1500, 1400, 'secretrepo|web|pnpm --filter --internal-client test', 'web', "
+                   "60.0, 1, 'succeeded', 0, 0)")
+        out = sim.export_rows(db, None, None, anonymize=True)
+        self.assertNotIn("internal-client", json.dumps(out))
+        f = next(e for e in out if e["t"] == 500.0)
+        self.assertEqual(f["argv"][:2], ["pnpm", "--filter"])
+
+    def test_a_cancelled_build_never_takes_a_run_from_after_the_trace(self):
+        db = self.metrics()  # 'c' (submitted 1000, cancelled) has no other run of its command
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, attempt_wall, mem_peak, state, exit) "
+                   "VALUES ('late', 9000, 5000, 'secretrepo|heavy|python3 private_script.py', 'heavy', 4000.0, "
+                   "4000.0, 1, 'succeeded', 0)")
+        c = next(e for e in sim.export_rows(db, None, 1050, anonymize=False) if e["t"] == 100.0)
+        self.assertNotEqual(c["wall"], 4000.0)  # not the run after --until
+
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
         text = json.dumps(out)
@@ -587,7 +606,8 @@ class Export(SimCase):
             self.assertNotIn(secret, json.dumps(words))
         self.assertEqual(words[1].split("=")[0], "--manifest-path")
         self.assertTrue(words[3].startswith("-C") and words[3] != argv[3])
-        self.assertTrue(words[4].startswith("--password=") and words[5].startswith("-p") and words[5] != argv[5])
+        self.assertTrue(words[4].startswith("--o") and words[5].startswith("-p") and words[5] != argv[5])
+        self.assertNotIn("password", json.dumps(words))  # (a private option's name is hashed too)
         self.assertEqual(words[0], "cargo")
         self.assertEqual(words[9:16], ["--profile=test", "--jobs=8", "-j8", "-j", "8", "-p", "--release"])
         self.assertNotEqual(words[16], "test")  # after an option, a common word may be its value
@@ -596,12 +616,17 @@ class Export(SimCase):
         # Only the subcommands a command starts with keep their names; any word after an option doesn't.
         self.assertEqual(hashed(["cargo", "test", "-p", "test"]), [False, False, False, True])
         self.assertEqual(hashed(["pnpm", "--filter", "build", "test"]), [False, False, True, True])
-        self.assertEqual(hashed(["cargo", "test", "--token", "test"]), [False, False, False, True])
+        self.assertEqual(hashed(["cargo", "test", "--token", "test"]), [False, False, True, True])  # (--token: not a public option)
         self.assertEqual(hashed(["git", "commit", "-m", "test"]), [False, True, False, True])  # (commit: not a public word)
         self.assertEqual(hashed(["python3", "-m", "unittest", "discover", "-s", "tests"]), [False] * 5 + [True])
         self.assertEqual(hashed(["cargo", "+nightly", "check"]), [False, False, False])
         self.assertEqual(hashed(["pnpm", "exec", "vitest", "run", "--shard", "1"]), [False] * 5 + [True])
         self.assertEqual(hashed(["cargo", "build", "--profile", "release"]), [False] * 4)  # (as command keys write it)
+        # A long option's name is kept only if it is a common public one: any other is hashed behind
+        # its dashes, a private tool's (through a -c script) or a value that looks like one.
+        self.assertEqual(hashed(["bash", "-c", "acme-deploy", "--acme-prod-eu"]), [False, False, True, True])
+        self.assertTrue(sim.anonymous_argv(["bash", "-c", "x", "--acme-prod-eu"])[3].startswith("--o"))
+        self.assertEqual(hashed(["cargo", "test", "--release", "--all-features", "-p"]), [False] * 5)
         self.assertEqual(sim.rank_correlation([1, 1, 2, 3], [5, 5, 6, 7]), 1.0)  # ties share their ranks
 
     def test_a_replay_is_set_beside_what_really_happened(self):
