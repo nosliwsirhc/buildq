@@ -2843,6 +2843,115 @@ class MakeRoomForCI(DaemonCase):
         self.assertEqual(self.runner.forced, [c.id])  # the second waits until the first has started
         del a, b
 
+    def behind_an_agent_build_that_waited(self):
+        """Two 12G builds running (11G free); a 20G agent build that has waited three times
+        starve_seconds (overdue: it goes before CI builds) holds its room; then a CI build arrives
+        needing 8G, which lacks it only because of that hold."""
+        old, new = self.agents(12, 12)
+        held = self.submit(("cargo", "test", "-p", "big"), mem="20G", caller="patient", cwd=self.workdir())
+        self.tick(901)  # past three times starve_seconds: overdue, and it holds its room
+        self.assertTrue(held.held)
+        self.now += 901
+        ci = self.submit(("cargo", "test"), mem="8G", env=self.CI)
+        self.assertEqual((ci.state, ci.reason_cat), ("queued", "held"))
+        return old, new, held, ci
+
+    def test_a_ci_build_behind_agents_builds_that_waited_longer_may_stop_builds(self):
+        self.behind_an_agent_build_that_waited()
+        self.tick(301)
+        self.assertTrue(self.runner.forced)  # by default: room for the held build and the CI one
+
+    def test_make_room_behind_agents_off_leaves_them_their_turn(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new, held, ci = self.behind_an_agent_build_that_waited()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])  # it waits behind them, as before make_room_for_ci (#38)
+        self.assertGreater(ci.short_agents, 0)
+
+    def test_a_build_that_has_run_long_is_spared(self):
+        self.daemon.cfg.make_room_spare_after = 200.0
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)  # both have run about 300 s: past 200, so neither is stopped
+        self.assertEqual(self.runner.forced, [])
+        self.daemon.cfg.make_room_spare_after = 400.0
+        self.daemon.room_made.clear()
+        self.tick(302)
+        self.assertEqual(self.runner.forced, [new.id])  # under 400: the newest is stopped as before
+
+    def test_time_paused_isnt_time_run(self):
+        self.daemon.cfg.make_room_spare_after = 200.0
+        old, new = self.agents(12, 12)
+        for t in (old, new):
+            t.frozen, t.frozen_at = True, self.now + 50  # paused since 50 s in: about 50 s of real work
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])  # not spared: a paused build hasn't run all that time
+
+    def test_with_behind_agents_off_a_build_that_went_first_isnt_stopped_once_it_runs(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new = self.agents(12, 12)
+        new.requeues = 1  # it had been stopped once, so it went before CI jobs' builds when it started
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [old.id])  # the other one, though older
+
+    def test_no_room_is_made_while_a_cancelled_build_gives_its_memory_back(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.daemon.cancel(old, self.now + 300)  # a CI job past its time limit, say: its build is stopping
+        self.tick(301)
+        self.assertNotIn(new.id, self.runner.forced)  # what the cancelled build frees may be enough
+        self.runner.running.discard(old.id)  # it is gone, but the CI build still doesn't fit
+        self.daemon.check(self.now + 302)
+        self.assertEqual(old.state, "cancelled")
+        self.tick(303)
+        self.assertIn(new.id, self.runner.forced)  # the guard opens again
+
+    def test_memory_is_read_again_before_making_room(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.daemon.schedule(self.now + 301)  # (the tick's own reading: the CI build doesn't fit)
+        self.machine.read_available = lambda: 45 * GIB  # a build ended since: its memory is back
+        self.daemon.make_room_for_ci(self.now + 301)
+        self.assertEqual(self.runner.forced, [])  # so nothing is stopped for it
+        self.assertEqual(ci.state, "queued")  # (it starts on the next pass)
+
+    def test_builds_ending_every_second_dont_hold_making_room_back(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        quick = [self.submit(("vitest", "run", f"q{i}"), lane="web", mem="1G", cores=1, caller=f"q{i}",
+                             cwd=self.workdir()) for i in range(5)]  # (a lane that may pass the CI build's held room)
+        self.assertEqual({q.state for q in quick}, {"running"})
+        for i, q in enumerate(quick):  # one ends in each tick, just before room would be made
+            self.finish(q, after=301 + i)
+            self.tick(301 + i)
+        self.assertEqual(self.runner.forced, [new.id])  # made all the same, in the first of those ticks
+
+    def test_a_build_that_waited_three_turns_is_protected_once_it_runs(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new = self.agents(12, 12)
+        new.submitted = new.started - 3 * self.daemon.cfg.starve_seconds  # it started after a long wait
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [old.id])
+
+    def test_a_lane_that_passes_held_room_has_no_overdue_builds(self):
+        self.daemon.cfg.lanes["web"].mem = 12 * GIB
+        (web,) = self.agents(12, argv=("vitest", "run"), lane="web")
+        web.requeues = 1
+        self.assertFalse(self.daemon.was_overdue(web))  # the queue gives it no head start, so no protection
+
+    def test_the_make_room_options_are_read(self):
+        cfg = buildqd.Config({}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (True, 0.0))
+        cfg = buildqd.Config({"ci_first": True, "make_room_for_ci": "5m", "make_room_behind_agents": False,
+                              "make_room_spare_after": "20m"}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (False, 1200.0))
+        self.assertEqual(cfg.summary()["make_room_spare_after"], 1200.0)
+        with self.assertRaises(ValueError):
+            buildqd.Config({"make_room_spare_after": "soon"}, 64 * GIB, 16)
+
     def test_stops_for_ci_dont_count_toward_the_limit_of_three(self):
         (t,) = self.agents(12)
         t.requeues, t.ci_stops = 3, 1

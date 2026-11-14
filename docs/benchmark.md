@@ -72,6 +72,7 @@ machine has 32 cores and 125 GB, with 26 GB and 3 cores taken by other work.
 | `burst` | ten cargo builds submitted within ten seconds |
 | `ci-behind-agents` | seven long agent test builds fill the machine; a release's CI steps arrive behind them, two of them big (16 and 12.6 GB) |
 | `outgrows-estimate` | two builds whose history says 3 GB grow to 24 GB by mid-run, while a stream of 12 GB builds keeps the machine full. The daemon's re-planning of a build past its estimate keeps the memory floor; a daemon without it spends minutes below the floor here |
+| `ci-behind-overdue` | long agent builds fill the machine, two more wait past overdue, then a release arrives: its CI steps wait partly behind those two (#38) |
 | `mixed-day` | two hours of agents' builds (cargo, checks, front-end, Python tests), a release every 30 minutes, a pull request's CI check every ten |
 
 Every command in them starts with a history of three earlier runs of its size, as on a machine that
@@ -89,6 +90,7 @@ A trace file works as a scenario too: one build per line, in JSON.
 | `wall`, `avg_cores` | how long it ran, and how many cores it kept busy on average |
 | `peak_mem`, `profile` | its peak memory in bytes, and the most memory in each tenth of its run in MiB |
 | `workspace` | optional: a target folder it shares with other builds, which then take turns |
+| `cancel_at`, `unfinished` | optional: cancel it this many seconds after its submission, as it was (#40); and, with `unfinished`, it never ends by itself before that (only part of its run is known) |
 | `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes), and whether cargo builds from scratch |
 | `history`, `history_peak` | optional: give its command a history of three earlier runs, of `history_peak` bytes |
 | `state`, `requeued` | written by `export`, for information only: how the build ended, and how often it was stopped and queued again. The replay decides both for itself |
@@ -113,7 +115,12 @@ and no profile, so its memory rises to its peak in the first fifth; a build whos
 ran (stopped, then cancelled while queued again) is left out. Each build's workspace comes along
 where the database keeps it (`workspace`, since #39), so builds that shared a target folder take
 turns in the replay as they did; from an older database they don't. A build that was
-cancelled or lost has no exit code, and replays as a failure; its `state` says what it was.
+cancelled replays as a whole run of its command did (the latest one in the trace that succeeded),
+cancelled the same time after its submission as it was (`cancel_at`), whether it was still queued
+or running then; with no such run in the trace, it runs as far as it got and then holds there until
+its cancel (`unfinished`), or is left out if it never ran. Runs are matched by their history key, the
+command's words, so two builds of one crate with different feature flags count as the same command. A build that was lost has no exit code, and replays as a failure; its `state` says what
+it was.
 
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
 and who ran them. `--anonymize` hashes repository names, workspaces, callers, lanes other than the
@@ -135,8 +142,10 @@ simulation, and that part is simplified:
   source checks, wait messages, pruning, GitHub statuses, hooks and the analytics.
 - **The machine's readings:** busy cores and CPU pressure are ten-second averages, as the daemon's
   are; free memory is read each second.
-- **Cores:** a build keeps busy the cores it is granted, up to its recorded average, from its first
-  second. When builds want more cores than the machine has, everyone slows down evenly.
+- **Cores:** a build of a tool that holds to its grant (cargo, make, ninja, dotnet, or anything with a
+  jobserver) keeps busy the cores it is granted, up to its recorded average; any other tool (vitest,
+  node) keeps busy its recorded average whatever it was granted, as it starts a worker per core. From
+  its first second. When builds want more cores than the machine has, everyone slows down evenly.
 - **Run time:** a build has the recorded run's work to do. With fewer cores than it used, it takes
   longer in proportion; it never goes faster than it was recorded.
 - **Memory** follows the recorded profile over the run. A tenth with no sample in it (a short run
@@ -166,6 +175,7 @@ simulation, and that part is simplified:
 | makespan | from the first submission to the last build's end; if the run was cut off at its horizon (six hours past the last arrival) before every build finished, the time simulated, marked "cut off" (`complete: false` in the JSON) |
 | wait p50 / p95 / max | from submission to first start; a build that never started counts until it ended. By lane, and for CI against agents |
 | CI timed out (in the queue) | CI jobs cancelled at their time limit, and how many of those never started |
+| cancelled as in the trace | builds cancelled at their `cancel_at` (a JSON field; with `--json`) |
 | stops for memory / for CI | builds stopped by `shed_memory` (queued again, or failed when they couldn't start over) and by `make_room_for_ci` |
 | running time lost to stops / cancels | how long the builds stopped or cancelled had been running |
 | OOM kills | over a build's own cap, or the machine out of memory |

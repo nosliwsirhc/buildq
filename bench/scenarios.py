@@ -94,6 +94,21 @@ def outgrows_estimate() -> dict:
             "machine": machine, "jobs": jobs, "seed_history": True}
 
 
+def ci_behind_overdue() -> dict:
+    """Long agent builds fill the machine, two more wait past overdue (three times starve_seconds),
+    and then a release arrives: its CI steps wait partly behind those two (#38: should stopping builds
+    for CI also make room for them?)."""
+    rng = random.Random(5)
+    jobs = [build(i * 30, ("cargo", "test", "-p", f"crate{i}"), rng.uniform(12, 14), rng.uniform(3000, 4200),
+                  rng.uniform(5, 7), shape=TESTS, repo="app", caller=f"session-{i}", workspace=f"wt{i}", history=True)
+            for i in range(6)]
+    jobs += [build(200 + k * 10, ("cargo", "build", "-p", f"waiting{k}"), 16, 1200, 8, repo="app",
+                   caller=f"session-w{k}", workspace=f"ww{k}", history=True) for k in range(2)]
+    jobs += release(2100, 1, heavy_lints=True)
+    return {"name": "ci-behind-overdue", "about": "a release arrives behind agent builds that have waited past overdue",
+            "machine": dict(WORKSTATION), "jobs": jobs, "seed_history": True}
+
+
 def mixed_day() -> dict:
     """Two hours of agents' builds (cargo, checks, front-end, Python tests), a release every 30
     minutes, and a pull request's quick CI check every ten."""
@@ -134,6 +149,7 @@ def mixed_day() -> dict:
 SCENARIOS = {
     "burst": burst,
     "ci-behind-agents": ci_behind_agents,
+    "ci-behind-overdue": ci_behind_overdue,
     "outgrows-estimate": outgrows_estimate,
     "mixed-day": mixed_day,
 }

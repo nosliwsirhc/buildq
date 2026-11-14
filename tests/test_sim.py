@@ -35,8 +35,8 @@ def agents(n, peak, wall, start=0, step=10, **extra):
             for i in range(n)]
 
 
-def ci_step(t, peak, wall, name="lint", **extra):
-    return scenarios.build(t, ("pnpm", "eslint"), peak, wall, 4, shape=scenarios.EARLY, lane="heavy", ci=True,
+def ci_step(t, peak, wall, name="lint", shape=scenarios.EARLY, **extra):
+    return scenarios.build(t, ("pnpm", "eslint"), peak, wall, 4, shape=shape, lane="heavy", ci=True,
                            repo="app", caller="runner-1", name=name, history=True, **extra)
 
 
@@ -244,7 +244,9 @@ class Replay(SimCase):
         self.assertGreater(s.machine.busy, 0.0)
 
     def test_a_cut_off_run_is_flagged_in_a_comparison(self):
-        done = {"complete": True, "makespan_s": 600.0, "wait": {"ci": {"p50": None, "p95": None, "max": None},
+        done = {"complete": True, "makespan_s": 600.0,
+                "turnaround": {"agent": {"p50": 60.0, "p95": 60.0, "max": 60.0}},
+                "wait": {"ci": {"p50": None, "p95": None, "max": None},
                 "agent": {"p50": 0.0, "p95": 0.0, "max": 0.0}}, "ci_timed_out": 0, "stops_for_memory": 0,
                 "stops_for_ci": 0, "stopped_run_s": 0.0, "cancelled_run_s": 0.0,
                 "oom_kills": {"own_cap": 0, "machine": 0}, "below_floor_s": 0, "idle_core_s_while_waiting": 0.0}
@@ -308,6 +310,87 @@ class Export(SimCase):
         self.assertEqual(out[4]["argv"][3], "-j8")  # and options stay
         self.assertEqual(out[0]["argv"][:3], ["cargo", "test", "-p"])  # the tool, its subcommand and options stay
 
+    def test_a_build_cancelled_while_queued_replays_as_its_command_runs_until_its_cancel(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        buildqd = load("buildqd_for_cancel", BUILDQD)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, attempt_wall, mem_peak, avg_cores, state, "
+                   "exit) VALUES ('ok', 1400, 1000, 'app|heavy|cargo test', 'heavy', 400.0, 400.0, ?, 4.0, "
+                   "'succeeded', 0)", (8 * GIB,))
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, mem_peak, state) "
+                   "VALUES ('gone', 1300, 1100, 'app|heavy|cargo test', 'heavy', 0, 0, 'cancelled')")
+        out = sim.export_rows(db, None, None, anonymize=False)
+        gone = out[1]
+        self.assertEqual((gone["wall"], gone["peak_mem"], gone["cancel_at"], gone["exit"]), (400.0, 8 * GIB, 200.0, 0))
+        self.assertNotIn("unfinished", gone)  # a whole run of its command says how it would have gone
+        self.assertNotIn("cancel_at", out[0])
+
+    def test_a_cancelled_build_known_only_in_part_never_ends_by_itself(self):
+        job = dict(scenarios.build(0, ("cargo", "test"), 2, 120, 2, repo="app"), cancel_at=300, unfinished=True)
+        summary, _ = sim.simulate(scenario([job]), CONFIG, BUILDQD, name="buildqd_unfinished")
+        self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
+        self.assertAlmostEqual(summary["makespan_s"], 300, delta=5)
+
+    def test_a_build_cancelled_while_still_queued(self):
+        jobs = agents(6, 12, 900, step=1)  # the machine full for 15 minutes
+        jobs.append(dict(scenarios.build(10, ("cargo", "test", "-p", "late"), 12, 300, 2, repo="app", caller="z",
+                                         workspace="wz", history=True), cancel_at=120))
+        _, s = sim.simulate(scenario(jobs), CONFIG, BUILDQD, name="buildqd_qcancel")
+        late = next(r for r in s.records.values() if "late" in r["name"])
+        self.assertEqual((late["outcome"], late["first_start"], late.get("cancelled_by_trace")), ("cancelled", None, True))
+
+    def test_tools_that_ignore_their_grant_run_at_their_own_pace(self):
+        spec = scenarios.build(0, ("pnpm", "vitest"), 1, 60, 4, lane="web", repo="app", history=True)
+        state = os.path.join(self.tmp.name, "pace")
+        os.makedirs(state)
+        s = sim.Simulation(scenario([spec], background_cpu=0.0), CONFIG, BUILDQD, state, name="buildqd_pace")
+        s.submit(spec, 0)
+        (t,) = s.daemon.tickets.values()
+        t.granted = 1  # as on a full machine: the web lane starts it on one core
+        s.clock.now += 1
+        s.step()
+        self.assertEqual(s.machine.busy_now, 4.0)  # vitest starts a worker per core all the same
+
+    def test_a_jobserver_doesnt_make_a_tool_hold_to_its_grant(self):
+        state = os.path.join(self.tmp.name, "grant")
+        os.makedirs(state)
+        specs = [scenarios.build(0, ("pnpm", "vitest"), 1, 60, 8, lane="heavy", repo="app"),  # gets a jobserver
+                 scenarios.build(0, ("cmake", "--build", "."), 1, 60, 8, repo="app"),
+                 scenarios.build(0, ("env", "X=1", "dotnet", "build"), 1, 60, 8, repo="app")]
+        s = sim.Simulation(scenario(specs), CONFIG, BUILDQD, state, name="buildqd_grant")
+        honors = []
+        for n, spec in enumerate(specs):
+            t = s.submit(spec, n)
+            honors.append((t.jobserver is not None, s.honors_grant(t)))
+        self.assertEqual(honors[0], (True, False))  # vitest ignores the jobserver it was handed
+        self.assertEqual([h for _, h in honors[1:]], [True, True])  # CMAKE_BUILD_PARALLEL_LEVEL, DOTNET_PROCESSOR_COUNT
+
+    def test_a_cancel_frees_its_memory_in_the_same_second(self):
+        # Room for two of these 25G builds (29G planned, 69G above the floor); the CI build waits until
+        # the first is cancelled.
+        jobs = [dict(scenarios.build(0, ("cargo", "test", "-p", "a"), 25, 900, 2, shape=(1.0,) * 10, repo="app",
+                                     caller="a", workspace="wa", history=True), cancel_at=200),
+                scenarios.build(1, ("cargo", "test", "-p", "b"), 25, 900, 2, shape=(1.0,) * 10, repo="app", caller="b",
+                                workspace="wb", history=True),
+                ci_step(5, 25, 60, shape=(1.0,) * 10)]
+        summary, s = sim.simulate(scenario(jobs, background_mem=40 * GIB), CONFIG, BUILDQD, name="buildqd_refresh")
+        ci = next(r for r in s.records.values() if r["ci"])
+        self.assertEqual(ci["first_start"], 200.0)  # in the second of the cancel, not the one after
+        self.assertEqual(summary["stops_for_ci"], 0)
+
+    def test_turnaround_counts_a_stopped_build_s_second_wait(self):
+        records = [{"ci": False, "submitted": 0.0, "first_start": 0.0, "ended": 900.0},
+                   {"ci": False, "submitted": 0.0, "first_start": 10.0, "ended": 100.0}]
+        self.assertEqual(sim.turnaround_stats(records, 1000)["max"], 900.0)  # started at once, ended late
+        self.assertEqual(sim.wait_stats(records, 1000)["max"], 10.0)
+
+    def test_a_replayed_build_is_cancelled_when_the_trace_says(self):
+        job = dict(scenarios.build(0, ("cargo", "test"), 2, 600, 2, repo="app"), cancel_at=120)
+        summary, s = sim.simulate(scenario([job]), CONFIG, BUILDQD, name="buildqd_cancel")
+        self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
+        self.assertAlmostEqual(summary["makespan_s"], 120, delta=5)
+
     def test_an_exported_trace_replays(self):
         path = os.path.join(self.tmp.name, "trace.jsonl")
         with open(path, "w") as f:
@@ -315,7 +398,7 @@ class Export(SimCase):
                 f.write(json.dumps(entry) + "\n")
         summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_trace")
         self.assertEqual(summary["builds"], 5)
-        self.assertEqual(summary["outcomes"], {"failed": 2, "succeeded": 3})
+        self.assertEqual(summary["outcomes"], {"cancelled": 1, "failed": 1, "succeeded": 3})  # cancelled as it was
 
 
 
