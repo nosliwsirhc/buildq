@@ -2384,6 +2384,27 @@ def colour_wanted(env=None) -> bool:
     return not (env if env is not None else os.environ).get("NO_COLOR")
 
 
+def init_colours(curses, wanted: bool) -> dict:
+    """The colour (and bold) for each kind of line. The terminal's own foreground and background stay
+    (use_default_colors), with colour or not: curses.wrapper has started colour, and without that call
+    the screen would turn white on black. With NO_COLOR, only bold is kept, for the headings."""
+    colours = {"": 0, "head": curses.A_BOLD}
+    try:
+        if not curses.has_colors():
+            return colours
+        curses.use_default_colors()
+        if not wanted:
+            return colours
+        for i, (name, fg) in enumerate((("head", curses.COLOR_CYAN), ("ok", curses.COLOR_GREEN),
+                                         ("warn", curses.COLOR_YELLOW), ("bad", curses.COLOR_RED),
+                                         ("dim", curses.COLOR_BLUE)), start=1):
+            curses.init_pair(i, fg, -1)
+            colours[name] = curses.color_pair(i) | (curses.A_BOLD if name == "head" else 0)
+    except curses.error:
+        return {"": 0, "head": curses.A_BOLD}  # no default colours on this terminal: plain text
+    return colours
+
+
 TERM_FALLBACK = "xterm-256color"
 
 
@@ -2402,18 +2423,23 @@ def curses_with_fallback(run, wrapper, env=None) -> tuple[int | None, str | None
     try:
         return wrapper(guarded), None
     except curses.error as e:
+        if isinstance(e.__context__, (SystemExit, KeyboardInterrupt)):
+            raise e.__context__ from None  # the terminal went away (SIGHUP): curses' own teardown failed on it
         if started:
             raise
         if not term or term in ("dumb", TERM_FALLBACK):
             return None, f"no usable terminal (TERM={term or 'unset'}: {e}); one snapshot instead"
     env["TERM"] = TERM_FALLBACK
     why = (f"this machine has no terminfo for TERM={term}, so `buildq top` used {TERM_FALLBACK}. To use "
-           f"{term} itself, copy its entry across (`infocmp -x {term} | ssh <this machine> -- tic -x -`), "
-           f"or set TERM={TERM_FALLBACK} for SSH to this machine")
+           f"{term} itself, install its entry here (Fedora's ncurses-term package has many; or, on the "
+           f"machine you connect from, `infocmp -x {term} | ssh <this machine> -- tic -x -`), or set "
+           f"TERM={TERM_FALLBACK} for SSH to this machine")
     try:
         return wrapper(guarded), why
     except curses.error as e:
-        if len(started) > 0:
+        if isinstance(e.__context__, (SystemExit, KeyboardInterrupt)):
+            raise e.__context__ from None
+        if started:
             raise
         return None, f"no usable terminal (TERM={term}, and {TERM_FALLBACK}: {e}); one snapshot instead"
 
@@ -2439,7 +2465,10 @@ class StatusFetcher:
 
     def loop(self) -> None:
         while not self.stopping:
-            status = self.ask()
+            try:
+                status = self.ask()
+            except Exception:  # (request() catches what it expects; anything else mustn't freeze the screen)
+                status = None
             with self.lock:
                 self.status, self.version = status, self.version + 1
             self.answered.set()
@@ -2479,6 +2508,14 @@ def cmd_top(args) -> int:
             return print_top_once(sampler)
         finally:
             sampler.sizes.stop()
+    if os.environ.get("TERM", "dumb") == "dumb":  # curses would start, and fill the screen with spaces
+        if wants_ascii(locale.nl_langinfo(locale.CODESET)):
+            use_ascii()
+        sampler = TopSampler(DirSizes(background=False))
+        try:
+            return print_top_once(sampler)
+        finally:
+            sampler.sizes.stop()
     import curses
     exit_on_signals()
     sizes = DirSizes()
@@ -2493,17 +2530,7 @@ def cmd_top(args) -> int:
         if wants_ascii(encoding):
             use_ascii()
         screen.timeout(100)
-        colours = {"": 0}
-        try:
-            if colour_wanted() and curses.has_colors():
-                curses.use_default_colors()
-                for i, (name, fg) in enumerate((("head", curses.COLOR_CYAN), ("ok", curses.COLOR_GREEN),
-                                                 ("warn", curses.COLOR_YELLOW), ("bad", curses.COLOR_RED),
-                                                 ("dim", curses.COLOR_BLUE)), start=1):
-                    curses.init_pair(i, fg, -1)
-                    colours[name] = curses.color_pair(i) | (curses.A_BOLD if name == "head" else 0)
-        except curses.error:
-            colours = {"": 0}  # no default colours on this terminal: plain text
+        colours = init_colours(curses, colour_wanted())
         sampler = TopSampler(sizes)
         sorts = ["age", "cpu", "mem", "io", "disk"]
         sort, selected, detail, logs = "age", None, False, False
@@ -2557,6 +2584,8 @@ def cmd_top(args) -> int:
         if code is not None:
             return code
         sizes.stop()
+        if wants_ascii(locale.nl_langinfo(locale.CODESET)):
+            use_ascii()
         once = TopSampler(DirSizes(background=False))  # no usable terminal: one snapshot instead
         try:
             return print_top_once(once)

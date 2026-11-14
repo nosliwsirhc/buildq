@@ -4254,7 +4254,7 @@ class Top(unittest.TestCase):
             with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
                 buildq.interval_arg(bad)
 
-    def test_ascii_when_the_terminal_isnt_utf8(self):
+    def test_which_encodings_want_ascii(self):
         self.assertTrue(buildq.wants_ascii("ANSI_X3.4-1968"))  # LC_ALL=C, as nl_langinfo and curses say
         self.assertTrue(buildq.wants_ascii("ascii"))
         self.assertTrue(buildq.wants_ascii(None))
@@ -4325,6 +4325,63 @@ class Top(unittest.TestCase):
                 os.kill(os.getpid(), sig)
                 time.sleep(1)  # (the handler runs at the next bytecode)
             self.assertEqual(caught.exception.code, 128 + sig)
+
+    def test_no_color_keeps_the_terminal_s_own_colours(self):
+        calls = []
+
+        class Curses:
+            A_BOLD, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE = 1 << 21, 6, 2, 3, 1, 4
+            error = Exception
+
+            def has_colors(self):
+                return True
+
+            def use_default_colors(self):
+                calls.append("default")
+
+            def init_pair(self, *a):
+                calls.append("pair")
+
+            def color_pair(self, i):
+                return i << 8
+        plain = buildq.init_colours(Curses(), wanted=False)
+        self.assertEqual(calls, ["default"])  # the terminal's own colours, not white on black
+        self.assertEqual((plain[""], plain["head"]), (0, Curses.A_BOLD))  # headings keep their bold
+        calls.clear()
+        coloured = buildq.init_colours(Curses(), wanted=True)
+        self.assertEqual(calls.count("pair"), 5)
+        self.assertNotEqual(coloured["ok"], 0)
+
+    def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
+        import curses
+
+        def wrapper(run):
+            try:
+                run(None)
+            finally:  # as curses.wrapper's teardown fails on a hung-up terminal
+                raise curses.error("nocbreak() returned ERR")
+
+        def run(screen):
+            raise SystemExit(129)
+        with self.assertRaises(SystemExit) as caught:
+            buildq.curses_with_fallback(run, wrapper, {"TERM": "xterm-256color"})
+        self.assertEqual(caught.exception.code, 129)
+
+    def test_the_fetcher_survives_an_unexpected_error(self):
+        answers = iter([{"overview": {}}, OSError(23, "too many open files"), {"overview": {"x": 1}}])
+
+        def ask():
+            a = next(answers, {"overview": {"x": 1}})
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fetcher = buildq.StatusFetcher(0.01, ask=ask).start()
+        self.addCleanup(fetcher.stop)
+        deadline = time.monotonic() + 5
+        while fetcher.latest()[0] < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(fetcher.latest()[0], 3)  # it went on asking
+        self.assertTrue(fetcher.thread.is_alive())
 
 if __name__ == "__main__":
     unittest.main()

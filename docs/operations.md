@@ -83,7 +83,8 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   - `NO_COLOR` turns colour off;
   - a terminal this machine has no terminfo entry for (Ghostty or kitty over SSH, say) is drawn as
     `xterm-256color`, and on exit it says how to install the real entry;
-  - with no usable terminal at all (or `--once`, or output to a pipe) it prints one snapshot.
+  - with no usable terminal at all (`TERM` unset or `dumb`, or `--once`, or output to a pipe) it
+    prints one snapshot.
 - **The daemon** is asked on a thread of its own, so keys never wait on it; while it doesn't
   answer, the screen says so. `SIGTERM` and a closed terminal end it cleanly.
 
