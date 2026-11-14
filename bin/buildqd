@@ -3526,8 +3526,9 @@ class Daemon:
         to free memory does. What it lacks is worked out again after the pass, with the builds the pass
         started. None is stopped if all of them together wouldn't make it fit, nor one stopped
         CI_STOPS_MAX times already, nor any for a CI job's build in a lane that passes held room (it
-        holds none, so what is freed could go elsewhere). One CI job's build at a time, once the
-        builds stopped for the last are gone, and not for the same one again within ROOM_PAUSE."""
+        holds none, so what is freed could go elsewhere). One CI job's build at a time: not while
+        builds stopped for the last are still going, nor within ROOM_PAUSE of making room for one
+        that is still queued."""
         wait = self.cfg.make_room_for_ci
         self.room_made = {k: v for k, v in self.room_made.items()
                           if k in self.tickets and self.tickets[k].state == "queued"}
@@ -3535,12 +3536,14 @@ class Daemon:
             return
         if any(t.requeue_pending and t.yields_to for t in self.active()):
             return  # builds stopped for a CI job's build are still going: their memory isn't free yet
+        if any(now - made < self.ROOM_PAUSE for made in self.room_made.values()):
+            return  # room was just made for one that is still queued: it starts first (what it frees may lag)
         running = self.active()
         free_now = self.machine.mem_available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
         for ci in self.queue(now):
             if not (ci.from_ci and ci.short_by > 0 and now - ci.submitted >= wait
                     and not self.lane(ci.lane).may_pass_held  # it holds no room: what is freed could go elsewhere
-                    and now - self.room_made.get(ci.id, -math.inf) >= self.ROOM_PAUSE):
+                    ):
                 continue
             # What it lacks now, after the builds this pass started (one in a lane that passes held
             # room may have taken what was free), with the room still held ahead of it.
@@ -3567,8 +3570,7 @@ class Daemon:
                     continue  # stopping every one of them wouldn't make it fit
             self.room_made[ci.id] = now
             waited = f"{(now - ci.submitted) / 60:.0f} min"
-            for t in chosen:
-                t.ci_stops += 1
+            for t in chosen:  # (counted in ci_stops once it is gone: it may yet finish by itself)
                 t.yields_to, t.yield_until = ci.id, now + self.YIELD_MAX
                 self.shed(t, now, why=f"to make room for a CI job's build that has waited {waited} for "
                                       f"{fmt_size(short)} more memory: {ci.label[:60]} ({ci.id[:8]})")
@@ -3601,9 +3603,10 @@ class Daemon:
                 except FileNotFoundError:
                     pass
             write_json(os.path.join(t.dir, "env.json"), t.env)
-            ci = self.tickets.get(t.yields_to) if self.yielding(t, now) else None
-            cause = (f"to make room for a CI job's build ({ci.label[:60]}, {ci.id[:8]})" if ci is not None
-                     else "because the machine ran short of memory")
+            ci = self.tickets.get(t.yields_to) if t.yields_to else None
+            cause = ("because the machine ran short of memory" if not t.yields_to else
+                     f"to make room for a CI job's build ({ci.label[:60]}, {ci.id[:8]})" if ci is not None
+                     else "to make room for a CI job's build")
             marker = (f"\nbuildq: stopped at {time.strftime('%H:%M:%S')} {cause}; "
                       "it starts again from the beginning when there is room.\n").encode()
             offsets = {}
@@ -3650,15 +3653,23 @@ class Daemon:
         t.source_verified = None  # the next attempt is checked afresh
         t.source_checks = {}
         t.requeues += 1
+        for_ci = bool(t.yields_to)  # stopped for a CI job's build (make_room_for_ci)
+        if for_ci:
+            t.ci_stops += 1
+            if not self.yielding(t, now):  # which has started since: nothing to yield to
+                t.yields_to = t.yield_until = None
         t.queued_at = t.wait_mark = now
         if self.yielding(t, now):
             t.reason_cat, t.reason = "held", ("stopped to make room for a CI job's build; it goes first once "
                                               "that has started")
+        elif for_ci:
+            t.reason_cat, t.reason = "memory", ("stopped to make room for a CI job's build, which has started; it "
+                                                "goes first once there is room")
         else:
             t.reason_cat, t.reason = "memory", "stopped to free memory; it goes first once there is room"
         self.save(t)
         self.broadcast(t, now)
-        what = "make room for a CI job's build" if self.yielding(t, now) else "free memory"
+        what = "make room for a CI job's build" if for_ci else "free memory"
         log(f"queued {t.id} again: stopped to {what} ({t.requeues} time{'s' if t.requeues != 1 else ''})", level=4)
 
     # ---- checking that a build built the source its record says
@@ -4634,7 +4645,7 @@ class Daemon:
         # What every attempt took, the ones stopped to free memory included.
         record = {"t": round(time.time()), "key": t.key, "lane": t.lane, "caller": t.caller, "state": t.state,
                   "exit": t.exit, "oom": t.oom, "timed_out": t.timed_out,
-                  "stopped_for_memory": bool(t.shed_error) or t.requeues > 0, "requeues": t.requeues,
+                  "stopped_for_memory": bool(t.shed_error) or t.requeues > t.ci_stops, "requeues": t.requeues,
                   "ci_stops": t.ci_stops,
                   "wall": round(wall + t.attempts_wall, 1), "waited": round(t.wait_total, 1),
                   "peak_mem": max(t.mem_peak, t.attempts_peak),

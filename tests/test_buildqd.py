@@ -2613,17 +2613,18 @@ class MakeRoomForCI(DaemonCase):
         self.assertEqual(self.runner.forced, [])  # not before it has waited make_room_for_ci
         self.tick(301)
         self.assertEqual(self.runner.forced, [new.id])  # the newest: the least work lost
-        self.assertEqual((new.requeue_pending, new.ci_stops, new.yields_to), (True, 1, ci.id))
+        self.assertEqual((new.requeue_pending, new.ci_stops, new.yields_to), (True, 0, ci.id))  # counted once gone
         self.tick(302)
         self.assertEqual(len(self.runner.forced), 1)  # nothing more while it is being stopped
         self.runner.running.discard(new.id)  # it is gone
         self.daemon.check(self.now + 303)
-        self.assertEqual((new.state, new.shed_error), ("queued", None))  # queued again, not failed
+        self.assertEqual((new.state, new.shed_error, new.ci_stops), ("queued", None, 1))  # queued again, not failed
         self.assertIn("CI job's build", new.reason)
         with open(new.log) as f:
             self.assertIn("to make room for a CI job's build", f.read())
         kept = buildqd.Ticket.from_record(json.loads(json.dumps(new.record())), new.dir)
-        self.assertEqual((kept.ci_stops, kept.yields_to), (1, ci.id))
+        self.assertEqual((kept.ci_stops, kept.yields_to, kept.yield_until), (1, ci.id, new.yield_until))
+        self.assertGreater(kept.yield_until, self.now + 303)
         self.tick(304)  # its memory isn't free yet
         self.assertEqual([t.id for t in self.daemon.queue(self.now + 304)], [ci.id, new.id])  # it yields
         self.assertEqual((ci.held, new.held, new.state), (True, False, "queued"))  # and holds nothing
@@ -2732,6 +2733,43 @@ class MakeRoomForCI(DaemonCase):
         self.ci_waiting("16G")
         self.tick(301)
         self.assertEqual(self.runner.forced, [])
+
+    def test_a_build_that_finishes_before_it_is_stopped_isnt_counted(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.finish(new, after=302)  # it ended by itself first
+        self.assertEqual((new.state, new.ci_stops, new.requeues), ("succeeded", 0, 0))
+
+    def test_a_ci_build_that_starts_before_the_stopped_build_is_gone(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.tick(301)
+        self.machine.mem_available += 6 * GIB  # other work ended: it fits without the stop
+        self.tick(302)
+        self.assertEqual(ci.state, "running")
+        self.runner.running.discard(new.id)
+        self.daemon.check(self.now + 303)
+        self.assertEqual((new.state, new.ci_stops, new.yields_to, new.yield_until), ("queued", 1, None, None))
+        self.assertIn("which has started", new.reason)
+        with open(new.log) as f:
+            self.assertIn("to make room for a CI job's build", f.read())
+        self.assertTrue(self.daemon.waited_out(new, self.now + 303))  # it goes first now
+
+    def test_one_ci_build_at_a_time(self):
+        a, b, c = self.agents(6, 6, 6)  # 17G free
+        self.machine.mem_available = 45 * GIB - 18 * GIB - 15 * GIB  # others hold 15G: 2G free
+        first = self.ci_waiting("6G")  # lacks 4G
+        second = self.submit(("cargo", "test", "-p", "other"), mem="6G", env=self.CI, cwd=self.workdir())
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [c.id])
+        self.runner.running.discard(c.id)
+        self.daemon.check(self.now + 302)  # gone, but what it frees isn't seen yet
+        self.tick(303)
+        self.assertEqual((first.state, second.state), ("queued", "queued"))
+        self.assertEqual(self.runner.forced, [c.id])  # the second waits until the first has started
+        del a, b
 
     def test_stops_for_ci_dont_count_toward_the_limit_of_three(self):
         (t,) = self.agents(12)

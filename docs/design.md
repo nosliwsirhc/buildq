@@ -213,10 +213,12 @@ A build gives back what it uses plus what it may still grow into, as admission c
 newest whose share covers `short_by` is stopped, else the newest few whose shares do together;
 none if all of them wouldn't. Stopped builds take the requeue path, with `yields_to` naming the CI
 ticket: until it starts, or for 30 minutes, a stopped build doesn't start (whatever its lane), and
-counts neither as overdue nor as waited out. These stops don't count toward the limit of three stops
+counts neither as overdue nor as waited out. A stop is counted (`ci_stops`) once the build is gone and
+queued again, not if it finished by itself first, and doesn't count toward the limit of three stops
 for memory. One CI ticket at a
-time, not while builds stopped for one are still going, and not for the same CI ticket again within
-two minutes.
+time: nothing more is stopped while builds stopped for one are still going, nor within two minutes of
+making room for a CI ticket that is still queued (what the stops free may not show yet), whichever
+CI ticket it would be for.
 
 **Holding room.** Once a ticket has waited `starve_seconds` (a CI ticket with `ci_first`: at
 once, but until it has waited `starve_seconds` its room binds only tickets of its priority or
