@@ -210,7 +210,12 @@ worked out again after the pass, since a lane that passes held room may have sta
 it) stops running builds after each pass, unless its lane passes held room (it holds none). The wait
 counts from when the CI ticket was submitted. The builds it may stop are those not CI tickets' or flock slots', of its priority or lower,
 restart-safe (`restart_safe`, with `restartable_scripts`) or `--restartable`, with their environment known, stopped this way fewer than twice,
-and stopped for memory fewer than three times (a fourth stop would fail them).
+stopped for memory fewer than three times (a fourth stop would fail them), and not running longer
+than `make_room_spare_after` (if set). With `make_room_behind_agents = false`, a CI ticket that the
+room held for agents' tickets ahead of it binds (`short_agents`, the part of `short_hm` held for
+non-CI tickets, any amount) stops nothing, since what it freed would go to them first; and a build
+that was overdue when it started (`was_overdue`: three times `starve_seconds` waited, or stopped once)
+is never stopped for one. `make_room_spare_after` counts run time without the pauses.
 A build gives back what it uses plus what it may still grow into, as admission counts it. The
 newest whose share covers `short_by` is stopped, else the newest few whose shares do together;
 none if all of them wouldn't. Stopped builds take the requeue path, with `yields_to` naming the CI

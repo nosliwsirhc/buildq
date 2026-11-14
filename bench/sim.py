@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import importlib.machinery
 import importlib.util
 import json
@@ -124,11 +125,16 @@ class Job:
         self.discarded = False  # stopped or cancelled: gone without a last word
         self.last_mem = 0  # what it held in its last second, for the daemon's last look
 
+    # Tools that hold to the cores buildq grants them: a jobserver's tokens, CARGO_BUILD_JOBS,
+    # DOTNET_PROCESSOR_COUNT, make's -j. Others (vitest, node, a test runner) start a worker per core
+    # the machine has, whatever they were granted, and run as they were recorded.
+    honors_grant = True  # set at launch (Simulation.honors_grant)
+
     def wanted_cores(self) -> float:
         if self.frozen:
             return 0.0
         avg = max(float(self.spec.get("avg_cores") or 1.0), 0.1)
-        return min(float(max(self.ticket.granted, 1)), avg)
+        return min(float(max(self.ticket.granted, 1)), avg) if self.honors_grant else avg
 
     def memory_at(self, progress: float) -> int:
         wall = max(float(self.spec["wall"]), 1.0)
@@ -306,7 +312,26 @@ class Simulation:
         if rec["first_start"] is None:
             rec["first_start"] = self.clock.now - EPOCH
         rec["planned"] = max(rec["planned"], int(ticket.est_mem))
-        self.jobs[ticket.id] = Job(ticket, self.specs[ticket.id], self.clock.now)
+        job = Job(ticket, self.specs[ticket.id], self.clock.now)
+        job.honors_grant = self.honors_grant(ticket)
+        self.jobs[ticket.id] = job
+
+    # Tools that hold to the cores buildq grants them: a jobserver's tokens or CARGO_BUILD_JOBS (cargo,
+    # make, ninja), DOTNET_PROCESSOR_COUNT, CMAKE_BUILD_PARALLEL_LEVEL. JS tools and test runners
+    # (vitest, eslint, node) start a worker per core the machine has, jobserver or not.
+    GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"})
+
+    def honors_grant(self, ticket) -> bool:
+        """cargo, make, ninja, dotnet, cmake and go hold to their grant; a script (a shell or an
+        interpreter running one) does under a jobserver, through the cargo or make it runs; anything
+        else (vitest, eslint, vite, storybook, node, a JS package script) runs at its own pace."""
+        tool, _ = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
+        if tool in self.GRANT_TOOLS:
+            return True
+        if tool in self.mod.SHELLS or tool in self.mod.INTERPRETERS - {"node", "deno", "bun"} \
+                or re.fullmatch(r"python3(\.\d+)?", tool):
+            return bool(ticket.jobserver)
+        return False
 
     def end(self, job: Job, result: dict | None, discarded: str | None = None):
         job.alive = False
@@ -376,8 +401,8 @@ class Simulation:
             limit = float(job.ticket.timeout or 0)
             if limit and self.clock.now - job.started >= limit:  # the supervisor's time limit
                 self.end(job, {"exit": 124, "timed_out": True})
-            elif job.progress >= float(job.spec["wall"]):
-                self.end(job, {"exit": int(job.spec.get("exit", 0))})
+            elif job.progress >= float(job.spec["wall"]) and not job.spec.get("unfinished"):
+                self.end(job, {"exit": int(job.spec.get("exit", 0))})  # (an unfinished one runs until it is cancelled)
         live = [j for j in live if j.alive]
         used = self.background_mem + sum(j.mem for j in live)  # what ended this second gave its memory back
         self.machine.mem_available = max(0, self.machine.mem_total - used)
@@ -395,6 +420,11 @@ class Simulation:
         if queued:
             self.events["idle_core_seconds"] += max(0.0, self.machine.ncpu * self.daemon.cfg.cpu_target - busy)
 
+    def refresh_memory(self):
+        """Free memory as it is now: after kills since this second's step (cancels), not at its start."""
+        used = self.background_mem + sum(j.mem for j in self.jobs.values() if j.alive)
+        self.machine.mem_available = max(0, self.machine.mem_total - used)
+
     def ci_timeouts(self, now: float):
         """A CI job that runs past its time limit is cancelled by GitHub, and its build with it."""
         for tid, spec in self.specs.items():
@@ -407,6 +437,21 @@ class Simulation:
             if now - t.submitted >= float(spec.get("timeout_s", DEFAULT_TIMEOUT)):
                 self.events["ci_timed_out"] += 1
                 self.records[tid]["timed_out_queued"] = t.state == "queued"
+                self.daemon.cancel(t, now)
+
+    def trace_cancels(self, now: float):
+        """A build the trace says was cancelled is cancelled the same time after its submission (#40)."""
+        for tid, spec in self.specs.items():
+            if spec.get("cancel_at") is None:
+                continue
+            t = self.daemon.tickets.get(tid)
+            if t is None or t.state in self.mod.FINISHED or t.cancel_requested:
+                continue
+            job = self.jobs.get(tid)
+            if job is not None and not job.alive and not job.discarded:
+                continue  # it finished this second
+            if now - t.submitted >= float(spec["cancel_at"]):
+                self.records[tid]["cancelled_by_trace"] = True
                 self.daemon.cancel(t, now)
 
     def run(self, horizon: float | None = None) -> dict:
@@ -425,6 +470,8 @@ class Simulation:
                 self.submit(spec, n)
                 i += 1
             self.ci_timeouts(now)
+            self.trace_cancels(now)
+            self.refresh_memory()  # a build cancelled this second gave its memory back at once
             d.check(now)
             d.shed_memory(now)
             d.schedule(now)
@@ -494,6 +541,14 @@ def waits(records: list[dict], end: float) -> list[float]:
     return out
 
 
+def turnaround_stats(records: list[dict], end: float) -> dict:
+    """From submission to the end, whatever happened between: a build stopped and queued again
+    waits twice, which the wait (to first start) doesn't count."""
+    t = [max(0.0, (r["ended"] if r["ended"] is not None else end) - r["submitted"]) for r in records]
+    r = lambda v: None if v is None else round(v, 1)  # noqa: E731
+    return {"builds": len(records), "p50": r(percentile(t, 0.5)), "p95": r(percentile(t, 0.95)), "max": r(max(t, default=None))}
+
+
 def wait_stats(records: list[dict], end: float) -> dict:
     w = waits(records, end)
     r = lambda v: None if v is None else round(v, 1)  # noqa: E731
@@ -519,12 +574,15 @@ def summarize(sim: Simulation, seconds: int) -> dict:
         "complete": complete,  # False: the horizon came first, and makespan is the time simulated
         "makespan_s": round((max(ends) if ends and complete else end) - first, 1),
         "outcomes": dict(sorted(outcomes.items())),
+        "turnaround": {"ci": turnaround_stats([r for r in records if r["ci"]], end),
+                       "agent": turnaround_stats([r for r in records if not r["ci"]], end)},
         "wait": {"all": wait_stats(records, end),
                  "ci": wait_stats([r for r in records if r["ci"]], end),
                  "agent": wait_stats([r for r in records if not r["ci"]], end),
                  **{f"lane:{lane}": wait_stats([r for r in records if r["lane"] == lane], end) for lane in lanes}},
         "ci_timed_out": sim.events["ci_timed_out"],
         "ci_timed_out_in_queue": sum(1 for r in records if r.get("timed_out_queued")),
+        "cancelled_as_in_trace": sum(1 for r in records if r.get("cancelled_by_trace")),
         "stops_for_memory": sum(max(0, (r.get("requeues") or 0) - (r.get("ci_stops") or 0)) + int(r.get("failed_stop", False))
                                 for r in records),
         "stops_for_ci": sum(r.get("ci_stops") or 0 for r in records),
@@ -546,6 +604,10 @@ def table(summary: dict) -> str:
     for group, w in summary["wait"].items():
         if w["builds"]:
             rows.append((f"wait {group} p50 / p95 / max ({w['builds']})",
+                         f"{fmt_s(w['p50'])} / {fmt_s(w['p95'])} / {fmt_s(w['max'])}"))
+    for group, w in summary["turnaround"].items():
+        if w["builds"]:
+            rows.append((f"turnaround {group} p50 / p95 / max",
                          f"{fmt_s(w['p50'])} / {fmt_s(w['p95'])} / {fmt_s(w['max'])}"))
     rows += [("CI timed out (in the queue)", f"{summary['ci_timed_out']} ({summary['ci_timed_out_in_queue']})"),
              ("stops for memory / for CI", f"{summary['stops_for_memory']} / {summary['stops_for_ci']}"),
@@ -627,6 +689,8 @@ COMPARED = [  # (label, how to read it from a summary, lower is better)
     ("CI wait max", lambda s: s["wait"]["ci"]["max"], fmt_s),
     ("agent wait p50", lambda s: s["wait"]["agent"]["p50"], fmt_s),
     ("agent wait p95", lambda s: s["wait"]["agent"]["p95"], fmt_s),
+    ("agent turnaround p50", lambda s: s["turnaround"]["agent"]["p50"], fmt_s),
+    ("agent turnaround p95", lambda s: s["turnaround"]["agent"]["p95"], fmt_s),
     ("CI timed out", lambda s: s["ci_timed_out"], str),
     ("stops (memory + CI)", lambda s: s["stops_for_memory"] + s["stops_for_ci"], str),
     ("running time lost to stops", lambda s: s["stopped_run_s"], fmt_s),
@@ -732,7 +796,7 @@ PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
-    query = "SELECT * FROM build WHERE wall > 0 AND submitted IS NOT NULL"
+    query = "SELECT * FROM build WHERE (wall > 0 OR state = 'cancelled') AND submitted IS NOT NULL"
     params: list = []
     if since is not None:
         query += " AND submitted >= ?"
@@ -745,17 +809,17 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
         return []
     first = rows[0]["submitted"]
     out = []
-    for r in rows:
-        repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
-        argv = words.split() or ["build"]
+    def shape(r: dict) -> dict | None:
+        """What one whole run of a row's command looked like (wall, cores, peak, profile), or None if
+        its last attempt never ran. wall counts every attempt; the profile and avg_cores describe the
+        last. Newer databases keep the last attempt's own wall time; without it, a requeued build's
+        profile can't be placed in time, so it is left out (memory then rises to the peak in the
+        first fifth)."""
         requeued = int(r.get("requeues") or 0)
-        # wall counts every attempt; the profile and avg_cores describe the last. Newer databases
-        # keep the last attempt's own wall time; without it, a requeued build's profile can't be
-        # placed in time, so it is left out (memory then rises to the peak in the first fifth).
         attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
-        if attempt is not None and float(attempt) <= 0:
-            continue  # its last attempt never ran (stopped, then cancelled while queued again): nothing to replay
-        wall = float(attempt) if attempt is not None else float(r["wall"])
+        wall = float(attempt) if attempt is not None else float(r.get("wall") or 0)
+        if wall <= 0:
+            return None
         profile = None
         if "profile" in cols and r.get("profile") and (attempt is not None or not requeued):
             try:
@@ -763,14 +827,35 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
             except (ValueError, TypeError):
                 profile = None
         avg = r.get("avg_cores") or ((r.get("cpu_seconds") or 0) / wall if wall else 1.0) or 1.0
+        return {"wall": wall, "avg": float(avg), "peak": int(r.get("mem_peak") or 0), "profile": profile}
+
+    # A whole run of each command that succeeded: what a cancelled build of it would have done (#40).
+    whole = {r.get("key"): shape(r) for r in rows if r.get("state") == "succeeded" and shape(r)}
+    for r in rows:
+        repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
+        argv = words.split() or ["build"]
+        requeued = int(r.get("requeues") or 0)
+        cancelled = r.get("state") == "cancelled"
+        run = whole.get(r.get("key")) if cancelled else shape(r)  # a cancelled one: how a whole run of it went
+        run = run or shape(r)
+        if run is None:
+            continue  # it never ran, and no other run of its command says how it would have: nothing to replay
+        wall, avg, profile = run["wall"], run["avg"], run["profile"]
         caller = str(r.get("caller") or "")
         state = str(r.get("state") or "")
         # A build that was cancelled or lost has no exit code: it didn't succeed, so it replays as a failure.
         exit_code = int(r["exit"]) if r.get("exit") is not None else (0 if state == "succeeded" else 1)
+        if cancelled and run is whole.get(r.get("key")):
+            exit_code = 0  # it would have run as that whole run did; its cancel ends it (cancel_at)
+        unfinished = cancelled and run is not whole.get(r.get("key"))  # only as far as it got: never ends by itself
         entry = {"t": round(float(r["submitted"]) - first, 1), "repo": repo or "project", "lane": lane or None,
                  "argv": argv, "ci": bool(r.get("from_ci")), "caller": caller, "wall": round(wall, 1),
-                 "avg_cores": round(float(avg), 2), "peak_mem": int(r.get("mem_peak") or 0), "exit": exit_code,
+                 "avg_cores": round(float(avg), 2), "peak_mem": int(run["peak"]), "exit": exit_code,
                  "state": state or None}
+        if cancelled and r.get("ended"):
+            entry["cancel_at"] = round(max(0.0, float(r["ended"]) - float(r["submitted"])), 1)
+        if unfinished:
+            entry["unfinished"] = True
         if requeued:
             entry["requeued"] = requeued
         if profile:

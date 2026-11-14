@@ -250,6 +250,8 @@ DEFAULTS = {
     "starve_seconds": 600,
     "ci_first": False,
     "make_room_for_ci": "0",
+    "make_room_behind_agents": True,
+    "make_room_spare_after": "0",
     "script_labels": [],
     "restartable_scripts": [],
     "unwatched_seconds": 30,
@@ -391,6 +393,11 @@ class Config:
         if self.make_room_for_ci and not self.ci_first:
             raise ValueError("make_room_for_ci needs ci_first = true: without it a CI job's build holds no room, "
                              "so the memory freed for it could go to another build")
+        # (#38) Whether a CI build waiting partly behind room held for agents' builds that have waited
+        # longer may stop builds; and how long a build may have run before it is never stopped for one.
+        self.make_room_behind_agents = boolean(d["make_room_behind_agents"], "make_room_behind_agents")
+        spare = d["make_room_spare_after"]
+        self.make_room_spare_after = 0.0 if spare in (0, "0", "", None, False) else parse_duration(spare)
         labels = d["script_labels"]
         if not isinstance(labels, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
                                                     for x in labels):
@@ -500,7 +507,8 @@ class Config:
             "disk_floor": f"{self.disk_floor_share * 100:g}%" if self.disk_floor_share else self.disk_floor,
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
-            "make_room_for_ci": self.make_room_for_ci, "script_labels": sorted(self.script_labels),
+            "make_room_for_ci": self.make_room_for_ci, "make_room_behind_agents": self.make_room_behind_agents,
+            "make_room_spare_after": self.make_room_spare_after, "script_labels": sorted(self.script_labels),
             "restartable_scripts": sorted(self.restartable_scripts),
             "slice": self.slice,
             "slice_guard": self.slice_guard,
@@ -612,6 +620,13 @@ class Machine:
         self.psi_cpu = pressure("cpu", "some")
         self.psi_mem = pressure("memory", "full")
         self.psi_mem_some = pressure("memory", "some")
+
+    def read_available(self) -> int:
+        """MemAvailable now, read again: a build that ended since this tick's sample has given its
+        memory back by now (see make_room_for_ci)."""
+        info = meminfo()
+        self.mem_available = info.get("MemAvailable", info.get("MemFree", self.mem_available))
+        return self.mem_available
 
     def summary(self) -> dict:
         return {
@@ -2827,6 +2842,7 @@ class Ticket:
         self.yields_to: str | None = None  # the CI job's build it was last stopped for: it doesn't go before it
         self.yield_until: float | None = None  # ...for at most this long
         self.short_hm = 0.0  # (not kept) the room held ahead of it then, which it couldn't use
+        self.short_agents = 0.0  # (not kept) of that, the room held for agents' builds (not CI jobs')
         self.short_by = 0.0  # (not kept) the memory it lacked when the queue was last looked at
         self.requeue_pending = False  # being stopped, to be queued again
         self.shed_error = None  # why it can't be queued again once stopped
@@ -3851,6 +3867,13 @@ class Daemon:
     CI_STOPS_MAX = 2  # times one build may be stopped to make room for CI jobs' builds
     ROOM_PAUSE = 120.0  # seconds after making room for a CI job's build, while it is queued, before more is made
 
+    def was_overdue(self, t: Ticket) -> bool:
+        """It went before CI jobs' builds when it started: it had waited three times starve_seconds,
+        or it had been stopped once, and its lane doesn't pass held room (see queue)."""
+        if self.lane(t.lane).may_pass_held:
+            return False  # never overdue there: it gets no head start, and none to protect
+        return t.requeues > 0 or (t.started is not None and t.started - t.submitted >= 3 * self.cfg.starve_seconds)
+
     def make_room_for_ci(self, now: float) -> None:
         """A CI job's build that has waited make_room_for_ci for memory that builds of ours hold: stop
         the newest of the builds that can start over safely (a compile or test run, or --restartable),
@@ -3872,24 +3895,39 @@ class Daemon:
             return  # builds stopped for a CI job's build are still going: their memory isn't free yet
         if any(now - made < self.ROOM_PAUSE for made in self.room_made.values()):
             return  # room was just made for one that is still queued: it starts first (what it frees may lag)
+        if any(t.cancel_requested and not t.flock for t in self.active()):
+            return  # a cancelled build (a CI job past its time limit, say) is giving its memory back: wait for it
         running = self.active()
-        free_now = self.machine.mem_available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
+        free_now = None
         for ci in self.queue(now):
             if not (ci.from_ci and ci.short_by > 0 and now - ci.submitted >= wait
                     and not self.lane(ci.lane).may_pass_held  # it holds no room: what is freed could go elsewhere
                     ):
                 continue
+            if ci.short_agents > 0 and not self.cfg.make_room_behind_agents:
+                continue  # it waits partly behind agents' builds that have waited longer: they go first (#38)
             # What it lacks now, after the builds this pass started (one in a lane that passes held
             # room may have taken what was free), with the room still held ahead of it.
+            if free_now is None:
+                # Read again rather than this tick's sample (only once a CI build is due): a build that
+                # ended in check() since has given its memory back, and stopping one for it would be
+                # for nothing.
+                read = getattr(self.machine, "read_available", None)
+                available = read() if read is not None else self.machine.mem_available
+                free_now = available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
             short = ci.est_mem - (free_now - ci.short_hm)
             if short <= 0:
                 continue  # it fits: it starts on the next pass
             weight = self.weight(ci)
+            spare = self.cfg.make_room_spare_after
+            protect = not self.cfg.make_room_behind_agents
             builds = [t for t in running if not t.flock and t.state == "running" and not t.from_ci
                       and not t.cancel_requested and not t.requeue_pending and t.started is not None
                       and self.weight(t) <= weight and t.ci_stops < self.CI_STOPS_MAX
                       and (t.restartable or restart_safe(t.argv, self.cfg.restartable_scripts)) and t.env is not None
-                      and t.requeues - t.ci_stops < 3]
+                      and t.requeues - t.ci_stops < 3
+                      and not (spare and now - t.started - self.paused_for(t, now) >= spare)  # far along: spared
+                      and not (protect and self.was_overdue(t))]  # its turn came first (#38)
             gives = {t.id: t.mem_now + self.still_to_grow(t, now) for t in builds}  # what admission sets aside
             newest = sorted(builds, key=lambda t: t.started, reverse=True)
             chosen = next(([t] for t in newest if gives[t.id] >= short), None)
@@ -4422,6 +4460,7 @@ class Daemon:
         count = len(running)
         per_lane = collections.Counter(t.lane for t in running)
         held_mem = held_cpu = 0.0
+        held_agents = 0.0  # of held_mem, the room held for builds that aren't CI jobs' (#38)
         # Room held for CI jobs' builds by ci_first, as (priority, memory, cores): it binds only
         # builds of the same priority or lower, so a higher lane can still start in room that is free.
         ci_holds: list[tuple[int, float, float]] = []
@@ -4499,6 +4538,7 @@ class Daemon:
             elif t.est_mem > free_mem - hm:
                 t.short_by = t.est_mem - (free_mem - hm)  # (unless no stopped build could free it, below)
                 t.short_hm = hm
+                t.short_agents = 0.0 if passes else held_agents
                 if t.est_mem <= free_mem:
                     reason = ("held", "the room it needs is held for a build that has waited longer"
                               if passes or t.est_mem > free_mem - held_mem else
@@ -4552,6 +4592,8 @@ class Daemon:
                 if self.waited_out(t, now):
                     held_mem += t.est_mem
                     held_cpu += cores
+                    if not t.from_ci:
+                        held_agents += t.est_mem
                 else:  # a CI job's build, first by ci_first: a higher lane may still use the room
                     ci_holds.append((weight, t.est_mem, cores))
                 if lane.exclusive and t.workspace:  # and its workspace: a quicker lane mustn't keep taking it

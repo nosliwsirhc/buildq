@@ -2939,6 +2939,115 @@ class MakeRoomForCI(DaemonCase):
         self.assertEqual(self.runner.forced, [new.id])
         self.daemon.cfg.restartable_scripts = frozenset()
 
+    def behind_an_agent_build_that_waited(self):
+        """Two 12G builds running (11G free); a 20G agent build that has waited three times
+        starve_seconds (overdue: it goes before CI builds) holds its room; then a CI build arrives
+        needing 8G, which lacks it only because of that hold."""
+        old, new = self.agents(12, 12)
+        held = self.submit(("cargo", "test", "-p", "big"), mem="20G", caller="patient", cwd=self.workdir())
+        self.tick(901)  # past three times starve_seconds: overdue, and it holds its room
+        self.assertTrue(held.held)
+        self.now += 901
+        ci = self.submit(("cargo", "test"), mem="8G", env=self.CI)
+        self.assertEqual((ci.state, ci.reason_cat), ("queued", "held"))
+        return old, new, held, ci
+
+    def test_a_ci_build_behind_agents_builds_that_waited_longer_may_stop_builds(self):
+        self.behind_an_agent_build_that_waited()
+        self.tick(301)
+        self.assertTrue(self.runner.forced)  # by default: room for the held build and the CI one
+
+    def test_make_room_behind_agents_off_leaves_them_their_turn(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new, held, ci = self.behind_an_agent_build_that_waited()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])  # it waits behind them, as before make_room_for_ci (#38)
+        self.assertGreater(ci.short_agents, 0)
+
+    def test_a_build_that_has_run_long_is_spared(self):
+        self.daemon.cfg.make_room_spare_after = 200.0
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)  # both have run about 300 s: past 200, so neither is stopped
+        self.assertEqual(self.runner.forced, [])
+        self.daemon.cfg.make_room_spare_after = 400.0
+        self.daemon.room_made.clear()
+        self.tick(302)
+        self.assertEqual(self.runner.forced, [new.id])  # under 400: the newest is stopped as before
+
+    def test_time_paused_isnt_time_run(self):
+        self.daemon.cfg.make_room_spare_after = 200.0
+        old, new = self.agents(12, 12)
+        for t in (old, new):
+            t.frozen, t.frozen_at = True, self.now + 50  # paused since 50 s in: about 50 s of real work
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])  # not spared: a paused build hasn't run all that time
+
+    def test_with_behind_agents_off_a_build_that_went_first_isnt_stopped_once_it_runs(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new = self.agents(12, 12)
+        new.requeues = 1  # it had been stopped once, so it went before CI jobs' builds when it started
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [old.id])  # the other one, though older
+
+    def test_no_room_is_made_while_a_cancelled_build_gives_its_memory_back(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.daemon.cancel(old, self.now + 300)  # a CI job past its time limit, say: its build is stopping
+        self.tick(301)
+        self.assertNotIn(new.id, self.runner.forced)  # what the cancelled build frees may be enough
+        self.runner.running.discard(old.id)  # it is gone, but the CI build still doesn't fit
+        self.daemon.check(self.now + 302)
+        self.assertEqual(old.state, "cancelled")
+        self.tick(303)
+        self.assertIn(new.id, self.runner.forced)  # the guard opens again
+
+    def test_memory_is_read_again_before_making_room(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.daemon.schedule(self.now + 301)  # (the tick's own reading: the CI build doesn't fit)
+        self.machine.read_available = lambda: 45 * GIB  # a build ended since: its memory is back
+        self.daemon.make_room_for_ci(self.now + 301)
+        self.assertEqual(self.runner.forced, [])  # so nothing is stopped for it
+        self.assertEqual(ci.state, "queued")  # (it starts on the next pass)
+
+    def test_builds_ending_every_second_dont_hold_making_room_back(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        quick = [self.submit(("vitest", "run", f"q{i}"), lane="web", mem="1G", cores=1, caller=f"q{i}",
+                             cwd=self.workdir()) for i in range(5)]  # (a lane that may pass the CI build's held room)
+        self.assertEqual({q.state for q in quick}, {"running"})
+        for i, q in enumerate(quick):  # one ends in each tick, just before room would be made
+            self.finish(q, after=301 + i)
+            self.tick(301 + i)
+        self.assertEqual(self.runner.forced, [new.id])  # made all the same, in the first of those ticks
+
+    def test_a_build_that_waited_three_turns_is_protected_once_it_runs(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new = self.agents(12, 12)
+        new.submitted = new.started - 3 * self.daemon.cfg.starve_seconds  # it started after a long wait
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [old.id])
+
+    def test_a_lane_that_passes_held_room_has_no_overdue_builds(self):
+        self.daemon.cfg.lanes["web"].mem = 12 * GIB
+        (web,) = self.agents(12, argv=("vitest", "run"), lane="web")
+        web.requeues = 1
+        self.assertFalse(self.daemon.was_overdue(web))  # the queue gives it no head start, so no protection
+
+    def test_the_make_room_options_are_read(self):
+        cfg = buildqd.Config({}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (True, 0.0))
+        cfg = buildqd.Config({"ci_first": True, "make_room_for_ci": "5m", "make_room_behind_agents": False,
+                              "make_room_spare_after": "20m"}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (False, 1200.0))
+        self.assertEqual(cfg.summary()["make_room_spare_after"], 1200.0)
+        with self.assertRaises(ValueError):
+            buildqd.Config({"make_room_spare_after": "soon"}, 64 * GIB, 16)
+
     def test_stops_for_ci_dont_count_toward_the_limit_of_three(self):
         (t,) = self.agents(12)
         t.requeues, t.ci_stops = 3, 1
@@ -4354,6 +4463,151 @@ class Top(unittest.TestCase):
         for bad in ("-1", "0", "0.1", "nan", "inf", "x"):
             with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
                 buildq.interval_arg(bad)
+
+    def test_which_encodings_want_ascii(self):
+        self.assertTrue(buildq.wants_ascii("ANSI_X3.4-1968"))  # LC_ALL=C, as nl_langinfo and curses say
+        self.assertTrue(buildq.wants_ascii("ascii"))
+        self.assertTrue(buildq.wants_ascii(None))
+        self.assertFalse(buildq.wants_ascii("UTF-8"))
+        self.assertFalse(buildq.wants_ascii("utf_8"))
+
+    def test_no_color_turns_colour_off(self):
+        self.assertTrue(buildq.colour_wanted({}))
+        self.assertFalse(buildq.colour_wanted({"NO_COLOR": "1"}))
+        self.assertTrue(buildq.colour_wanted({"NO_COLOR": ""}))  # set but empty: no-color.org says ignore it
+
+    def test_a_terminal_this_machine_has_no_terminfo_for_falls_back(self):
+        import curses
+        env, tried = {"TERM": "xterm-ghostty"}, []
+
+        def wrapper(run):
+            tried.append(env["TERM"])
+            if env["TERM"] == "xterm-ghostty":
+                raise curses.error("setupterm: could not find terminal")
+            return run(None)
+        code, why = buildq.curses_with_fallback(lambda screen: 7, wrapper, env)
+        self.assertEqual((code, tried), (7, ["xterm-ghostty", "xterm-256color"]))
+        self.assertIn("no terminfo for TERM=xterm-ghostty", why)
+        self.assertIn("infocmp -x xterm-ghostty", why)
+
+    def test_no_terminal_at_all_is_one_snapshot_and_says_why(self):
+        import curses
+
+        def wrapper(run):
+            raise curses.error("setupterm: could not find terminal")
+        code, why = buildq.curses_with_fallback(lambda screen: 0, wrapper, {"TERM": "dumb"})
+        self.assertIsNone(code)
+        self.assertIn("one snapshot instead", why)
+
+    def test_a_curses_error_once_running_isnt_taken_for_the_terminal(self):
+        import curses
+
+        def run(screen):
+            raise curses.error("addwstr() returned ERR")
+        with self.assertRaises(curses.error):
+            buildq.curses_with_fallback(run, lambda r: r(None), {"TERM": "xterm-ghostty"})
+
+    def test_the_screen_never_waits_on_the_daemon(self):
+        import threading
+        release = threading.Event()
+
+        def slow():
+            release.wait(5)
+            return {"overview": {}}
+        fetcher = buildq.StatusFetcher(0.05, ask=slow).start()
+        self.addCleanup(fetcher.stop)
+        self.addCleanup(release.set)
+        started = time.monotonic()
+        self.assertEqual(fetcher.latest(), (0, None))  # at once, while the daemon is still answering
+        self.assertLess(time.monotonic() - started, 0.5)
+        release.set()
+        self.assertTrue(fetcher.answered.wait(5))
+        version, status = fetcher.latest()
+        self.assertEqual((version >= 1, status), (True, {"overview": {}}))
+
+    def test_sigterm_and_sighup_end_it_as_an_exception(self):
+        import signal as signals
+        saved = {s: signals.getsignal(s) for s in (signals.SIGTERM, signals.SIGHUP)}
+        self.addCleanup(lambda: [signals.signal(s, h) for s, h in saved.items()])
+        buildq.exit_on_signals()
+        for sig in (signals.SIGTERM, signals.SIGHUP):
+            with self.assertRaises(SystemExit) as caught:
+                os.kill(os.getpid(), sig)
+                time.sleep(1)  # (the handler runs at the next bytecode)
+            self.assertEqual(caught.exception.code, 128 + sig)
+
+    def test_no_color_keeps_the_terminal_s_own_colours(self):
+        calls = []
+
+        class Curses:
+            A_BOLD, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE = 1 << 21, 6, 2, 3, 1, 4
+            error = Exception
+
+            def has_colors(self):
+                return True
+
+            def use_default_colors(self):
+                calls.append("default")
+
+            def init_pair(self, *a):
+                calls.append("pair")
+
+            def color_pair(self, i):
+                return i << 8
+        plain = buildq.init_colours(Curses(), wanted=False)
+        self.assertEqual(calls, ["default"])  # the terminal's own colours, not white on black
+        self.assertEqual((plain[""], plain["head"]), (0, Curses.A_BOLD))  # headings keep their bold
+        calls.clear()
+        coloured = buildq.init_colours(Curses(), wanted=True)
+        self.assertEqual(calls.count("pair"), 5)
+        self.assertNotEqual(coloured["ok"], 0)
+
+    def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
+        import curses
+
+        def wrapper(run):
+            try:
+                run(None)
+            finally:  # as curses.wrapper's teardown fails on a hung-up terminal
+                raise curses.error("nocbreak() returned ERR")
+
+        def run(screen):
+            raise SystemExit(129)
+        with self.assertRaises(SystemExit) as caught:
+            buildq.curses_with_fallback(run, wrapper, {"TERM": "xterm-256color"})
+        self.assertEqual(caught.exception.code, 129)
+        env, calls = {"TERM": "xterm-ghostty"}, []
+
+        def fallback_wrapper(run):  # the first try fails setupterm; the fallback runs, then hangs up
+            calls.append(env["TERM"])
+            if len(calls) == 1:
+                raise curses.error("setupterm: could not find terminal")
+            return wrapper(run)
+        with self.assertRaises(SystemExit) as caught:
+            buildq.curses_with_fallback(run, fallback_wrapper, env)
+        self.assertEqual((caught.exception.code, calls), (129, ["xterm-ghostty", "xterm-256color"]))
+
+        def interrupted(screen):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            buildq.curses_with_fallback(interrupted, wrapper, {"TERM": "xterm-256color"})
+
+    def test_the_fetcher_survives_an_unexpected_error(self):
+        answers = iter([{"overview": {}}, OSError(23, "too many open files"), {"overview": {"x": 1}}])
+
+        def ask():
+            a = next(answers, {"overview": {"x": 1}})
+            if isinstance(a, Exception):
+                raise a
+            return a
+        fetcher = buildq.StatusFetcher(0.01, ask=ask).start()
+        self.addCleanup(fetcher.stop)
+        deadline = time.monotonic() + 5
+        while fetcher.latest()[0] < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(fetcher.latest()[0], 3)  # it went on asking
+        self.assertTrue(fetcher.thread.is_alive())
+
 
 if __name__ == "__main__":
     unittest.main()
