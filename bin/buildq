@@ -329,7 +329,10 @@ def print_ticket(row: dict) -> None:
     if row.get("frozen"):
         print("  paused    to give the machine its memory back; it goes on once there is room")
     if row.get("requeues"):
-        print(f"  requeued  {row['requeues']} time{'s' if row['requeues'] != 1 else ''}: stopped to free memory, "
+        for_ci = row.get("ci_stops") or 0
+        why = ("to free memory" if not for_ci else "to make room for CI jobs' builds" if for_ci == row["requeues"]
+               else f"to free memory or ({for_ci}) to make room for CI jobs' builds")
+        print(f"  requeued  {row['requeues']} time{'s' if row['requeues'] != 1 else ''}: stopped {why}, "
               "then started over")
     if row["state"] in ("starting", "running") and row.get("measured"):
         print(f"  using     {row['cores_now']:.1f} cores, {fmt_size(row['mem_now'])} now; "
@@ -524,7 +527,9 @@ class Follower:
                 note("paused: the machine is short of memory; it goes on where it was once there is room."
                      if message.get("frozen") else "going on: there is memory again.")
             if not self.quiet and previous in ("starting", "running") and message["state"] == "queued":
-                note("stopped to free memory, and queued again at the front: it starts from the beginning "
+                note("stopped to make room for a CI job's build, and queued again: it starts from the beginning "
+                     "once that build has started, and goes first then. Keep waiting." if message.get("yields_to")
+                     else "stopped to free memory, and queued again at the front: it starts from the beginning "
                      "once there is room. Keep waiting.")
             if previous == "queued" and message["state"] in ("starting", "running") and not self.quiet \
                     and (message.get("waited") or 0) >= 2:

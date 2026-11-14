@@ -40,6 +40,17 @@ build gets a head start (not in a lane that may pass held room), with its room h
 busy machine. A `ci` lane can give them a priority or caps
 of their own (see [config.example.toml](../config.example.toml)).
 
+Going first can't free memory that running builds already use, so a CI step that needs a lot
+(a lint that peaks at 16 GB, say) can still wait out a long build. With `make_room_for_ci = "5m"`,
+a CI job's build that has waited that long for memory that buildq's builds hold stops the newest of
+the builds that can safely start over (a compile or test run, or one submitted `--restartable`), of
+its priority or lower and not a CI job's. It stops the one whose memory covers what the step lacks,
+or, if no one build does, the newest few that do together, and none if stopping all of them wouldn't
+make it fit. Each stopped build is queued again with its place, yields to that CI build until it
+has started, and then goes first; cargo keeps the crates it finished, so it repeats only the ones it
+was compiling. A build is stopped this way at most twice. Pausing a build wouldn't help: a paused
+build keeps its memory.
+
 ## A new step's first run
 
 A step's first run is planned at its lane's default memory, since its command has no history, and a

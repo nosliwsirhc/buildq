@@ -243,6 +243,7 @@ DEFAULTS = {
     "ramp_seconds": 90,
     "starve_seconds": 600,
     "ci_first": False,
+    "make_room_for_ci": "0",
     "script_labels": [],
     "unwatched_seconds": 30,
     "history_runs": 30,
@@ -374,6 +375,11 @@ class Config:
         self.ramp_seconds = number(d["ramp_seconds"], "ramp_seconds", 0, 3600)
         self.starve_seconds = number(d["starve_seconds"], "starve_seconds", 1, 7 * 86400)
         self.ci_first = boolean(d["ci_first"], "ci_first")
+        room = d["make_room_for_ci"]
+        self.make_room_for_ci = 0.0 if room in (0, "0", "", None, False) else parse_duration(room)
+        if self.make_room_for_ci and not self.ci_first:
+            raise ValueError("make_room_for_ci needs ci_first = true: without it a CI job's build holds no room, "
+                             "so the memory freed for it could go to another build")
         labels = d["script_labels"]
         if not isinstance(labels, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
                                                     for x in labels):
@@ -473,7 +479,7 @@ class Config:
             "disk_floor": f"{self.disk_floor_share * 100:g}%" if self.disk_floor_share else self.disk_floor,
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
-            "script_labels": sorted(self.script_labels),
+            "make_room_for_ci": self.make_room_for_ci, "script_labels": sorted(self.script_labels),
             "slice": self.slice,
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
@@ -1808,6 +1814,7 @@ BUILD_COLUMNS = [
     ("cores_granted", "REAL"), ("avg_cores", "REAL"), ("peak_cores", "REAL"), ("cpu_seconds", "REAL"),
     ("requeues", "INTEGER"), ("paused", "REAL"), ("oom", "INTEGER"), ("mem_high", "INTEGER"),
     ("mem_wait", "REAL"),
+    ("ci_stops", "INTEGER"),  # of its requeues, the times it was stopped to make room for a CI job's build
 ]
 CI_UNITS = ("actions.runner.*", "gha-*", "*-runner-*", "gitlab-runner*")  # CI runner services, by unit name
 
@@ -2435,7 +2442,7 @@ class Ticket:
                "after_release_peak", "release_revoked", "observed_gap", "release_end", "peak_cpu",
                "past_peak_attempts", "past_peak_over", "past_peak_most_over", "past_peak_freed",
                "past_peak_unknown", "past_peak_released", "release_est", "release_oom_base", "release_breach",
-               "release_open_at_gap", "write_dirs")
+               "release_open_at_gap", "write_dirs", "ci_stops", "yields_to")
 
     def __init__(self, tid: str, argv: list[str], cwd: str, lane: str, key: str, submitted: float,
                  directory: str | None):
@@ -2540,6 +2547,9 @@ class Ticket:
         self.frozen = False  # paused to give the machine its memory back
         self.frozen_at = None
         self.requeues = 0  # times it was stopped to free memory and queued again
+        self.ci_stops = 0  # of those, the times it was stopped to make room for a CI job's build
+        self.yields_to: str | None = None  # the CI job's build it was last stopped for: it doesn't go before it
+        self.short_by = 0.0  # (not kept) the memory it lacked when the queue was last looked at
         self.requeue_pending = False  # being stopped, to be queued again
         self.shed_error = None  # why it can't be queued again once stopped
         self.restartable = False  # its caller says it can start over from the beginning safely
@@ -2612,6 +2622,8 @@ class Ticket:
         t.waited_by = {str(k): v for k, v in ((k, sane_count(v)) for k, v in waited.items()) if v is not None}
         t.peak_at = sane_count(t.peak_at) or 0.0
         t.tail = int(sane_count(t.tail) or 0)
+        t.ci_stops = int(sane_count(t.ci_stops) or 0)
+        t.yields_to = t.yields_to if isinstance(t.yields_to, str) else None
         t.released = t.released is True
         t.release_at = sane_count(t.release_at)
         t.release_hold = int(sane_count(t.release_hold) or 0)
@@ -2731,7 +2743,8 @@ class Ticket:
             "measured": self.measured, "exit": self.exit, "oom": self.oom, "timed_out": self.timed_out,
             "mem_wait_some": round(self.mem_wait_some, 1), "mem_wait_full": round(self.mem_wait_full, 1),
             "mem_high": self.mem_high, "source": self.source, "caller": self.caller, "frozen": self.frozen,
-            "requeues": self.requeues, "source_changed": self.source_changed, "attempt_offsets": self.attempt_offsets,
+            "requeues": self.requeues, "ci_stops": self.ci_stops, "yields_to": self.yields_to,
+            "source_changed": self.source_changed, "attempt_offsets": self.attempt_offsets,
             "source_verified": self.source_verified,
             "joiners": self.joiners,
             "error": self.error, "reason": self.reason if self.state == "queued" else None,
@@ -2799,6 +2812,7 @@ class Daemon:
         self.memory_thread_lock = threading.Lock()
         self.memory_thread_failed = False
         self.last_freeze = self.last_kill = -1e9
+        self.room_made: dict[str, float] = {}  # a CI job's build -> when builds were last stopped for it
         self.started_at = time.time()
         self.avail_seen: collections.deque = collections.deque()  # (time, memory available) of the last 10 s
         self.submit_outcome: dict = {}  # how the last submission was answered: joined, reused, passed before
@@ -2934,7 +2948,7 @@ class Daemon:
             # counts so at once, and any build that has waited much longer goes before it: a
             # session's, or a CI job's that higher-lane CI builds keep passing.
             starving = self.starving(t, now) and not passes
-            overdue = (self.cfg.ci_first and not passes
+            overdue = (self.cfg.ci_first and not passes and not self.yielding(t)
                        and (now - t.submitted >= 3 * self.cfg.starve_seconds or t.requeues > 0))
             # A CI job's build goes before the others at its priority, and one that has waited out its
             # turn before newer ones, or a stream of quicker CI builds could keep it waiting past its
@@ -2962,8 +2976,19 @@ class Daemon:
         return t.priority + (lane.priority if lane else 0)
 
     def waited_out(self, t: Ticket, now: float) -> bool:
-        """It has waited starve_seconds, or it was stopped to free memory once already."""
+        """It has waited starve_seconds, or it was stopped to free memory once already (and doesn't
+        yield to the CI job's build it was stopped for)."""
+        if self.yielding(t):
+            return False
         return now - t.submitted >= self.cfg.starve_seconds or t.requeues > 0
+
+    def yielding(self, t: Ticket) -> bool:
+        """It was stopped to make room for a CI job's build that is still waiting: it doesn't go
+        before that build, hold room or count as waited out, or it would take back the room it gave."""
+        if not t.yields_to:
+            return False
+        ci = self.tickets.get(t.yields_to)
+        return ci is not None and ci.state == "queued"
 
     def starving(self, t: Ticket, now: float) -> bool:
         """It has waited out its turn, or (with ci_first) it comes from a CI job, which has a time
@@ -3468,7 +3493,7 @@ class Daemon:
         elif t.env is None:
             t.shed_error = (f"{stopped}. Its environment is gone since the daemon restarted, so it isn't queued "
                             "again: run it again")
-        elif t.requeues >= 3:
+        elif t.requeues - t.ci_stops >= 3:  # (stops for a CI job's build don't count: those are limited apart)
             t.shed_error = f"{stopped} for the fourth time; run it again later"
         if t.frozen and t.frozen_at:  # its pause ends here: it is being killed
             t.frozen_attempt += max(0.0, now - t.frozen_at)
@@ -3481,6 +3506,55 @@ class Daemon:
                         f"{fmt_size(self.cfg.mem_floor / 4)})")
         log(f"stopping {t.id} ({fmt_size(t.mem_now)}) {cause}{'' if t.shed_error else '; it will be queued again'}",
             level=4)
+
+    CI_STOPS_MAX = 2  # times one build may be stopped to make room for CI jobs' builds
+    ROOM_PAUSE = 120.0  # seconds before room is made again for the same CI job's build
+
+    def make_room_for_ci(self, now: float) -> None:
+        """A CI job's build that has waited make_room_for_ci for memory that builds of ours hold: stop
+        the newest of the builds that can start over safely (a compile or test run, or --restartable),
+        of its priority or lower and not a CI job's, whose memory covers what it lacks, else the newest
+        few that do together, and queue them again (see requeue). Each yields to it until it has
+        started, then goes first, as a build stopped to free memory does. None is stopped if all of
+        them together wouldn't make it fit, nor one stopped CI_STOPS_MAX times already. One CI job's
+        build at a time, once the builds stopped for the last are gone."""
+        wait = self.cfg.make_room_for_ci
+        self.room_made = {k: v for k, v in self.room_made.items()
+                          if k in self.tickets and self.tickets[k].state == "queued"}
+        if not wait or self.stopping or self.paused is not None:
+            return
+        if any(t.requeue_pending and t.yields_to for t in self.active()):
+            return  # builds stopped for a CI job's build are still going: their memory isn't free yet
+        for ci in self.queue(now):
+            if not (ci.from_ci and ci.short_by > 0 and now - ci.submitted >= wait
+                    and now - self.room_made.get(ci.id, -math.inf) >= self.ROOM_PAUSE):
+                continue
+            weight = self.weight(ci)
+            builds = [t for t in self.active() if not t.flock and t.state == "running" and not t.from_ci
+                      and not t.cancel_requested and not t.requeue_pending and t.started is not None
+                      and self.weight(t) <= weight and t.ci_stops < self.CI_STOPS_MAX
+                      and (t.restartable or restart_safe(t.argv)) and t.env is not None
+                      and t.requeues - t.ci_stops < 3]
+            gives = {t.id: t.mem_now + self.still_to_grow(t, now) for t in builds}  # what admission sets aside
+            newest = sorted(builds, key=lambda t: t.started, reverse=True)
+            chosen = next(([t] for t in newest if gives[t.id] >= ci.short_by), None)
+            if chosen is None:
+                chosen, total = [], 0.0
+                for t in newest:
+                    chosen.append(t)
+                    total += gives[t.id]
+                    if total >= ci.short_by:
+                        break
+                else:
+                    continue  # stopping every one of them wouldn't make it fit
+            self.room_made[ci.id] = now
+            waited = f"{(now - ci.submitted) / 60:.0f} min"
+            for t in chosen:
+                t.ci_stops += 1
+                t.yields_to = ci.id
+                self.shed(t, now, why=f"to make room for a CI job's build that has waited {waited} for "
+                                      f"{fmt_size(ci.short_by)} more memory: {ci.label[:60]} ({ci.id[:8]})")
+            return
 
     def requeue(self, t: Ticket, now: float) -> None:
         """A build stopped to free memory is gone: queue it again, at the front, or fail it."""
@@ -3509,7 +3583,10 @@ class Daemon:
                 except FileNotFoundError:
                     pass
             write_json(os.path.join(t.dir, "env.json"), t.env)
-            marker = (f"\nbuildq: stopped at {time.strftime('%H:%M:%S')} because the machine ran short of memory; "
+            ci = self.tickets.get(t.yields_to) if t.yields_to else None
+            cause = (f"to make room for a CI job's build ({ci.label[:60]}, {ci.id[:8]})" if ci is not None
+                     else "because the machine ran short of memory")
+            marker = (f"\nbuildq: stopped at {time.strftime('%H:%M:%S')} {cause}; "
                       "it starts again from the beginning when there is room.\n").encode()
             offsets = {}
             for name in ("output.log", "stderr.log", "stdout.log"):
@@ -3556,10 +3633,15 @@ class Daemon:
         t.source_checks = {}
         t.requeues += 1
         t.queued_at = t.wait_mark = now
-        t.reason_cat, t.reason = "memory", "stopped to free memory; it goes first once there is room"
+        if t.yields_to and self.yielding(t):
+            t.reason_cat, t.reason = "memory", ("stopped to make room for a CI job's build; it goes first once "
+                                                "that has started")
+        else:
+            t.reason_cat, t.reason = "memory", "stopped to free memory; it goes first once there is room"
         self.save(t)
         self.broadcast(t, now)
-        log(f"queued {t.id} again: stopped to free memory ({t.requeues} time{'s' if t.requeues != 1 else ''})", level=4)
+        what = "make room for a CI job's build" if self.yielding(t) else "free memory"
+        log(f"queued {t.id} again: stopped to {what} ({t.requeues} time{'s' if t.requeues != 1 else ''})", level=4)
 
     # ---- checking that a build built the source its record says
 
@@ -3983,6 +4065,7 @@ class Daemon:
             hm = 0.0 if passes else held_mem + sum(mem for w, mem, _ in ci_holds if w >= weight)
             hc = 0.0 if passes else held_cpu + sum(cores for w, _, cores in ci_holds if w >= weight)
             t.held = False
+            t.short_by = 0.0
             reason, holds = None, True
             if not os.path.isdir(t.cwd):
                 self.finalize(t, now, None, error=f"its working directory {t.cwd} is gone")
@@ -4025,6 +4108,7 @@ class Daemon:
                 reason = ("max-jobs", f"{count} build{'s are' if count != 1 else ' is'} running, the most "
                                       f"allowed (max_jobs = {cfg.max_jobs})")
             elif t.est_mem > free_mem - hm:
+                t.short_by = t.est_mem - (free_mem - hm)  # (unless no stopped build could free it, below)
                 if t.est_mem <= free_mem:
                     reason = ("held", "the room it needs is held for a build that has waited longer"
                               if passes or t.est_mem > free_mem - held_mem else
@@ -4032,6 +4116,7 @@ class Daemon:
                 elif t.est_mem > m.mem_available + ours_now - cfg.mem_floor:
                     # It wouldn't fit even with every build of ours gone: holding room for it would
                     # stop everything else for nothing.
+                    t.short_by = 0.0
                     reason, holds = ("memory", f"needs {fmt_size(t.est_mem)} of memory; even with no builds "
                                                f"running only {fmt_size(m.mem_available + ours_now - cfg.mem_floor)} "
                                                "would be free: other work holds the rest, and it starts "
@@ -4127,6 +4212,7 @@ class Daemon:
         t.runner = self.runner.name
         t.oom_base = 0
         t.reason = t.reason_cat = ""
+        t.yields_to = None  # running again: a later stop for memory isn't one for that CI job's build
         t.granted = t.max_granted = granted
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
         t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
@@ -4527,6 +4613,7 @@ class Daemon:
         record = {"t": round(time.time()), "key": t.key, "lane": t.lane, "caller": t.caller, "state": t.state,
                   "exit": t.exit, "oom": t.oom, "timed_out": t.timed_out,
                   "stopped_for_memory": bool(t.shed_error) or t.requeues > 0, "requeues": t.requeues,
+                  "ci_stops": t.ci_stops,
                   "wall": round(wall + t.attempts_wall, 1), "waited": round(t.wait_total, 1),
                   "peak_mem": max(t.mem_peak, t.attempts_peak),
                   "mem_wait_some": round(t.mem_wait_some + t.attempts_mem_wait, 1), "mem_high": t.mem_high,
@@ -4571,7 +4658,8 @@ class Daemon:
             "cores_granted": round(t.grant_area / wall, 2) if wall > 0 and t.grant_area else t.max_granted,
             "avg_cores": round(t.avg_cores, 2), "peak_cores": round(t.peak_cores, 2),
             "cpu_seconds": round(t.attempts_cpu + max(0, t.cpu_usec - (t.cpu_usec_base or 0)) / 1e6, 1),
-            "requeues": t.requeues, "paused": round(t.frozen_total + t.frozen_attempt, 1), "oom": int(bool(t.oom)),
+            "requeues": t.requeues, "ci_stops": t.ci_stops,
+            "paused": round(t.frozen_total + t.frozen_attempt, 1), "oom": int(bool(t.oom)),
             "mem_high": t.mem_high + t.attempts_mem_high, "mem_wait": round(t.mem_wait_some + t.attempts_mem_wait, 1),
         })
 
@@ -4805,6 +4893,7 @@ class Daemon:
         self.drop_unwatched(now)
         self.scan_flock_slots(now)
         self.schedule(now)
+        self.make_room_for_ci(now)
         try:
             self.observe_metrics(now)
         except Exception as e:  # nor the loop its tick
