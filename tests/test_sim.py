@@ -300,6 +300,12 @@ class Export(SimCase):
         self.assertEqual((out[2]["exit"], out[2]["state"], out[2]["requeued"]), (1, "cancelled", 2))
         self.assertNotIn("profile", out[2])
 
+    def test_a_window_starts_with_the_builds_already_in_the_machine(self):
+        out = sim.export_rows(self.metrics(), 990, None, anonymize=False)  # 'a' (900-1000) and 'b' (960-2000) were in
+        self.assertEqual([e["t"] for e in out], [0.0, 60.0, 100.0, 110.0, 120.0])
+        self.assertEqual([e.get("warmup", False) for e in out], [True, True, False, False, False])
+        self.assertEqual(len(sim.export_rows(self.metrics(), 1000, None, anonymize=False)), 4)  # 'a' had ended
+
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
         text = json.dumps(out)
@@ -391,14 +397,21 @@ class Export(SimCase):
         self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
         self.assertAlmostEqual(summary["makespan_s"], 120, delta=5)
 
-    def test_other_work_s_memory_comes_from_the_minute_rows(self):
+    def minutes(self, rows, average=False):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
         db.execute("CREATE TABLE minute (t INTEGER, cores INTEGER, mem_total INTEGER, mem_available INTEGER, "
-                   "builds_mem INTEGER, cpu_busy REAL, builds_cores REAL)")
-        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?)",
-                       [(960, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, 4.0),     # others: 20G, 2 cores
-                        (1020, 32, 125 * GIB, 60 * GIB, 15 * GIB, 20.0, 8.0)])  # others: 50G, 12 cores
+                   "builds_mem INTEGER, cpu_busy REAL, builds_cores REAL"
+                   + (", builds_mem_avg INTEGER)" if average else ")"))
+        width = 8 if average else 7
+        db.executemany(f"INSERT INTO minute VALUES ({','.join('?' * width)})", rows)
+        return db
+
+    def test_other_work_s_memory_comes_from_the_minute_rows(self):
+        # builds_mem_avg: the builds' own average over the minute, set against the machine's
+        db = self.minutes([(960, 32, 125 * GIB, 100 * GIB, 0, 6.0, 4.0, 5 * GIB),       # others: 20G, 2 cores
+                           (1020, 32, 125 * GIB, 60 * GIB, 0, 20.0, 8.0, 15 * GIB)],    # others: 50G, 12 cores
+                          average=True)
         out = sim.export_machine(db, 1000, None, 1000)
         self.assertEqual(out["machine"], {"ncpu": 32, "mem_total": 125 * GIB})
         self.assertEqual(out["background"], [[-40.0, 20 * GIB, 2.0], [20.0, 50 * GIB, 12.0]])
@@ -408,6 +421,7 @@ class Export(SimCase):
             f.write(json.dumps(scenarios.build(0, ("cargo", "build"), 1, 600, 1, repo="app")) + "\n")
         loaded = sim.load_scenario(path)
         self.assertEqual(loaded["machine"]["background"], out["background"])
+        self.assertNotIn("background", sim.load_scenario(path, background=False)["machine"])  # --no-background
         state = os.path.join(self.tmp.name, "bg")
         os.makedirs(state)
         s = sim.Simulation(loaded, CONFIG, BUILDQD, state, name="buildqd_bg")
@@ -417,6 +431,83 @@ class Export(SimCase):
         s.clock.now = sim.EPOCH + 20
         s.step()
         self.assertEqual(s.machine.mem_available, 125 * GIB - 50 * GIB)  # it follows the recorded minute
+
+    def test_without_the_builds_average_their_readings_either_side_of_the_minute_are_taken(self):
+        # builds_mem is one reading as a minute ends. A 30G build that ended mid-minute 1020 left
+        # 15G in that minute's average memory; the readings either side (30G, 0) average 15G too.
+        db = self.minutes([(900, 32, 125 * GIB, 75 * GIB, 30 * GIB, 6.0, 4.0),    # before the window: its reading only
+                           (960, 32, 125 * GIB, 75 * GIB, 30 * GIB, 6.0, 4.0),    # others: 20G
+                           (1020, 32, 125 * GIB, 90 * GIB, 0, 6.0, 4.0)])         # others: still 20G
+        out = sim.export_machine(db, 1000, None, 1000)
+        self.assertEqual([b[:2] for b in out["background"]], [[-40.0, 20 * GIB], [20.0, 20 * GIB]])
+
+    def test_minutes_that_can_t_say_what_the_builds_used_are_left_out_and_noted(self):
+        db = self.minutes([(960, 32, 125 * GIB, 100 * GIB, None, 6.0, 4.0),     # before the builds' columns
+                           (1020, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, 4.0),  # no reading before it
+                           (1080, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, None),  # first after a restart
+                           (1140, 32, 125 * GIB, 100 * GIB, 5 * GIB, 6.0, 4.0),
+                           (1800, 32, 125 * GIB, 90 * GIB, 5 * GIB, 6.0, 4.0),   # after a gap: no reading before
+                           (1860, 32, 125 * GIB, 90 * GIB, 5 * GIB, 6.0, 4.0)])
+        notes: list[str] = []
+        out = sim.export_machine(db, 960, None, 960, notes)
+        self.assertEqual([b[:2] for b in out["background"]], [[180.0, 20 * GIB], [900.0, 30 * GIB]])
+        text = " ".join(notes)
+        self.assertIn("4 minute(s)", text)
+        self.assertIn("gap", text)
+        self.assertIn("begin 3.0m after the first build", text)
+        notes.clear()
+        self.assertIsNone(sim.export_machine(db, 99_000, None, 99_000, notes))  # no rows that far on
+        self.assertIn("built-in background", notes[0])
+
+    def test_export_writes_the_machine_from_the_first_build_to_after_the_last_ended(self):
+        db = self.metrics()  # the builds before --until (1015) came in from 900, and ended by 3100
+        db.execute("CREATE TABLE minute (t INTEGER, cores INTEGER, mem_total INTEGER, mem_available INTEGER, "
+                   "builds_mem INTEGER, cpu_busy REAL, builds_cores REAL, builds_mem_avg INTEGER)")
+        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?,?)",
+                       [(t, 32, 125 * GIB, 100 * GIB, 0, 6.0, 4.0, 0) for t in range(600, 8000, 60)])
+        db.execute("UPDATE minute SET mem_available = ? WHERE t = 3000", (80 * GIB,))  # after --until's end
+        path = os.path.join(self.tmp.name, "metrics.db")
+        db.commit()  # (a backup waits for the source's open write to end)
+        disk = sqlite3.connect(path)
+        db.backup(disk)
+        disk.close()
+        args = sim.argparse.Namespace(db=path, since="900", until="1015", anonymize=True)
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", err):
+            sim.cmd_export(args)
+        lines = [json.loads(line) for line in out.getvalue().splitlines()]
+        machine, jobs = lines[0], lines[1:]
+        self.assertEqual(jobs[0]["t"], 0.0)  # the machine's steps and the builds share their zero
+        steps = {b[0]: b[1] for b in machine["background"]}
+        self.assertEqual(min(steps), -60.0)  # the minute the first build came in (900 is in 840's)
+        self.assertEqual(steps[3000 - 900], 45 * GIB)  # past --until: builds still running then had it
+        self.assertLess(max(steps), 3200 + 3600 - 900)  # an hour past the last end, no more
+        self.assertEqual(err.getvalue(), "")
+
+    def test_anonymizing_hashes_option_values(self):
+        argv = ["--manifest-path=/home/someone/client/Cargo.toml", "--token=hunter2", "-C/home/someone/fw",
+                "--profile=test", "--jobs=8", "-j8", "-p", "--release", "--", "-"]
+        words = [sim.anonymous_word(w) for w in argv]
+        for secret in ("someone", "client", "hunter2", "fw"):
+            self.assertNotIn(secret, json.dumps(words))
+        self.assertEqual(words[0].split("=")[0], "--manifest-path")
+        self.assertTrue(words[2].startswith("-C") and words[2] != argv[2])
+        self.assertEqual(words[3:], ["--profile=test", "--jobs=8", "-j8", "-p", "--release", "--", "-"])
+
+    def test_a_replay_is_set_beside_what_really_happened(self):
+        jobs = [dict(scenarios.build(i * 5, ("cargo", "test", f"-p{i}"), 4, 300, 2, repo="app"),
+                     recorded_wait=float(i * 100)) for i in range(4)]
+        jobs.append(dict(scenarios.build(0, ("cargo", "test", "-pw"), 4, 300, 2, repo="app"),
+                         recorded_wait=5000.0, warmup=True))  # in the machine before the window: not compared
+        summary, _ = sim.simulate(scenario(jobs), CONFIG, BUILDQD, name="buildqd_recorded")
+        agent = summary["against_recorded"]["agent"]
+        self.assertEqual(agent["builds"], 4)
+        self.assertEqual(agent["total_min"][0], 10.0)  # 0 + 100 + 200 + 300 seconds
+        self.assertIn("agent wait, recorded / replayed (4)", sim.table(summary))
+        self.assertEqual(sim.rank_correlation([1, 2, 3, 4], [10, 20, 30, 40]), 1.0)
+        self.assertEqual(sim.rank_correlation([1, 2, 3, 4], [40, 30, 20, 10]), -1.0)
+        self.assertIsNone(sim.rank_correlation([1, 2, 3], [5, 5, 5]))
+        self.assertEqual(sim.ranks([3.0, 1.0, 3.0]), [2.5, 1.0, 2.5])
 
     def test_an_exported_trace_replays(self):
         path = os.path.join(self.tmp.name, "trace.jsonl")

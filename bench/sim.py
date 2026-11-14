@@ -503,6 +503,10 @@ class Simulation:
                 continue
             rec["ended"] = (t.ended - EPOCH) if t.ended else None
             rec["outcome"] = t.state
+            queued_now = max(0.0, now - (t.queued_at or t.submitted)) if t.state == "queued" else 0.0
+            rec["waited"] = round(float(t.wait_total) + queued_now, 1)  # over all its attempts, as the database counts it
+            rec["recorded_wait"] = self.specs.get(t.id, {}).get("recorded_wait")  # what it really waited (a trace)
+            rec["warmup"] = bool(self.specs.get(t.id, {}).get("warmup"))  # in the machine before the window
             rec["requeues"] = t.requeues
             rec["ci_stops"] = getattr(t, "ci_stops", 0)
             rec["failed_stop"] = bool(t.shed_error)  # stopped for memory, and failed: it couldn't start over
@@ -567,6 +571,57 @@ def wait_stats(records: list[dict], end: float) -> dict:
     return {"builds": len(records), "p50": r(percentile(w, 0.5)), "p95": r(percentile(w, 0.95)), "max": r(max(w, default=None))}
 
 
+def ranks(values: list[float]) -> list[float]:
+    """Each value's rank (1 = the smallest), ties sharing the mean of theirs."""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    out = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            out[order[k]] = (i + j) / 2 + 1
+        i = j + 1
+    return out
+
+
+def rank_correlation(a: list[float], b: list[float]) -> float | None:
+    """Spearman's: 1 when the replay puts the builds in the order of their real waits, 0 when it
+    says nothing about it. None for fewer than three, or when either side is all the same."""
+    if len(a) < 3:
+        return None
+    ra, rb = ranks(a), ranks(b)
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va, vb = sum((x - ma) ** 2 for x in ra), sum((y - mb) ** 2 for y in rb)
+    return round(cov / math.sqrt(va * vb), 2) if va and vb else None
+
+
+def against_recorded(records: list[dict]) -> dict:
+    """A trace's replay beside what really happened to the same builds: their waits (over all their
+    attempts) in total, at the median and the 90th percentile, how far off the replay is per build
+    on average, and whether it puts them in the same order. Built-in scenarios have no record, and
+    the builds already in the machine as the window began (warmup) aren't compared: what they had
+    waited before it was the night before's doing."""
+    out = {}
+    for group, pick in (("ci", lambda r: r["ci"]), ("agent", lambda r: not r["ci"])):
+        pairs = [(float(r["recorded_wait"]), float(r["waited"])) for r in records
+                 if pick(r) and not r.get("warmup") and r.get("recorded_wait") is not None
+                 and r.get("waited") is not None]
+        if not pairs:
+            continue
+        real, replay = [p[0] for p in pairs], [p[1] for p in pairs]
+        r = lambda v: None if v is None else round(v, 1)  # noqa: E731
+        out[group] = {"builds": len(pairs),
+                      "total_min": [r(sum(real) / 60), r(sum(replay) / 60)],
+                      "p50": [r(percentile(real, 0.5)), r(percentile(replay, 0.5))],
+                      "p90": [r(percentile(real, 0.9)), r(percentile(replay, 0.9))],
+                      "mean_error_s": r(sum(abs(x - y) for x, y in pairs) / len(pairs)),
+                      "rank_correlation": rank_correlation(real, replay)}
+    return out
+
+
 def summarize(sim: Simulation, seconds: int) -> dict:
     records = list(sim.records.values())
     end = float(seconds)
@@ -607,6 +662,7 @@ def summarize(sim: Simulation, seconds: int) -> dict:
         "released_after_peak": sum(1 for r in records if r.get("released")),
         "planned_over_peak": {"median": None if not ratios else round(percentile(ratios, 0.5), 2),
                               "under_planned": len(under)},
+        "against_recorded": against_recorded(records),  # (recorded, replayed) pairs; empty for a built-in scenario
     }
 
 
@@ -633,6 +689,12 @@ def table(summary: dict) -> str:
              ("planned / peak (median), under-planned", f"{summary['planned_over_peak']['median']}, "
                                                         f"{summary['planned_over_peak']['under_planned']}"),
              ("outcomes", ", ".join(f"{k} {v}" for k, v in summary["outcomes"].items()))]
+    for group, a in summary.get("against_recorded", {}).items():
+        rows.append((f"{group} wait, recorded / replayed ({a['builds']})",
+                     f"total {fmt_s(a['total_min'][0] * 60)} / {fmt_s(a['total_min'][1] * 60)}, "
+                     f"p50 {fmt_s(a['p50'][0])} / {fmt_s(a['p50'][1])}, p90 {fmt_s(a['p90'][0])} / {fmt_s(a['p90'][1])}"))
+        rows.append((f"{group} wait, off per build / rank correlation",
+                     f"{fmt_s(a['mean_error_s'])} / {'-' if a['rank_correlation'] is None else a['rank_correlation']}"))
     width = max(len(k) for k, _ in rows)
     return "\n".join(f"{k:<{width}}  {v}" for k, v in rows)
 
@@ -650,9 +712,11 @@ def fmt_s(seconds) -> str:
 
 # ---- running
 
-def load_scenario(name: str, seed_history: bool = False) -> dict:
+def load_scenario(name: str, seed_history: bool = False, background: bool = True) -> dict:
     """A built-in scenario, or a trace file. A trace starts with no history (every build planned at its
-    lane's default) unless seed_history gives each command three earlier runs of its own size."""
+    lane's default) unless seed_history gives each command three earlier runs of its own size; and
+    replays the other work its machine recorded each minute, or with background=False, the built-in
+    scenarios' fixed amount (to see what the recorded minutes change)."""
     if name in builtin.SCENARIOS:
         return builtin.SCENARIOS[name]()
     jobs, machine = [], dict(builtin.WORKSTATION)
@@ -663,7 +727,7 @@ def load_scenario(name: str, seed_history: bool = False) -> dict:
             entry = json.loads(line)
             if "background" in entry or "machine" in entry:  # the machine the trace ran on (export's first line)
                 machine.update(entry.get("machine") or {})
-                if entry.get("background"):
+                if entry.get("background") and background:
                     machine["background"] = entry["background"]
                 continue
             jobs.append(entry)
@@ -689,7 +753,7 @@ def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim
 
 
 def cmd_run(args) -> int:
-    scenario = load_scenario(args.scenario, args.seed_history)
+    scenario = load_scenario(args.scenario, args.seed_history, background=not args.no_background)
     summary, sim = simulate(scenario, args.config, args.buildqd)
     if args.jobs:
         with open(args.jobs, "w") as f:
@@ -813,20 +877,50 @@ PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node vit
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 
+PLAIN_OPTION = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9_-]*")  # an option's name and nothing else
+
+
+def anonymous_word(word: str) -> str:
+    """A word of a command (not its first) as an anonymized trace keeps it: subcommands that are the
+    same everywhere, option names, and counts; any value an option carries is hashed with the rest
+    (--manifest-path=/a/b keeps "--manifest-path=", -C/a/b keeps "-C")."""
+    if word in PUBLIC_WORDS or word in ("-", "--") or re.fullmatch(r"\d+", word):
+        return word
+    if word.startswith("--"):
+        name, eq, value = word.partition("=")
+        if not PLAIN_OPTION.fullmatch(name):
+            return hashed("w", word)
+        return name + eq + (anonymous_word(value) if value and not value.startswith("-") else hashed("w", value) if value else "")
+    if word.startswith("-"):
+        if re.fullmatch(r"-[A-Za-z0-9]|-[A-Za-z]\d+", word):  # -p, -j8
+            return word
+        if PLAIN_OPTION.fullmatch(word[:2]):
+            return word[:2] + hashed("w", word[2:])  # a value (or other options) run on to it
+    return hashed("w", word)
+
+
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
+    return export_builds(db, since, until, anonymize)[0]
+
+
+def export_builds(db: sqlite3.Connection, since: float | None, until: float | None,
+                  anonymize: bool) -> tuple[list[dict], float | None, float | None]:
+    """The trace's builds, and when (in the database's time) its first came in and its last ended.
+    From `since`, these are the builds submitted then or later, and the ones still queued or running
+    as it began (marked warmup): a replay starts with the machine as full as it was."""
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
     query = "SELECT * FROM build WHERE (wall > 0 OR state = 'cancelled') AND submitted IS NOT NULL"
     params: list = []
     if since is not None:
-        query += " AND submitted >= ?"
-        params.append(since)
+        query += " AND (submitted >= ? OR ended > ?)"
+        params += [since, since]
     if until is not None:
         query += " AND submitted < ?"
         params.append(until)
     rows = [dict(r) for r in db.execute(query + " ORDER BY submitted, id", params)]
     if not rows:
-        return []
+        return [], None, None
     first = rows[0]["submitted"]
     out = []
     def shape(r: dict) -> dict | None:
@@ -884,18 +978,23 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
             entry["workspace"] = str(r["workspace"])  # (older databases don't say; repo may be its source, not it)
         if r.get("name"):
             entry["name"] = r["name"]
+        if r.get("waited") is not None:
+            entry["recorded_wait"] = round(float(r["waited"]), 1)  # what it really waited (all its attempts)
+        if since is not None and float(r["submitted"]) < since:
+            entry["warmup"] = True  # in the machine before the window: there for the others, not compared
         if anonymize:
             entry["repo"] = hashed("r", entry["repo"])
             entry["caller"] = hashed("c", caller)
-            entry["argv"] = [w if (w in PUBLIC_TOOLS if i == 0 else w.startswith("-") or w in PUBLIC_WORDS)
-                             else hashed("w", w) for i, w in enumerate(argv)]
+            entry["argv"] = [(w if w in PUBLIC_TOOLS else hashed("w", w)) if i == 0 else anonymous_word(w)
+                             for i, w in enumerate(argv)]
             if entry["lane"] and entry["lane"] not in PUBLIC_LANES:
                 entry["lane"] = hashed("l", entry["lane"])
             if "workspace" in entry:
                 entry["workspace"] = hashed("s", entry["workspace"])
             entry.pop("name", None)
         out.append(entry)
-    return out
+    ends = [float(r["ended"]) for r in rows if r.get("ended") is not None]
+    return out, float(first), max(ends, default=None)
 
 
 def parse_when(value: str | None) -> float | None:
@@ -907,33 +1006,70 @@ def parse_when(value: str | None) -> float | None:
         return real_time.mktime(real_time.strptime(value, "%Y-%m-%dT%H:%M"))
 
 
-def export_machine(db: sqlite3.Connection, since: float | None, until: float | None, zero: float) -> dict | None:
+def export_machine(db: sqlite3.Connection, since: float | None, until: float | None, zero: float,
+                   notes: list[str] | None = None) -> dict | None:
     """The machine a trace ran on, from the analytics' minute rows: its cores and memory, and other
     work's (everything but buildq's builds: CI runners, containers, sessions) memory and cores each
-    minute, as [seconds from the trace's start, bytes, cores]. None without minute rows."""
+    minute, as [seconds from the trace's start, bytes, cores]. None without minute rows.
+
+    Other work's memory is the memory in use, on average over the minute, less the builds' own over
+    the same minute: their average where the database has it (builds_mem_avg), otherwise the mean of
+    the readings as the minute began and as it ended (builds_mem is one reading, taken as a minute
+    ends: the one as it began is the row before's). A minute that can't say what the builds used
+    (rows from before the builds' columns, the first after a restart) is left out, and the one before
+    it holds; so is a gap in the rows. Each of these, and a window the rows don't reach, adds a line
+    to notes."""
+    notes = notes if notes is not None else []
     cols = {r[1] for r in db.execute("PRAGMA table_info(minute)")}
     if not {"t", "mem_total", "mem_available", "builds_mem", "cpu_busy", "builds_cores"} <= cols:
+        notes.append("the analytics' minute rows don't say what the builds used: the replay has the built-in background")
         return None
-    query = "SELECT t, cores, mem_total, mem_available, builds_mem, cpu_busy, builds_cores FROM minute WHERE 1=1"
+    average = "builds_mem_avg" if "builds_mem_avg" in cols else "NULL"
+    query = (f"SELECT t, cores, mem_total, mem_available, builds_mem, {average}, cpu_busy, builds_cores "
+             "FROM minute WHERE 1=1")
     params: list = []
     if since is not None:
         query += " AND t >= ?"
-        params.append(since - 60)  # (the minute the first build came in)
+        params.append(since - 120)  # the minute holding `since` and the row before it (its reading starts it)
     if until is not None:
         query += " AND t < ?"
         params.append(until)
     rows = db.execute(query + " ORDER BY t", params).fetchall()
-    if not rows:
-        return None
-    background = []
-    for t, cores, total, available, builds_mem, busy, builds_cores in rows:
-        if total is None or available is None:
+    background, before, unknown, gaps, machine = [], None, 0, 0, None
+    for t, cores, total, available, end_mem, avg_mem, busy, builds_cores in rows:
+        t = float(t)
+        previous, before = before, (t, end_mem)
+        if since is not None and t < since - 60:
+            continue  # (only the reading it ended with is wanted, for the next minute)
+        if total is not None and cores is not None:
+            machine = {"ncpu": int(cores), "mem_total": int(total)}
+        if avg_mem is not None:
+            builds = float(avg_mem)
+        elif end_mem is not None and previous is not None and previous[0] == t - 60 and previous[1] is not None:
+            builds = (float(previous[1]) + float(end_mem)) / 2
+        else:
+            builds = None
+        if None in (total, available, busy, builds_cores) or builds is None:
+            unknown += 1
             continue
-        mem = max(0, int(total) - int(available) - int(builds_mem or 0))
-        cpu = max(0.0, float(busy or 0) - float(builds_cores or 0))
-        background.append([round(float(t) - zero, 1), mem, round(cpu, 2)])
-    last = rows[-1]
-    machine = {"ncpu": int(last[1] or builtin.WORKSTATION["ncpu"]), "mem_total": int(last[2])}
+        if background and t - zero - background[-1][0] > 300:
+            gaps += 1
+        mem = max(0, int(total) - int(available) - int(builds))
+        cpu = max(0.0, float(busy) - float(builds_cores))
+        background.append([round(t - zero, 1), mem, round(cpu, 2)])
+    if not background or machine is None:
+        notes.append("no minute rows say what other work used in this window (they are kept 14 days): "
+                     "the replay has the built-in background")
+        return None
+    if unknown:
+        notes.append(f"{unknown} minute(s) don't say what the builds used (from before the database had "
+                     "the columns, or just after a restart): the minute before each holds")
+    if gaps:
+        notes.append(f"{gaps} gap(s) of more than five minutes in the minute rows (the daemon was down?): "
+                     "the minute before each holds")
+    if background[0][0] > 120:
+        notes.append(f"the minute rows begin {fmt_s(background[0][0])} after the first build: until then "
+                     "the replay has the built-in background")
     return {"machine": machine, "background": background}
 
 
@@ -941,11 +1077,15 @@ def cmd_export(args) -> int:
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     try:
         since, until = parse_when(args.since), parse_when(args.until)
-        rows = export_rows(db, since, until, args.anonymize)
-        zero = db.execute("SELECT MIN(submitted) FROM build WHERE (wall > 0 OR state = 'cancelled')"
-                          + (" AND submitted >= ?" if since is not None else ""),
-                          [since] if since is not None else []).fetchone()[0]
-        machine = export_machine(db, since, until, float(zero or 0)) if rows else None
+        rows, first, last_end = export_builds(db, since, until, args.anonymize)
+        notes: list[str] = []
+        machine = None
+        if rows:
+            # Other work from the first build's minute to an hour after the last ended: a replay
+            # that runs longer than the night did still has what came next.
+            machine = export_machine(db, first, last_end + 3600 if last_end is not None else None, first, notes)
+        for note in notes:
+            print(f"sim.py export: {note}", file=sys.stderr)
         if machine:
             print(json.dumps(machine, sort_keys=True))
         for entry in rows:
@@ -966,6 +1106,8 @@ def main(argv=None) -> int:
     r.add_argument("--jobs", help="write what happened to each build here (JSONL)")
     r.add_argument("--log", help="write the daemon's log here")
     r.add_argument("--seed-history", action="store_true", help="a trace's commands start with a history of their size")
+    r.add_argument("--no-background", action="store_true",
+                   help="replay a trace with the built-in fixed background, not the minutes it recorded")
     c = sub.add_parser("compare", help="replay scenarios with two daemons (or two configs) and compare")
     c.add_argument("scenario", nargs="*")
     c.add_argument("--base", default=DEFAULT_BUILDQD)
