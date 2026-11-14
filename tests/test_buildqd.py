@@ -1475,14 +1475,27 @@ class SheddingMemory(DaemonCase):
                      ["env", "X=1", "-u", "wrap.sh", "cargo", "check"], ["sudo", "-D", "wrap.sh", "bash", "deploy.sh"]):
             self.assertFalse(safe(argv, scripts), argv)  # an option's value is never taken for the script
         self.assertEqual(buildqd.strip_wrappers(["env", "-i", "A=1", "cargo", "test"]), ["cargo", "test"])
+        self.assertFalse(safe(["env", "X-Y=./wrap.sh", "bash", "deploy.sh"], scripts))  # GNU env: any word with "="
+        self.assertFalse(safe(["/usr/bin/time", "-f", "eslint", "bash", "deploy.sh"], scripts))  # -f's value isn't the tool
+        self.assertFalse(buildqd.reusable_check(["/usr/bin/time", "-f", "eslint", "bash", "deploy.sh"]))
+        self.assertFalse(safe(["nice", "-n", "5", "cargo", "test"]))  # (a wrapper given options: not read for certain)
+        self.assertTrue(safe(["timeout", "1h", "cargo", "test"]))
+        # history keys and lanes still read env's exact forms (a decision to restart or reuse never does)
+        words = buildqd.command_words
+        self.assertEqual(words(["env", "-u", "CI", "pnpm", "test"]), words(["pnpm", "test"]))
+        self.assertEqual(words(["env", "--unset=X", "-C", "api", "dotnet", "test"]), words(["dotnet", "test"]))
+        self.assertEqual(words(["env", "-u", "RUSTFLAGS", "cargo", "test", "-p", "api"]), words(["cargo", "test", "-p", "api"]))
         # a listed script that runs the command after its `--` is only as safe as that command
         self.assertTrue(safe(["bash", "wrap.sh", "label", "12G", "--", "cargo", "check"], scripts))
         self.assertFalse(safe(["bash", "wrap.sh", "label", "--", "git", "push"], scripts))
         self.assertFalse(safe(["bash", "wrap.sh", "--"], scripts))
         self.assertFalse(safe(["./wrap.sh", "--", "git", "push"], scripts))  # run directly, too
         self.assertTrue(safe(["bash", "wrap.sh", "--", "--nocapture"], scripts))  # its own arguments, not a command
+        self.assertFalse(safe(["bash", "wrap.sh", "--", "--", "git", "push"], scripts))  # another `--`: a command after it
+        self.assertFalse(safe(["bash", "wrap.sh", "--", "-a", "x", "git", "push"], scripts))  # a short option: fails safe
         self.assertFalse(safe(["wrap.sh", "--"] * 1100 + ["cargo", "check"], scripts))  # deep, but no RecursionError
-        for tool in ("bash", "git", "cargo", "env", "python3.12", "python2", "node22", "nice", "sudo", "xargs", "mvn"):
+        for tool in ("bash", "git", "cargo", "env", "python3.12", "python2", "node22", "nice", "sudo", "xargs", "mvn",
+                     "heavy-run", "buildq", "bash5", "nodejs", "systemd-run"):
             with self.assertRaises(ValueError, msg=tool) as refused:
                 buildqd.Config({"restartable_scripts": [tool]}, 64 * GIB, 16)
             self.assertIn("names scripts, not tools", str(refused.exception))

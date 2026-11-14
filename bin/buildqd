@@ -1209,9 +1209,13 @@ NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | {"env", "timeout", "git", "car
                                                     "npm", "pnpm", "yarn", "npx", "pnpx", "bunx", "kubectl", "aws",
                                                     "gh", "ssh", "scp", "rsync", "curl", "wget", "xargs",
                                                     "parallel", "busybox", "uv", "uvx", "just", "mvn", "gradle",
-                                                    "gradlew", "go", "terraform", "pytest", "jest", "sbt"})
-# (and any versioned interpreter: python2, python3.12, pypy3, node22, ruby3 …; the list can't be complete)
-NOT_SCRIPT_PATTERN = re.compile(r"(python|pypy|node|ruby|perl|php|lua)[0-9.]*")
+                                                    "gradlew", "go", "terraform", "pytest", "jest", "sbt",
+                                                    "heavy-run", "buildq", "flock", "systemd-run", "run0", "pkexec",
+                                                    "nix-shell", "firejail", "xvfb-run", "strace", "valgrind", "tsx",
+                                                    "ts-node", "zx", "pwsh", "nodejs"})
+# (and any versioned interpreter or shell: python2, python3.12, pypy3, node22, bash5 …; the list can't
+# be complete)
+NOT_SCRIPT_PATTERN = re.compile(r"(python|pypy|node|ruby|perl|php|lua|bash|zsh|ksh|dash|sh|fish)[0-9.]*")
 JS_TOOLS = {"npm", "pnpm", "yarn", "npx", "pnpx", "bunx"}
 CARGO_VALUE_OPTIONS = {"--manifest-path", "--target-dir", "-j", "--jobs", "--color", "--config",
                        "-Z", "--profile", "--target", "-F", "--features", "--bin", "--test",
@@ -1238,11 +1242,17 @@ def strip_wrappers(argv: list[str]) -> list[str]:
                 option = rest.pop(0)
                 if option == "--":
                     break
-                if not (option in ("--ignore-environment", "--null", "--debug") or re.fullmatch(r"-[i0v]+", option)):
-                    return t
+                if option in ("--ignore-environment", "--null", "--debug") or re.fullmatch(r"-[i0v]+", option):
+                    continue
+                if option in ("-u", "--unset", "-C", "--chdir") and rest:
+                    rest.pop(0)  # its value, written apart
+                    continue
+                if re.fullmatch(r"(-u|-C|--unset=|--chdir=).+", option):
+                    continue  # its value, written with it
+                return t  # grouped (-iu), abbreviated (--un), -a, -S: leave env as the command, unread
             if rest[:1] == ["-"]:  # (env - …: the same as -i)
                 rest = rest[1:]
-            while rest and ASSIGNMENT.match(rest[0]):
+            while rest and "=" in rest[0]:  # GNU env takes any word with "=" for an assignment
                 rest = rest[1:]
             t = rest
         elif head == "timeout":
@@ -1410,7 +1420,7 @@ def reusable_check(argv: list[str]) -> bool:
     --update-snapshots, watch modes, --no-run, which keeps the test binaries for later). A second
     pass on the same source tells nothing the first didn't, so the first answers it. Commands that
     produce files (builds, docs, bundles) and package scripts, which might do anything, never do."""
-    tool, args = _tool_and_args(argv)
+    tool, args = sure_tool_and_args(argv)  # (a wrapper with options: no tool, so no reuse)
     if any(WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
         return False
     if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
@@ -1459,6 +1469,19 @@ def no_emit(args: list[str]) -> bool:
 SURE_WRAPPERS = {"nice", "ionice", "nohup", "setsid", "stdbuf", "time", "command", "exec", "sudo", "doas"}
 
 
+def sure_tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
+    """The tool and its arguments for a decision that must not be fooled (restart_safe,
+    reusable_check): read with plainly, so a wrapper with options yields no tool at all ("", [])
+    rather than a guess (`time -f eslint bash deploy.sh` runs deploy.sh, not eslint)."""
+    t = plainly(argv)
+    if not t:
+        return "", []
+    if os.path.basename(t[0]) in ("npx", "pnpx", "bunx"):
+        t = [t[0]] + [a for a in t[1:] if a not in ("-y", "--yes", "--no-install")]
+        return (os.path.basename(t[1]) if len(t) > 1 else ""), t[2:]
+    return os.path.basename(t[0]), t[1:]
+
+
 def plainly(argv: list[str]) -> list[str] | None:
     """The command, if it can be read for certain: past leading assignments, `env` with nothing but
     assignments, `timeout DURATION` and the wrappers in SURE_WRAPPERS, none of them given an
@@ -1471,7 +1494,7 @@ def plainly(argv: list[str]) -> list[str] | None:
             t = t[1:]
         elif head == "env":
             t = t[1:]
-            while t and ASSIGNMENT.match(t[0]):
+            while t and "=" in t[0]:  # GNU env takes any word with "=" for an assignment (X-Y=./wrap.sh)
                 t = t[1:]
             if t[:1] and t[0].startswith("-"):
                 return None
@@ -1506,8 +1529,9 @@ def listed_script(argv: list[str], scripts) -> list[str] | bool | None:
         return None
     if "--" in script_args:
         command = script_args[script_args.index("--") + 1:]
-        if not command or not command[0].startswith("-"):
-            return command  # (empty: nothing to run, so no)
+        if command and command[0].startswith("--") and command[0] != "--":
+            return True  # its own long options (`run-tests.sh -- --nocapture`), not a command
+        return command  # the command it runs (a short option or another `--` fails safe); empty: no
     return True
 
 
@@ -1528,7 +1552,7 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
         argv = inner
     else:
         return False
-    tool, args = _tool_and_args(argv)
+    tool, args = sure_tool_and_args(argv)
     if tool == "cargo":
         words = command_words(["cargo", *args])
         return (words[1] if len(words) > 1 else "") in RESTART_CARGO
