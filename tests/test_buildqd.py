@@ -2647,6 +2647,19 @@ class Cores(DaemonCase):
         with open(os.path.join(cargo.dir, "parallel.json")) as f:
             self.assertEqual(json.load(f)["MAKEFLAGS"], "")  # cleared: cargo's build scripts mustn't use it
 
+    def test_options_go_before_a_double_dash_and_an_inherited_parallel_make_stays_parallel(self):
+        t = self.submit(("make", "all"), env={"MAKEFLAGS": "rRw -j --jobserver-auth=3,4 -- FOO=bar"})
+        self.assertIsNotNone(t.jobserver)
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            flags = json.load(f)["MAKEFLAGS"]
+        self.assertEqual(flags, f"rRw -j{t.want} --jobserver-auth=fifo:{t.jobserver} -- FOO=bar")
+        self.assertEqual(buildqd.with_make_flags("a -- X=1", "-j2"), "a -j2 -- X=1")
+        self.assertEqual(buildqd.with_make_flags("", "-j2"), "-j2")
+
+    def test_an_empty_inherited_variable_is_no_choice_of_the_callers(self):
+        t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=3,4", "CARGO_MAKEFLAGS": ""})
+        self.assertIsNotNone(t.jobserver)
+
     def test_a_fifo_jobserver_from_the_caller_is_kept(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})
         self.assertIsNone(t.jobserver)
@@ -3327,6 +3340,34 @@ class QueriesOffTheLoop(DaemonCase):
                 break
         self.assertTrue(t.oom)  # with systemd's verdict
         self.assertEqual(self.daemon.pending_queries, {})
+
+
+class QueriesBelongToTheirAttempt(DaemonCase):
+    def test_a_ticket_s_queries_go_when_its_attempt_ends(self):
+        gate = threading.Event()
+        self.runner.result = lambda ticket: "oom-kill" if gate.wait(10) else ""
+        self.daemon.queries = buildqd.ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(self.daemon.queries.shutdown, wait=False)
+        t = self.submit()
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 10)  # asked; not in yet
+        self.assertEqual(len(self.daemon.pending_queries), 1)
+        self.daemon.requeue(t, self.now + 11)  # (stopped for memory meanwhile: a new attempt)
+        self.assertEqual(self.daemon.pending_queries, {})  # the old attempt's question is dropped
+        gate.set()
+
+    def test_unreadable_container_storage_is_said_once(self):
+        self.daemon.cfg.container_storage = ["/root/no-access"]
+        with mock.patch.object(buildqd.os, "stat", side_effect=PermissionError("denied")) as _, \
+                mock.patch.object(buildqd, "log") as log:
+            t = buildqd.Ticket("x" * 36, ["docker", "build", "."], self.workdir(), "image", "k", self.now, self.tmp.name)
+            t.disk_paths = []
+            with mock.patch.object(buildqd, "disk_space", return_value=None), \
+                    mock.patch.object(buildqd, "fs_device", return_value=None):
+                self.daemon.disk_short(t)
+                self.daemon.disk_short(t)
+        said = [c for c in log.call_args_list if "can't read container storage" in str(c)]
+        self.assertEqual(len(said), 1)
 
 
 class Configuration(unittest.TestCase):

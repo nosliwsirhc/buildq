@@ -68,6 +68,7 @@ import termios
 import threading
 import time
 import traceback
+import types
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 
@@ -1039,6 +1040,16 @@ def without_fd_jobserver(flags: str) -> str | None:
     if not any(FD_JOBSERVER.fullmatch(w) for w in words):
         return None
     return " ".join(w for w in words if not FD_JOBSERVER.fullmatch(w) and not re.fullmatch(r"-j\d*", w))
+
+
+def with_make_flags(flags: str, more: str) -> str:
+    """Make flags with more options added: before a `--` and the variable assignments after it,
+    or make would take the options for targets."""
+    words = flags.split()
+    if "--" in words:
+        i = words.index("--")
+        return " ".join([*words[:i], *more.split(), *words[i:]])
+    return " ".join([*words, *more.split()])
 
 
 def fs_device(path: str) -> int | None:
@@ -2810,6 +2821,7 @@ class Daemon:
         # event loop: a stalled systemd mustn't stall every client (#2). See query().
         self.queries = queries or ThreadPoolExecutor(max_workers=4, thread_name_prefix="buildq-query")
         self.pending_queries: dict[tuple, Future] = {}
+        self.storage_unreadable: set[str] = set()  # container storage said to be unreadable, once each
         self.state_dir = state_dir
         os.makedirs(state_dir, exist_ok=True)
         self.last_good = os.path.join(state_dir, "config.last-good.toml")
@@ -2889,6 +2901,21 @@ class Daemon:
         self.status_posts = list(newest.values())
 
     # ---- configuration
+
+    def attempt(self, t: Ticket) -> tuple:
+        """A ticket's attempt: queries are keyed by it, so an answer never outlives its attempt."""
+        return (t.id, t.requeues, t.unit)
+
+    @staticmethod
+    def snapshot(t: Ticket):
+        """What a runner's query reads from a ticket, copied: the loop goes on changing the ticket
+        while the query runs on another thread."""
+        return types.SimpleNamespace(id=t.id, unit=t.unit, cg=t.cg, dir=t.dir)
+
+    def drop_queries(self, t: Ticket) -> None:
+        """Forget a ticket's queries (its attempt has ended): their answers belong to it alone."""
+        for key in [k for k in self.pending_queries if len(k) > 1 and isinstance(k[1], tuple) and k[1][0] == t.id]:
+            self.pending_queries.pop(key).cancel()
 
     def query(self, key: tuple, fn, *args):
         """fn(*args), run off the event loop: its answer, or PENDING while it isn't in yet, so the
@@ -3543,6 +3570,7 @@ class Daemon:
 
     def requeue(self, t: Ticket, now: float) -> None:
         """A build stopped to free memory is gone: queue it again, at the front, or fail it."""
+        self.drop_queries(t)  # its attempt's answers are no use to the next one, or to no one
         result = read_json(os.path.join(t.dir, "result.json"))  # its kills, before the file goes
         if isinstance(result, dict):
             t.kills_seen = max(t.kills_seen, int(sane_count(result.get("oom_kills")) or 0))
@@ -3826,7 +3854,18 @@ class Daemon:
         already running can still write below it."""
         paths = [*(t.disk_paths or [t.cwd]), self.state_dir]
         if _tool_and_args(t.argv)[0] in ("docker", "podman", "buildah"):
-            paths += [p for p in self.cfg.container_storage if os.path.isdir(p)]
+            for path in self.cfg.container_storage:
+                try:
+                    os.stat(path)
+                except FileNotFoundError:
+                    continue  # (not on this machine)
+                except OSError as e:
+                    if path not in self.storage_unreadable:  # once
+                        self.storage_unreadable.add(path)
+                        log(f"can't read container storage at {path} ({e}); name a readable directory on "
+                            "that filesystem in container_storage, or image builds aren't held to disk_floor there")
+                    continue
+                paths.append(path)
         worst, devices = None, set()
         for path in paths:
             device = fs_device(path)  # None: unreadable (disk_space says what it can)
@@ -4215,8 +4254,9 @@ class Daemon:
                     "don't reach the build")
             # The caller's own choice still wins: flags it set, or, where its dead jobserver was
             # dropped, a -j or jobserver of its own left in them.
-            callers_own = any(k in env and (k not in cleaned or re.search(r"(?:^|\s)-j|--jobserver", cleaned[k]))
-                              for k in MAKE_FLAG_VARS)
+            callers_own = any(k in env and str(env[k]).strip()
+                              and (k not in cleaned or re.search(r"(?:^|\s)-j|--jobserver", cleaned[k]))
+                              for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
             if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
                 t.jobserver = os.path.join(t.dir, "jobserver")
@@ -4229,8 +4269,13 @@ class Daemon:
             # is queued again after a restart gets fresh ones.
             ours = self.build_env(t)
             parallel = {k: v for k, v in ours.items() if k not in env}
-            for k, rest in cleaned.items():  # the caller's other flags, then buildq's (later ones win)
-                parallel[k] = " ".join(x for x in (rest, ours.get(k, "")) if x)
+            for k, rest in cleaned.items():
+                # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
+                # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)
+                mine = ours.get(k) or (f"-j{t.want} --jobserver-auth=fifo:{t.jobserver}"
+                                       if t.jobserver and k != "CARGO_MAKEFLAGS"
+                                       and tool in ("make", "gmake", "ninja") else "")
+                parallel[k] = with_make_flags(rest, mine)
             write_json(os.path.join(t.dir, "parallel.json"), parallel)
             self.runner.prepare(t, self.cfg.slice)
             self.save(t)  # with its service's name, before it exists
@@ -4400,7 +4445,7 @@ class Daemon:
                                   timed_out=bool(result.get("timed_out")), result=result)
                 else:
                     # Killed as a whole, supervisor and all: systemd-oomd, or SIGKILL from outside.
-                    verdict = self.query(("result", t.id), self.runner_of(t).result, t)
+                    verdict = self.query(("result", self.attempt(t)), self.runner_of(t).result, self.snapshot(t))
                     if verdict is PENDING:
                         continue  # finalized on a later tick, with systemd's verdict
                     oom = verdict == "oom-kill"
@@ -4432,7 +4477,7 @@ class Daemon:
                 return True
             if now < (t.recheck_at or 0):
                 return False
-            state = self.query(("unit-state", t.id), runner.unit_state, t)
+            state = self.query(("unit-state", self.attempt(t)), runner.unit_state, self.snapshot(t))
             if state is PENDING:
                 return False  # asked; the answer comes on a later tick
             if state in ("pending", "unknown"):
@@ -4444,7 +4489,7 @@ class Daemon:
                 # Systemd has neither the service nor a job to start it, and no supervisor read
                 # its environment: it never started. Queue it again, clearing any failed unit of
                 # that name first, so the next launch can use it.
-                if self.query(("reset-failed", t.id), reset_failed_unit, t.unit) is PENDING:
+                if self.query(("reset-failed", self.attempt(t)), reset_failed_unit, t.unit) is PENDING:
                     return False  # the build stays starting until the name is free
                 self.close_jobserver(t, remove=True)
                 t.state, t.started, t.unit, t.cg, t.granted = "queued", None, None, None, 0
@@ -4464,7 +4509,7 @@ class Daemon:
             t.recheck_at = now
             return False
         if rc != 0:
-            state = self.query(("unit-state", t.id), self.runner_of(t).unit_state, t)
+            state = self.query(("unit-state", self.attempt(t)), self.runner_of(t).unit_state, self.snapshot(t))
             if state is PENDING:
                 return False  # the launcher's exit code keeps; look again on a later tick
             if state == "pending":
@@ -4503,6 +4548,7 @@ class Daemon:
                  error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
         if t.state in FINISHED:
             return
+        self.drop_queries(t)  # its attempt's answers are no use to anyone now
         t.env = None
         if isinstance(result, dict):  # the supervisor's reading, taken as the build ended
             t.take_waits(result.get("mem_wait_some"), result.get("mem_wait_full"), result.get("mem_high"))
