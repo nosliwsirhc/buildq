@@ -114,6 +114,7 @@ doesn't have yet is tried again after the next `git push` run through buildq fro
 repository, and every ten minutes, for a day; the first refusal is logged with `gh`'s message.
 Statuses go to the `origin` remote's repository (in a fork, the fork). A build from a GitHub
 Actions job never posts `success`, since the job reports its own result. Its failure can still
-turn red a `success` posted on the same commit. The daemon looks for `gh`
-on its `PATH`, then in `~/.local/bin` and `~/bin`, since a systemd user service's `PATH` often
-has neither.
+turn red a `success` posted on the same commit. The daemon runs the `gh` the `gh` setting names
+(its full path), else looks on its `PATH`, then in `~/.local/bin` and `~/bin`, since a systemd user
+service's `PATH` often has neither. Name it for Homebrew on Linux, `/snap/bin`, `~/go/bin` or a
+version manager's install.

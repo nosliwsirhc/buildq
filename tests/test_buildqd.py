@@ -2180,6 +2180,46 @@ class GitHubStatuses(DaemonCase):
                 first = place(os.path.join(on_path, "gh"))
                 self.assertEqual(buildqd.find_gh(), first)  # PATH before both
 
+    def test_the_gh_setting_is_used_ahead_of_the_search(self):
+        script = os.path.join(self.tmp.name, "my-gh")
+        with open(script, "w") as f:
+            f.write(f"#!/bin/sh\necho \"$*\" >> {self.calls_file}\n")
+        os.chmod(script, 0o755)
+        self.daemon.gh = None  # nothing stood in: the configuration decides
+        self.daemon.cfg.gh = script
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        with mock.patch.object(buildqd, "find_gh", side_effect=AssertionError("searched")):
+            self.drain(self.now + 60)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("state=success", self.calls()[0])
+
+    def test_the_gh_setting_must_be_a_full_path(self):
+        script = os.path.join(self.tmp.name, "gh")
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(script, 0o755)
+        self.assertEqual(buildqd.Config({"gh": script}, 64 * GIB, 16).gh, script)
+        self.assertEqual(buildqd.Config({"gh": script}, 64 * GIB, 16).summary()["gh"], script)
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).gh, "")
+        missing = os.path.join(self.tmp.name, "missing")  # gone later: the configuration still loads
+        self.assertEqual(buildqd.Config({"gh": missing}, 64 * GIB, 16).gh, missing)
+        self.assertEqual(buildqd.Config({"gh": "~/bin/gh"}, 64 * GIB, 16).gh, os.path.expanduser("~/bin/gh"))
+        for bad in ("gh", "bin/gh"):
+            with self.assertRaises(ValueError, msg=bad):
+                buildqd.Config({"gh": bad}, 64 * GIB, 16)
+
+    def test_check_config_warns_of_a_gh_that_cant_run_and_still_passes(self):
+        config = os.path.join(self.tmp.name, "check.toml")
+        with open(config, "w") as f:
+            f.write(f'gh = "{os.path.join(self.tmp.name, "no-such-gh")}"\n')
+        result = subprocess.run([sys.executable, BUILDQD, "--check-config", "--config", config],
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("isn't an executable file", result.stderr)
+        self.assertEqual(json.loads(result.stdout)["gh"], os.path.join(self.tmp.name, "no-such-gh"))
+
     def test_gh_that_cant_run_is_logged_once_and_tried_again_later(self):
         self.daemon.gh = [os.path.join(self.tmp.name, "no-such-gh")]
         for argv in (("cargo", "test"), ("cargo", "check")):

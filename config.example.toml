@@ -105,6 +105,12 @@ reuse_window = "2h"
 # named build passes on a commit with no changes on top, so pull requests show it was verified here.
 github_status = false
 
+# The gh to post them with, by its full path (~ is expanded). Unset, the daemon looks on its PATH, then in
+# ~/.local/bin and ~/bin (a systemd user service's PATH often has neither). Name it here for
+# Homebrew (/home/linuxbrew/.linuxbrew/bin/gh), /snap/bin, ~/go/bin and the like; a mise or asdf
+# shim needs its own PATH, so name the real gh it runs.
+# gh = "/home/linuxbrew/.linuxbrew/bin/gh"
+
 # Keep metrics.db, the analytics: a row a minute (14 days), an hour (a year) and a finished build
 # (180 days), a few tens of megabytes at most. `buildq report --capacity` and `buildq query` read it.
 metrics = true
