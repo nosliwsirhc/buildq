@@ -91,7 +91,9 @@ A build started by `buildq run` belongs
 to that command: interrupting it (Ctrl-C, SIGTERM, SIGHUP) cancels the build, and `run` then ends
 by the same signal, so a calling script stops as it would have. If `run` is killed outright
 (SIGKILL, as editors and tool timeouts do), the build is cancelled once nobody has followed it for
-`unwatched_seconds` (30 s), so abandoned builds don't hold turns. A build dropped off with `buildq
+`unwatched_seconds` (30 s), so abandoned builds don't hold turns. A harness that timed the tool call
+out usually runs it again: the same command, in the same directory and lane, submitted within ten
+minutes takes the cancelled build's place in the queue rather than going to the back. A build dropped off with `buildq
 submit` belongs to its ticket and runs to the end whoever is watching.
 
 ## Being told when a build finishes

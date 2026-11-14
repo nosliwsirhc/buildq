@@ -237,13 +237,16 @@ it is assumed to need proportionally more, up to its lane's enforced `MemoryMax`
 starts with are cut until their memory fits, and the rebalancer grows a build only if the memory
 for its extra cores is free, sharing what is free among the builds it grows.
 
-**The slice guard.** Every five seconds the daemon sets `buildq.slice`'s `memory.max` to what its
+**The slice guard.** Every five seconds, and every second while memory is short (less than twice
+`mem_floor` free), under pressure (memory "some" above 1%) or has fallen a gigabyte since the last
+time, the daemon sets `buildq.slice`'s `memory.max` to what its
 builds hold (`memory.current`) plus what the machine has free above half of `mem_floor`, at least
 2 GB above what they hold, and never above the `MemoryMax` the slice is configured with. When other
 work on the machine grows, the room for builds shrinks with it, and past it builds are stopped
 inside their slice rather than elsewhere. It never writes below what the builds hold, so the kernel
 needn't reclaim anything when it is written. When the daemon stops, the configured limit is put
-back. It is a poll: other work that grows faster than five seconds allow can still outrun it.
+back. It is a poll, of a second at its fastest: other work that grows faster than that can still
+outrun it, for that second.
 
 ## Cores
 

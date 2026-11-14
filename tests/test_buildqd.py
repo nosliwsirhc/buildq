@@ -814,6 +814,34 @@ class SameSource(DaemonCase):
         self.daemon.drop_unwatched(self.now + 61)
         self.assertTrue(run.cancel_requested)
 
+    def test_a_retry_after_a_tool_timeout_keeps_the_place_in_the_queue(self):
+        self.machine.mem_available = 15 * GIB  # nothing fits: everything waits
+        work = self.workdir()
+        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first")
+        self.now += 10
+        later = self.submit(("cargo", "build"), cwd=self.workdir(), submission="later")
+        self.daemon.drop_unwatched(self.now + 100)  # the run's client was killed: cancelled
+        self.now += 120
+        self.assertTrue(first.cancel_requested)
+        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry")
+        self.assertEqual(retry.submitted, first.submitted)  # its place, not the back of the queue
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [retry.id, later.id])
+        again = self.submit(("cargo", "test"), cwd=work, attach=True, submission="again")
+        self.assertGreater(again.submitted, first.submitted)  # a place is taken once
+        other = self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="other")
+        self.assertGreater(other.submitted, first.submitted)  # another directory: its own build
+
+    def test_a_vacated_place_isnt_kept_for_ever(self):
+        work = self.workdir()
+        self.machine.mem_available = 15 * GIB
+        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first")
+        self.daemon.drop_unwatched(self.now + 100)
+        self.daemon.drop_unwatched(self.now + 100 + buildqd.Daemon.VACATED_SECONDS + 1)
+        self.assertEqual(self.daemon.vacated, {})
+        self.now += 1000
+        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry")
+        self.assertGreater(retry.submitted, first.submitted)
+
     def test_a_ticket_from_before_this_version_doesnt_break_the_tick(self):
         t = self.submit(("cargo", "test"), attach=True, submission="old")
         t.followed = {}  # saved by an earlier version: no follow history
@@ -2685,6 +2713,38 @@ class SliceGuard(DaemonCase):
         self.daemon.guard_slice(stopping=True)
         with open(os.path.join(slice_dir, "memory.max")) as f:
             self.assertEqual(int(f.read()), 40 * GIB)  # the configured limit back
+
+
+    def test_it_guards_every_tick_while_memory_is_short_or_falling(self):
+        self.daemon.runner = self.runner
+        self.daemon.cg_base = os.path.join(self.tmp.name, "cg")
+        slice_dir = os.path.join(self.daemon.cg_base, "buildq.slice")
+        os.makedirs(slice_dir)
+        with open(os.path.join(slice_dir, "memory.current"), "w") as f:
+            f.write(str(10 * GIB))
+        self.daemon.slice_limit = "max"
+        self.machine.mem_available = 100 * GIB
+        guarded = []
+        real = self.daemon.guard_slice
+        self.daemon.guard_slice = lambda stopping=False: (guarded.append(self.machine.mem_available), real(stopping))
+        self.machine.sample = lambda tick: None  # the test sets the numbers
+        start = time.monotonic()
+        with mock.patch.object(buildqd.time, "monotonic", side_effect=lambda: start + len(ticks)):
+            ticks = []
+            for available in (100, 100, 100, 98, 98, 98, 98):  # GiB: a 2G fall, then steady
+                self.machine.mem_available = available * GIB
+                ticks.append(available)
+                self.daemon.tick(self.now + len(ticks))
+        # the first tick rebalances (and guards); quiet ticks don't; a 2G fall guards, then steady
+        # ticks with plenty free wait for the next rebalance (five seconds on: the sixth tick)
+        self.assertEqual([g // GIB for g in guarded], [100, 98, 98])
+        guarded.clear()
+        self.daemon.cfg.mem_floor = 60 * GIB  # less than twice the floor free: short
+        for _ in range(3):
+            ticks.append(0)
+            with mock.patch.object(buildqd.time, "monotonic", return_value=start + 100 + len(ticks) * 0.0):
+                self.daemon.tick(self.now + len(ticks))
+        self.assertEqual(len(guarded), 3)  # every tick
 
 
 class MemoryWatch(DaemonCase):
