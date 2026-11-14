@@ -125,7 +125,8 @@ build (scripts that call them too), `false` for none. A build gets none when its
 `CARGO_MAKEFLAGS` or `MFLAGS` (that jobserver is the caller's), or when its history shows it ignores
 the job count. A jobserver an outer make passed by file descriptor (`--jobserver-auth=R,W`) doesn't
 count: those descriptors don't reach the build, so buildq drops it, with its `-j`, keeps the
-caller's other make flags, and gives the build its own. Every five seconds buildq hands idle cores to
+caller's other make flags, and gives the build its own, unless a `-j` or jobserver of the caller's
+is still left in them. Every five seconds buildq hands idle cores to
 builds that are using all of theirs, if the memory more cores need is free, and takes cores back when
 the machine is over its target or a queued build needs them. A build whose history shows it keeps
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to

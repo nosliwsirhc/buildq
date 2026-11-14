@@ -3334,10 +3334,11 @@ class QueriesOffTheLoop(DaemonCase):
         self.assertLess(time.monotonic() - began, 1.0)  # not the seconds systemctl takes
         self.assertEqual(t.state, "running")  # decided once systemd answers
         gate.set()
-        for _ in range(100):
+        for _ in range(500):
             self.daemon.check(self.now + 11)
             if t.state != "running":
                 break
+            time.sleep(0.01)  # (a second look doesn't wait: give the worker its moment)
         self.assertTrue(t.oom)  # with systemd's verdict
         self.assertEqual(self.daemon.pending_queries, {})
 

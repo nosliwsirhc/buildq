@@ -240,8 +240,10 @@ DEFAULTS = {
     "cpu_target": 0.9,
     "mem_floor": "10%",
     "disk_floor": "2G",
-    # Where image builds write: Docker's default root, and Podman's rootful and rootless stores.
-    "container_storage": ["/var/lib/docker", "/var/lib/containers/storage", "~/.local/share/containers/storage"],
+    # Where image builds write: Docker's root, containerd's image store, rootless Docker's, and
+    # Podman's rootful and rootless stores (those that exist).
+    "container_storage": ["/var/lib/docker", "/var/lib/containerd", "~/.local/share/docker",
+                          "/var/lib/containers/storage", "~/.local/share/containers/storage"],
     "cpu_psi_block": 50.0,
     "mem_psi_block": 10.0,
     "ramp_seconds": 90,
@@ -2917,6 +2919,21 @@ class Daemon:
         for key in [k for k in self.pending_queries if len(k) > 1 and isinstance(k[1], tuple) and k[1][0] == t.id]:
             self.pending_queries.pop(key).cancel()
 
+    def unit_state_of(self, t: Ticket):
+        """The runner's view of a ticket's service: through query() for systemd (a systemctl call that
+        can be slow); the direct runner's is a file read, done here on the ticket itself."""
+        runner = self.runner_of(t)
+        if runner.name != "systemd":
+            return runner.unit_state(t)
+        return self.query(("unit-state", self.attempt(t)), runner.unit_state, self.snapshot(t))
+
+    def result_of(self, t: Ticket):
+        """systemd's verdict on a build's service (through query()), or the runner's own."""
+        runner = self.runner_of(t)
+        if runner.name != "systemd":
+            return runner.result(t)
+        return self.query(("result", self.attempt(t)), runner.result, self.snapshot(t))
+
     def query(self, key: tuple, fn, *args):
         """fn(*args), run off the event loop: its answer, or PENDING while it isn't in yet, so the
         caller asks again on a later tick. A quick answer (a healthy systemctl takes milliseconds)
@@ -2924,8 +2941,11 @@ class Daemon:
         future = self.pending_queries.get(key)
         if future is None:
             future = self.pending_queries[key] = self.queries.submit(fn, *args)
+            wait = 0.05  # a quick answer is used at once
+        else:
+            wait = 0.0  # asked before: look, don't wait again (a stalled systemd mustn't cost every tick)
         try:
-            answer = future.result(timeout=0.05)
+            answer = future.result(timeout=wait)
         except FutureTimeout:
             return PENDING
         finally:
@@ -2994,6 +3014,8 @@ class Daemon:
     def apply(self, cfg: "Config") -> None:
         self.cfg = cfg
         self.slice_limit = None  # read it again: the slice may have changed
+        for key in [k for k in self.pending_queries if k[0] == "slice-max"]:
+            self.pending_queries.pop(key).cancel()  # (and not from an answer asked for before)
         self.runner = self.runner_for_config(self.cfg)
         self.history.max_keys = self.cfg.history_keys
         log(f"configuration in force: {json.dumps(self.cfg.summary())}")
@@ -3853,8 +3875,9 @@ class Daemon:
         size. A path whose filesystem can't be read is skipped. The floor gates starts only: builds
         already running can still write below it."""
         paths = [*(t.disk_paths or [t.cwd]), self.state_dir]
-        if _tool_and_args(t.argv)[0] in ("docker", "podman", "buildah"):
-            for path in self.cfg.container_storage:
+        remote = str((t.env or {}).get("DOCKER_HOST") or (t.env or {}).get("CONTAINER_HOST") or "")
+        if _tool_and_args(t.argv)[0] in ("docker", "podman", "buildah") and not remote.startswith(("tcp:", "ssh:")):
+            for path in self.cfg.container_storage:  # (a build on a remote engine writes there, not here)
                 try:
                     os.stat(path)
                 except FileNotFoundError:
@@ -4445,7 +4468,7 @@ class Daemon:
                                   timed_out=bool(result.get("timed_out")), result=result)
                 else:
                     # Killed as a whole, supervisor and all: systemd-oomd, or SIGKILL from outside.
-                    verdict = self.query(("result", self.attempt(t)), self.runner_of(t).result, self.snapshot(t))
+                    verdict = self.result_of(t)
                     if verdict is PENDING:
                         continue  # finalized on a later tick, with systemd's verdict
                     oom = verdict == "oom-kill"
@@ -4477,10 +4500,14 @@ class Daemon:
                 return True
             if now < (t.recheck_at or 0):
                 return False
-            state = self.query(("unit-state", self.attempt(t)), runner.unit_state, self.snapshot(t))
+            state = self.unit_state_of(t)
             if state is PENDING:
                 return False  # asked; the answer comes on a later tick
             if state in ("pending", "unknown"):
+                # systemd has it again (or can't say): a reset-failed asked for meanwhile is stale
+                stale = self.pending_queries.pop(("reset-failed", self.attempt(t)), None)
+                if stale is not None:
+                    stale.cancel()
                 t.recheck_at = now + 10  # systemd has it, or can't say yet: look again
                 return False
             if os.path.exists(os.path.join(t.dir, "env.json")) and t.cancel_requested:
@@ -4492,6 +4519,7 @@ class Daemon:
                 if self.query(("reset-failed", self.attempt(t)), reset_failed_unit, t.unit) is PENDING:
                     return False  # the build stays starting until the name is free
                 self.close_jobserver(t, remove=True)
+                self.drop_queries(t)  # (this attempt is over)
                 t.state, t.started, t.unit, t.cg, t.granted = "queued", None, None, None, 0
                 self.save(t)
                 log(f"requeued {t.id}: it hadn't started when the daemon stopped")
@@ -4509,7 +4537,7 @@ class Daemon:
             t.recheck_at = now
             return False
         if rc != 0:
-            state = self.query(("unit-state", self.attempt(t)), self.runner_of(t).unit_state, self.snapshot(t))
+            state = self.unit_state_of(t)
             if state is PENDING:
                 return False  # the launcher's exit code keeps; look again on a later tick
             if state == "pending":

@@ -29,10 +29,13 @@ mem_floor = "10%"
 # container storage below that exists.
 disk_floor = "2G"
 
-# Where image builds (docker, podman, buildah) write their layers, for disk_floor. The defaults are
-# Docker's root and Podman's rootful and rootless stores; name yours if you moved them
-# (docker info --format '{{.DockerRootDir}}', podman info --format '{{.Store.GraphRoot}}').
-# container_storage = ["/var/lib/docker", "/var/lib/containers/storage", "~/.local/share/containers/storage"]
+# Where image builds (docker, podman, buildah) write their layers, for disk_floor: those that exist.
+# The defaults are Docker's root, containerd's image store, rootless Docker's, and Podman's rootful
+# and rootless stores; name yours if you moved them (docker info --format '{{.DockerRootDir}}',
+# podman info --format '{{.Store.GraphRoot}}'). A build sent to a remote engine (DOCKER_HOST or
+# CONTAINER_HOST of tcp: or ssh:) isn't held to them.
+# container_storage = ["/var/lib/docker", "/var/lib/containerd", "~/.local/share/docker",
+#                      "/var/lib/containers/storage", "~/.local/share/containers/storage"]
 
 # No new build while CPU pressure ("some", avg10, %) is above this and a build is running, or
 # while memory pressure ("full", avg10, %) is above mem_psi_block.
