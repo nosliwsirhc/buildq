@@ -357,6 +357,7 @@ class Simulation:
             avg = max(float(job.spec.get("avg_cores") or 1.0), 0.1)
             job.progress += min(job.used_cores / avg, 1.0)  # the recorded run's work, at its recorded pace at most
             job.mem = job.last_mem = job.memory_at(min(job.progress, float(job.spec["wall"])))
+        ran = list(live)  # every build that used cores this second: the ones killed or ended in it too
         for job in live:
             lane = self.daemon.cfg.lanes.get(job.ticket.lane)
             mem_cap = getattr(lane, "mem_cap", None) if lane else None
@@ -377,7 +378,6 @@ class Simulation:
                 self.end(job, {"exit": 124, "timed_out": True})
             elif job.progress >= float(job.spec["wall"]):
                 self.end(job, {"exit": int(job.spec.get("exit", 0))})
-        ran = live  # every build that used cores this second, the ones that ended in it too
         live = [j for j in live if j.alive]
         used = self.background_mem + sum(j.mem for j in live)  # what ended this second gave its memory back
         self.machine.mem_available = max(0, self.machine.mem_total - used)

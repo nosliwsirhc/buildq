@@ -280,7 +280,7 @@ class Export(SimCase):
         db.executemany("INSERT INTO build (id, ended, submitted, key, label, name, lane, caller, from_ci, wall, "
                        "mem_peak, profile, avg_cores, exit, state, repo, requeues, attempt_wall) "
                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-        db.execute("UPDATE build SET workspace = 'target:/shared/target' WHERE id = 'a'")
+        db.execute("UPDATE build SET workspace = 'tree:/home/someone/secretrepo' WHERE id = 'a'")
         db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, mem_peak, state, requeues, attempt_wall) "
                    "VALUES ('z', 4000, 1100, 'secretrepo|heavy|cargo build', 'heavy', 90.0, 1, 'cancelled', 1, 0)")
         return db
@@ -291,9 +291,8 @@ class Export(SimCase):
         self.assertEqual(out[0]["argv"], ["cargo", "test", "-p", "private-crate"])
         self.assertEqual((out[0]["ci"], out[0]["lane"], out[0]["profile"]), (True, "heavy", [100, 200, 300]))
         self.assertEqual((out[1]["ci"], out[1]["exit"], out[1]["peak_mem"]), (False, 1, GIB))
-        self.assertEqual(out[0]["workspace"], "target:/shared/target")  # what it wrote to, not its source repo
+        self.assertEqual(out[0]["workspace"], "tree:/home/someone/secretrepo")  # what it wrote to, not its source repo
         self.assertNotIn("workspace", out[1])  # no workspace recorded: none made up
-        self.assertNotIn("z", [e.get("name") for e in out])
         self.assertEqual(len(out), 5)  # 'z' never ran its last attempt: left out
         # cancelled, with no exit code: a failure; stopped twice, with no attempt_wall: no profile to place
         self.assertEqual((out[2]["exit"], out[2]["state"], out[2]["requeued"]), (1, "cancelled", 2))

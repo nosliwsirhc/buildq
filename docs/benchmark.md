@@ -147,7 +147,8 @@ simulation, and that part is simplified:
   is stopped gives its memory back at once.
 - **Running out:** a build over its lane's `MemoryMax` is killed, and fails. If all the builds
   together pass the machine's memory, the largest is killed, as the kernel would. These limits apply
-  in a build's last second too, and the daemon sees that second's use.
+  in a build's last second too. The daemon sees that second's busy cores; the memory of a build
+  that ended is free by the time it looks.
 - **Time limits:** a build past its lane's `timeout` is stopped and fails (exit 124), as the
   supervisor would stop it.
 - **A stopped build starts over from the beginning** with all of its work to do again. A real cargo

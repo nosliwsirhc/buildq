@@ -1899,8 +1899,10 @@ class Analytics(DaemonCase):
         t = self.submit()
         t.attempts_wall, t.requeues = 100.0, 1  # as if it had been stopped once, 100 s in
         self.finish(t, after=30)
-        row = self.db().execute("SELECT wall, attempt_wall FROM build WHERE id = ?", (t.id,)).fetchone()
+        row = self.db().execute("SELECT wall, attempt_wall, workspace FROM build WHERE id = ?", (t.id,)).fetchone()
         self.assertEqual((row["wall"], row["attempt_wall"]), (130.0, 30.0))  # its profile is the 30 s one
+        self.assertTrue(t.workspace)
+        self.assertEqual(row["workspace"], t.workspace)  # what it wrote to: replays of it take turns by this
 
     def test_a_ticket_too_big_to_ever_fit_isnt_waiting_on_memory(self):
         minute = int(self.now // 60) * 60
