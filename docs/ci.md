@@ -32,7 +32,7 @@ On a runner without buildq (GitHub-hosted, or another machine), the step warns a
 
 ## Waiting, cancelling and `ci_first`
 
-While the queue is paused (`buildq pause`), such a step waits like any other build,
+While the queue is paused (`buildq pause`), a queued step waits like any other build,
 up to the job's timeout. Cancelling the job cancels the build. CI jobs share turns fairly with
 everything else (each runner is a caller of its own), unless `ci_first = true`: then a CI job's
 build goes first, with its room held from builds of its priority or lower from the start (see
