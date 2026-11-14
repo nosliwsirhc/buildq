@@ -339,6 +339,15 @@ class Export(SimCase):
         self.assertEqual(agent["builds"], 1)  # c alone: b and d are warm-up
         self.assertAlmostEqual(agent["p50"][1], 500.0, delta=15)  # it waited for b, as it did
         self.assertEqual(summary["cancelled_as_in_trace"], 1)
+        # With a lead-in, A replays too and B waits for it in the replay: C still waits 500s.
+        out = sim.export_rows(db, 11500, None, anonymize=False, lead_in=1000)
+        self.assertEqual([(e["t"], e.get("submitted_at"), e.get("warmup", False)) for e in out],
+                         [(0.0, 0.0, True), (500.0, 100.0, True), (1400.0, None, True), (1500.0, None, False)])
+        with open(path, "w") as f:
+            for entry in out:
+                f.write(json.dumps(entry) + "\n")
+        summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_lead_in")
+        self.assertAlmostEqual(summary["against_recorded"]["agent"]["p50"][1], 500.0, delta=15)
 
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
@@ -505,7 +514,7 @@ class Export(SimCase):
         disk = sqlite3.connect(path)
         db.backup(disk)
         disk.close()
-        args = sim.argparse.Namespace(db=path, since="900", until="1015", anonymize=True)
+        args = sim.argparse.Namespace(db=path, since="900", until="1015", anonymize=True, lead_in=None)
         out, err = io.StringIO(), io.StringIO()
         with unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", err):
             sim.cmd_export(args)

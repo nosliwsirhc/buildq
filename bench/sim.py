@@ -928,25 +928,29 @@ def anonymous_argv(argv: list[str]) -> list[str]:
             for i, w in enumerate(argv)]
 
 
-def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
-    return export_builds(db, since, until, anonymize)[0]
+def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool,
+                lead_in: float = 0.0) -> list[dict]:
+    return export_builds(db, since, until, anonymize, lead_in)[0]
 
 
 def export_builds(db: sqlite3.Connection, since: float | None, until: float | None,
-                  anonymize: bool) -> tuple[list[dict], float | None, float | None]:
+                  anonymize: bool, lead_in: float = 0.0) -> tuple[list[dict], float | None, float | None]:
     """The trace's builds, and when (in the database's time) its first came in and its last ended.
     From `since`, these are the builds submitted then or later, and the ones still queued or running
     as it began (marked warmup). The builds that held those up before the window aren't in it, so a
     warm-up build enters the replay as it really started if it was running then, else as the window
     begins; either way with its real submission time (submitted_at), so its age and its cancel are
-    as they were."""
+    as they were. A lead-in (seconds) starts the trace that much earlier, the usual way to warm a
+    replay up: the builds submitted in it replay as they came in, marked warmup too, and the queue
+    the window begins with is the replay's own."""
+    begins = since - lead_in if since is not None else None  # where the trace starts
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
     query = "SELECT * FROM build WHERE (wall > 0 OR state = 'cancelled') AND submitted IS NOT NULL"
     params: list = []
-    if since is not None:
+    if begins is not None:
         query += " AND (submitted >= ? OR ended > ?)"
-        params += [since, since]
+        params += [begins, begins]
     if until is not None:
         query += " AND submitted < ?"
         params.append(until)
@@ -956,12 +960,12 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
     def enters(r: dict) -> float:
         """When a build comes into the replay (see above)."""
         submitted = float(r["submitted"])
-        if since is None or submitted >= since:
+        if begins is None or submitted >= begins:
             return submitted
         attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
         ran = float(attempt or r.get("wall") or 0)  # (an older database: all its attempts, so it starts earlier)
         start = float(r["ended"]) - ran if r.get("ended") is not None and ran > 0 else None
-        return max(submitted, start) if start is not None and start <= since else since
+        return max(submitted, start) if start is not None and start <= begins else begins
 
     out: list[tuple[float, dict]] = []
     def shape(r: dict) -> dict | None:
@@ -1028,7 +1032,8 @@ def export_builds(db: sqlite3.Connection, since: float | None, until: float | No
             entry["recorded_wait"] = round(float(r["waited"]), 1)  # what it really waited (all its attempts)
         if since is not None and float(r["submitted"]) < since:
             entry["warmup"] = True  # in the machine before the window: there for the others, not compared
-            entry["submitted_at"] = float(r["submitted"])  # (its age, and when its cancel_at counts from)
+            if float(r["submitted"]) < begins:
+                entry["submitted_at"] = float(r["submitted"])  # (its age, and when its cancel_at counts from)
         if anonymize:
             entry["repo"] = hashed("r", entry["repo"])
             entry["caller"] = hashed("c", caller)
@@ -1130,7 +1135,8 @@ def cmd_export(args) -> int:
     db = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     try:
         since, until = parse_when(args.since), parse_when(args.until)
-        rows, first, last_end = export_builds(db, since, until, args.anonymize)
+        lead_in = load_buildqd(DEFAULT_BUILDQD, "buildqd_durations").parse_duration(args.lead_in) if args.lead_in else 0.0
+        rows, first, last_end = export_builds(db, since, until, args.anonymize, lead_in)
         notes: list[str] = []
         machine = None
         if rows:
@@ -1179,6 +1185,8 @@ def main(argv=None) -> int:
     e.add_argument("--since", help="epoch seconds, or YYYY-MM-DDTHH:MM local time")
     e.add_argument("--until")
     e.add_argument("--anonymize", action="store_true", help="hash repository names, callers and package words")
+    e.add_argument("--lead-in", help="start the trace this long before --since (1h, 30m), its builds marked "
+                                     "warmup: the replay builds the queue the window begins with")
     sub.add_parser("scenarios", help="list the built-in scenarios")
     args = p.parse_args(argv)
     return {"run": cmd_run, "compare": cmd_compare, "check": cmd_check, "export": cmd_export,

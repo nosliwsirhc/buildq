@@ -103,7 +103,7 @@ as a step that holds until the next).
 
 ```sh
 python3 bench/sim.py export --db ~/.local/state/buildq/metrics.db \
-    --since 2026-11-14T06:00 --until 2026-11-14T08:00 --anonymize > ~/morning.jsonl
+    --since 2026-11-14T06:00 --until 2026-11-14T08:00 --lead-in 1h --anonymize > ~/morning.jsonl
 python3 bench/sim.py run ~/morning.jsonl
 ```
 
@@ -121,6 +121,11 @@ begins if it was still queued. Either way it keeps its real submission time (`su
 is as old as it was when the scheduler orders the queue, and is cancelled when it was. That brings
 the replay's start closer to the machine it had, not all the way: a warm-up build's own wait before
 the window isn't replayed.
+
+`--lead-in 1h` is the usual way to warm a replay up instead: the trace starts an hour before
+`--since`, every build of that hour replays as it came in (marked `warmup` too, so not compared),
+and the queue the window begins with is the one the replay built. Only builds in flight as the
+lead-in begins are placed as above, and an hour later their effect has mostly worked through.
 
 The trace's first line is the machine (its cores and memory) and other work's memory and cores (CI
 runners, containers, sessions: everything but buildq's builds), a step a minute from the analytics'
