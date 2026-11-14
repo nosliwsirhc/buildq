@@ -69,6 +69,15 @@ ci_first = false
 # room. Pausing a build would free no memory. "0" (the default) never stops one for CI.
 make_room_for_ci = "0"
 
+# With make_room_for_ci: whether a CI job's build may stop builds when part of what it lacks is room
+# held for agents' builds that have waited longer than it (three times starve_seconds, or stopped
+# once): stopping builds then lets those go first too. false: it waits behind them (#38).
+make_room_behind_agents = true
+
+# With make_room_for_ci: never stop a build that has run this long ("20m"): it is likely far along,
+# and starting it over would throw the most work away. "0" (the default) spares none.
+make_room_spare_after = "0"
+
 # Scripts (file names) whose argument right after the script names what they run, so it joins the
 # history key: `bash ci/wrap.sh lint …` and `bash ci/wrap.sh tests …` are then sized apart. Only
 # when the script comes straight after its interpreter (no option before it), and only a plain

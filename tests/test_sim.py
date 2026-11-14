@@ -308,6 +308,27 @@ class Export(SimCase):
         self.assertEqual(out[4]["argv"][3], "-j8")  # and options stay
         self.assertEqual(out[0]["argv"][:3], ["cargo", "test", "-p"])  # the tool, its subcommand and options stay
 
+    def test_a_build_cancelled_while_queued_replays_as_its_command_runs_until_its_cancel(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        buildqd = load("buildqd_for_cancel", BUILDQD)
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, attempt_wall, mem_peak, avg_cores, state, "
+                   "exit) VALUES ('ok', 1400, 1000, 'app|heavy|cargo test', 'heavy', 400.0, 400.0, ?, 4.0, "
+                   "'succeeded', 0)", (8 * GIB,))
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, mem_peak, state) "
+                   "VALUES ('gone', 1300, 1100, 'app|heavy|cargo test', 'heavy', 0, 0, 'cancelled')")
+        out = sim.export_rows(db, None, None, anonymize=False)
+        gone = out[1]
+        self.assertEqual((gone["wall"], gone["peak_mem"], gone["cancel_at"], gone["exit"]), (400.0, 8 * GIB, 200.0, 0))
+        self.assertNotIn("cancel_at", out[0])
+
+    def test_a_replayed_build_is_cancelled_when_the_trace_says(self):
+        job = dict(scenarios.build(0, ("cargo", "test"), 2, 600, 2, repo="app"), cancel_at=120)
+        summary, s = sim.simulate(scenario([job]), CONFIG, BUILDQD, name="buildqd_cancel")
+        self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
+        self.assertAlmostEqual(summary["makespan_s"], 120, delta=5)
+
     def test_an_exported_trace_replays(self):
         path = os.path.join(self.tmp.name, "trace.jsonl")
         with open(path, "w") as f:

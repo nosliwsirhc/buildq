@@ -53,6 +53,12 @@ goes first. cargo keeps the crates it finished, so it repeats only the ones it w
 build is stopped this way at most twice, and never for a CI step in a lane with `may_pass_held`,
 which holds no room. Pausing a build wouldn't help: a paused build keeps its memory.
 
+Two settings tune it (#38). `make_room_behind_agents = false` leaves a CI step that waits partly
+behind agents' builds that have waited longer than it (and so go first) to wait its turn: stopping
+builds for it would mostly let those go first. `make_room_spare_after = "20m"` never stops a build
+that has run that long, since starting it over would lose the most work. Compare them on your own
+builds with the replay simulator ([Benchmarking](benchmark.md)).
+
 ## A new step's first run
 
 A step's first run is planned at its lane's default memory, since its command has no history, and a

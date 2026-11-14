@@ -2843,6 +2843,52 @@ class MakeRoomForCI(DaemonCase):
         self.assertEqual(self.runner.forced, [c.id])  # the second waits until the first has started
         del a, b
 
+    def behind_an_agent_build_that_waited(self):
+        """Two 12G builds running (11G free); a 20G agent build that has waited three times
+        starve_seconds (overdue: it goes before CI builds) holds its room; then a CI build arrives
+        needing 8G, which lacks it only because of that hold."""
+        old, new = self.agents(12, 12)
+        held = self.submit(("cargo", "test", "-p", "big"), mem="20G", caller="patient", cwd=self.workdir())
+        self.tick(901)  # past three times starve_seconds: overdue, and it holds its room
+        self.assertTrue(held.held)
+        self.now += 901
+        ci = self.submit(("cargo", "test"), mem="8G", env=self.CI)
+        self.assertEqual((ci.state, ci.reason_cat), ("queued", "held"))
+        return old, new, held, ci
+
+    def test_a_ci_build_behind_agents_builds_that_waited_longer_may_stop_builds(self):
+        self.behind_an_agent_build_that_waited()
+        self.tick(301)
+        self.assertTrue(self.runner.forced)  # by default: room for the held build and the CI one
+
+    def test_make_room_behind_agents_off_leaves_them_their_turn(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new, held, ci = self.behind_an_agent_build_that_waited()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])  # it waits behind them, as before make_room_for_ci (#38)
+        self.assertGreater(ci.short_agents, 0)
+
+    def test_a_build_that_has_run_long_is_spared(self):
+        self.daemon.cfg.make_room_spare_after = 200.0
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)  # both have run about 300 s: past 200, so neither is stopped
+        self.assertEqual(self.runner.forced, [])
+        self.daemon.cfg.make_room_spare_after = 400.0
+        self.daemon.room_made.clear()
+        self.tick(302)
+        self.assertEqual(self.runner.forced, [new.id])  # under 400: the newest is stopped as before
+
+    def test_the_make_room_options_are_read(self):
+        cfg = buildqd.Config({}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (True, 0.0))
+        cfg = buildqd.Config({"ci_first": True, "make_room_for_ci": "5m", "make_room_behind_agents": False,
+                              "make_room_spare_after": "20m"}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (False, 1200.0))
+        self.assertEqual(cfg.summary()["make_room_spare_after"], 1200.0)
+        with self.assertRaises(ValueError):
+            buildqd.Config({"make_room_spare_after": "soon"}, 64 * GIB, 16)
+
     def test_stops_for_ci_dont_count_toward_the_limit_of_three(self):
         (t,) = self.agents(12)
         t.requeues, t.ci_stops = 3, 1

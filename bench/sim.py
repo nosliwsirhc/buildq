@@ -409,6 +409,21 @@ class Simulation:
                 self.records[tid]["timed_out_queued"] = t.state == "queued"
                 self.daemon.cancel(t, now)
 
+    def trace_cancels(self, now: float):
+        """A build the trace says was cancelled is cancelled the same time after its submission (#40)."""
+        for tid, spec in self.specs.items():
+            if spec.get("cancel_at") is None:
+                continue
+            t = self.daemon.tickets.get(tid)
+            if t is None or t.state in self.mod.FINISHED or t.cancel_requested:
+                continue
+            job = self.jobs.get(tid)
+            if job is not None and not job.alive and not job.discarded:
+                continue  # it finished this second
+            if now - t.submitted >= float(spec["cancel_at"]):
+                self.records[tid]["cancelled_by_trace"] = True
+                self.daemon.cancel(t, now)
+
     def run(self, horizon: float | None = None) -> dict:
         d = self.daemon
         self.seed_history()
@@ -425,6 +440,7 @@ class Simulation:
                 self.submit(spec, n)
                 i += 1
             self.ci_timeouts(now)
+            self.trace_cancels(now)
             d.check(now)
             d.shed_memory(now)
             d.schedule(now)
@@ -525,6 +541,7 @@ def summarize(sim: Simulation, seconds: int) -> dict:
                  **{f"lane:{lane}": wait_stats([r for r in records if r["lane"] == lane], end) for lane in lanes}},
         "ci_timed_out": sim.events["ci_timed_out"],
         "ci_timed_out_in_queue": sum(1 for r in records if r.get("timed_out_queued")),
+        "cancelled_as_in_trace": sum(1 for r in records if r.get("cancelled_by_trace")),
         "stops_for_memory": sum(max(0, (r.get("requeues") or 0) - (r.get("ci_stops") or 0)) + int(r.get("failed_stop", False))
                                 for r in records),
         "stops_for_ci": sum(r.get("ci_stops") or 0 for r in records),
@@ -732,7 +749,7 @@ PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
-    query = "SELECT * FROM build WHERE wall > 0 AND submitted IS NOT NULL"
+    query = "SELECT * FROM build WHERE (wall > 0 OR state = 'cancelled') AND submitted IS NOT NULL"
     params: list = []
     if since is not None:
         query += " AND submitted >= ?"
@@ -745,17 +762,17 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
         return []
     first = rows[0]["submitted"]
     out = []
-    for r in rows:
-        repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
-        argv = words.split() or ["build"]
+    def shape(r: dict) -> dict | None:
+        """What one whole run of a row's command looked like (wall, cores, peak, profile), or None if
+        its last attempt never ran. wall counts every attempt; the profile and avg_cores describe the
+        last. Newer databases keep the last attempt's own wall time; without it, a requeued build's
+        profile can't be placed in time, so it is left out (memory then rises to the peak in the
+        first fifth)."""
         requeued = int(r.get("requeues") or 0)
-        # wall counts every attempt; the profile and avg_cores describe the last. Newer databases
-        # keep the last attempt's own wall time; without it, a requeued build's profile can't be
-        # placed in time, so it is left out (memory then rises to the peak in the first fifth).
         attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
-        if attempt is not None and float(attempt) <= 0:
-            continue  # its last attempt never ran (stopped, then cancelled while queued again): nothing to replay
-        wall = float(attempt) if attempt is not None else float(r["wall"])
+        wall = float(attempt) if attempt is not None else float(r.get("wall") or 0)
+        if wall <= 0:
+            return None
         profile = None
         if "profile" in cols and r.get("profile") and (attempt is not None or not requeued):
             try:
@@ -763,14 +780,32 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
             except (ValueError, TypeError):
                 profile = None
         avg = r.get("avg_cores") or ((r.get("cpu_seconds") or 0) / wall if wall else 1.0) or 1.0
+        return {"wall": wall, "avg": float(avg), "peak": int(r.get("mem_peak") or 0), "profile": profile}
+
+    # A whole run of each command that succeeded: what a cancelled build of it would have done (#40).
+    whole = {r.get("key"): shape(r) for r in rows if r.get("state") == "succeeded" and shape(r)}
+    for r in rows:
+        repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
+        argv = words.split() or ["build"]
+        requeued = int(r.get("requeues") or 0)
+        cancelled = r.get("state") == "cancelled"
+        run = whole.get(r.get("key")) if cancelled else shape(r)  # a cancelled one: how a whole run of it went
+        run = run or shape(r)
+        if run is None:
+            continue  # it never ran, and no other run of its command says how it would have: nothing to replay
+        wall, avg, profile = run["wall"], run["avg"], run["profile"]
         caller = str(r.get("caller") or "")
         state = str(r.get("state") or "")
         # A build that was cancelled or lost has no exit code: it didn't succeed, so it replays as a failure.
         exit_code = int(r["exit"]) if r.get("exit") is not None else (0 if state == "succeeded" else 1)
+        if cancelled and run is whole.get(r.get("key")):
+            exit_code = 0  # it would have run as that whole run did; its cancel ends it (cancel_at)
         entry = {"t": round(float(r["submitted"]) - first, 1), "repo": repo or "project", "lane": lane or None,
                  "argv": argv, "ci": bool(r.get("from_ci")), "caller": caller, "wall": round(wall, 1),
-                 "avg_cores": round(float(avg), 2), "peak_mem": int(r.get("mem_peak") or 0), "exit": exit_code,
+                 "avg_cores": round(float(avg), 2), "peak_mem": int(run["peak"]), "exit": exit_code,
                  "state": state or None}
+        if cancelled and r.get("ended"):
+            entry["cancel_at"] = round(max(0.0, float(r["ended"]) - float(r["submitted"])), 1)
         if requeued:
             entry["requeued"] = requeued
         if profile:
