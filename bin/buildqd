@@ -1899,6 +1899,7 @@ BUILD_COLUMNS = [
     ("requeues", "INTEGER"), ("paused", "REAL"), ("oom", "INTEGER"), ("mem_high", "INTEGER"),
     ("mem_wait", "REAL"),
     ("ci_stops", "INTEGER"),  # of its requeues, the times it was stopped to make room for a CI job's build
+    ("attempt_wall", "REAL"),  # its last attempt's wall time, which its profile and avg_cores describe
 ]
 CI_UNITS = ("actions.runner.*", "gha-*", "*-runner-*", "gitlab-runner*")  # CI runner services, by unit name
 
@@ -4880,6 +4881,7 @@ class Daemon:
             "label": t.label[:200], "name": t.name, "lane": t.lane, "caller": t.caller,
             "repo": (t.source or {}).get("repo") or t.workspace, "state": t.state, "exit": t.exit,
             "from_ci": int(bool(t.from_ci)), "wall": round(wall + t.attempts_wall, 1), "waited": round(t.wait_total, 1),
+            "attempt_wall": round(wall, 1),
             "waited_by": json.dumps(t.waited_by, separators=(",", ":"), sort_keys=True),
             "est_mem": t.est_mem, "est_src": t.est_src, "mem_peak": max(t.mem_peak, t.attempts_peak),
             "peak_at": round(t.peak_at, 1) if whole else None, "tail": t.tail if whole else None,

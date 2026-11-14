@@ -119,6 +119,8 @@ class Job:
         self.used_cores = 0.0
         self.frozen = False
         self.alive = True
+        self.discarded = False  # stopped or cancelled: gone without a last word
+        self.last_mem = 0  # what it held in its last second, for the daemon's last look
 
     def wanted_cores(self) -> float:
         if self.frozen:
@@ -131,7 +133,13 @@ class Job:
         profile = self.spec.get("profile")
         share = min(max(progress / wall, 0.0), 1.0)
         if profile:
-            return int(profile[min(len(profile) - 1, int(share * len(profile)))]) * MIB
+            # The daemon keeps the most memory in each ten seconds, so a short run's profile has
+            # tenths with no sample in them (0): those hold what the last sample did.
+            i = min(len(profile) - 1, int(share * len(profile)))
+            while i > 0 and not profile[i]:
+                i -= 1
+            value = profile[i] or next((v for v in profile if v), 0)
+            return int(value) * MIB
         peak = int(self.spec["peak_mem"])
         return int(peak * min(1.0, share / 0.2)) if share < 0.2 else peak  # up to its peak in the first fifth
 
@@ -203,6 +211,9 @@ class Simulation:
         self.submitting: tuple[dict, dict] | None = None
         config = os.path.join(state_dir, "config.toml")
         shutil.copyfile(config_path, config)
+        # The daemon falls back to its defaults when its configuration doesn't load; here that would
+        # compare something else, so it is an error (ValueError).
+        self.mod.load_config_file(config, self.machine.mem_total, self.machine.ncpu)
         self.daemon = self.mod.Daemon(config, os.path.join(state_dir, "state"), machine=self.machine,
                                       runner=Runner(self), queries=self.mod.InlineExecutor())
         self.daemon.source_command = None
@@ -222,6 +233,7 @@ class Simulation:
         mod.parent_freeze_set = lambda path: False
         mod.repo_name = lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd))
         mod.cargo_cold = lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False)
+        mod.disk_space = lambda path: (1 << 50, 1 << 50)  # (free, size): plenty; there is no disk here
 
     def job_at(self, path: str | None) -> Job | None:
         if not path or not path.startswith("/sim/"):
@@ -230,9 +242,9 @@ class Simulation:
 
     def stats(self, path: str):
         job = self.job_at(path)
-        if job is None or not job.alive:
+        if job is None or job.discarded:
             return None
-        return job.cpu_usec, job.mem, 0
+        return job.cpu_usec, job.last_mem, 0  # (a build that just ended still shows its last second)
 
     def frozen(self, path: str):
         job = self.job_at(path)
@@ -251,7 +263,8 @@ class Simulation:
     def env_of(self, spec: dict) -> dict:
         env = dict(CI_ENV, RUNNER_NAME=spec.get("caller", "runner")) if spec.get("ci") else {}
         if spec.get("workspace"):
-            target = os.path.join(self.state_dir, "targets", spec["workspace"])
+            name = hashlib.sha256(str(spec["workspace"]).encode()).hexdigest()[:12]
+            target = os.path.join(self.state_dir, "targets", name)
             os.makedirs(target, exist_ok=True)
             env["CARGO_TARGET_DIR"] = target
         return env
@@ -285,7 +298,9 @@ class Simulation:
 
     def end(self, job: Job, result: dict | None, discarded: str | None = None):
         job.alive = False
+        job.mem = 0
         if discarded:  # its run so far is lost: stopped (it starts over) or cancelled
+            job.discarded = True
             self.events[f"{discarded}_seconds"] += self.clock.now - job.started
         if result is not None:
             with open(os.path.join(job.ticket.dir, "result.json"), "w") as f:
@@ -318,7 +333,9 @@ class Simulation:
     # ---- the clock
 
     def step(self):
-        """One simulated second of the machine: builds use cores and memory, finish, or are killed."""
+        """One simulated second of the machine. Builds use cores and memory; then the kernel's limits
+        (a build over its lane's MemoryMax, then the machine out of memory: the largest goes), the
+        supervisor's time limit, and last, the builds whose work is done end."""
         live = [j for j in self.jobs.values() if j.alive]
         cap = max(self.machine.ncpu - self.background_cpu, 1.0)
         demand = sum(j.wanted_cores() for j in live)
@@ -327,27 +344,29 @@ class Simulation:
             job.used_cores = job.wanted_cores() * share
             job.cpu_usec += int(job.used_cores * 1e6)
             avg = max(float(job.spec.get("avg_cores") or 1.0), 0.1)
-            job.progress += min(job.used_cores / avg, 1.0) if avg >= 1 else (1.0 if job.used_cores else 0.0)
-            job.mem = job.memory_at(job.progress)
-            if job.progress >= float(job.spec["wall"]):
-                job.mem = 0
-                self.end(job, {"exit": int(job.spec.get("exit", 0))})
-                continue
+            job.progress += min(job.used_cores / avg, 1.0)  # the recorded run's work, at its recorded pace at most
+            job.mem = job.last_mem = job.memory_at(min(job.progress, float(job.spec["wall"])))
+        for job in live:
             lane = self.daemon.cfg.lanes.get(job.ticket.lane)
             mem_cap = getattr(lane, "mem_cap", None) if lane else None
             if mem_cap and job.mem > mem_cap:  # over its own MemoryMax: the kernel kills it
                 self.events["own_cap_oom"] += 1
-                job.mem = 0
                 self.end(job, {"exit": 137, "oom_kills": 1, "hit_own_cap": True})
-        live = [j for j in self.jobs.values() if j.alive]
+        live = [j for j in live if j.alive]
         used = self.background_mem + sum(j.mem for j in live)
         while used > self.machine.mem_total and live:  # the machine is out: the kernel kills the largest
-            victim = max(live, key=lambda j: j.mem)
+            victim = max(live, key=lambda j: (j.mem, j.ticket.id))
             self.events["machine_oom"] += 1
             used -= victim.mem
-            victim.mem = 0
             self.end(victim, {"exit": 137, "oom_kills": 1, "hit_own_cap": False})
             live.remove(victim)
+        for job in live:
+            limit = float(job.ticket.timeout or 0)
+            if limit and self.clock.now - job.started >= limit:  # the supervisor's time limit
+                self.end(job, {"exit": 124, "timed_out": True})
+            elif job.progress >= float(job.spec["wall"]):
+                self.end(job, {"exit": int(job.spec.get("exit", 0))})
+        live = [j for j in live if j.alive]
         self.machine.mem_available = max(0, self.machine.mem_total - used)
         low = self.events["min_available"]
         self.events["min_available"] = self.machine.mem_available if low is None else min(low, self.machine.mem_available)
@@ -447,13 +466,15 @@ def summarize(sim: Simulation, seconds: int) -> dict:
     ratios = [r["planned"] / r["peak"] for r in finished if r["peak"] > 0 and r["planned"] > 0]
     ends = [r["ended"] for r in records if r["ended"] is not None]
     first = min((r["submitted"] for r in records), default=0.0)
+    complete = all(r["outcome"] in sim.mod.FINISHED for r in records)
     outcomes: dict[str, int] = {}
     for r in records:
         outcomes[r["outcome"] or "unfinished"] = outcomes.get(r["outcome"] or "unfinished", 0) + 1
     return {
         "scenario": sim.scenario.get("name", "trace"),
         "builds": len(records),
-        "makespan_s": round((max(ends) if ends else end) - first, 1),
+        "complete": complete,  # False: the horizon came first, and makespan is the time simulated
+        "makespan_s": round((max(ends) if ends and complete else end) - first, 1),
         "outcomes": dict(sorted(outcomes.items())),
         "wait": {"all": wait_stats(records, end),
                  "ci": wait_stats([r for r in records if r["ci"]], end),
@@ -474,7 +495,8 @@ def summarize(sim: Simulation, seconds: int) -> dict:
 
 
 def table(summary: dict) -> str:
-    rows = [("builds", summary["builds"]), ("makespan", fmt_s(summary["makespan_s"]))]
+    rows = [("builds", summary["builds"]),
+            ("makespan", fmt_s(summary["makespan_s"]) + ("" if summary["complete"] else " (cut off: not all finished)"))]
     for group, w in summary["wait"].items():
         if w["builds"]:
             rows.append((f"wait {group} p50 / p95 / max ({w['builds']})",
@@ -627,6 +649,13 @@ def hashed(prefix: str, word: str) -> str:
     return prefix + hashlib.sha256(word.encode()).hexdigest()[:6]
 
 
+# Words an anonymized trace keeps, besides the tool and options: subcommands that are the same
+# everywhere, which the lane rules and restart_safe read. Anything else (a script, a package, a
+# test filter) is hashed.
+PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
+    vitest tsc typecheck unittest pytest discover buildx compose image make ninja""".split())
+
+
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
     db.row_factory = sqlite3.Row
     cols = {r[1] for r in db.execute("PRAGMA table_info(build)")}
@@ -646,27 +675,42 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
     for r in rows:
         repo, lane, words = (str(r.get("key") or "").split("|", 2) + ["", ""])[:3]
         argv = words.split() or ["build"]
+        requeued = int(r.get("requeues") or 0)
+        # wall counts every attempt; the profile and avg_cores describe the last. Newer databases
+        # keep the last attempt's own wall time; without it, a requeued build's profile can't be
+        # placed in time, so it is left out (memory then rises to the peak in the first fifth).
+        attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
+        wall = float(attempt) if attempt else float(r["wall"])
         profile = None
-        if "profile" in cols and r.get("profile"):
+        if "profile" in cols and r.get("profile") and (attempt or not requeued):
             try:
                 profile = [int(x) for x in json.loads(r["profile"])]
             except (ValueError, TypeError):
                 profile = None
-        wall = float(r["wall"])
         avg = r.get("avg_cores") or ((r.get("cpu_seconds") or 0) / wall if wall else 1.0) or 1.0
         caller = str(r.get("caller") or "")
+        state = str(r.get("state") or "")
+        # A build that was cancelled or lost has no exit code: it didn't succeed, so it replays as a failure.
+        exit_code = int(r["exit"]) if r.get("exit") is not None else (0 if state == "succeeded" else 1)
         entry = {"t": round(float(r["submitted"]) - first, 1), "repo": repo or "project", "lane": lane or None,
                  "argv": argv, "ci": bool(r.get("from_ci")), "caller": caller, "wall": round(wall, 1),
-                 "avg_cores": round(float(avg), 2), "peak_mem": int(r.get("mem_peak") or 0),
-                 "exit": int(r["exit"]) if r.get("exit") is not None else 0}
+                 "avg_cores": round(float(avg), 2), "peak_mem": int(r.get("mem_peak") or 0), "exit": exit_code,
+                 "state": state or None}
+        if requeued:
+            entry["requeued"] = requeued
         if profile:
             entry["profile"] = profile
+        if r.get("repo"):  # its workspace (or source repository): builds that shared one take turns
+            entry["workspace"] = str(r["repo"])
         if r.get("name"):
             entry["name"] = r["name"]
         if anonymize:
             entry["repo"] = hashed("r", entry["repo"])
             entry["caller"] = hashed("c", caller)
-            entry["argv"] = argv[:2] + [w if w.startswith("-") else hashed("w", w) for w in argv[2:]]
+            entry["argv"] = argv[:1] + [w if w.startswith("-") or w in PUBLIC_WORDS else hashed("w", w)
+                                        for w in argv[1:]]
+            if "workspace" in entry:
+                entry["workspace"] = hashed("s", entry["workspace"])
             entry.pop("name", None)
         out.append(entry)
     return out

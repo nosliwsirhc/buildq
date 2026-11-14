@@ -99,11 +99,17 @@ python3 bench/sim.py run ~/morning.jsonl
 ```
 
 `export` reads finished builds from the analytics database (`metrics = true`) and writes them as a
-trace. Their memory profile, cores and run time are what the machine measured.
+trace. Their memory profile, cores and run time are what the machine measured, for their last
+attempt. A build that was stopped and queued again (`requeued`) has its last attempt's run time where
+the database keeps it (`attempt_wall`, since #39). In an older database it has every attempt's run time
+and no profile, so its memory rises to its peak in the first fifth. Each build's workspace comes along,
+so builds that shared a target folder take turns in the replay as they did. A build that was
+cancelled or lost has no exit code, and replays as a failure; its `state` says what it was.
 
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
-and who ran them. `--anonymize` hashes repository names, callers and the words of a command after
-its tool and subcommand, and drops build names. That hides them from a casual reader, but a hash of a
+and who ran them. `--anonymize` hashes repository names, workspaces, callers and every word of a
+command except its tool, its options and a short list of public subcommands (`build`, `test`,
+`vitest`, `unittest` …), and drops build names. That hides them from a casual reader, but a hash of a
 common word can be guessed. Keep traces on your machine; the scenarios in the repository are
 synthetic.
 
@@ -119,24 +125,28 @@ simulation, and that part is simplified:
   more cores than the machine has, everyone slows down evenly.
 - **Run time:** a build has the recorded run's work to do. With fewer cores than it used, it takes
   longer in proportion; it never goes faster than it was recorded.
-- **Memory** follows the recorded profile over the run. Without a profile, it rises to its peak over
-  the first fifth. Page cache, swap and memory pressure aren't modelled: memory PSI stays at 0, so
+- **Memory** follows the recorded profile over the run. A tenth with no sample in it (a short run
+  is sampled every ten seconds) holds what the last sample did. Without a profile, memory rises to
+  its peak over the first fifth. Page cache, swap and memory pressure aren't modelled: memory PSI stays at 0, so
   admission never waits on memory pressure. CPU pressure is the share of the cores asked for that
   the machine couldn't give.
 - **Running out:** a build over its lane's `MemoryMax` is killed, and fails. If all the builds
-  together pass the machine's memory, the largest is killed, as the kernel would.
+  together pass the machine's memory, the largest is killed, as the kernel would. These limits apply
+  in a build's last second too, and the daemon sees that second's use.
+- **Time limits:** a build past its lane's `timeout` is stopped and fails (exit 124), as the
+  supervisor would stop it.
 - **A stopped build starts over from the beginning** with all of its work to do again. A real cargo
   build keeps the crates it finished, so the simulation overstates what a stop costs.
 - **CI jobs** are cancelled at their time limit, as GitHub cancels them, whether queued or running.
 - **Other work** (sessions, idle CI runners, containers) holds a fixed amount of memory and cores.
-  There is no disk: `disk_floor` is 0 in the bench configuration.
+  There is no disk: every path has plenty of room, whatever `disk_floor` says.
 - **Jobservers** aren't modelled beyond the cores granted.
 
 ## Reading the summary
 
 | Line | Meaning |
 |---|---|
-| makespan | from the first submission to the last build's end |
+| makespan | from the first submission to the last build's end; if the run was cut off at its horizon (six hours past the last arrival) before every build finished, the time simulated, marked "cut off" (`complete: false` in the JSON) |
 | wait p50 / p95 / max | from submission to first start; a build that never started counts until it ended. By lane, and for CI against agents |
 | CI timed out (in the queue) | CI jobs cancelled at their time limit, and how many of those never started |
 | stops for memory / for CI | builds stopped and queued again by `shed_memory` and by `make_room_for_ci` |
