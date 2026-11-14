@@ -21,8 +21,8 @@ buildq replaces the slot count with measurement.
 | **When a build starts** | a slot is free | its expected peak memory fits in what's free, and there are cores for it |
 | **What it sees** | its own jobs | the whole machine: CI runners, containers, anything outside the queue |
 | **How big a build is** | every build is "one slot" | learned from that command's past runs |
-| **Cores per build** | whatever the build picks | sized to the build and the machine, resized while it runs |
-| **When memory runs out anyway** | the machine stalls | the newest build is paused, then stopped and queued again |
+| **Cores per build** | whatever the build picks | sized to the build and the machine; cargo, make and ninja are resized while they run |
+| **When memory runs out anyway** | the machine stalls | buildq pauses its newest build, then stops one; a compile or test run is queued again at the front |
 
 ## How it works
 
@@ -30,18 +30,21 @@ buildq replaces the slot count with measurement.
 flowchart TB
     A["Coding agents"] --> Q
     T["You, in a terminal"] --> Q
-    C["Self-hosted CI runners"] --> Q
-    Q["buildq run · buildq submit<br/>the queue and its tickets"] --> D
-    M["The whole machine<br/>/proc · PSI · cgroups"] -.-> D
-    D("Fits now?<br/>memory · cores · pressure · disk · workspace") -- "yes" --> S
+    C["CI jobs on self-hosted runners"] --> Q
+    Q["The queue: buildq submit · buildq run<br/>a repeat of a running build joins it"] --> D
+    M["The whole machine<br/>/proc · PSI · build cgroups"] -.-> D
+    D("Fits now?<br/>memory · cores · pressure · disk · job count · workspace") -- "yes" --> S
     D -. "not yet" .-> Q
-    S["Its own systemd service in buildq.slice<br/>capped, measured, cores resized while it runs"] -- "peak memory, cores, time" --> H[("History")]
+    S["A systemd service of its own in buildq.slice<br/>capped by its lane, measured<br/>cargo, make and ninja: cores resized while it runs"]
+    S -. "memory runs short: paused,<br/>or stopped and queued again" .-> Q
+    S -- "peak memory, cores, time" --> H[("History, per command")]
     H -. "sizes the next run" .-> Q
 ```
 
-Every build runs in a cgroup of its own. What it used is recorded under its command (repository,
-tool, subcommand, package), and the next run of that command is planned from it. The daemon
-re-plans every second and whenever a build arrives or ends.
+With a systemd user session, every build runs as a systemd service of its own, so it can be capped
+and measured. What it used is recorded under its command (repository, tool, subcommand, package), and
+the next run of that command is planned from it. The daemon re-plans every second and whenever a
+build arrives or ends.
 
 ## What you get
 
@@ -49,12 +52,12 @@ re-plans every second and whenever a build arrives or ends.
 | --- | --- |
 | **Admission by measurement** | A build starts when its expected peak memory fits in what is free, after setting aside room for running builds to grow into, and there are cores for it. [How it decides](docs/scheduling.md#when-a-build-starts) |
 | **Learned sizes** | Peak memory, peak cores and time are recorded per command, and the next run is planned with them. [Estimates](docs/scheduling.md#estimates) |
-| **Cores that follow the load** | Each build starts with the cores that are free, within its lane's range. Cargo, make and ninja get a jobserver that buildq resizes while they run. [Cores](docs/scheduling.md#cores) |
+| **Cores that follow the load** | Each build starts with as many cores as are free, between its lane's minimum and what its history says it can use. Cargo, make and ninja get a jobserver of their own, which buildq resizes while they run. [Cores](docs/scheduling.md#cores) |
 | **Quick builds first** | Lanes have priorities, and within a lane the build expected to finish soonest goes first. A front-end lane can have turns of its own and never wait for CPU. [Lanes](docs/scheduling.md#lanes) |
-| **CI first, if you want** | With `ci_first`, a CI job's step goes ahead of waiting builds, so a release isn't cancelled at its job's time limit. [CI jobs](docs/ci.md) |
+| **CI first, if you want** | With `ci_first`, a CI job's step goes ahead of waiting builds of its priority or lower, so a release isn't cancelled at its job's time limit. [CI jobs](docs/ci.md) |
 | **Caps** | Lanes give their builds systemd limits (`MemoryHigh`, `MemoryMax`, CPU and IO weights). All builds share one slice whose limit follows what the machine has free, so when other work grows, builds are slowed or stopped, not the machine. |
-| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build, then stops it and queues it again at the front. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
-| **One build per source** | The same command on the same source joins the build already running, and a check that already passed isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
+| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build, then stops one before the machine can stall. A compile or test run is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
+| **One build per source** | The same command on the same source joins the build already running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
 | **Fair shares** | At the same priority, the session with fewer builds running goes first. |
 | **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` behaves like running the command directly. [Using buildq](docs/usage.md) |
 | **Visibility** | `buildq top` is a live view like btop. `buildq report --capacity` says what builds waited for, and SQLite analytics answer the rest. [Operating](docs/operations.md) |
@@ -120,7 +123,7 @@ exit 0
 | `buildq logs TICKET [--follow] [--tail N]` | its output |
 | `buildq cancel [--all] TICKET…` | take it out of the queue, or stop it (`--all` stops one that others share) |
 | `buildq pause [REASON]`, `buildq resume` | start nothing new while running builds carry on, or go on again |
-| `buildq report [--since 7d] [--by command,lane,caller]` | what the history says, per command (or lane, or caller) |
+| `buildq report [--since 7d] [--by lane]` | what the history says, per command (or `--by lane`, `--by caller`) |
 | `buildq report --capacity [--hourly]` | what builds waited for, and what sat idle meanwhile |
 | `buildq top [--interval 2] [--once]` | a live view of the machine and each build, like btop |
 | `buildq query ["SQL"] [--json]` | a read-only query on the analytics (none: list the tables) |
