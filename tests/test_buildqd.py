@@ -4254,5 +4254,77 @@ class Top(unittest.TestCase):
             with self.assertRaises(argparse.ArgumentTypeError, msg=bad):
                 buildq.interval_arg(bad)
 
+    def test_ascii_when_the_terminal_isnt_utf8(self):
+        self.assertTrue(buildq.wants_ascii("ANSI_X3.4-1968"))  # LC_ALL=C, as nl_langinfo and curses say
+        self.assertTrue(buildq.wants_ascii("ascii"))
+        self.assertTrue(buildq.wants_ascii(None))
+        self.assertFalse(buildq.wants_ascii("UTF-8"))
+        self.assertFalse(buildq.wants_ascii("utf_8"))
+
+    def test_no_color_turns_colour_off(self):
+        self.assertTrue(buildq.colour_wanted({}))
+        self.assertFalse(buildq.colour_wanted({"NO_COLOR": "1"}))
+        self.assertTrue(buildq.colour_wanted({"NO_COLOR": ""}))  # set but empty: no-color.org says ignore it
+
+    def test_a_terminal_this_machine_has_no_terminfo_for_falls_back(self):
+        import curses
+        env, tried = {"TERM": "xterm-ghostty"}, []
+
+        def wrapper(run):
+            tried.append(env["TERM"])
+            if env["TERM"] == "xterm-ghostty":
+                raise curses.error("setupterm: could not find terminal")
+            return run(None)
+        code, why = buildq.curses_with_fallback(lambda screen: 7, wrapper, env)
+        self.assertEqual((code, tried), (7, ["xterm-ghostty", "xterm-256color"]))
+        self.assertIn("no terminfo for TERM=xterm-ghostty", why)
+        self.assertIn("infocmp -x xterm-ghostty", why)
+
+    def test_no_terminal_at_all_is_one_snapshot_and_says_why(self):
+        import curses
+
+        def wrapper(run):
+            raise curses.error("setupterm: could not find terminal")
+        code, why = buildq.curses_with_fallback(lambda screen: 0, wrapper, {"TERM": "dumb"})
+        self.assertIsNone(code)
+        self.assertIn("one snapshot instead", why)
+
+    def test_a_curses_error_once_running_isnt_taken_for_the_terminal(self):
+        import curses
+
+        def run(screen):
+            raise curses.error("addwstr() returned ERR")
+        with self.assertRaises(curses.error):
+            buildq.curses_with_fallback(run, lambda r: r(None), {"TERM": "xterm-ghostty"})
+
+    def test_the_screen_never_waits_on_the_daemon(self):
+        import threading
+        release = threading.Event()
+
+        def slow():
+            release.wait(5)
+            return {"overview": {}}
+        fetcher = buildq.StatusFetcher(0.05, ask=slow).start()
+        self.addCleanup(fetcher.stop)
+        self.addCleanup(release.set)
+        started = time.monotonic()
+        self.assertEqual(fetcher.latest(), (0, None))  # at once, while the daemon is still answering
+        self.assertLess(time.monotonic() - started, 0.5)
+        release.set()
+        self.assertTrue(fetcher.answered.wait(5))
+        version, status = fetcher.latest()
+        self.assertEqual((version >= 1, status), (True, {"overview": {}}))
+
+    def test_sigterm_and_sighup_end_it_as_an_exception(self):
+        import signal as signals
+        saved = {s: signals.getsignal(s) for s in (signals.SIGTERM, signals.SIGHUP)}
+        self.addCleanup(lambda: [signals.signal(s, h) for s, h in saved.items()])
+        buildq.exit_on_signals()
+        for sig in (signals.SIGTERM, signals.SIGHUP):
+            with self.assertRaises(SystemExit) as caught:
+                os.kill(os.getpid(), sig)
+                time.sleep(1)  # (the handler runs at the next bytecode)
+            self.assertEqual(caught.exception.code, 128 + sig)
+
 if __name__ == "__main__":
     unittest.main()

@@ -2372,6 +2372,98 @@ def print_top_once(sampler: TopSampler) -> int:
     return 0 if snap["overview"] is not None else 75
 
 
+def wants_ascii(encoding: str | None) -> bool:
+    """Whether to draw with ASCII: the terminal's encoding (the curses window's own, or the locale's
+    codeset) isn't UTF-8. Python's UTF-8 mode says utf-8 under LC_ALL=C while curses writes ASCII,
+    and ncurses then draws block characters as spaces without an error."""
+    return "utf8" not in (encoding or "ascii").lower().replace("-", "").replace("_", "")
+
+
+def colour_wanted(env=None) -> bool:
+    """Colour unless NO_COLOR is set to anything (no-color.org)."""
+    return not (env if env is not None else os.environ).get("NO_COLOR")
+
+
+TERM_FALLBACK = "xterm-256color"
+
+
+def curses_with_fallback(run, wrapper, env=None) -> tuple[int | None, str | None]:
+    """Run a curses program; if this machine has no terminfo for the terminal's TERM (a newer
+    terminal, such as Ghostty or kitty, over SSH), try once more as TERM_FALLBACK. Returns (the
+    program's exit code, or None if no terminal works) and a note for after the screen is gone."""
+    import curses
+    env = os.environ if env is None else env
+    term = env.get("TERM", "")
+    started = []
+
+    def guarded(screen):
+        started.append(True)  # past initscr: a curses.error from here on is the program's, not the terminal's
+        return run(screen)
+    try:
+        return wrapper(guarded), None
+    except curses.error as e:
+        if started:
+            raise
+        if not term or term in ("dumb", TERM_FALLBACK):
+            return None, f"no usable terminal (TERM={term or 'unset'}: {e}); one snapshot instead"
+    env["TERM"] = TERM_FALLBACK
+    why = (f"this machine has no terminfo for TERM={term}, so `buildq top` used {TERM_FALLBACK}. To use "
+           f"{term} itself, copy its entry across (`infocmp -x {term} | ssh <this machine> -- tic -x -`), "
+           f"or set TERM={TERM_FALLBACK} for SSH to this machine")
+    try:
+        return wrapper(guarded), why
+    except curses.error as e:
+        if len(started) > 0:
+            raise
+        return None, f"no usable terminal (TERM={term}, and {TERM_FALLBACK}: {e}); one snapshot instead"
+
+
+class StatusFetcher:
+    """Asks the daemon for its status every interval on a thread of its own, so the screen never
+    waits on it: keys and redraws go on while the daemon is slow or down."""
+
+    def __init__(self, interval: float, ask=None):
+        import threading
+        self.interval = interval
+        self.ask = ask or (lambda: request({"op": "status"}, 1.5, connect_timeout=0.5))
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.stopping = False
+        self.status, self.version = None, 0
+        self.answered = threading.Event()  # the first request has come back (with an answer or not)
+        self.thread = threading.Thread(target=self.loop, name="status", daemon=True)
+
+    def start(self) -> "StatusFetcher":
+        self.thread.start()
+        return self
+
+    def loop(self) -> None:
+        while not self.stopping:
+            status = self.ask()
+            with self.lock:
+                self.status, self.version = status, self.version + 1
+            self.answered.set()
+            self.wake.wait(self.interval)  # (after the request: a slow daemon isn't asked again at once)
+            self.wake.clear()
+
+    def latest(self) -> tuple[int, dict | None]:
+        with self.lock:
+            return self.version, self.status
+
+    def stop(self) -> None:
+        self.stopping = True
+        self.wake.set()
+
+
+def exit_on_signals() -> None:
+    """SIGTERM and SIGHUP (the terminal or SSH session gone) end the program as an exception, so the
+    screen is restored and what it started is stopped; ncurses' own handler would exit at once."""
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)
+
+
 def cmd_top(args) -> int:
     """A live view of the machine and each build, refreshed every --interval seconds."""
     import locale
@@ -2379,27 +2471,31 @@ def cmd_top(args) -> int:
         locale.setlocale(locale.LC_ALL, "")
     except locale.Error:  # a locale named in the environment but not installed
         pass
-    encoding = locale.getpreferredencoding(False) or "ascii"
-    if "utf" not in encoding.lower().replace("-", ""):
-        use_ascii()
     if args.once or not sys.stdout.isatty():
+        if wants_ascii(locale.nl_langinfo(locale.CODESET)):
+            use_ascii()
         sampler = TopSampler(DirSizes(background=False))
         try:
             return print_top_once(sampler)
         finally:
             sampler.sizes.stop()
     import curses
+    exit_on_signals()
     sizes = DirSizes()
+    fetcher = StatusFetcher(args.interval)
 
     def run(screen) -> int:
         try:
             curses.curs_set(0)
         except curses.error:
             pass
+        encoding = getattr(screen, "encoding", None) or "ascii"  # what curses really writes
+        if wants_ascii(encoding):
+            use_ascii()
         screen.timeout(100)
         colours = {"": 0}
         try:
-            if curses.has_colors():
+            if colour_wanted() and curses.has_colors():
                 curses.use_default_colors()
                 for i, (name, fg) in enumerate((("head", curses.COLOR_CYAN), ("ok", curses.COLOR_GREEN),
                                                  ("warn", curses.COLOR_YELLOW), ("bad", curses.COLOR_RED),
@@ -2411,12 +2507,14 @@ def cmd_top(args) -> int:
         sampler = TopSampler(sizes)
         sorts = ["age", "cpu", "mem", "io", "disk"]
         sort, selected, detail, logs = "age", None, False, False
-        snap, next_at, order, dirty = None, 0.0, [], True
+        snap, seen, order, dirty = None, -1, [], True
+        if not fetcher.thread.is_alive():
+            fetcher.start()
+        fetcher.answered.wait(2.0)  # the first answer, if it comes soon (else "not answering" until it does)
         while True:
-            if time.monotonic() >= next_at:
-                snap = sampler.snapshot(request({"op": "status"}, 1.5, connect_timeout=0.5))
-                next_at = time.monotonic() + args.interval  # (after the request: a slow daemon isn't asked again at once)
-                dirty = True
+            version, status = fetcher.latest()
+            if snap is None or version != seen:
+                snap, seen, dirty = sampler.snapshot(status), version, True
             if dirty:
                 height, width = screen.getmaxyx()
                 row = next((r for r in (snap["overview"] or {}).get("running") or [] if r["id"] == selected), None)
@@ -2453,19 +2551,24 @@ def cmd_top(args) -> int:
                 logs = not logs
             # KEY_RESIZE: redrawn at the new size, without taking a new sample
 
+    why = None
     try:
-        return curses.wrapper(run)
-    except KeyboardInterrupt:
-        return 0
-    except curses.error:  # no usable terminal (TERM unset, dumb): one snapshot instead
+        code, why = curses_with_fallback(run, curses.wrapper)
+        if code is not None:
+            return code
         sizes.stop()
-        once = TopSampler(DirSizes(background=False))
+        once = TopSampler(DirSizes(background=False))  # no usable terminal: one snapshot instead
         try:
             return print_top_once(once)
         finally:
             once.sizes.stop()
+    except KeyboardInterrupt:
+        return 0
     finally:
+        fetcher.stop()
         sizes.stop()
+        if why:
+            note(why)
 
 
 def skill_file() -> str | None:
