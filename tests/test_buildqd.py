@@ -3152,6 +3152,54 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
         self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 pytest")
 
+    def test_a_labelled_scripts_label_tells_its_builds_apart(self):
+        labels = frozenset({"persistent-cargo-target.sh", "gen.py"})
+        wrapper = ("bash", "scripts/ci/persistent-cargo-target.sh")
+
+        def words(*argv):
+            return " ".join(buildqd.command_words(list(argv), labels))
+        self.assertEqual(words(*wrapper, "architecture", "2G", "--", "cargo", "run", "--release"),
+                         "bash persistent-cargo-target.sh architecture")
+        self.assertEqual(words(*wrapper, "rust-tests", "60G", "--", "bash", "scripts/ci/rust-unit-tests.sh"),
+                         "bash persistent-cargo-target.sh rust-tests")
+        self.assertEqual(self.words(*wrapper, "architecture", "2G"), "bash persistent-cargo-target.sh")  # not listed
+        self.assertEqual(words("python3", "tools/gen.py", "wire_types"), "python3 gen.py wire_types")
+        # only the argument right after the script, and only a plain lowercase word
+        self.assertEqual(words("python3", "tools/gen.py", "--password", "hunter"), "python3 gen.py")
+        for arg in ("/home/u/.t3/worktrees/x", "./tree", "60G", "Ab3dE9fGh2", "ghp_0123456789abcdefABCDEF",
+                    "a-very-long-argument-of-thirty-chars"):
+            self.assertEqual(words("bash", "persistent-cargo-target.sh", arg), "bash persistent-cargo-target.sh", arg)
+        # an unlisted script, -c, -lc and modules are keyed as before
+        self.assertEqual(words("bash", "run.sh", "build"), "bash run.sh")
+        self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh build"), self.words("bash", "-lc", "persistent-cargo-target.sh build"))
+        self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")
+        # only a script that comes straight after the interpreter: not a command string or an option's value
+        self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh", "hunter"),
+                         self.words("bash", "-lc", "persistent-cargo-target.sh", "hunter"))
+        self.assertEqual(" ".join(buildqd.command_words(["node", "--require", "preload.js", "hunter"],
+                                                        frozenset({"preload.js"}))),
+                         self.words("node", "--require", "preload.js", "hunter"))
+        # a script's own -m is neither a module nor a label
+        self.assertEqual(words(*wrapper, "architecture", "-m", "fast"), "bash persistent-cargo-target.sh architecture")
+        # its own -c is its argument, not a command string
+        self.assertEqual(words(*wrapper, "architecture", "-c", "debug"), "bash persistent-cargo-target.sh architecture")
+        # an option before the script turns the label off
+        self.assertEqual(words("bash", "-e", *wrapper[1:], "architecture"), "bash persistent-cargo-target.sh")
+
+    def test_labelled_scripts_are_configured(self):
+        cfg = buildqd.Config({"script_labels": ["persistent-cargo-target.sh"]}, 64 * GIB, 16)
+        self.assertEqual(cfg.script_labels, frozenset({"persistent-cargo-target.sh"}))
+        self.assertEqual(cfg.summary()["script_labels"], ["persistent-cargo-target.sh"])
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).script_labels, frozenset())
+        ruled = buildqd.Config(buildqd.tomllib.loads('script_labels = ["wrap.sh"]\n[[lane_rules]]\n'
+                                                     'match = "^bash wrap.sh architecture$"\nlane = "small"\n'
+                                                     '[lanes.default]\n[lanes.small]\n'), 64 * GIB, 16)
+        self.assertEqual(ruled.lane_for(["bash", "wrap.sh", "architecture"]), "small")  # rules see the label
+        self.assertEqual(ruled.lane_for(["bash", "wrap.sh", "rust-tests"]), "default")
+        for bad in ("x.sh", ["a/b.sh"], [3]):
+            with self.assertRaises(ValueError):
+                buildqd.Config({"script_labels": bad}, 64 * GIB, 16)
+
     def test_keys_hold_no_urls_but_keep_npm_scopes(self):
         self.assertNotIn("token", self.words("wget", "https://files.example/private-access-token"))
         self.assertEqual(self.words("pnpm", "--filter", "@scope/web", "build"), "pnpm --filter @scope/web build")
@@ -3178,6 +3226,15 @@ class Keys(unittest.TestCase):
                 f.write(f"gitdir: {os.path.join(main, '.git', 'worktrees', 'feature')}\n")
             self.assertEqual(buildqd.repo_name(main), "project")
             self.assertEqual(buildqd.repo_name(os.path.join(tree, "sub")), "project")
+
+
+class ScriptLabels(DaemonCase):
+    def test_a_submitted_ticket_carries_its_label_and_keeps_its_key(self):
+        self.daemon.cfg.script_labels = frozenset({"persistent-cargo-target.sh"})
+        t = self.submit(("bash", "scripts/ci/persistent-cargo-target.sh", "architecture", "2G", "--", "cargo", "run"))
+        self.assertTrue(t.key.endswith("|bash persistent-cargo-target.sh architecture"), t.key)
+        self.daemon.cfg.script_labels = frozenset()  # a reload that drops it keeps the ticket's key
+        self.assertEqual(buildqd.Ticket.from_record(t.record(), t.dir).key, t.key)
 
 
 class Configuration(unittest.TestCase):

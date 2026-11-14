@@ -569,7 +569,14 @@ run cancelled with its job teaches the history nothing. If a new step keeps timi
 queue, run it once by hand so the history learns its real size. The history is kept per
 repository, lane and command (`<repository>|<lane>|<command words>`, where the repository is the
 name of its main checkout's folder, `filedrop` for a runner's `_work/filedrop/filedrop`), so run it
-from a checkout whose folder has the same name, with the same `--lane` and the same command.
+from a checkout whose folder has the same name, with the same `--lane` and the same command. The
+command words are the tool and what it runs: cargo's subcommand and packages, a JS tool's script, a
+script's name. A script listed in `script_labels` and run straight after its interpreter also gets
+the argument right after it, when that is a plain lowercase word (letters, `-` and `_`, at most 24;
+no digits): `bash persistent-cargo-target.sh architecture`, for a wrapper whose runs differ by that
+label. An option before the script (`bash -e wrap.sh …`) turns it off. Listing a script trusts that
+argument to be a public label, since it is kept in the history, and each label then starts with no
+history of its own: its first run is planned at the lane's default.
 
 ## Limitations
 
