@@ -572,9 +572,11 @@ name of its main checkout's folder, `filedrop` for a runner's `_work/filedrop/fi
 from a checkout whose folder has the same name, with the same `--lane` and the same command. The
 command words are the tool and what it runs: cargo's subcommand and packages, a JS tool's script, a
 script's name. A script listed in `script_labels` and run straight after its interpreter also gets
-the argument right after it, when that is a plain lowercase word: `bash persistent-cargo-target.sh
-architecture`, for a wrapper whose runs differ by that label. Listing a script trusts that argument
-to be a public label, since it is kept in the history.
+the argument right after it, when that is a plain lowercase word (letters, `-` and `_`, at most 24;
+no digits): `bash persistent-cargo-target.sh architecture`, for a wrapper whose runs differ by that
+label. An option before the script (`bash -e wrap.sh …`) turns it off. Listing a script trusts that
+argument to be a public label, since it is kept in the history, and each label then starts with no
+history of its own: its first run is planned at the lane's default.
 
 ## Limitations
 

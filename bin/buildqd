@@ -1188,7 +1188,7 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
                 words += [os.path.basename(w) for w in script[:2]]
         else:
             pos = positionals(rest, {"-m"} if "python" in tool else set())
-            module = option_values(rest, {"-m"})[:1]
+            module = option_values(rest, {"-m"})[:1] if "python" in tool else []  # (a script's own -m isn't a module)
             words += [os.path.basename(p) for p in pos[:1]] + module
             # A script named in script_labels takes a label as the argument right after it, naming
             # what it runs (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are

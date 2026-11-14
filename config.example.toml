@@ -52,8 +52,10 @@ ci_first = false
 
 # Scripts (file names) whose argument right after the script names what they run, so it joins the
 # history key: `bash ci/wrap.sh lint …` and `bash ci/wrap.sh tests …` are then sized apart. Only
-# when the script comes straight after its interpreter, and only a plain lowercase word. List only
-# scripts whose first argument is a public label: it is kept in the history.
+# when the script comes straight after its interpreter (no option before it), and only a plain
+# lowercase word (letters, - and _, at most 24). List only scripts whose first argument is a public
+# label: it is kept in the history. Each label starts with no history: its first run is planned at
+# the lane's default.
 # script_labels = ["persistent-cargo-target.sh"]
 
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its

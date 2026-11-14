@@ -3179,8 +3179,10 @@ class Keys(unittest.TestCase):
         self.assertEqual(" ".join(buildqd.command_words(["node", "--require", "preload.js", "hunter"],
                                                         frozenset({"preload.js"}))),
                          self.words("node", "--require", "preload.js", "hunter"))
-        # a later -m doesn't stand in for the label
-        self.assertNotEqual(words(*wrapper, "architecture", "-m", "fast"), words(*wrapper, "rust-tests", "-m", "fast"))
+        # a script's own -m is neither a module nor a label
+        self.assertEqual(words(*wrapper, "architecture", "-m", "fast"), "bash persistent-cargo-target.sh architecture")
+        # an option before the script turns the label off
+        self.assertEqual(words("bash", "-e", *wrapper[1:], "architecture"), "bash persistent-cargo-target.sh")
 
     def test_labelled_scripts_are_configured(self):
         cfg = buildqd.Config({"script_labels": ["persistent-cargo-target.sh"]}, 64 * GIB, 16)
@@ -3217,6 +3219,15 @@ class Keys(unittest.TestCase):
                 f.write(f"gitdir: {os.path.join(main, '.git', 'worktrees', 'feature')}\n")
             self.assertEqual(buildqd.repo_name(main), "project")
             self.assertEqual(buildqd.repo_name(os.path.join(tree, "sub")), "project")
+
+
+class ScriptLabels(DaemonCase):
+    def test_a_submitted_ticket_carries_its_label_and_keeps_its_key(self):
+        self.daemon.cfg.script_labels = frozenset({"persistent-cargo-target.sh"})
+        t = self.submit(("bash", "scripts/ci/persistent-cargo-target.sh", "architecture", "2G", "--", "cargo", "run"))
+        self.assertTrue(t.key.endswith("|bash persistent-cargo-target.sh architecture"), t.key)
+        self.daemon.cfg.script_labels = frozenset()  # a reload that drops it keeps the ticket's key
+        self.assertEqual(buildqd.Ticket.from_record(t.record(), t.dir).key, t.key)
 
 
 class Configuration(unittest.TestCase):
