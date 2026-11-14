@@ -44,9 +44,10 @@ starve_seconds = 600
 # limit and holds up a merge or a release, while a session's build can wait. A CI job's build goes
 # before every waiting build that hasn't waited starve_seconds, whatever its lane, and before the
 # rest at its priority. The room it needs is held from builds of its priority or lower from the
-# start; a higher lane may still start in room that is free, as may lanes with may_pass_held. A
-# session's build that has waited three times starve_seconds, or was stopped to free memory, still
-# goes before it. Off by default.
+# start; a higher lane may still start in room that is free, as may lanes with may_pass_held (a CI
+# job's build in such a lane gets no head start and holds nothing, like any build there). Any
+# build that has waited three times starve_seconds, or was stopped to free memory, still goes
+# before it. Off by default.
 ci_first = false
 
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its

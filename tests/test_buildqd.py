@@ -2359,6 +2359,19 @@ class CIFirst(DaemonCase):
         self.daemon.schedule(self.now)
         self.assertTrue(session.held)
 
+    def test_a_ci_build_that_has_waited_three_turns_goes_before_newer_higher_lane_ci(self):
+        self.daemon.cfg.ci_first = True
+        self.higher_lane()
+        old = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.now += 3 * 300 - 1  # just under three times starve_seconds (300 here)
+        fresh = self.submit(("dotnet", "build"), lane="web", mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [fresh.id, old.id])
+        self.now += 1
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [old.id, fresh.id])
+        self.finish(self.running)
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual(self.states(old, fresh), ["running", "queued"])  # room for one: the older
+
     def test_a_build_stopped_to_free_memory_goes_before_ci(self):
         self.daemon.cfg.ci_first = True
         stopped = self.submit(mem="20G")

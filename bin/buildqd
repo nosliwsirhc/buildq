@@ -2880,8 +2880,10 @@ class Daemon:
         """Queued tickets in the order they get a turn: any that has waited starve_seconds (or, with
         ci_first, comes from a CI job) first, then the higher priority (the lane's plus the ticket's
         own), CI jobs first at the same priority with ci_first (one that has waited starve_seconds
-        before newer ones), then the one expected to finish soonest, then the oldest. With ci_first, a session's build that has waited three times
-        starve_seconds, or was stopped to free memory, goes before all of those, so CI jobs can't
+        before newer ones), then the one expected to finish soonest, then the oldest.
+
+        With ci_first, any build that has waited three times starve_seconds, or was stopped to free
+        memory, goes before all of those, so CI jobs (in a higher lane, for a CI job's build) can't
         keep it waiting for ever."""
         now = time.time() if now is None else now
 
@@ -2895,9 +2897,10 @@ class Daemon:
             ci = self.cfg.ci_first and t.from_ci
             # A build that has waited starve_seconds goes ahead of everything else, or a stream of
             # quicker or higher builds could keep it waiting for ever. With ci_first a CI job's build
-            # counts so at once, and a session's build that has waited much longer goes before it.
+            # counts so at once, and any build that has waited much longer goes before it: a
+            # session's, or a CI job's that higher-lane CI builds keep passing.
             starving = self.starving(t, now) and not passes
-            overdue = (self.cfg.ci_first and not t.from_ci and not passes
+            overdue = (self.cfg.ci_first and not passes
                        and (now - t.submitted >= 3 * self.cfg.starve_seconds or t.requeues > 0))
             # ...and a CI job's build that has waited out its turn goes before newer CI builds, or a
             # stream of quicker CI builds could keep it waiting past its job's time limit.

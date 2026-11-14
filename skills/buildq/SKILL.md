@@ -86,6 +86,7 @@ outside it, your toolchain, or ignored files other than `.env*`. After changing 
 | `needs 4 cores; 1.2 of 28.8 are free …` | The CPU is at its target. | Wait. |
 | `the room it needs is held for a build that has waited longer` | A long-waiting build goes first. | Wait. |
 | `the room it needs is held for a CI job's build, which goes first` | With `ci_first`, a CI job's step goes before builds of its priority or lower. | Wait. |
+| `another build in the same workspace is a CI job's, which goes first, and is held (…)` | The same, for the workspace. | Wait. |
 | `… builds are running, the most allowed` | Every turn is taken. | Wait. |
 | `another build in the same workspace is running` | Same `CARGO_TARGET_DIR` or git worktree; two builds would fight over it. | Wait. A new target directory means a cold rebuild, which costs the machine far more than the wait. |
 | `memory pressure is …%` / `CPU pressure is …%` | The machine is struggling right now. | Wait. |

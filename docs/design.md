@@ -212,7 +212,7 @@ stop the queue.
 
 **Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped to
 free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` and `RUNNER_NAME`
-both set), goes first (unless its lane may pass held room). With `ci_first`, a non-CI ticket that has
+both set), goes first (unless its lane may pass held room). With `ci_first`, any ticket that has
 waited three times `starve_seconds`, or was queued again after being stopped, goes before all of
 those, so a stream of CI tickets can't keep it waiting for ever. Then tickets go by priority (lane
 plus ticket, highest first), then, with `ci_first`, CI tickets first (one that has waited

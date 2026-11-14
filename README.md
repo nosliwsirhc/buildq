@@ -213,15 +213,16 @@ order and starts every build that fits:
 
 **Order.** A build that has waited `starve_seconds`, or was stopped once to free memory, goes
 first, and the room it needs, its workspace included, is held for it, so later builds can't keep
-passing it (the workspace binds every lane in its group; for the rest, lanes with
+passing it (the workspace binds every lane in its group, a fresh CI build's only its priority or
+lower; for the rest, lanes with
 `may_pass_held` still may). With `ci_first`, a build from a CI job counts as having waited from the
 moment it is queued: a CI step has a job time limit and holds up a merge or a release, while a
 session's build can wait. It goes ahead of every build that hasn't waited `starve_seconds`,
 whatever its lane, and of the others at its priority, so when room frees up it gets it first. While
 it waits, the room it needs is held only from builds of its priority or lower: a higher lane may
 still start in room that is free (until the CI build has really waited `starve_seconds`). A
-session's build that has waited three times `starve_seconds`, or was stopped to free memory, goes
-before CI builds. After that, the higher priority
+build that has waited three times `starve_seconds`, or was stopped to free memory, goes before
+those (a CI build in a lane with `may_pass_held` gets no head start, like any build there). After that, the higher priority
 first (the lane's plus the ticket's own); within a priority, the build whose caller has the fewest
 builds running (a fair share: one
 session's burst of builds doesn't keep the others waiting), then the build expected to finish
