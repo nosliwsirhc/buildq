@@ -329,8 +329,10 @@ def print_ticket(row: dict) -> None:
     if row.get("frozen"):
         print("  paused    to give the machine its memory back; it goes on once there is room")
     if row.get("requeues"):
-        print(f"  requeued  {row['requeues']} time{'s' if row['requeues'] != 1 else ''}: stopped to free memory, "
-              "then started over")
+        n, for_ci = row["requeues"], row.get("ci_stops") or 0
+        why = ("stopped to free memory" if not for_ci else "stopped to make room for CI jobs' builds" if for_ci == n
+               else f"{n - for_ci} to free memory, {for_ci} to make room for CI jobs' builds")
+        print(f"  requeued  {n} time{'s' if n != 1 else ''} ({why}), then started over")
     if row["state"] in ("starting", "running") and row.get("measured"):
         print(f"  using     {row['cores_now']:.1f} cores, {fmt_size(row['mem_now'])} now; "
               f"peak {fmt_size(row['mem_peak'])}, {row['peak_cores']:.1f} cores")
@@ -519,12 +521,17 @@ class Follower:
                          f"`{command_for('submit', '<command>')}` prints a ticket to wait on.")
         elif kind == "ticket":
             previous, was_frozen = self.row["state"], self.row.get("frozen")
+            for_ci = (message.get("ci_stops") or 0) > (self.row.get("ci_stops") or 0)
             self.row = message
             if not self.quiet and message.get("frozen") != was_frozen and message["state"] == "running":
                 note("paused: the machine is short of memory; it goes on where it was once there is room."
                      if message.get("frozen") else "going on: there is memory again.")
             if not self.quiet and previous in ("starting", "running") and message["state"] == "queued":
-                note("stopped to free memory, and queued again at the front: it starts from the beginning "
+                note("stopped to make room for a CI job's build, and queued again: it starts from the beginning "
+                     "once that build has started, and goes first then. Keep waiting." if for_ci and message.get("yields_to")
+                     else "stopped to make room for a CI job's build, and queued again at the front: it starts from "
+                     "the beginning once there is room. Keep waiting." if for_ci
+                     else "stopped to free memory, and queued again at the front: it starts from the beginning "
                      "once there is room. Keep waiting.")
             if previous == "queued" and message["state"] in ("starting", "running") and not self.quiet \
                     and (message.get("waited") or 0) >= 2:
@@ -1373,7 +1380,7 @@ def cmd_report(args) -> int:
         rows.append({
             "name": name, "runs": len(runs), "failed": sum(1 for r in runs if r.get("state") != "succeeded"),
             "killed_for_memory": sum(1 for r in runs if r.get("oom") or r.get("stopped_for_memory")),
-            "requeues": int(sum(num(runs, "requeues"))),
+            "requeues": int(sum(num(runs, "requeues"))), "ci_stops": int(sum(num(runs, "ci_stops"))),
             "over_memory_high": sum(1 for r in runs if r.get("mem_high_all", r.get("mem_high"))),
             "median_seconds": median(walls), "total_seconds": sum(walls),
             "median_wait_seconds": median(num(runs, "waited")), "peak_memory": max(num(runs, "peak_mem"), default=0),
@@ -1397,7 +1404,8 @@ def cmd_report(args) -> int:
               f"{r['killed_for_memory']:>6} {r['requeues']:>5}  {r['name']}")
     print("FAILED: didn't succeed (failed, cancelled, timed out or lost). HIGH: went over its MemoryHigh, where the "
           "kernel slows it. MEMWAIT: time spent waiting on memory in all. KILLED: killed for memory, or stopped to "
-          "free it. AGAIN: times stopped for memory and started over.")
+          "free it. AGAIN: times stopped and started over, for memory or (make_room_for_ci) to make room for a CI "
+          "job's build.")
     return 0
 
 

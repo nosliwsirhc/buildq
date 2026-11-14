@@ -2615,6 +2615,236 @@ class CIFirst(DaemonCase):
             buildqd.Config({"ci_first": "sometimes"}, 64 * GIB, 16)
 
 
+class MakeRoomForCI(DaemonCase):
+    """make_room_for_ci: a CI job's build that has waited for memory our builds hold stops some."""
+    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "filedrop-runner-2"}
+
+    def setUp(self):
+        super().setUp()
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.make_room_for_ci = 300.0
+        self.daemon.cfg.lanes["heavy"].mem = GIB  # builds with no history count as 1G
+        self.daemon.cfg.lanes["web"].mem = GIB
+        self.machine.mem_available = 45 * GIB  # 35G above the 10G floor
+
+    def agents(self, *sizes, argv=("cargo", "build"), lane=None):
+        """Agent builds running, one started after another, each using all it planned."""
+        builds = []
+        for i, size in enumerate(sizes):
+            t = self.submit(argv, lane=lane, mem=f"{size}G", caller=f"agent-{i}", cwd=self.workdir())
+            self.assertEqual(t.state, "running")
+            t.started = self.now + i
+            builds.append(t)
+        for t in builds:
+            t.mem_now = t.est_mem
+        self.machine.mem_available = 45 * GIB - sum(t.mem_now for t in builds)
+        return builds
+
+    def ci_waiting(self, mem="16G"):
+        ci = self.submit(("cargo", "test"), mem=mem, env=self.CI)
+        self.assertEqual((ci.state, ci.reason_cat), ("queued", "memory"))
+        return ci
+
+    def tick(self, after):
+        self.daemon.schedule(self.now + after)
+        self.daemon.make_room_for_ci(self.now + after)
+
+    def test_after_its_wait_the_newest_build_that_covers_the_shortfall_is_stopped_and_yields(self):
+        old, new = self.agents(12, 12)  # 11G free
+        ci = self.ci_waiting()  # lacks 5G
+        self.tick(100)
+        self.assertEqual(self.runner.forced, [])  # not before it has waited make_room_for_ci
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])  # the newest: the least work lost
+        self.assertEqual((new.requeue_pending, new.ci_stops, new.yields_to), (True, 0, ci.id))  # counted once gone
+        self.tick(302)
+        self.assertEqual(len(self.runner.forced), 1)  # nothing more while it is being stopped
+        self.runner.running.discard(new.id)  # it is gone
+        self.daemon.check(self.now + 303)
+        self.assertEqual((new.state, new.shed_error, new.ci_stops), ("queued", None, 1))  # queued again, not failed
+        self.assertIn("CI job's build", new.reason)
+        with open(new.log) as f:
+            self.assertIn("to make room for a CI job's build", f.read())
+        kept = buildqd.Ticket.from_record(json.loads(json.dumps(new.record())), new.dir)
+        self.assertEqual((kept.ci_stops, kept.yields_to, kept.yield_until), (1, ci.id, new.yield_until))
+        self.assertGreater(kept.yield_until, self.now + 303)
+        self.tick(304)  # its memory isn't free yet
+        self.assertEqual([t.id for t in self.daemon.queue(self.now + 304)], [ci.id, new.id])  # it yields
+        self.assertEqual((ci.held, new.held, new.state), (True, False, "queued"))  # and holds nothing
+        self.assertFalse(self.daemon.waited_out(new, self.now + 304))
+        self.machine.mem_available += 12 * GIB  # now it is
+        self.tick(305)
+        self.assertEqual((ci.state, new.state), ("running", "queued"))  # the CI job's build gets the room
+        self.assertTrue(self.daemon.waited_out(new, self.now + 305))  # then it goes first, as a stopped build does
+        self.assertEqual(len(self.runner.forced), 1)
+        self.assertEqual(old.state, "running")
+
+    def test_the_newest_few_are_stopped_when_no_one_covers_it(self):
+        a, b, c = self.agents(5, 4, 4)
+        self.machine.mem_available = 14 * GIB  # other work holds the rest: 4G free
+        self.ci_waiting("10G")  # lacks 6G: no one build gives that; the newest two do
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [c.id, b.id])
+        self.assertEqual(a.state, "running")
+
+    def test_nothing_is_stopped_when_stopping_all_would_not_make_it_fit(self):
+        self.agents(2, 2)
+        self.machine.mem_available = 15 * GIB  # others hold the rest: 5G free, 4G more from ours
+        self.ci_waiting("12G")  # lacks 7G
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])
+
+    def test_scripts_ci_builds_higher_lanes_and_twice_stopped_builds_are_left_alone(self):
+        script = self.submit(("bash", "build.sh"), mem="12G", caller="s", cwd=self.workdir())
+        other_ci = self.submit(("cargo", "test", "-p", "x"), mem="6G", env=self.CI, cwd=self.workdir())
+        self.daemon.cfg.lanes["web"].priority = 100
+        web = self.submit(("pnpm", "build"), lane="web", mem="6G", caller="w", cwd=self.workdir())
+        twice = self.submit(("cargo", "build"), mem="8G", caller="t", cwd=self.workdir())
+        twice.ci_stops = 2
+        for i, t in enumerate((script, other_ci, web, twice)):
+            self.assertEqual(t.state, "running")
+            t.started, t.mem_now = self.now + i, t.est_mem
+        self.machine.mem_available = 45 * GIB - 32 * GIB  # 3G free
+        self.ci_waiting("10G")
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])
+
+    def test_off_by_default_and_only_with_ci_first(self):
+        self.daemon.cfg.make_room_for_ci = 0.0
+        self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(3600)
+        self.assertEqual(self.runner.forced, [])
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).make_room_for_ci, 0.0)
+        cfg = buildqd.Config({"ci_first": True, "make_room_for_ci": "5m"}, 64 * GIB, 16)
+        self.assertEqual((cfg.make_room_for_ci, cfg.summary()["make_room_for_ci"]), (300.0, 300.0))
+        with self.assertRaises(ValueError):
+            buildqd.Config({"make_room_for_ci": "5m"}, 64 * GIB, 16)  # its CI build would hold no room
+        with self.assertRaises(ValueError):
+            buildqd.Config({"ci_first": True, "make_room_for_ci": "soon"}, 64 * GIB, 16)
+
+    def test_a_stopped_build_in_a_lane_that_passes_held_room_still_waits_for_its_ci_build(self):
+        self.daemon.cfg.lanes["web"].mem = 12 * GIB
+        (web,) = self.agents(12, argv=("vitest", "run"), lane="web")  # it may pass held room
+        self.daemon.cfg.lanes["web"].priority = 0  # (so the CI build's priority covers it)
+        self.machine.mem_available = 45 * GIB - 12 * GIB - 9 * GIB  # others hold 9G: 14G free
+        ci = self.ci_waiting()  # lacks 2G
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [web.id])
+        self.runner.running.discard(web.id)
+        self.daemon.check(self.now + 302)
+        self.machine.mem_available += 12 * GIB - 11 * GIB  # freed, but other work grew by 11G: 15G free
+        self.tick(303)
+        self.assertEqual((ci.state, web.state), ("queued", "queued"))  # it doesn't take the room back
+        self.assertIn("make room for a CI job's build", web.reason)
+        self.tick(303 + self.daemon.YIELD_MAX)  # a CI build that can't start doesn't keep it for ever
+        self.assertEqual(web.state, "running")
+
+    def test_a_ci_build_in_a_lane_that_passes_held_room_stops_nothing(self):
+        self.agents(12, 12)
+        ci = self.submit(("vitest", "run"), lane="web", mem="16G", env=self.CI)
+        self.assertEqual(ci.state, "queued")
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])  # it holds no room: what is freed could go elsewhere
+
+    def test_the_shortfall_is_checked_again_after_the_pass(self):
+        self.daemon.cfg.lanes["web"].priority = 100
+        self.agents(12)  # 23G free
+        self.machine.mem_available = 45 * GIB - 12 * GIB - 10 * GIB  # others hold 10G: 13G free
+        ci = self.ci_waiting()  # lacks 3G: stopping the 12G build would do
+        self.now += 301
+        self.daemon.paused = {"reason": "test"}  # so the next build starts in the same pass as ci is looked at
+        web = self.submit(("vitest", "run"), lane="web", mem="12G", caller="w")
+        self.daemon.paused = None
+        self.tick(0)  # ci first (lacking 3G), then the higher lane passes its hold and takes 12G
+        self.assertEqual((ci.state, web.state), ("queued", "running"))
+        self.assertEqual(self.runner.forced, [])  # it lacks 15G now: stopping the 12G build wouldn't do
+
+    def test_what_a_build_may_still_grow_into_counts_and_restartable_scripts_may_be_stopped(self):
+        (script,) = self.agents(12, argv=("bash", "build.sh"))
+        script.restartable = True  # submitted with --restartable
+        script.mem_now = 4 * GIB  # it may still grow 8G, which admission holds for it
+        self.machine.mem_available = 45 * GIB - 4 * GIB - 21 * GIB  # others hold 21G: 12G free, 8G of it held
+        self.ci_waiting("10G")  # lacks 6G; the script gives back its 4G and the 8G held for it
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [script.id])
+
+    def test_a_build_whose_environment_is_gone_is_left_alone(self):
+        (t,) = self.agents(12)
+        t.env = None  # picked up after a daemon restart: it couldn't be queued again
+        self.machine.mem_available = 45 * GIB - 12 * GIB - 10 * GIB  # others hold 10G: 13G free
+        self.ci_waiting("16G")
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])
+
+    def test_a_build_that_finishes_before_it_is_stopped_isnt_counted(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.finish(new, after=302)  # it ended by itself first
+        self.assertEqual((new.state, new.ci_stops, new.requeues), ("succeeded", 0, 0))
+
+    def test_a_ci_build_that_starts_before_the_stopped_build_is_gone(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.tick(301)
+        self.machine.mem_available += 6 * GIB  # other work ended: it fits without the stop
+        self.tick(302)
+        self.assertEqual(ci.state, "running")
+        self.runner.running.discard(new.id)
+        self.daemon.check(self.now + 303)
+        self.assertEqual((new.state, new.ci_stops, new.yields_to, new.yield_until), ("queued", 1, None, None))
+        self.assertIn("no longer needs it", new.reason)
+        with open(new.log) as f:
+            self.assertIn("to make room for a CI job's build", f.read())
+        self.assertTrue(self.daemon.waited_out(new, self.now + 303))  # it goes first now
+
+    def test_a_build_slow_to_die_isnt_followed_by_more_stops(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.tick(301 + self.daemon.ROOM_PAUSE + 60)  # still alive: what it frees isn't free yet
+        self.assertEqual(set(self.runner.forced), {new.id})
+        self.assertEqual(old.state, "running")
+
+    def test_a_ci_build_cancelled_before_the_stopped_build_is_gone(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.tick(301)
+        self.daemon.cancel(ci, self.now + 302)
+        self.runner.running.discard(new.id)
+        self.daemon.check(self.now + 303)
+        self.assertEqual((new.state, new.ci_stops, new.yields_to), ("queued", 1, None))
+        self.assertIn("no longer needs it", new.reason)
+        del old
+
+    def test_one_ci_build_at_a_time(self):
+        a, b, c = self.agents(6, 6, 6)  # 17G free
+        self.machine.mem_available = 45 * GIB - 18 * GIB - 15 * GIB  # others hold 15G: 2G free
+        first = self.ci_waiting("6G")  # lacks 4G
+        second = self.submit(("cargo", "test", "-p", "other"), mem="6G", env=self.CI, cwd=self.workdir())
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [c.id])
+        self.runner.running.discard(c.id)
+        self.daemon.check(self.now + 302)  # gone, but what it frees isn't seen yet
+        self.tick(303)
+        self.assertEqual((first.state, second.state), ("queued", "queued"))
+        self.assertEqual(self.runner.forced, [c.id])  # the second waits until the first has started
+        del a, b
+
+    def test_stops_for_ci_dont_count_toward_the_limit_of_three(self):
+        (t,) = self.agents(12)
+        t.requeues, t.ci_stops = 3, 1
+        self.daemon.shed(t, self.now)
+        self.assertIsNone(t.shed_error)
+        (u,) = self.agents(12)
+        u.requeues = 3
+        self.daemon.shed(u, self.now)
+        self.assertIn("fourth time", u.shed_error)
+
+
 class Priorities(DaemonCase):
     config = BASE_CONFIG.replace('may_pass_held = true', 'may_pass_held = true\npriority = 100\nextra_jobs = 2') + """
 [lanes.dotnet]

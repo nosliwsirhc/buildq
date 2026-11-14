@@ -29,7 +29,9 @@ whatever its lane, and of the others at its priority, so when room frees up it g
 it waits, the room it needs is held only from builds of its priority or lower: a higher lane may
 still start in room that is free (until the CI build has really waited `starve_seconds`). A
 build that has waited three times `starve_seconds`, or was stopped to free memory, goes before
-those (a CI build in a lane with `may_pass_held` gets no head start, like any build there). After that, the higher priority
+those (a CI build in a lane with `may_pass_held` gets no head start, like any build there), except
+one stopped to make room for a CI build (`make_room_for_ci`, see [CI jobs](ci.md)): until that CI
+build has started (30 minutes at most), it doesn't start, go before it or hold room. After that, the higher priority
 first (the lane's plus the ticket's own); within a priority, the build whose caller has the fewest
 builds running (a fair share: one
 session's burst of builds doesn't keep the others waiting), then the build expected to finish

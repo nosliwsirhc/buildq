@@ -60,6 +60,15 @@ starve_seconds = 600
 # before it. Off by default.
 ci_first = false
 
+# With ci_first: once a CI job's build has been queued this long and waits for memory that builds of ours hold, stop
+# the newest builds that can safely start over (a compile or test run, or --restartable), of its
+# priority or lower and not a CI job's: the one whose memory covers what it lacks, else the newest
+# few that do together; none if all of them together wouldn't. Each is queued again, yields to that
+# build (doesn't start) until it has started or for 30 minutes at most, then goes first; one build is
+# stopped this way at most twice. Not for a CI build in a lane with may_pass_held, which holds no
+# room. Pausing a build would free no memory. "0" (the default) never stops one for CI.
+make_room_for_ci = "0"
+
 # Scripts (file names) whose argument right after the script names what they run, so it joins the
 # history key: `bash ci/wrap.sh lint …` and `bash ci/wrap.sh tests …` are then sized apart. Only
 # when the script comes straight after its interpreter (no option before it), and only a plain
