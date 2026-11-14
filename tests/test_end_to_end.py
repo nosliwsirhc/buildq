@@ -513,6 +513,9 @@ class Enforcement(Harness):
         guard = os.path.join(ROOT, "bin", "buildq-rustc-guard")
         env = {k: v for k, v in self.env.items() if k not in ("CI", "GITHUB_ACTIONS")}
         env["XDG_CONFIG_HOME"] = self.tmp.name  # no guard.env
+        with open("/proc/self/cgroup") as f:
+            if "/buildq.slice/" in f.read():  # the guard passes every compile inside a queued build
+                self.skipTest("the suite runs inside a buildq build, where the guard refuses nothing")
 
         def compile_(extra_env=None, *args):
             return subprocess.run([guard, rustc, *(args or ("--crate-name", "demo", "src/lib.rs"))],

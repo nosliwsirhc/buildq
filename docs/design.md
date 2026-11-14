@@ -203,14 +203,24 @@ Without the ramp term, a burst of submissions would all see the same idle machin
 **The lone build.** Tests 8 and 9 are skipped when nothing runs, so outside load can slow the queue
 but not stop it. Memory has no such exception.
 
-**Holding room.** Once a ticket has waited `starve_seconds`, its memory and minimum cores are
+**Holding room.** Once a ticket has waited `starve_seconds` (a CI ticket with `ci_first`: at
+once, but until it has waited `starve_seconds` its room binds only tickets of its priority or
+lower, so a higher lane still starts in room that is free), its memory and minimum cores are
 subtracted for every ticket behind it, except tickets in lanes with `may_pass_held`. Room is never
 held for a ticket that couldn't fit even with every buildq build gone, so an oversized ticket can't
-stop the queue.
+stop the queue. A ticket kept out of its workspace holds nothing, except (with `ci_first`) one that
+has waited `starve_seconds` and is kept out only by a fresh CI ticket's hold on that workspace: it
+still holds its room and the workspace, so builds behind it can't pass it there.
 
 **Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped to
-free memory, goes first (unless its lane may pass held room). Then tickets go by priority (lane plus
-ticket, highest first), then by how many builds their caller has running (fewest first), then by
+free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` and `RUNNER_NAME`
+both set), goes first (unless its lane may pass held room). With `ci_first`, any ticket that has
+waited three times `starve_seconds`, or was queued again after being stopped, goes before all of
+those, so a stream of CI tickets can't keep it waiting for ever; among those, CI tickets get no
+preference. Then tickets go by priority (lane plus ticket, highest first), then, with `ci_first`,
+CI tickets first (one that has waited `starve_seconds` before newer ones; not in a lane that may pass
+held room), then by how many builds their
+caller has running (fewest first), then by
 expected duration (the median wall time of the command's successful runs, or of all its runs if
 none succeeded; shortest first, unknown last), then by submission.
 
