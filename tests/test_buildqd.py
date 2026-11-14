@@ -3152,18 +3152,36 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
         self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 pytest")
 
-    def test_a_scripts_first_word_tells_its_builds_apart(self):
+    def test_a_labelled_scripts_label_tells_its_builds_apart(self):
+        labels = frozenset({"persistent-cargo-target.sh", "gen.py"})
         wrapper = ("bash", "scripts/ci/persistent-cargo-target.sh")
-        self.assertEqual(self.words(*wrapper, "architecture", "2G", "--", "cargo", "run", "--release"),
+
+        def words(*argv):
+            return " ".join(buildqd.command_words(list(argv), labels))
+        self.assertEqual(words(*wrapper, "architecture", "2G", "--", "cargo", "run", "--release"),
                          "bash persistent-cargo-target.sh architecture")
-        self.assertEqual(self.words(*wrapper, "rust-tests", "60G", "--", "bash", "scripts/ci/rust-unit-tests.sh"),
+        self.assertEqual(words(*wrapper, "rust-tests", "60G", "--", "bash", "scripts/ci/rust-unit-tests.sh"),
                          "bash persistent-cargo-target.sh rust-tests")
-        self.assertEqual(self.words("python3", "tools/gen.py", "wire_types"), "python3 gen.py wire_types")
-        # not a path (a script run per worktree would never have a history), a value, or a token
+        self.assertEqual(self.words(*wrapper, "architecture", "2G"), "bash persistent-cargo-target.sh")  # not listed
+        self.assertEqual(words("python3", "tools/gen.py", "wire_types"), "python3 gen.py wire_types")
+        # only the argument right after the script, and only a plain lowercase word
+        self.assertEqual(words("python3", "tools/gen.py", "--password", "hunter"), "python3 gen.py")
         for arg in ("/home/u/.t3/worktrees/x", "./tree", "60G", "Ab3dE9fGh2", "ghp_0123456789abcdefABCDEF",
                     "a-very-long-argument-of-thirty-chars"):
-            self.assertEqual(self.words("bash", "run.sh", arg, "x"), "bash run.sh", arg)
-        self.assertEqual(self.words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")  # a module: as before
+            self.assertEqual(words("bash", "persistent-cargo-target.sh", arg), "bash persistent-cargo-target.sh", arg)
+        # an unlisted script, -c, -lc and modules are keyed as before
+        self.assertEqual(words("bash", "run.sh", "build"), "bash run.sh")
+        self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh build"), self.words("bash", "-lc", "persistent-cargo-target.sh build"))
+        self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")
+
+    def test_labelled_scripts_are_configured(self):
+        cfg = buildqd.Config({"script_labels": ["persistent-cargo-target.sh"]}, 64 * GIB, 16)
+        self.assertEqual(cfg.script_labels, frozenset({"persistent-cargo-target.sh"}))
+        self.assertEqual(cfg.summary()["script_labels"], ["persistent-cargo-target.sh"])
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).script_labels, frozenset())
+        for bad in ("x.sh", ["a/b.sh"], [3]):
+            with self.assertRaises(ValueError):
+                buildqd.Config({"script_labels": bad}, 64 * GIB, 16)
 
     def test_keys_hold_no_urls_but_keep_npm_scopes(self):
         self.assertNotIn("token", self.words("wget", "https://files.example/private-access-token"))

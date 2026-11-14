@@ -243,6 +243,7 @@ DEFAULTS = {
     "ramp_seconds": 90,
     "starve_seconds": 600,
     "ci_first": False,
+    "script_labels": [],
     "unwatched_seconds": 30,
     "history_runs": 30,
     "history_days": 30,
@@ -372,6 +373,11 @@ class Config:
         self.ramp_seconds = number(d["ramp_seconds"], "ramp_seconds", 0, 3600)
         self.starve_seconds = number(d["starve_seconds"], "starve_seconds", 1, 7 * 86400)
         self.ci_first = boolean(d["ci_first"], "ci_first")
+        labels = d["script_labels"]
+        if not isinstance(labels, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
+                                                    for x in labels):
+            raise ValueError("script_labels must be a list of script file names, such as [\"build.sh\"]")
+        self.script_labels = frozenset(labels)
         self.unwatched_seconds = number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)
         self.history_runs = number(d["history_runs"], "history_runs", 1, 1000, integer=True)
         self.history_days = number(d["history_days"], "history_days", 1, 3650)
@@ -459,6 +465,7 @@ class Config:
             "disk_floor": f"{self.disk_floor_share * 100:g}%" if self.disk_floor_share else self.disk_floor,
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
+            "script_labels": sorted(self.script_labels),
             "slice": self.slice,
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
@@ -1145,7 +1152,7 @@ def repo_name(cwd: str) -> str:
 SCRIPT_WORD = re.compile(r"[a-z][a-z_-]{0,23}")
 
 
-def command_words(argv: list[str]) -> list[str]:
+def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> list[str]:
     t = strip_wrappers(argv)
     if "--" in t:
         t = t[: t.index("--")]
@@ -1183,12 +1190,14 @@ def command_words(argv: list[str]) -> list[str]:
             pos = positionals(rest, {"-m"} if "python" in tool else set())
             module = option_values(rest, {"-m"})[:1]
             words += [os.path.basename(p) for p in pos[:1]] + module
-            # A script's first argument, when it is a plain word, often names what it runs
-            # (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are different builds
-            # of different sizes). Not a path or a value: a session's script run per worktree would
-            # never have a history, and nothing that could be a secret may reach a key.
-            if not module and pos[1:2] and SCRIPT_WORD.fullmatch(pos[1]):
-                words.append(pos[1])
+            # A script named in script_labels takes a label as the argument right after it, naming
+            # what it runs (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are
+            # different builds of different sizes). Only there, and only a plain lowercase word:
+            # nothing that could be a path, a value or a secret reaches a key.
+            if not module and pos[:1] and os.path.basename(pos[0]) in labels:
+                after = rest[rest.index(pos[0]) + 1:][:1]
+                if after and SCRIPT_WORD.fullmatch(after[0]):
+                    words.append(after[0])
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
     else:
@@ -1388,8 +1397,8 @@ def cgroup_frozen(path: str) -> bool | None:
     return None
 
 
-def command_key(argv: list[str], cwd: str, lane: str) -> str:
-    return f"{repo_name(cwd)}|{lane}|{' '.join(command_words(argv))}"
+def command_key(argv: list[str], cwd: str, lane: str, labels: "frozenset[str] | tuple" = ()) -> str:
+    return f"{repo_name(cwd)}|{lane}|{' '.join(command_words(argv, labels))}"
 
 
 def workspace_of(cwd: str, env: dict) -> str:
@@ -3042,7 +3051,7 @@ class Daemon:
                 self.submit_outcome = {how: True} if how in ("joined", "reused") else {}
                 return earlier, None
         tid = str(uuid.uuid4())
-        t = Ticket(tid, argv, cwd, lane_name, command_key(argv, cwd, lane_name), now,
+        t = Ticket(tid, argv, cwd, lane_name, command_key(argv, cwd, lane_name, self.cfg.script_labels), now,
                    os.path.join(self.tickets_dir, tid))
         try:
             t.priority = number(msg.get("priority") or 0, "priority", -1000, 1000, integer=True)
@@ -4620,7 +4629,7 @@ class Daemon:
         except OSError:
             pass
         argv = argv or [f"(holder of {os.path.basename(path)})"]
-        t = Ticket(tid, argv, cwd, lane, command_key(argv, cwd, lane), now, None)
+        t = Ticket(tid, argv, cwd, lane, command_key(argv, cwd, lane, self.cfg.script_labels), now, None)
         t.state, t.started, t.running_since, t.runner = "running", now, now, "outside"
         t.flock = (path, pid)
         t.cg = cg
