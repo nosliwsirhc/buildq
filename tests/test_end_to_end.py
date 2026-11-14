@@ -645,6 +645,14 @@ class ScopeTests(EndToEnd):
         self.assertGreater(record["peak_mem"], 64 << 20)
         self.assertGreater(record["peak_cores"], 0.5)
 
+    def test_the_slice_guard_limits_the_slice(self):
+        # The guard writes the slice's memory.max on the daemon's rebalance (every five seconds),
+        # once the slice exists: a build that outlasts one sees a number there, not systemd's "max".
+        script = 'sleep 7; cat "/sys/fs/cgroup$(dirname "$(cut -d: -f3 /proc/self/cgroup)")/memory.max"'
+        result = self.q("run", "sh", "-c", script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^\d+$")  # bytes: the guard's limit
+
 
 
 if __name__ == "__main__":

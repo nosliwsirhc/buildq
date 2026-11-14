@@ -210,6 +210,8 @@ BUILDQ_TEST_SCOPES=1 python3 -m unittest discover -s tests  # also with builds a
 ```
 
 The end-to-end tests start a private daemon on a temporary socket and never touch an installed one.
+CI runs the suite on Python 3.11 to 3.13, and once more in a systemd user session with GNU make 4.4,
+so the systemd services, limits, pausing, the slice guard and make's jobserver are exercised too.
 [docs/design.md](docs/design.md) describes the internals.
 
 ## License
