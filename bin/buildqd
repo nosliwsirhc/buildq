@@ -3088,7 +3088,7 @@ class Daemon:
         t.from_ci = bool(env.get("GITHUB_ACTIONS") and env.get("RUNNER_NAME"))  # (the shim's test, too)
         # A place left by the same build of this caller's, cancelled when its `buildq run` went: taken
         # here, so a retry that joins another build uses it up too.
-        place = self.vacated.pop((cwd, tuple(argv), lane_name, t.caller), None)
+        place = self.vacated.pop((cwd, tuple(argv), lane_name, t.caller), None) if t.caller else None
         source = sane_source(msg.get("source"))
         if source and source.get("repo") and paths_inside(argv, cwd, source["repo"]):
             settings = [t.timeout, t.umask, t.rlimits, t.cores_given, t.mem_given, self.cfg.env]
@@ -4964,8 +4964,8 @@ class Daemon:
         place is the time it waited, so the retry doesn't go to the back of the queue, where under load
         it could cycle without ever running (#7). A build that was running leaves none: it had its
         turn, and one that can't finish within the tool's time limit mustn't come back first for ever."""
-        if t.state != "queued" or not t.attached:
-            return
+        if t.state != "queued" or not t.attached or not t.caller:
+            return  # (with no caller to tell whose retry it is, no place: anyone could take it)
         key = (t.cwd, tuple(t.argv), t.lane, t.caller)
         waited = max(0.0, now - t.submitted)
         earlier = self.vacated.get(key)

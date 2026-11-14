@@ -838,6 +838,12 @@ class SameSource(DaemonCase):
         stranger = self.submit(("cargo", "test"), cwd=work, attach=True, submission="s", caller="someone-else")
         self.assertEqual(stranger.submitted, self.now)
 
+    def test_a_build_with_no_caller_leaves_no_place(self):
+        self.machine.mem_available = 15 * GIB
+        self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="first")  # no caller
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertEqual(self.daemon.vacated, {})
+
     def test_a_build_that_was_running_leaves_no_place(self):
         work = self.workdir()
         ran = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
