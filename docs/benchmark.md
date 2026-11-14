@@ -109,8 +109,10 @@ planned at its lane's default memory, as on a machine that has never run them.
 trace. Their memory profile, cores and run time are what the machine measured, for their last
 attempt. A build that was stopped and queued again (`requeued`) has its last attempt's run time where
 the database keeps it (`attempt_wall`, since #39). In an older database it has every attempt's run time
-and no profile, so its memory rises to its peak in the first fifth. Each build's workspace comes along,
-so builds that shared a target folder take turns in the replay as they did. A build that was
+and no profile, so its memory rises to its peak in the first fifth; a build whose last attempt never
+ran (stopped, then cancelled while queued again) is left out. Each build's workspace comes along
+where the database keeps it (`workspace`, since #39), so builds that shared a target folder take
+turns in the replay as they did; from an older database they don't. A build that was
 cancelled or lost has no exit code, and replays as a failure; its `state` says what it was.
 
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran

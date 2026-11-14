@@ -377,13 +377,15 @@ class Simulation:
                 self.end(job, {"exit": 124, "timed_out": True})
             elif job.progress >= float(job.spec["wall"]):
                 self.end(job, {"exit": int(job.spec.get("exit", 0))})
+        ran = live  # every build that used cores this second, the ones that ended in it too
         live = [j for j in live if j.alive]
+        used = self.background_mem + sum(j.mem for j in live)  # what ended this second gave its memory back
         self.machine.mem_available = max(0, self.machine.mem_total - used)
         if self.machine.mem_available < self.daemon.cfg.mem_floor:
             self.events["below_floor_s"] += 1  # what admission keeps free for everything else is gone
         low = self.events["min_available"]
         self.events["min_available"] = self.machine.mem_available if low is None else min(low, self.machine.mem_available)
-        busy = self.background_cpu + sum(j.used_cores for j in live)
+        busy = self.background_cpu + sum(j.used_cores for j in ran)
         pressure = 100.0 * max(0.0, demand - cap) / demand if demand > cap else 0.0
         # The daemon's busy cores and CPU pressure are ten-second averages (Machine.TAU, PSI avg10).
         self.machine.busy += (busy - self.machine.busy) * AVERAGE
@@ -637,11 +639,14 @@ COMPARED = [  # (label, how to read it from a summary, lower is better)
 
 def compare_markdown(name: str, base: dict, head: dict) -> str:
     lines = [f"#### {name}", "", "| | base | head | change |", "|---|---:|---:|---:|"]
+    cut = [side for side, s in (("base", base), ("head", head)) if not s.get("complete", True)]
     for label, get, fmt in COMPARED:
         b, h = get(base), get(head)
         if b is None and h is None:
             continue
-        if b is None or h is None:
+        if cut and label == "makespan":
+            change = "cut off"  # one side never finished: its makespan is only the time simulated
+        elif b is None or h is None:
             change = ""
         elif b == h:
             change = "same"
@@ -650,6 +655,9 @@ def compare_markdown(name: str, base: dict, head: dict) -> str:
         else:
             change = f"+{fmt(h)}"
         lines.append(f"| {label} | {fmt(b) if b is not None else '-'} | {fmt(h) if h is not None else '-'} | {change} |")
+    if cut:
+        lines += ["", f"The {' and '.join(cut)} run{'s were' if len(cut) > 1 else ' was'} cut off at the horizon with "
+                      "builds unfinished: its waits and makespan stop there."]
     return "\n".join(lines)
 
 
@@ -745,9 +753,11 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
         # keep the last attempt's own wall time; without it, a requeued build's profile can't be
         # placed in time, so it is left out (memory then rises to the peak in the first fifth).
         attempt = r.get("attempt_wall") if "attempt_wall" in cols else None
-        wall = float(attempt) if attempt else float(r["wall"])
+        if attempt is not None and float(attempt) <= 0:
+            continue  # its last attempt never ran (stopped, then cancelled while queued again): nothing to replay
+        wall = float(attempt) if attempt is not None else float(r["wall"])
         profile = None
-        if "profile" in cols and r.get("profile") and (attempt or not requeued):
+        if "profile" in cols and r.get("profile") and (attempt is not None or not requeued):
             try:
                 profile = [int(x) for x in json.loads(r["profile"])]
             except (ValueError, TypeError):
@@ -765,8 +775,8 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
             entry["requeued"] = requeued
         if profile:
             entry["profile"] = profile
-        if r.get("repo"):  # its workspace (or source repository): builds that shared one take turns
-            entry["workspace"] = str(r["repo"])
+        if r.get("workspace"):  # what it wrote to: builds that shared one take turns
+            entry["workspace"] = str(r["workspace"])  # (older databases don't say; repo may be its source, not it)
         if r.get("name"):
             entry["name"] = r["name"]
         if anonymize:

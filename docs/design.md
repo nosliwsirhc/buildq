@@ -594,7 +594,8 @@ over), `past_peak_attempts`, `past_peak_over`, `past_peak_most_over`, `past_peak
 restart), `cores_granted` (average), `avg_cores`,
 `peak_cores`, `cpu_seconds`, `requeues`, `ci_stops` (of those, stops to make room for a CI build),
 `attempt_wall` (the last attempt's wall time, which `profile` and `avg_cores` describe; `wall` counts
-every attempt),
+every attempt), `workspace` (what it wrote to, its `CARGO_TARGET_DIR` or worktree: builds that share
+one take turns; `repo` is its source repository when it sent one),
 `paused`, `oom`, `mem_high`, `mem_wait`.
 
 The profile comes from a trace kept while the build runs: the most memory in each ten seconds,

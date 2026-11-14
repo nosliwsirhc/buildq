@@ -221,6 +221,38 @@ class Replay(SimCase):
         summary = self.run_sim(jobs)
         self.assertEqual((summary["ci_timed_out"], summary["outcomes"]), (0, {"succeeded": 1}))
 
+    def test_a_build_that_ends_gives_its_memory_back_that_second(self):
+        flat = (1.0,) * 10
+        jobs = [scenarios.build(0, ("cargo", "build", "-p", "brief"), 25, 1, 1, shape=flat, repo="app", caller="a",
+                                workspace="wa", history=True, history_peak=10 * GIB),
+                scenarios.build(0, ("cargo", "build", "-p", "long"), 20, 300, 1, shape=flat, repo="app", caller="b",
+                                workspace="wb", history=True, history_peak=10 * GIB)]
+        # 45 GB in use in the brief build's one second, of 47: had it still counted after it ended, the long
+        # build would be stopped for memory (under a quarter of the floor free).
+        summary = self.run_sim(jobs, mem_total=47 * GIB, background_mem=0)
+        self.assertEqual((summary["stops_for_memory"], summary["outcomes"]), (0, {"succeeded": 2}))
+
+    def test_a_build_s_last_second_counts_toward_busy_cores(self):
+        state = os.path.join(self.tmp.name, "busy")
+        os.makedirs(state)
+        spec = scenarios.build(0, ("cargo", "build"), 1, 1, 8, repo="app", history=True)
+        s = sim.Simulation(scenario([spec], background_cpu=0.0), CONFIG, BUILDQD, state, name="buildqd_busy")
+        s.submit(spec, 0)
+        s.clock.now += 1
+        s.step()  # its one second of work: it ends in it
+        self.assertEqual(s.machine.busy_now, 8.0)
+        self.assertGreater(s.machine.busy, 0.0)
+
+    def test_a_cut_off_run_is_flagged_in_a_comparison(self):
+        done = {"complete": True, "makespan_s": 600.0, "wait": {"ci": {"p50": None, "p95": None, "max": None},
+                "agent": {"p50": 0.0, "p95": 0.0, "max": 0.0}}, "ci_timed_out": 0, "stops_for_memory": 0,
+                "stops_for_ci": 0, "stopped_run_s": 0.0, "cancelled_run_s": 0.0,
+                "oom_kills": {"own_cap": 0, "machine": 0}, "below_floor_s": 0, "idle_core_s_while_waiting": 0.0}
+        cut = dict(done, complete=False, makespan_s=21600.0)
+        text = sim.compare_markdown("x", done, cut)
+        self.assertIn("| makespan | 10.0m | 6.0h | cut off |", text)
+        self.assertIn("The head run was cut off", text)
+
     def test_the_built_in_scenarios_load(self):
         for name, make in scenarios.SCENARIOS.items():
             s = make()
@@ -248,6 +280,9 @@ class Export(SimCase):
         db.executemany("INSERT INTO build (id, ended, submitted, key, label, name, lane, caller, from_ci, wall, "
                        "mem_peak, profile, avg_cores, exit, state, repo, requeues, attempt_wall) "
                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        db.execute("UPDATE build SET workspace = 'target:/shared/target' WHERE id = 'a'")
+        db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, mem_peak, state, requeues, attempt_wall) "
+                   "VALUES ('z', 4000, 1100, 'secretrepo|heavy|cargo build', 'heavy', 90.0, 1, 'cancelled', 1, 0)")
         return db
 
     def test_a_metrics_db_becomes_a_trace(self):
@@ -256,7 +291,10 @@ class Export(SimCase):
         self.assertEqual(out[0]["argv"], ["cargo", "test", "-p", "private-crate"])
         self.assertEqual((out[0]["ci"], out[0]["lane"], out[0]["profile"]), (True, "heavy", [100, 200, 300]))
         self.assertEqual((out[1]["ci"], out[1]["exit"], out[1]["peak_mem"]), (False, 1, GIB))
-        self.assertEqual(out[0]["workspace"], "/home/someone/secret/target")  # builds that shared it take turns
+        self.assertEqual(out[0]["workspace"], "target:/shared/target")  # what it wrote to, not its source repo
+        self.assertNotIn("workspace", out[1])  # no workspace recorded: none made up
+        self.assertNotIn("z", [e.get("name") for e in out])
+        self.assertEqual(len(out), 5)  # 'z' never ran its last attempt: left out
         # cancelled, with no exit code: a failure; stopped twice, with no attempt_wall: no profile to place
         self.assertEqual((out[2]["exit"], out[2]["state"], out[2]["requeued"]), (1, "cancelled", 2))
         self.assertNotIn("profile", out[2])
