@@ -3043,6 +3043,29 @@ class Cores(DaemonCase):
                 flags = json.load(f)["MAKEFLAGS"]
             self.assertEqual(flags, f"s -j{t.want} --jobserver-auth=fifo:{t.jobserver} -- {value}")
 
+    def test_escaped_whitespace_in_an_option_is_kept_as_written(self):
+        # make writes a directory ending in a space as `-Ia\ `, one with a tab in it as `-Ia\<tab>b` (#37)
+        self.assertEqual(buildqd.without_fd_jobserver("s -j4 --jobserver-auth=3,4 -Ia\\  -- X=1"), "s -Ia\\  -- X=1")
+        self.assertEqual(buildqd.without_fd_jobserver("s --jobserver-auth=3,4 -Ia\\\tb"), "s -Ia\\\tb")
+        self.assertEqual(buildqd.with_make_flags("s -Ia\\ ", "-j2"), "s -Ia\\  -j2")
+        self.assertEqual(buildqd.make_words("a\\\\ b"), ["a\\\\", "b"])  # an escaped backslash, then a split
+
+    def test_make_s_own_word_rules_in_the_corners(self):
+        self.assertEqual(buildqd.make_words("s -Ia\\"), ["s", "-Ia\\"])  # a lone backslash at the end stays
+        self.assertEqual(buildqd.with_make_flags("s -Ia\\", "-j2"), "s -Ia\\\\ -j2")  # and can't escape what follows
+        self.assertEqual(buildqd.make_words("s -Ia\nb"), ["s", "-Ia\nb"])  # only spaces and tabs split
+        self.assertEqual(buildqd.without_fd_jobserver("s -j 8 --jobserver-auth=3,4"), "s")  # -j's count goes with it
+        self.assertFalse(buildqd.callers_jobs("s -I -jx"))  # a folder called -jx
+        self.assertTrue(buildqd.callers_jobs("s --jobs=3"))
+        self.assertTrue(buildqd.callers_jobs("s \\--jobserver-auth=fifo:/x"))  # make takes the backslash out
+
+    def test_a_j_inside_an_option_s_path_doesnt_stop_buildqs_jobserver(self):
+        t = self.submit(("make", "all"), env={"MAKEFLAGS": "s -j4 --jobserver-auth=3,4 -I a\\ -jx"})
+        self.assertIsNotNone(t.jobserver)  # `a\ -jx` is a directory, not the caller's -j
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            flags = json.load(f)["MAKEFLAGS"]
+        self.assertEqual(flags, f"s -I a\\ -jx -j{t.want} --jobserver-auth=fifo:{t.jobserver}")
+
     def test_a_fifo_jobserver_from_the_caller_is_kept(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})
         self.assertIsNone(t.jobserver)

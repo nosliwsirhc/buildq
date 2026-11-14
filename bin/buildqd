@@ -1044,13 +1044,45 @@ class InlineExecutor:
 
 MAKE_FLAG_VARS = ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")
 FD_JOBSERVER = re.compile(r"--jobserver-(?:auth|fds)=-?\d+,-?\d+")
+# A word of make flags as make splits them: whitespace ends a word unless a backslash escapes it (a
+# directory with a space in it is written `-Ia\ b`), and a backslash escapes the character after it.
+MAKE_WORD = re.compile(r"(?:\\[\s\S]?|[^ \t\\])+")  # (only spaces and tabs split: a newline is in a word)
+# Options whose argument may be the next word: that word is an argument, not an option.
+MAKE_ARG_OPTIONS = frozenset({"-C", "-f", "-I", "-o", "-W", "-l", "--directory", "--file", "--makefile",
+                              "--include-dir", "--old-file", "--assume-old", "--what-if", "--new-file",
+                              "--assume-new", "--load-average", "--max-load"})
+
+
+def make_words(flags: str) -> list[str]:
+    """Make flags split into words as make splits them (MAKE_WORD), each kept exactly as written: a
+    backslash keeps the next character (or, last, itself) in the word."""
+    return MAKE_WORD.findall(flags)
+
+
+def make_options(words: list[str]) -> list[str]:
+    """The words that are options (not an option's separate argument, `-I DIR`), with make's
+    backslash escapes taken out, as make reads them."""
+    out, argument = [], False
+    for w in words:
+        plain = re.sub(r"\\(.)", r"\1", w, flags=re.S)
+        if not argument:
+            out.append(plain)
+        argument = plain in MAKE_ARG_OPTIONS
+    return out
+
+
+def callers_jobs(options: str) -> bool:
+    """Make options that set the job count or a jobserver of the caller's own (#37: whole options,
+    not a word inside an option's argument)."""
+    return any(w.startswith("-j") or w.startswith(("--jobs", "--jobserver"))
+               for w in make_options(make_words(options)))
 
 
 def split_make_flags(flags: str) -> tuple[str, str | None]:
     """Make flags split at their first `--`: the options before it, and the variable assignments
     after it, kept exactly as written (escaped spaces and all), or None if there is no `--`. A `--`
     after an escaped space (an odd number of backslashes before it) is part of a value, not the split."""
-    for m in re.finditer(r"(?:^|\s)--(?=\s|$)", flags):
+    for m in re.finditer(r"(?:^|[ \t])--(?=[ \t]|$)", flags):
         before = flags[:m.start()]
         if (len(before) - len(before.rstrip("\\"))) % 2 == 0:
             return before, flags[m.end() + 1:]
@@ -1065,10 +1097,20 @@ def without_fd_jobserver(flags: str) -> str | None:
     instead. A fifo jobserver (fifo:PATH) can still be opened there, so it is left alone. Only the
     options before a `--` are looked at; the assignments after it are kept as they are."""
     options, assignments = split_make_flags(flags)
-    words = options.split()
+    words = make_words(options)  # (an escaped space or tab stays in its word, as written: #37)
     if not any(FD_JOBSERVER.fullmatch(w) for w in words):
         return None
-    kept = " ".join(w for w in words if not FD_JOBSERVER.fullmatch(w) and not re.fullmatch(r"-j\d*", w))
+    kept, drop_number = [], False
+    for w in words:
+        if FD_JOBSERVER.fullmatch(w) or re.fullmatch(r"-j\d*", w):
+            drop_number = w == "-j"  # `-j 8`: its count goes with it
+            continue
+        if drop_number and w.isdigit():
+            drop_number = False
+            continue
+        drop_number = False
+        kept.append(w)
+    kept = " ".join(kept)
     return kept if assignments is None else f"{kept} -- {assignments}".lstrip()
 
 
@@ -1076,7 +1118,10 @@ def with_make_flags(flags: str, more: str) -> str:
     """Make flags with more options added: before a `--` and the variable assignments after it
     (kept exactly as written), or make would take the options for targets."""
     options, assignments = split_make_flags(flags)
-    head = " ".join(x for x in (options.strip(), more.strip()) if x)
+    words = make_words(options)
+    if words and (len(words[-1]) - len(words[-1].rstrip("\\"))) % 2:
+        words[-1] += "\\"  # a lone backslash at the end (`-Ia\` is the folder `a\`) mustn't escape what comes next
+    head = " ".join(words + make_words(more))  # (an escaped trailing space stays: #37)
     return head if assignments is None else f"{head} -- {assignments}".lstrip()
 
 
@@ -4434,8 +4479,7 @@ class Daemon:
             # dropped, a -j or jobserver of its own left in their options (an assignment after the
             # `--`, such as SUBMAKE=make\ -j4, is a variable's value, not make's own setting).
             callers_own = any(k in env and str(env[k]).strip()
-                              and (k not in cleaned
-                                   or re.search(r"(?:^|\s)-j|--jobserver", split_make_flags(cleaned[k])[0]))
+                              and (k not in cleaned or callers_jobs(split_make_flags(cleaned[k])[0]))
                               for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
             if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
