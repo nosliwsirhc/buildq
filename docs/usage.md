@@ -34,7 +34,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | `--notify COMMAND` | a shell command to run when it finishes |
 | `--again` | run it even if the same command on the same source is queued, running, or passed within `reuse_window` |
 | `--reuse` | take an earlier pass of the same command on the same source as its result, even for a command that isn't a check |
-| `--restartable` | it is safe to stop and start over from the beginning (it only builds and tests): stopped to free memory, it is queued again instead of failed |
+| `--restartable` | it is safe to stop and start over from the beginning (it only builds and tests): stopped to free memory, or to make room for a CI job's build, it is queued again instead of failed. A machine can name such scripts once in `restartable_scripts` (by file name: every script of that name counts, wherever it is) |
 
 A build runs with the environment, working directory, umask and resource limits (open files,
 stack, core size) of the command that submitted it, and no stdin or terminal. `buildq run` streams its
@@ -77,7 +77,20 @@ arguments name no path outside the tree:
   joiner's `--notify` runs when it ends;
 - is answered by an earlier pass within `reuse_window` (2 hours) if the command is a check: cargo
   check, clippy, test or `nextest run`, dotnet test, `tsc --noEmit`, eslint, `vitest run`, with no
-  `--fix`, `-u`, `--update-snapshots`, watch mode or `--no-run`. `run` prints that run's output
+  `--fix`, `-u`, `--update-snapshots`, watch mode or `--no-run`, run directly or behind a wrapper
+  buildq can read for certain (`env` with exact options, `timeout DURATION`, `nice`/`time` with no
+  options: behind `ionice -c3` or `nice -n 5`, say, it isn't). The command is run, not read by a
+  shell, so `X=1 cargo test` names a program called `X=1`: write `env X=1 cargo test`. `npx BIN`
+  and `pnpm exec BIN` (with no pnpm options) are read as BIN. A check that moves to another folder
+  or reads its paths from one (`env -C`, `make -C`, `sudo -D`, `vitest --root`) or names a path
+  outside the tree whose source was recorded, anywhere in a word (`--manifest-path
+  ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`)
+  is never answered from an earlier pass; nor is one with a word buildq can't read for certain
+  (quotes, escapes, brackets, `$` or a URL in it, as a `--config` TOML value has), or one naming a
+  system folder (`PATH=/usr/bin`): either costs a run, never a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`,
+  eslint's `--cache-location`) doesn't count. Source that no
+  word names isn't seen (a path dependency outside the tree, a `[patch]` in a config file, a
+  symlinked folder): `--again` runs such a build regardless. `run` prints that run's output
   and exits 0, and nothing runs. A build that makes files (cargo build, a bundle, docs) or a
   script runs again, with a note that it passed before: its output may have changed or gone since,
   and a script might do anything. `--reuse` takes the earlier pass for those too;

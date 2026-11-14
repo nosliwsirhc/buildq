@@ -61,7 +61,8 @@ starve_seconds = 600
 ci_first = false
 
 # With ci_first: once a CI job's build has been queued this long and waits for memory that builds of ours hold, stop
-# the newest builds that can safely start over (a compile or test run, or --restartable), of its
+# the newest builds that can safely start over (a compile or test run, --restartable, or a script in
+# restartable_scripts), of its
 # priority or lower and not a CI job's: the one whose memory covers what it lacks, else the newest
 # few that do together; none if all of them together wouldn't. Each is queued again, yields to that
 # build (doesn't start) until it has started or for 30 minutes at most, then goes first; one build is
@@ -87,6 +88,17 @@ make_room_spare_after = "0"
 # label: it is kept in the history. Each label starts with no history: its first run is planned at
 # the lane's default.
 # script_labels = ["persistent-cargo-target.sh"]
+
+# Scripts (file names) that only build and run tests, so starting one over is safe: stopped for
+# memory, or to make room for a CI job's build, it is queued again instead of failed, as a plain
+# `cargo test` is, without each caller passing --restartable. Only when the script is run directly
+# or straight after its interpreter (`bash ci/wrap.sh …`), not inside `bash -c "…"`. A listed script
+# that runs the command after its `--` (a wrapper) counts only if that command does. By file name:
+# every script of that name counts, wherever it is; and only when buildq can read the command for
+# certain (a wrapper given options, such as `nice -n 5` or `env -u X`, isn't read through). List
+# only scripts that never push, commit, upload, deploy, send or change anything outside their own
+# build output. Common tool names are refused, but the list of them can't be complete.
+# restartable_scripts = ["persistent-cargo-target.sh"]
 
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its
 # client was killed); builds dropped off with `buildq submit` aren't.

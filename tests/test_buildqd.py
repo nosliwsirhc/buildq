@@ -1047,6 +1047,71 @@ class SameSource(DaemonCase):
         os.symlink(self.tmp.name, os.path.join(repo, "external"))  # a one-word path that leads outside
         self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "-p", "external"], repo, repo))
         self.assertTrue(buildqd.paths_inside(["cargo", "test", "test_name"], repo, repo))
+        os.symlink(self.tmp.name, os.path.join(repo, "ext deps"))  # a name with a space in it, leading outside
+        self.assertFalse(buildqd.paths_inside(["cargo", "test", "--manifest-path", "ext deps/Cargo.toml"], repo, repo))
+        self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "--project=ext deps/tsconfig.json"], repo, repo))
+        outside_file = os.path.join(self.tmp.name, "lint-me.js")
+        open(outside_file, "w").close()
+        os.symlink(outside_file, os.path.join(repo, "--external.js"))
+        for argv in (["env", "CFLAGS=-isystemexternal", "cargo", "check"],  # -isystem + external: where it splits can't be told
+                     ["eslint", "--", "--external.js"],  # after --, a name, whatever it starts with
+                     ["cargo", "clippy", "--", "-Lext deps/lib"],  # a name with a space, run on to its option
+                     ["env", "CARGO_ENCODED_RUSTFLAGS=--sysroot\x1fext deps", "cargo", "check"],  # cargo splits at \x1f
+                     ["vitest", "run", "-r=..", "--config", "x.ts"], ["vitest", "run", "-sr", ".."],
+                     ["../other/check.sh"]):  # the command's own path (with --reuse)
+            self.assertFalse(buildqd.paths_inside(argv, repo, repo), argv)
+        for argv in (["cargo", "test", "--", "--test-threads=1"], ["cargo", "clippy", "--", "-D", "warnings"],
+                     ["/usr/bin/env", "cargo", "test"], ["cargo", "test", "-F", "Cli"]):
+            self.assertTrue(buildqd.paths_inside(argv, repo, repo), argv)
+        inside = buildqd.paths_inside
+        # A command that moves to another folder matches nothing, whatever it names after: what
+        # `env -Csub env -Cexternal` or `--manifest-path external/…` finds there can't be told from here.
+        for argv in (["env", "-C../other", "cargo", "test"], ["env", "-C", "sub", "cargo", "test"],
+                     ["env", "--chdir=sub", "cargo", "test"], ["env", "-Csub", "env", "-Cexternal", "cargo", "test"],
+                     ["env", "-iC../other", "cargo", "test"], ["make", "-sC../other", "test"],
+                     ["make", "--directory=sub", "test"], ["sudo", "-D", "/r", "cargo", "test"],
+                     ["sudo", "-u", "x", "cargo", "test"], ["vitest", "run", "--root", "sub", "--config", "external/v.ts"],
+                     ["pnpm", "--dir", "sub", "exec", "vitest", "run"], ["env", "--ch=sub", "cargo", "test"],
+                     ["make", "--dir=sub", "test"], ["npm", "--prefix", "sub", "test"], ["yarn", "--cwd", "sub", "test"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
+        # Any part of a word that might be a path is checked: after "=", run on, in quotes.
+        for argv in (["cargo", "test", "-p../other=1"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"],
+                     ["cargo", "check", "--config", 'patch.crates-io.foo.path="../../foo"'],
+                     ["cargo", "check", "--config", "patch.crates-io.foo = { path = '/x/foo' }"],
+                     ["tsc", "--noEmit", "-p../other/tsconfig.json"],
+                     # a value with several in it: cut at spaces, commas, quotes, brackets, ":"
+                     ["cargo", "check", "--config", 'paths=["vendor", "../other"]'],
+                     ["env", "RUSTFLAGS=-L../other", "cargo", "check"], ["env", "RUSTFLAGS=-L /x/lib", "cargo", "test"],
+                     ["cargo", "check", "--config", 'build.rustflags=["--sysroot", "/outside"]'],
+                     ["cargo", "check", "--config", 'registries.x.index="file:///x/index"'],
+                     ["dotnet", "test", "@../other/args.rsp"],
+                     ["env", "PATH=/usr/bin", "cargo", "test"],  # (a system folder too: that costs a run, no more)
+                     ["env", "CFLAGS=-isystem/outside/include", "cargo", "check"], ["dotnet", "test", "/outside"],
+                     ["vitest", "run", "-r", "sub"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
+        # What a tool interprets rather than reads as it is (quotes, escapes, brackets, $, URLs) can't
+        # be read for certain: refused, not guessed at.
+        for argv in (["cargo", "check", "--config", 'patch."https://github.com/x/foo".foo.path="../foo"'],
+                     ["cargo", "check", "--config",
+                      'build.rustflags=["--remap-path-prefix=src=https://example.invalid","--sysroot","/outside"]'],
+                     ["cargo", "check", "--config", 'build.rustflags=["--sysroot","\\u002foutside"]'],
+                     ["cargo", "check", "--config", 'paths=["vendor"]'], ["cargo", "test", "--config", "registry.x=https://x.example/y"],
+                     ["cargo", "check", "--config", "registries.x.index=file://localhost/x"], ["vitest", "run", "-t", "^adds$"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
+        # Output folders aren't what a check reads; options, URLs and test names aren't paths.
+        for argv in (["cargo", "test", "--target-dir", "/cache/t"], ["cargo", "test", "--target-dir=/cache/t"],
+                     ["env", "CARGO_TARGET_DIR=/cache/t", "cargo", "test"], ["cargo", "clippy", "--", "-D", "warnings"],
+                     ["cargo", "test", "-p", "api", "-j8", "--", "-Dwarnings"], ["vitest", "run", "--shard=1/2"],
+                     ["sudo", "X=1", "cargo", "test"],
+                     ["env", "RUSTFLAGS=-C target-cpu=native -D warnings", "cargo", "check"],
+                     ["dotnet", "test", "/p:Configuration=Release"], ["dotnet", "test", "-c", "Release", "-p:Configuration=Release"],
+                     ["eslint", ".", "--cache-location", "/cache/eslint"], ["cargo", "test", "foo::bar"],
+                     ["cargo", "nextest", "run", "--profile", "ci"], ["vitest", "run", "-t", "adds 1 + 2"],
+                     ["dotnet", "test", "--logger", "console;verbosity=normal"],
+                     ["dotnet", "test", "--filter", "FullyQualifiedName~X&Category!=Slow"], ["eslint", ".", "--max-warnings=0"],
+                     ["cargo", "clippy", "--", "-W", "clippy::pedantic", "-Dclippy::all"], ["cargo", "test", "-F", "Cli"],
+                     ["cargo", "test", "--", "--test-threads=1"]):
+            self.assertTrue(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
         failed = self.submit(("cargo", "test"), source=SOURCE)
@@ -1440,6 +1505,96 @@ class SheddingMemory(DaemonCase):
         self.runner.running.discard(safe.id)
         self.daemon.check(self.now + 111)
         self.assertEqual((safe.state, safe.requeues), ("queued", 1))
+
+    def test_a_script_named_in_restartable_scripts_is_queued_again(self):
+        self.daemon.cfg.restartable_scripts = frozenset({"wrap.sh"})
+        script = self.submit(("bash", "ci/wrap.sh", "rust-tests"), cores=2)
+        script.mem_now = 6 * GIB
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.runner.running.discard(script.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual((script.state, script.requeues), ("queued", 1))
+
+    def test_which_scripts_restartable_scripts_covers(self):
+        scripts = frozenset({"wrap.sh", "tests.py"})
+        safe = buildqd.restart_safe
+        self.assertTrue(safe(["bash", "ci/wrap.sh", "label"], scripts))
+        self.assertTrue(safe(["./wrap.sh"], scripts))
+        self.assertTrue(safe(["/home/x/wrap.sh", "a"], scripts))
+        self.assertTrue(safe(["python3", "tests.py"], scripts))
+        self.assertFalse(safe(["bash", "ci/wrap.sh"]))  # not listed
+        self.assertFalse(safe(["bash", "-c", "wrap.sh"], scripts))  # a command string: anything could be in it
+        self.assertFalse(safe(["bash", "deploy.sh"], scripts))
+        self.assertFalse(safe(["bash", "-e", "wrap.sh"], scripts))  # an option before it: not straight after
+        self.assertFalse(safe(["python3", "-u", "tests.py"], scripts))
+        self.assertTrue(safe(["env", "FOO=1", "bash", "wrap.sh"], scripts))  # wrappers are seen through
+        self.assertTrue(safe(["nice", "./wrap.sh"], scripts))
+        self.assertFalse(safe(["nice", "-n", "5", "./wrap.sh"], scripts))  # a wrapper given options isn't read through
+        self.assertTrue(safe(["timeout", "1h", "bash", "wrap.sh"], scripts))
+        self.assertFalse(safe(["env", "-u", "wrap.sh", "bash", "deploy.sh"], scripts))  # -u's operand isn't the command
+        self.assertFalse(safe(["env", "-S", "bash wrap.sh"], scripts))  # a command string: unread
+        for argv in (["env", "-iu", "wrap.sh", "bash", "deploy.sh"], ["env", "-a", "wrap.sh", "bash", "deploy.sh"],
+                     ["env", "--argv0", "wrap.sh", "bash", "deploy.sh"], ["env", "-iC", "wrap.sh", "bash", "deploy.sh"],
+                     ["env", "--un", "wrap.sh", "bash", "deploy.sh"], ["env", "--", "-u", "wrap.sh", "cargo", "check"],
+                     ["env", "X=1", "-u", "wrap.sh", "cargo", "check"], ["sudo", "-D", "wrap.sh", "bash", "deploy.sh"]):
+            self.assertFalse(safe(argv, scripts), argv)  # an option's value is never taken for the script
+        self.assertEqual(buildqd.strip_wrappers(["env", "-i", "A=1", "cargo", "test"]), ["cargo", "test"])
+        self.assertFalse(safe(["env", "X-Y=./wrap.sh", "bash", "deploy.sh"], scripts))  # GNU env: any word with "="
+        self.assertFalse(safe(["/usr/bin/time", "-f", "eslint", "bash", "deploy.sh"], scripts))  # -f's value isn't the tool
+        self.assertFalse(buildqd.reusable_check(["/usr/bin/time", "-f", "eslint", "bash", "deploy.sh"]))
+        self.assertFalse(safe(["nice", "-n", "5", "cargo", "test"]))  # (a wrapper given options: not read for certain)
+        for argv in (["env", "--split-string=bash deploy.sh", "cargo", "test"], ["env", "-Sbash deploy.sh", "cargo", "test"],
+                     ["env", "--split-string=bash deploy.sh", "bash", "wrap.sh"], ["sudo", "X-Y=./wrap.sh", "bash", "deploy.sh"]):
+            self.assertFalse(safe(argv, scripts), argv)  # an option with "=" in it isn't an assignment
+            self.assertFalse(buildqd.reusable_check(argv), argv)
+        self.assertTrue(safe(["env", "-u", "RUSTFLAGS", "cargo", "test"]))  # env's exact forms are read for certain
+        self.assertTrue(safe(["env", "-i", "PATH=/usr/bin", "cargo", "check"]))
+        self.assertTrue(safe(["timeout", "1h", "cargo", "test"]))
+        for argv in (["env", "--chdir=", "-C", ".", "cargo", "test"], ["env", "--unset=", "-i", "cargo", "test"]):
+            self.assertTrue(safe(argv), argv)  # an empty value fails or is overridden: the command is the same
+        # A command is run, not read by a shell: a word with "=" is an assignment only where sudo or
+        # env takes one. Before the command or after another wrapper, it is a path (the folder "X=.").
+        for argv in (["X=./deploy.sh", "cargo", "test"], ["nice", "X=./deploy.sh", "cargo", "test"],
+                     ["timeout", "1h", "X=./deploy.sh", "cargo", "test"]):
+            self.assertFalse(safe(argv), argv)
+            self.assertFalse(buildqd.reusable_check(argv), argv)
+        for argv in (["sudo", "X=1", "cargo", "test"], ["env", "RUST_LOG=debug", "cargo", "test"]):
+            self.assertTrue(safe(argv), argv)
+            self.assertTrue(buildqd.reusable_check(argv), argv)
+        # `pnpm exec BIN` runs a binary, never a package script (pnpm.io/cli/exec); with any of
+        # pnpm's own options (a filter, -r, -c's shell), before or after exec, it isn't read.
+        for argv in (["pnpm", "exec", "vitest", "run"], ["pnpm", "exec", "tsc", "--noEmit"]):
+            self.assertTrue(buildqd.reusable_check(argv), argv)
+            self.assertTrue(safe(argv), argv)
+        for argv in (["pnpm", "exec", "-c", "vitest run"], ["pnpm", "-r", "exec", "vitest", "run"],
+                     ["pnpm", "exec", "--filter", "x", "vitest", "run"], ["pnpm", "vitest", "run"], ["pnpm", "exec"]):
+            self.assertFalse(buildqd.reusable_check(argv), argv)
+            self.assertFalse(safe(argv), argv)
+        # history keys and lanes still read env's exact forms (a decision to restart or reuse never does)
+        words = buildqd.command_words
+        self.assertEqual(words(["env", "-u", "CI", "pnpm", "test"]), words(["pnpm", "test"]))
+        self.assertEqual(words(["env", "--unset=X", "-C", "api", "dotnet", "test"]), words(["dotnet", "test"]))
+        self.assertEqual(words(["env", "-u", "RUSTFLAGS", "cargo", "test", "-p", "api"]), words(["cargo", "test", "-p", "api"]))
+        # a listed script that runs the command after its `--` is only as safe as that command
+        self.assertTrue(safe(["bash", "wrap.sh", "label", "12G", "--", "cargo", "check"], scripts))
+        self.assertFalse(safe(["bash", "wrap.sh", "label", "--", "git", "push"], scripts))
+        self.assertFalse(safe(["bash", "wrap.sh", "--"], scripts))
+        self.assertFalse(safe(["./wrap.sh", "--", "git", "push"], scripts))  # run directly, too
+        self.assertTrue(safe(["bash", "wrap.sh", "--", "--nocapture"], scripts))  # its own arguments, not a command
+        self.assertFalse(safe(["bash", "wrap.sh", "--", "--", "git", "push"], scripts))  # another `--`: a command after it
+        self.assertFalse(safe(["bash", "wrap.sh", "--", "-a", "x", "git", "push"], scripts))  # a short option: fails safe
+        self.assertFalse(safe(["wrap.sh", "--"] * 1100 + ["cargo", "check"], scripts))  # deep, but no RecursionError
+        for tool in ("bash", "git", "cargo", "env", "python3.12", "python2", "node22", "nice", "sudo", "xargs", "mvn",
+                     "heavy-run", "buildq", "bash5", "nodejs", "systemd-run"):
+            with self.assertRaises(ValueError, msg=tool) as refused:
+                buildqd.Config({"restartable_scripts": [tool]}, 64 * GIB, 16)
+            self.assertIn("names scripts, not tools", str(refused.exception))
+        cfg = buildqd.Config({"restartable_scripts": ["wrap.sh"]}, 64 * GIB, 16)
+        self.assertEqual((cfg.restartable_scripts, cfg.summary()["restartable_scripts"]), ({"wrap.sh"}, ["wrap.sh"]))
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).restartable_scripts, frozenset())
+        with self.assertRaises(ValueError):
+            buildqd.Config({"restartable_scripts": ["../x.sh"]}, 64 * GIB, 16)
 
     def test_a_cancel_while_it_is_being_stopped_wins(self):
         (t,) = self.running(1)
@@ -2847,6 +3002,15 @@ class MakeRoomForCI(DaemonCase):
         self.assertEqual(self.runner.forced, [c.id])  # the second waits until the first has started
         del a, b
 
+    def test_a_listed_script_may_be_stopped_for_ci(self):
+        self.daemon.cfg.restartable_scripts = frozenset({"wrap.sh"})
+        (old, new) = self.agents(12, 12, argv=("bash", "wrap.sh", "tests"))
+        self.assertFalse(new.restartable)
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.daemon.cfg.restartable_scripts = frozenset()
+
     def behind_an_agent_build_that_waited(self):
         """Two 12G builds running (11G free); a 20G agent build that has waited three times
         starve_seconds (overdue: it goes before CI builds) holds its room; then a CI build arrives
@@ -3178,6 +3342,11 @@ class Cores(DaemonCase):
         with open(os.path.join(t.dir, "parallel.json")) as f:
             flags = json.load(f)["MAKEFLAGS"]
         self.assertEqual(flags, f"s -I a\\ -jx -j{t.want} --jobserver-auth=fifo:{t.jobserver}")
+
+    def test_a_wrapper_s_own_words_are_never_rewritten(self):
+        t = self.submit(("env", "-u", "-j", "make", "-j8"))  # unset a variable called -j, then run make -j8
+        self.assertIsNotNone(t.jobserver)
+        self.assertEqual(t.exec_argv, ["env", "-u", "-j", "make"])  # only make's own -j8 goes
 
     def test_a_fifo_jobserver_from_the_caller_is_kept(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})

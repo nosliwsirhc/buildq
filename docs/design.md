@@ -209,7 +209,7 @@ what it needs less what is free after the floor, growth and the room held for ti
 worked out again after the pass, since a lane that passes held room may have started a build after
 it) stops running builds after each pass, unless its lane passes held room (it holds none). The wait
 counts from when the CI ticket was submitted. The builds it may stop are those not CI tickets' or flock slots', of its priority or lower,
-restart-safe or `--restartable`, with their environment known, stopped this way fewer than twice,
+restart-safe (`restart_safe`, with `restartable_scripts`) or `--restartable`, with their environment known, stopped this way fewer than twice,
 stopped for memory fewer than three times (a fourth stop would fail them), and not running longer
 than `make_room_spare_after` (if set). With `make_room_behind_agents = false`, a CI ticket that the
 room held for agents' tickets ahead of it binds (`short_agents`, the part of `short_hm` held for
@@ -324,7 +324,8 @@ stops one build even when a stop takes a few seconds to land.
    its service is empty, `requeue()`:
    - if it was cancelled meanwhile, finalizes it as cancelled;
    - if it isn't safe to start over (`restart_safe()`: a cargo build, check, test, clippy, doc,
-     nextest or bench, a dotnet build or test, tsc, eslint, vitest or ninja; or `--restartable`),
+     nextest or bench, a dotnet build or test, tsc, eslint, vitest or ninja; a script listed in
+     `restartable_scripts`, if the command after its `--`, if any, is too; or `--restartable`),
      fails it with a reason, as a script might upload or push before it compiles;
    - otherwise queues it again: the old service is unloaded in the background (the next attempt's
      service is `buildq-<id>-r<n>.service`), its jobserver, `result.json`, `supervisor.json` and
