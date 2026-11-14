@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -132,7 +133,8 @@ class DaemonCase(unittest.TestCase):
         self.machine = FakeMachine()
         self.runner = FakeRunner()
         self.state = os.path.join(self.tmp.name, "state")
-        self.daemon = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        self.daemon = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         self.seen_source = dict(SOURCE)  # what `buildq source` finds when the daemon checks a build's tree
         self.daemon.source_command = [sys.executable, "-c",
                                       "import sys; print(open(sys.argv[1]).read())", self.source_file(), "--"]
@@ -278,26 +280,55 @@ class Admission(DaemonCase):
             with self.assertRaises(ValueError, msg=bad):
                 buildqd.Config(buildqd.tomllib.loads(f"disk_floor = {bad}"), 128 * GIB, 32)
 
+    def test_the_state_directory_and_container_storage_count_too(self):
+        self.daemon.cfg.disk_floor, self.daemon.cfg.disk_floor_share = 10 * GIB, 0.0
+        storage = os.path.join(self.tmp.name, "storage")
+        os.makedirs(storage)
+        self.daemon.cfg.container_storage = [storage, os.path.join(self.tmp.name, "not-there")]
+        work = self.workdir()
+        roomy, short = (500 * GIB, 1900 * GIB), (GIB, 1900 * GIB)
+        # each path on a filesystem of its own here, as the stand-in says
+        with mock.patch.object(buildqd, "disk_space",
+                               side_effect=lambda path: short if path == self.state else roomy), \
+                mock.patch.object(buildqd, "fs_device", side_effect=hash):
+            t = self.submit(cwd=work)
+        self.assertEqual(t.reason_cat, "disk")
+        self.assertIn(f"free at {self.state}", t.reason)  # its log would go there
+        with mock.patch.object(buildqd, "disk_space",
+                               side_effect=lambda path: short if path == storage else roomy), \
+                mock.patch.object(buildqd, "fs_device", side_effect=hash):
+            image = self.submit(("docker", "build", "."), cwd=self.workdir())
+            cargo = self.submit(("cargo", "build"), cwd=self.workdir())
+        self.assertEqual(image.reason_cat, "disk")
+        self.assertIn(f"free at {storage}", image.reason)
+        self.assertNotEqual(cargo.reason_cat, "disk")  # only an image build writes there
+        cfg = buildqd.Config({"container_storage": ["~/x"]}, 64 * GIB, 16)
+        self.assertEqual(cfg.container_storage, [os.path.expanduser("~/x")])
+        for bad in ("/x", [""], [3]):
+            with self.assertRaises(ValueError, msg=bad):
+                buildqd.Config({"container_storage": bad}, 64 * GIB, 16)
+
     def test_each_filesystem_is_held_to_its_own_share(self):
         self.daemon.cfg.disk_floor, self.daemon.cfg.disk_floor_share = 0, 0.125
         spaces = {"/big": (400 * GIB, 1900 * GIB), "/small": (GIB, 16 * GIB), "/gone": None}
         with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, (GIB, 16 * GIB))):
             t = self.submit()  # (held at submission too, by its working directory)
         t.disk_paths = ["/big", "/gone", "/small"]
-        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces[path]):
+        plenty = (900 * GIB, 1900 * GIB)  # buildq's state directory
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, plenty)):
             self.daemon.schedule(self.now)
         self.assertEqual(t.reason_cat, "disk")
         self.assertIn("1.0G of disk is free", t.reason)
         self.assertIn("12.5% of its 16G, 2.0G", t.reason)  # the small one, by its own size
         spaces["/small"] = (4 * GIB, 16 * GIB)
-        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces[path]):
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, plenty)):
             self.daemon.schedule(self.now + 1)
         self.assertNotEqual(t.reason_cat, "disk")
         self.daemon.cfg.disk_floor, self.daemon.cfg.disk_floor_share = 500 * GIB, 0.0
         with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, (GIB, 16 * GIB))):
             u = self.submit()
         u.disk_paths = ["/big"]
-        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces[path]):
+        with mock.patch.object(buildqd, "disk_space", side_effect=lambda path: spaces.get(path, plenty)):
             self.daemon.schedule(self.now + 2)
         self.assertIn("(disk_floor is 500G)", u.reason)
 
@@ -357,7 +388,8 @@ class Admission(DaemonCase):
         check = self.submit(("cargo", "check"), lane="check", cwd=tree)
         check.workspace_group = check.group_lane = None  # saved by an older daemon
         self.daemon.save(check)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
         again.load_tickets(self.now + 10)
         self.assertEqual(again.tickets[check.id].workspace_group, "heavy")
@@ -367,7 +399,8 @@ class Admission(DaemonCase):
     def restart(self, config):
         with open(self.config_path, "w") as f:
             f.write(config)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
         again.load_tickets(self.now + 10)
         return again
@@ -697,7 +730,8 @@ class Pausing(DaemonCase):
         waiting = self.submit(cores=1)
         self.assertEqual((running.state, waiting.state, waiting.reason_cat), ("running", "queued", "paused"))
         self.assertIn("rebooting at noon", waiting.reason)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         self.assertEqual(again.paused["reason"], "rebooting at noon")
         self.daemon.resume(self.now + 1)
         self.assertEqual(waiting.state, "running")
@@ -910,7 +944,8 @@ class SameSource(DaemonCase):
             def send(self, message):
                 return True
         self.daemon.handle_message({"op": "watch", "ticket": owner.id, "submission": "joiner"}, Conn(), self.now)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now + 1)
         self.assertIn("joiner", again.tickets[owner.id].interests)
         again.stop_memory_watch()
@@ -1206,7 +1241,8 @@ class SheddingMemory(DaemonCase):
         self.assertTrue(t.frozen)
         self.daemon.save(t)
         self.cgroup(t, frozen=False)  # resumed meanwhile
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now + 130)
         loaded = again.tickets[t.id]
         self.assertEqual((loaded.frozen, round(loaded.frozen_attempt)), (False, 30))
@@ -1234,7 +1270,8 @@ class SheddingMemory(DaemonCase):
         sent = len(self.runner.frozen)
         self.daemon.thaw_all(self.now + 130)  # the daemon stops
         self.assertEqual(self.runner.frozen[sent:], [(t.id, False)])  # one last thaw on the way out
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now + 140)
         loaded = again.tickets[t.id]
         self.assertEqual(loaded.freeze_asked[0], False)  # still asked for, sent again
@@ -1283,7 +1320,8 @@ class SheddingMemory(DaemonCase):
         self.assertTrue(t.thaw_failed)
         self.daemon.save(t)
         self.cgroup(t, frozen=False)  # someone thawed it while the daemon was away
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now + 200)
         loaded = again.tickets[t.id]
         self.assertEqual((loaded.frozen, loaded.thaw_failed), (False, False))
@@ -1663,7 +1701,8 @@ class Analytics(DaemonCase):
         self.settle_release(t, 190)
         self.sample(t, 300, 6)
         self.daemon.save_queued(self.now + 310)  # the daemon stops: running tickets are saved too
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.cfg.release_after_peak = "shadow"
         again.history = self.daemon.history
         again.load_tickets(self.now + 320)
@@ -1676,7 +1715,8 @@ class Analytics(DaemonCase):
             again.close_jobserver(x)
 
     def reload(self):
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.cfg.release_after_peak = "shadow"
         again.history = self.daemon.history
         self.addCleanup(lambda: (again.stop_memory_watch(), [again.close_jobserver(x) for x in again.tickets.values()]))
@@ -1819,7 +1859,8 @@ class Analytics(DaemonCase):
         t = self.past_its_peak(mode="shadow")
         self.history_of(t.key, 3)
         self.settle_release(t, 190)  # decided, and saved
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.cfg.release_after_peak = "shadow"
         again.history = self.daemon.history
         again.load_tickets(self.now + 300)
@@ -2046,7 +2087,8 @@ class Analytics(DaemonCase):
         self.daemon.schedule(self.now)
         self.daemon.schedule(self.now + 30)
         self.daemon.save_queued(self.now + 40)  # the daemon stops
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now + 100)
         loaded = again.tickets[t.id]
         again.schedule(self.now + 100)  # the time it was away counts as "restart"
@@ -2143,7 +2185,8 @@ class GitHubStatuses(DaemonCase):
                   "next": self.now, "order": [self.now + i, 0, ""]} for i, state in enumerate(("success", "failure"))]
         with open(os.path.join(self.state, "github-statuses.json"), "w") as f:
             json.dump({"queue": posts, "posted": {}}, f)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         self.assertEqual([p["state"] for p in again.status_posts], ["failure"])
         again.stop_memory_watch()
 
@@ -2706,6 +2749,67 @@ class Cores(DaemonCase):
         t = self.submit(env={"MAKEFLAGS": "-j3"})
         self.assertIsNone(t.jobserver)
 
+    def test_an_inherited_fd_jobserver_is_replaced_by_buildqs(self):
+        outer = {"MAKEFLAGS": "w -j8 --jobserver-auth=3,4 --no-print-directory",
+                 "CARGO_MAKEFLAGS": "-j8 --jobserver-fds=3,4 --jobserver-auth=3,4"}
+        t = self.submit(("make", "-j4", "all"), env=outer)
+        self.assertIsNotNone(t.jobserver)  # its descriptors don't reach the build: buildq's instead
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            parallel = json.load(f)
+        self.assertEqual(parallel["MAKEFLAGS"], f"w --no-print-directory -j{t.want} --jobserver-auth=fifo:{t.jobserver}")
+        self.assertEqual(parallel["CARGO_MAKEFLAGS"], f"-j{t.want} --jobserver-auth=fifo:{t.jobserver}")
+        self.assertNotIn("3,4", json.dumps(parallel))
+        cargo = self.submit(("cargo", "build"), env={"MAKEFLAGS": " -j8 --jobserver-auth=3,4"})
+        self.assertIsNotNone(cargo.jobserver)
+        with open(os.path.join(cargo.dir, "parallel.json")) as f:
+            self.assertEqual(json.load(f)["MAKEFLAGS"], "")  # cleared: cargo's build scripts mustn't use it
+
+    def test_options_go_before_a_double_dash_and_an_inherited_parallel_make_stays_parallel(self):
+        t = self.submit(("make", "all"), env={"MAKEFLAGS": "rRw -j --jobserver-auth=3,4 -- FOO=bar"})
+        self.assertIsNotNone(t.jobserver)
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            flags = json.load(f)["MAKEFLAGS"]
+        self.assertEqual(flags, f"rRw -j{t.want} --jobserver-auth=fifo:{t.jobserver} -- FOO=bar")
+        self.assertEqual(buildqd.with_make_flags("a -- X=1", "-j2"), "a -j2 -- X=1")
+        self.assertEqual(buildqd.with_make_flags("", "-j2"), "-j2")
+
+    def test_an_empty_inherited_variable_is_no_choice_of_the_callers(self):
+        t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=3,4", "CARGO_MAKEFLAGS": ""})
+        self.assertIsNotNone(t.jobserver)
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            self.assertIn(f"--jobserver-auth=fifo:{t.jobserver}", json.load(f)["CARGO_MAKEFLAGS"])  # it reaches cargo
+        # a make recipe exports MAKEFLAGS= and MFLAGS=: a make -j8 it runs still gets buildq's jobserver
+        m = self.submit(("make", "-j8", "all"), env={"MAKEFLAGS": "", "MFLAGS": ""})
+        self.assertIsNotNone(m.jobserver)
+        with open(os.path.join(m.dir, "parallel.json")) as f:
+            self.assertIn(f"--jobserver-auth=fifo:{m.jobserver}", json.load(f)["MAKEFLAGS"])
+        self.assertEqual(m.exec_argv, ["make", "all"])
+
+    def test_assignments_after_a_double_dash_are_kept_as_written(self):
+        flags = "s -j4 --jobserver-auth=3,4 -- SUBMAKE=make\\ -j4 TAB=a\\\tb"
+        self.assertEqual(buildqd.without_fd_jobserver(flags), "s -- SUBMAKE=make\\ -j4 TAB=a\\\tb")
+        self.assertEqual(buildqd.with_make_flags("s -- X=make\\ -j4", "-j2"), "s -j2 -- X=make\\ -j4")
+        self.assertEqual(buildqd.with_make_flags("-- X=1", "-j2"), "-j2 -- X=1")
+        self.assertIsNone(buildqd.without_fd_jobserver("-- X=--jobserver-auth=3,4"))  # a value, not an option
+        self.assertEqual(buildqd.split_make_flags("-I a\\ -- -- X=1"), ("-I a\\ --", "X=1"))  # an escaped space
+        self.assertEqual(buildqd.split_make_flags("-I a\\\\ -- X=1"), ("-I a\\\\", "X=1"))  # an escaped backslash
+        self.assertEqual(buildqd.split_make_flags("s --"), ("s", ""))
+        self.assertEqual(buildqd.split_make_flags("--foo X=a--"), ("--foo X=a--", None))
+
+    def test_a_j_in_a_kept_assignment_doesnt_stop_buildqs_jobserver(self):
+        for value in ("SUBMAKE=make\\ -j4", "X=--jobserver-auth=fifo:/x"):
+            t = self.submit(("make", "all"), env={"MAKEFLAGS": f"s -j4 --jobserver-auth=3,4 -- {value}"})
+            self.assertIsNotNone(t.jobserver)  # the caller's make ran in parallel; the -j is a value's
+            with open(os.path.join(t.dir, "parallel.json")) as f:
+                flags = json.load(f)["MAKEFLAGS"]
+            self.assertEqual(flags, f"s -j{t.want} --jobserver-auth=fifo:{t.jobserver} -- {value}")
+
+    def test_a_fifo_jobserver_from_the_caller_is_kept(self):
+        t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})
+        self.assertIsNone(t.jobserver)
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            self.assertNotIn("MAKEFLAGS", json.load(f))
+
     def test_given_cores_are_used_as_they_are(self):
         t = self.submit(cores=3)
         self.assertEqual((t.want, t.need, t.granted), (3, 3, 3))
@@ -2993,7 +3097,8 @@ class Recovery(DaemonCase):
         first = self.submit(cwd=cwd, submission="abc")
         again = self.submit(cwd=cwd, submission="abc")
         self.assertIs(first, again)
-        restarted = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        restarted = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         restarted.load_tickets(self.now)
         t, _ = restarted.submit({"argv": ["cargo", "build"], "cwd": cwd, "env": {}, "submission": "abc"}, self.now)
         self.assertEqual(t.id, first.id)
@@ -3004,7 +3109,8 @@ class Recovery(DaemonCase):
         t = self.submit()
         t.runner = "direct"
         self.daemon.save(t)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now)
         self.assertEqual(again.tickets[t.id].state, "running")  # not given up for a runner change
         for ticket in again.tickets.values():
@@ -3014,7 +3120,8 @@ class Recovery(DaemonCase):
         t = self.submit()
         self.daemon.cancel(t, self.now)
         self.runner.stopped.clear()
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now)
         self.assertEqual(self.runner.stopped, [t.id])
         for ticket in again.tickets.values():
@@ -3026,7 +3133,8 @@ class Recovery(DaemonCase):
         self.daemon.save(t)
         self.runner.running.discard(t.id)
         self.runner.unit_state = lambda ticket: "gone"
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now)
         again.check(self.now + 11)
         self.assertEqual(again.tickets[t.id].state, "queued")
@@ -3061,7 +3169,8 @@ class Turns(DaemonCase):
         record = list(self.daemon.history.by_key[t.key])[0]
         self.assertEqual((record["mem_wait_some"], record["mem_wait_full"], record["mem_high"]),
                          (340.5, 120.0, 104492))
-        restarted = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        restarted = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         restarted.load_tickets(self.now + 60)
         self.assertEqual(restarted.tickets[t.id].mem_high, 104492)
 
@@ -3166,7 +3275,8 @@ class Turns(DaemonCase):
         self.daemon.cfg.max_jobs = 1
         running = self.submit(cores=2)
         queued = self.submit(cores=1)
-        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                                     queries=buildqd.InlineExecutor())
         again.load_tickets(self.now)
         self.assertEqual(again.tickets[running.id].state, "running")
         self.assertEqual(again.tickets[queued.id].state, "queued")
@@ -3384,6 +3494,75 @@ class ScriptLabels(DaemonCase):
         self.assertTrue(t.key.endswith("|bash persistent-cargo-target.sh architecture"), t.key)
         self.daemon.cfg.script_labels = frozenset()  # a reload that drops it keeps the ticket's key
         self.assertEqual(buildqd.Ticket.from_record(t.record(), t.dir).key, t.key)
+
+
+class QueriesOffTheLoop(DaemonCase):
+    def test_a_slow_systemctl_doesnt_hold_up_the_daemon(self):
+        gate = threading.Event()
+        self.runner.result = lambda ticket: "oom-kill" if gate.wait(10) else ""
+        self.daemon.queries = buildqd.ThreadPoolExecutor(max_workers=1)  # the real thing
+        self.addCleanup(self.daemon.queries.shutdown, wait=False)
+        t = self.submit()
+        self.assertEqual(t.state, "running")
+        self.runner.running.discard(t.id)  # gone without a result: systemd's verdict is asked for
+        began = time.monotonic()
+        self.daemon.check(self.now + 10)
+        self.assertLess(time.monotonic() - began, 1.0)  # not the seconds systemctl takes
+        self.assertEqual(t.state, "running")  # decided once systemd answers
+        gate.set()
+        for _ in range(500):
+            self.daemon.check(self.now + 11)
+            if t.state != "running":
+                break
+            time.sleep(0.01)  # (a second look doesn't wait: give the worker its moment)
+        self.assertTrue(t.oom)  # with systemd's verdict
+        self.assertEqual(self.daemon.pending_queries, {})
+
+
+class QueriesBelongToTheirAttempt(DaemonCase):
+    def test_a_ticket_s_queries_go_when_its_attempt_ends(self):
+        gate = threading.Event()
+        self.runner.result = lambda ticket: "oom-kill" if gate.wait(10) else ""
+        self.daemon.queries = buildqd.ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(self.daemon.queries.shutdown, wait=False)
+        t = self.submit()
+        self.runner.running.discard(t.id)
+        self.daemon.check(self.now + 10)  # asked; not in yet
+        self.assertEqual(len(self.daemon.pending_queries), 1)
+        self.daemon.requeue(t, self.now + 11)  # (stopped for memory meanwhile: a new attempt)
+        self.assertEqual(self.daemon.pending_queries, {})  # the old attempt's question is dropped
+        gate.set()
+
+    def test_the_direct_runners_state_is_read_inline_on_the_ticket(self):
+        t = self.submit()
+
+        class Direct:
+            name = "direct"
+
+            def unit_state(self, ticket):
+                ticket.pid = 4242  # (as the direct runner records the supervisor it found)
+                return "pending"
+
+            def result(self, ticket):
+                return ""
+        self.daemon.queries = mock.Mock(submit=mock.Mock(side_effect=AssertionError("not through the pool")))
+        with mock.patch.object(self.daemon, "runner_of", return_value=Direct()):
+            self.assertEqual(self.daemon.unit_state_of(t), "pending")
+            self.assertEqual(self.daemon.result_of(t), "")
+        self.assertEqual(t.pid, 4242)  # on the ticket itself, not a copy
+
+    def test_unreadable_container_storage_is_said_once(self):
+        self.daemon.cfg.container_storage = ["/root/no-access"]
+        with mock.patch.object(buildqd.os, "stat", side_effect=PermissionError("denied")) as _, \
+                mock.patch.object(buildqd, "log") as log:
+            t = buildqd.Ticket("x" * 36, ["docker", "build", "."], self.workdir(), "image", "k", self.now, self.tmp.name)
+            t.disk_paths = []
+            with mock.patch.object(buildqd, "disk_space", return_value=None), \
+                    mock.patch.object(buildqd, "fs_device", return_value=None):
+                self.daemon.disk_short(t)
+                self.daemon.disk_short(t)
+        said = [c for c in log.call_args_list if "can't read container storage" in str(c)]
+        self.assertEqual(len(said), 1)
 
 
 class Configuration(unittest.TestCase):

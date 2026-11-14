@@ -24,8 +24,18 @@ cpu_target = 0.9
 mem_floor = "10%"
 
 # No build starts where its working directory's filesystem has less free than this: a size, or a
-# percentage of that filesystem's own size ("20%").
+# percentage of that filesystem's own size ("20%"). The same goes for its CARGO_TARGET_DIR and
+# TMPDIR, buildq's own state directory (its log goes there), and, for an image build, the
+# container storage below that exists.
 disk_floor = "2G"
+
+# Where image builds (docker, podman, buildah) write their layers, for disk_floor: those that exist.
+# The defaults are Docker's root, containerd's image store, rootless Docker's, and Podman's rootful
+# and rootless stores; name yours if you moved them (docker info --format '{{.DockerRootDir}}',
+# podman info --format '{{.Store.GraphRoot}}'). A build sent to a remote engine (DOCKER_HOST or
+# CONTAINER_HOST of tcp: or ssh:) isn't held to them.
+# container_storage = ["/var/lib/docker", "/var/lib/containerd", "~/.local/share/docker",
+#                      "/var/lib/containers/storage", "~/.local/share/containers/storage"]
 
 # No new build while CPU pressure ("some", avg10, %) is above this and a build is running, or
 # while memory pressure ("full", avg10, %) is above mem_psi_block.

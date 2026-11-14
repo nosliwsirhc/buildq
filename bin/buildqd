@@ -68,7 +68,9 @@ import termios
 import threading
 import time
 import traceback
+import types
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 try:
     import tomllib
@@ -238,6 +240,10 @@ DEFAULTS = {
     "cpu_target": 0.9,
     "mem_floor": "10%",
     "disk_floor": "2G",
+    # Where image builds write: Docker's root, containerd's image store, rootless Docker's, and
+    # Podman's rootful and rootless stores (those that exist).
+    "container_storage": ["/var/lib/docker", "/var/lib/containerd", "~/.local/share/docker",
+                          "/var/lib/containers/storage", "~/.local/share/containers/storage"],
     "cpu_psi_block": 50.0,
     "mem_psi_block": 10.0,
     "ramp_seconds": 90,
@@ -359,6 +365,10 @@ class Config:
         if not 0 <= self.mem_floor < mem_total:
             raise ValueError("mem_floor must be less than the machine's memory")
         # A size, or a percentage of each build's own filesystem ("20%"), worked out where it runs.
+        storage = d["container_storage"]
+        if not isinstance(storage, list) or not all(isinstance(p, str) and p for p in storage):
+            raise ValueError("container_storage must be a list of directories")
+        self.container_storage = [os.path.expanduser(p) for p in storage]
         floor = d["disk_floor"]
         if isinstance(floor, str) and floor.strip().endswith("%"):
             try:
@@ -1006,6 +1016,80 @@ def fifo_in_use(cgroup: str, path: str | None) -> bool:
         except OSError:
             continue
     return users > 1  # the supervisor holds it open for the whole build
+
+
+PENDING = object()  # a query run off the event loop whose answer isn't in yet
+
+
+class InlineExecutor:
+    """Runs each query at once, on the caller's thread (tests)."""
+
+    def submit(self, fn, *args) -> Future:
+        future: Future = Future()
+        try:
+            future.set_result(fn(*args))
+        except BaseException as e:  # (as a pool's future would hold it)
+            future.set_exception(e)
+        return future
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        pass
+
+
+MAKE_FLAG_VARS = ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")
+FD_JOBSERVER = re.compile(r"--jobserver-(?:auth|fds)=-?\d+,-?\d+")
+
+
+def split_make_flags(flags: str) -> tuple[str, str | None]:
+    """Make flags split at their first `--`: the options before it, and the variable assignments
+    after it, kept exactly as written (escaped spaces and all), or None if there is no `--`. A `--`
+    after an escaped space (an odd number of backslashes before it) is part of a value, not the split."""
+    for m in re.finditer(r"(?:^|\s)--(?=\s|$)", flags):
+        before = flags[:m.start()]
+        if (len(before) - len(before.rstrip("\\"))) % 2 == 0:
+            return before, flags[m.end() + 1:]
+    return flags, None
+
+
+def without_fd_jobserver(flags: str) -> str | None:
+    """The make flags without an inherited jobserver passed by file descriptor
+    (--jobserver-auth=R,W, or the older --jobserver-fds=R,W) and the -j that came with it, or None
+    if they have none (#4). Those descriptors belong to the make that ran the caller and don't reach
+    the build's service: make would warn and run serially, so the build gets buildq's jobserver
+    instead. A fifo jobserver (fifo:PATH) can still be opened there, so it is left alone. Only the
+    options before a `--` are looked at; the assignments after it are kept as they are."""
+    options, assignments = split_make_flags(flags)
+    words = options.split()
+    if not any(FD_JOBSERVER.fullmatch(w) for w in words):
+        return None
+    kept = " ".join(w for w in words if not FD_JOBSERVER.fullmatch(w) and not re.fullmatch(r"-j\d*", w))
+    return kept if assignments is None else f"{kept} -- {assignments}".lstrip()
+
+
+def with_make_flags(flags: str, more: str) -> str:
+    """Make flags with more options added: before a `--` and the variable assignments after it
+    (kept exactly as written), or make would take the options for targets."""
+    options, assignments = split_make_flags(flags)
+    head = " ".join(x for x in (options.strip(), more.strip()) if x)
+    return head if assignments is None else f"{head} -- {assignments}".lstrip()
+
+
+def fs_device(path: str) -> int | None:
+    """The device of the filesystem path is on, or None if it can't be read."""
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def reset_failed_unit(unit: str | None) -> bool:
+    """Unload a failed service of that name, so a launch can use the name again."""
+    try:
+        subprocess.run(["systemctl", "--user", "reset-failed", unit or "-"], stdin=DEVNULL,
+                       stdout=DEVNULL, stderr=DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return True
 
 
 def configured_memory_max(slice_name: str) -> str | None:
@@ -2753,8 +2837,14 @@ class Daemon:
     REBALANCE_SECONDS = 5.0
     VACATED_SECONDS = 600.0  # how long a cancelled `run` build's place is kept for its retry
 
-    def __init__(self, config_path: str, state_dir: str, machine: Machine | None = None, runner=None):
+    def __init__(self, config_path: str, state_dir: str, machine: Machine | None = None, runner=None,
+                 queries=None):
         self.config_path = config_path
+        # systemctl queries, which take seconds when the user manager is slow, run here, off the
+        # event loop: a stalled systemd mustn't stall every client (#2). See query().
+        self.queries = queries or ThreadPoolExecutor(max_workers=4, thread_name_prefix="buildq-query")
+        self.pending_queries: dict[tuple, Future] = {}
+        self.storage_unreadable: set[str] = set()  # container storage said to be unreadable, once each
         self.state_dir = state_dir
         os.makedirs(state_dir, exist_ok=True)
         self.last_good = os.path.join(state_dir, "config.last-good.toml")
@@ -2840,6 +2930,55 @@ class Daemon:
 
     # ---- configuration
 
+    def attempt(self, t: Ticket) -> tuple:
+        """A ticket's attempt: queries are keyed by it, so an answer never outlives its attempt."""
+        return (t.id, t.requeues, t.unit)
+
+    @staticmethod
+    def snapshot(t: Ticket):
+        """What a runner's query reads from a ticket, copied: the loop goes on changing the ticket
+        while the query runs on another thread."""
+        return types.SimpleNamespace(id=t.id, unit=t.unit, cg=t.cg, dir=t.dir)
+
+    def drop_queries(self, t: Ticket) -> None:
+        """Forget a ticket's queries (its attempt has ended): their answers belong to it alone."""
+        for key in [k for k in self.pending_queries if len(k) > 1 and isinstance(k[1], tuple) and k[1][0] == t.id]:
+            self.pending_queries.pop(key).cancel()
+
+    def unit_state_of(self, t: Ticket):
+        """The runner's view of a ticket's service: through query() for systemd (a systemctl call that
+        can be slow); the direct runner's is a file read, done here on the ticket itself."""
+        runner = self.runner_of(t)
+        if runner.name != "systemd":
+            return runner.unit_state(t)
+        return self.query(("unit-state", self.attempt(t)), runner.unit_state, self.snapshot(t))
+
+    def result_of(self, t: Ticket):
+        """systemd's verdict on a build's service (through query()), or the runner's own."""
+        runner = self.runner_of(t)
+        if runner.name != "systemd":
+            return runner.result(t)
+        return self.query(("result", self.attempt(t)), runner.result, self.snapshot(t))
+
+    def query(self, key: tuple, fn, *args):
+        """fn(*args), run off the event loop: its answer, or PENDING while it isn't in yet, so the
+        caller asks again on a later tick. A quick answer (a healthy systemctl takes milliseconds)
+        is waited for, up to 50 ms, so it is used at once."""
+        future = self.pending_queries.get(key)
+        if future is None:
+            future = self.pending_queries[key] = self.queries.submit(fn, *args)
+            wait = 0.05  # a quick answer is used at once
+        else:
+            wait = 0.0  # asked before: look, don't wait again (a stalled systemd mustn't cost every tick)
+        try:
+            answer = future.result(timeout=wait)
+        except FutureTimeout:
+            return PENDING
+        finally:
+            if future.done():
+                self.pending_queries.pop(key, None)
+        return answer
+
     def runner_for_config(self, cfg: Config):
         """The runner new builds use. A build already running keeps the runner it started under."""
         if self.override is not None:
@@ -2901,6 +3040,8 @@ class Daemon:
     def apply(self, cfg: "Config") -> None:
         self.cfg = cfg
         self.slice_limit = None  # read it again: the slice may have changed
+        for key in [k for k in self.pending_queries if k[0] == "slice-max"]:
+            self.pending_queries.pop(key).cancel()  # (and not from an answer asked for before)
         self.runner = self.runner_for_config(self.cfg)
         self.history.max_keys = self.cfg.history_keys
         log(f"configuration in force: {json.dumps(self.cfg.summary())}")
@@ -3484,6 +3625,7 @@ class Daemon:
 
     def requeue(self, t: Ticket, now: float) -> None:
         """A build stopped to free memory is gone: queue it again, at the front, or fail it."""
+        self.drop_queries(t)  # its attempt's answers are no use to the next one, or to no one
         result = read_json(os.path.join(t.dir, "result.json"))  # its kills, before the file goes
         if isinstance(result, dict):
             t.kills_seen = max(t.kills_seen, int(sane_count(result.get("oom_kills")) or 0))
@@ -3758,21 +3900,43 @@ class Daemon:
 
     # ---- admission
 
-    def disk_short(self, t: Ticket) -> tuple[int, int, int] | None:
-        """(free, floor, size) of the filesystem where a build would write that is furthest under
-        its floor, or None if every one has its floor free. The floor is disk_floor (a size) or,
-        given as a percentage, disk_floor_share of that filesystem's own size. A path whose
-        filesystem can't be read is skipped. The floor gates starts only: builds already running
-        can still write below it."""
-        worst = None
-        for path in t.disk_paths or [t.cwd]:
+    def disk_short(self, t: Ticket) -> tuple[int, int, int, str] | None:
+        """(free, floor, size, path) of the filesystem where a build would write that is furthest
+        under its floor, or None if every one has its floor free. Those are its own (directory,
+        CARGO_TARGET_DIR, TMPDIR), buildq's state directory (its log and ticket go there), and, for
+        an image build (docker, podman, buildah), the container storage that exists. The floor is
+        disk_floor (a size) or, given as a percentage, disk_floor_share of that filesystem's own
+        size. A path whose filesystem can't be read is skipped. The floor gates starts only: builds
+        already running can still write below it."""
+        paths = [*(t.disk_paths or [t.cwd]), self.state_dir]
+        remote = str((t.env or {}).get("DOCKER_HOST") or (t.env or {}).get("CONTAINER_HOST") or "")
+        if _tool_and_args(t.argv)[0] in ("docker", "podman", "buildah") and not remote.startswith(("tcp:", "ssh:")):
+            for path in self.cfg.container_storage:  # (a build on a remote engine writes there, not here)
+                try:
+                    os.stat(path)
+                except FileNotFoundError:
+                    continue  # (not on this machine)
+                except OSError as e:
+                    if path not in self.storage_unreadable:  # once
+                        self.storage_unreadable.add(path)
+                        log(f"can't read container storage at {path} ({e}); name a readable directory on "
+                            "that filesystem in container_storage, or image builds aren't held to disk_floor there")
+                    continue
+                paths.append(path)
+        worst, devices = None, set()
+        for path in paths:
+            device = fs_device(path)  # None: unreadable (disk_space says what it can)
+            if device is not None:
+                if device in devices:
+                    continue  # that filesystem is counted already
+                devices.add(device)
             space = disk_space(path)
             if space is None:
                 continue
             free, size = space
             floor = max(self.cfg.disk_floor, int(self.cfg.disk_floor_share * size))
             if free < floor and (worst is None or free - floor < worst[0] - worst[1]):
-                worst = (free, floor, size)
+                worst = (free, floor, size, path)
         return worst
 
     def add_wait(self, t: Ticket, now: float) -> None:
@@ -3993,10 +4157,10 @@ class Daemon:
                                             f"({fmt_size(m.mem_total - cfg.mem_floor)} above the floor); cancel it "
                                             "or give its lane a smaller MemoryMax"), False
             elif short is not None:
-                free, floor, size = short
+                free, floor, size, where = short
                 said = (f"{cfg.disk_floor_share * 100:g}% of its {fmt_size(size)}, {fmt_size(floor)}"
                         if floor > cfg.disk_floor else fmt_size(floor))
-                reason, holds = ("disk", f"only {fmt_size(free)} of disk is free where it runs "
+                reason, holds = ("disk", f"only {fmt_size(free)} of disk is free at {where} "
                                          f"(disk_floor is {said})"), False
             elif lane.exclusive and (lane.workspace_group, t.workspace) in busy_workspaces and not (
                     # a CI job's build held by ci_first binds only builds of its priority or lower
@@ -4138,7 +4302,21 @@ class Daemon:
             tool = os.path.basename((strip_wrappers(t.argv) or ["?"])[0])
             known = tool in JOBSERVER_TOOLS
             wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
-            if wanted and not t.rigid and not any(k in env for k in ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")):
+            # An inherited jobserver passed by descriptor is dead in the build's service: drop it,
+            # and give the build buildq's, unless the caller still brings make flags of its own.
+            cleaned = {k: c for k in MAKE_FLAG_VARS if k in env
+                       for c in [without_fd_jobserver(str(env[k]))] if c is not None}
+            if cleaned:
+                log(f"{t.id}: dropped the caller's jobserver ({', '.join(sorted(cleaned))}): its descriptors "
+                    "don't reach the build")
+            # The caller's own choice still wins: flags it set, or, where its dead jobserver was
+            # dropped, a -j or jobserver of its own left in their options (an assignment after the
+            # `--`, such as SUBMAKE=make\ -j4, is a variable's value, not make's own setting).
+            callers_own = any(k in env and str(env[k]).strip()
+                              and (k not in cleaned
+                                   or re.search(r"(?:^|\s)-j|--jobserver", split_make_flags(cleaned[k])[0]))
+                              for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
+            if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
                 t.jobserver = os.path.join(t.dir, "jobserver")
                 t.js = Jobserver(t.jobserver, create=True)
@@ -4146,10 +4324,21 @@ class Daemon:
                 t.tokens_out = t.js.out
             if t.jobserver and tool in ("make", "gmake", "ninja") and asks_for_jobs(t.argv[1:]):
                 t.exec_argv = without_jobs(t.argv)  # its -j would make it ignore the jobserver
-            # The caller's own settings win; the rest go in a file of their own, so a build that
-            # is queued again after a restart gets fresh ones.
-            write_json(os.path.join(t.dir, "parallel.json"),
-                       {k: v for k, v in self.build_env(t).items() if k not in env})
+            # buildq's settings go in a file of their own, so a build that is queued again after a
+            # restart gets fresh ones.
+            ours = self.build_env(t)
+            # The caller's own settings win; an empty make variable is no setting (a make recipe
+            # exports MAKEFLAGS= and MFLAGS=), so buildq's flags go in its place.
+            given = {k for k in env if k not in MAKE_FLAG_VARS or str(env[k]).strip()}
+            parallel = {k: v for k, v in ours.items() if k not in given}
+            for k, rest in cleaned.items():
+                # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
+                # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)
+                mine = ours.get(k) or (f"-j{t.want} --jobserver-auth=fifo:{t.jobserver}"
+                                       if t.jobserver and k != "CARGO_MAKEFLAGS"
+                                       and tool in ("make", "gmake", "ninja") else "")
+                parallel[k] = with_make_flags(rest, mine)
+            write_json(os.path.join(t.dir, "parallel.json"), parallel)
             self.runner.prepare(t, self.cfg.slice)
             self.save(t)  # with its service's name, before it exists
             t.launcher, running = self.runner.launch(t, lane, self.cfg.slice)
@@ -4244,7 +4433,13 @@ class Daemon:
             return
         path = os.path.join(self.cg_base, slice_path(self.cfg.slice))
         if self.slice_limit is None:
-            self.slice_limit = configured_memory_max(self.cfg.slice) or "max"
+            if stopping:  # (putting the limit back as the daemon stops: no later tick to wait for)
+                self.slice_limit = configured_memory_max(self.cfg.slice) or "max"
+            else:
+                limit = self.query(("slice-max", self.cfg.slice), configured_memory_max, self.cfg.slice)
+                if limit is PENDING:
+                    return  # guarded from a later tick, once systemd has said
+                self.slice_limit = limit or "max"
         m = self.machine
         if stopping:
             value = self.slice_limit
@@ -4322,7 +4517,9 @@ class Daemon:
                                   timed_out=bool(result.get("timed_out")), result=result)
                 else:
                     # Killed as a whole, supervisor and all: systemd-oomd, or SIGKILL from outside.
-                    verdict = self.runner_of(t).result(t)
+                    verdict = self.result_of(t)
+                    if verdict is PENDING:
+                        continue  # finalized on a later tick, with systemd's verdict
                     oom = verdict == "oom-kill"
                     error = None if t.cancel_requested else (
                         "it was stopped for memory (systemd-oomd or the kernel)" if oom else
@@ -4352,8 +4549,14 @@ class Daemon:
                 return True
             if now < (t.recheck_at or 0):
                 return False
-            state = runner.unit_state(t)
+            state = self.unit_state_of(t)
+            if state is PENDING:
+                return False  # asked; the answer comes on a later tick
             if state in ("pending", "unknown"):
+                # systemd has it again (or can't say): a reset-failed asked for meanwhile is stale
+                stale = self.pending_queries.pop(("reset-failed", self.attempt(t)), None)
+                if stale is not None:
+                    stale.cancel()
                 t.recheck_at = now + 10  # systemd has it, or can't say yet: look again
                 return False
             if os.path.exists(os.path.join(t.dir, "env.json")) and t.cancel_requested:
@@ -4362,12 +4565,10 @@ class Daemon:
                 # Systemd has neither the service nor a job to start it, and no supervisor read
                 # its environment: it never started. Queue it again, clearing any failed unit of
                 # that name first, so the next launch can use it.
-                try:
-                    subprocess.run(["systemctl", "--user", "reset-failed", t.unit or "-"], stdin=DEVNULL,
-                                   stdout=DEVNULL, stderr=DEVNULL, timeout=5)
-                except (OSError, subprocess.SubprocessError):
-                    pass
+                if self.query(("reset-failed", self.attempt(t)), reset_failed_unit, t.unit) is PENDING:
+                    return False  # the build stays starting until the name is free
                 self.close_jobserver(t, remove=True)
+                self.drop_queries(t)  # (this attempt is over)
                 t.state, t.started, t.unit, t.cg, t.granted = "queued", None, None, None, 0
                 self.save(t)
                 log(f"requeued {t.id}: it hadn't started when the daemon stopped")
@@ -4385,7 +4586,9 @@ class Daemon:
             t.recheck_at = now
             return False
         if rc != 0:
-            state = self.runner_of(t).unit_state(t)
+            state = self.unit_state_of(t)
+            if state is PENDING:
+                return False  # the launcher's exit code keeps; look again on a later tick
             if state == "pending":
                 rc = 0  # the service exists: a launch from before a daemon restart got there first
             elif state == "unknown":
@@ -4422,6 +4625,7 @@ class Daemon:
                  error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
         if t.state in FINISHED:
             return
+        self.drop_queries(t)  # its attempt's answers are no use to anyone now
         t.env = None
         if isinstance(result, dict):  # the supervisor's reading, taken as the build ended
             t.take_waits(result.get("mem_wait_some"), result.get("mem_wait_full"), result.get("mem_high"))
@@ -5500,6 +5704,7 @@ async def serve(args) -> None:
     daemon.guard_slice(stopping=True)
     ticker.cancel()
     daemon.stop_memory_watch()
+    daemon.queries.shutdown(wait=False, cancel_futures=True)
     server.close()
     if owned:
         try:

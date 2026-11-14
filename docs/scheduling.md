@@ -13,7 +13,7 @@ order and starts every build that fits:
 | Cores | its minimum cores fit in what is free: `cpu_target` × cores − busy cores − cores that builds just started haven't reached yet + cores that resizable builds could give back. Skipped when nothing is running, so outside load can slow the queue but never stall it, and for lanes with `waits_for_cpu = false`. |
 | Pressure | memory pressure (PSI `full avg10`) ≤ `mem_psi_block`; CPU pressure (`some avg10`) ≤ `cpu_psi_block` while a build runs (not for lanes with `waits_for_cpu = false`) |
 | Count | fewer than `max_jobs` builds run, not counting up to `extra_jobs` of its own lane |
-| Disk | its filesystem has at least `disk_floor` free (a size, or a percentage of that filesystem's size, such as `"20%"`). This gates starts only: builds already running can still write below it. |
+| Disk | every filesystem it writes to has at least `disk_floor` free (a size, or a percentage of that filesystem's size, such as `"20%"`): its directory's, its `CARGO_TARGET_DIR`'s and `TMPDIR`'s, buildq's state directory's, and, for an image build (docker, podman, buildah), the container storage's (`container_storage`). This gates starts only: builds already running can still write below it. |
 | Workspace | in an exclusive lane, no other build of that lane or of its `workspace_group` runs in its workspace (its `CARGO_TARGET_DIR`, or its git worktree), and the workspace isn't held for a build of the group that goes first (one that has waited longest, or a CI job's with `ci_first`); they would only fight over the build directory |
 
 ## Order
@@ -122,8 +122,15 @@ and a `make -j`, in `MAKEFLAGS`, with the command's own `-j` removed, since make
 when given `-j` on its command line. A lane's `jobserver` setting says for
 which builds: `"tools"` (the default) when the command is cargo, make or ninja, `true` for every
 build (scripts that call them too), `false` for none. A build gets none when its caller set `MAKEFLAGS`,
-`CARGO_MAKEFLAGS` or `MFLAGS` (that jobserver is the caller's), or when its history shows it ignores
-the job count. Every five seconds buildq hands idle cores to
+`CARGO_MAKEFLAGS` or `MFLAGS` to something (that jobserver is the caller's; an empty one, as a make
+recipe exports, is no setting), or when its history shows it ignores the job count. A jobserver an
+outer make passed by file descriptor (`--jobserver-auth=R,W`) doesn't count: those descriptors don't
+reach the build, so buildq drops it, with its `-j`, keeps the caller's other make flags (and any
+variable assignments after their `--`, as written), and gives the build its own, unless a `-j` or
+jobserver of the caller's is still left in those options (a `-j` inside an assignment, such as
+`SUBMAKE=make\ -j4`, is a value, not a setting). A make or ninja build
+whose caller's make ran in parallel that way gets buildq's jobserver in `MAKEFLAGS`, with or without
+a `-j` of its own. Every five seconds buildq hands idle cores to
 builds that are using all of theirs, if the memory more cores need is free, and takes cores back when
 the machine is over its target or a queued build needs them. A build whose history shows it keeps
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to

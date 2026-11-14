@@ -92,7 +92,7 @@ outside it, your toolchain, or ignored files other than `.env*`. After changing 
 | `memory pressure is …%` / `CPU pressure is …%` | The machine is struggling right now. | Wait. |
 | `… even with no builds running only … would be free: other work holds the rest` | Work outside the queue (CI jobs, containers) holds the memory it needs. Nothing is held back for it, and it starts when that work ends. | Wait. Tell the owner if it lasts. |
 | `needs …, more than this machine has` | It can never fit as it is. | Cancel it. Run a smaller job (one crate or test target), or tell the owner. |
-| `only … of disk is free where it runs` | The disk is nearly full. | Don't build. Tell the owner. |
+| `only … of disk is free at <path>` | The disk is nearly full there (the build's folders, buildq's state, or container storage for an image build). | Don't build. Tell the owner. |
 | `failed (exit …, killed for memory)` | The build reached its own lane's memory cap and was stopped. | Run a smaller job. Don't look for a way around the cap. |
 | `failed (exit 137)` without "killed for memory", or `stopped for memory (systemd-oomd or the kernel)` | The machine as a whole ran short, and something outside the build stopped it. | Run it again once: it queues until there is room. If it happens again, tell the owner. |
 | `waited on memory …s …; it went over its MemoryHigh` | It ran, but was slowed at its memory limit. | Nothing. Mention it to the owner if a command keeps doing it. |
