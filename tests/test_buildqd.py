@@ -1441,6 +1441,32 @@ class SheddingMemory(DaemonCase):
         self.daemon.check(self.now + 111)
         self.assertEqual((safe.state, safe.requeues), ("queued", 1))
 
+    def test_a_script_named_in_restartable_scripts_is_queued_again(self):
+        self.daemon.cfg.restartable_scripts = frozenset({"wrap.sh"})
+        script = self.submit(("bash", "ci/wrap.sh", "rust-tests"), cores=2)
+        script.mem_now = 6 * GIB
+        self.machine.mem_available = 1 * GIB
+        self.daemon.shed_memory(self.now + 100)
+        self.runner.running.discard(script.id)
+        self.daemon.check(self.now + 101)
+        self.assertEqual((script.state, script.requeues), ("queued", 1))
+
+    def test_which_scripts_restartable_scripts_covers(self):
+        scripts = frozenset({"wrap.sh", "tests.py"})
+        safe = buildqd.restart_safe
+        self.assertTrue(safe(["bash", "ci/wrap.sh", "label"], scripts))
+        self.assertTrue(safe(["./wrap.sh"], scripts))
+        self.assertTrue(safe(["/home/x/wrap.sh", "a"], scripts))
+        self.assertTrue(safe(["python3", "tests.py"], scripts))
+        self.assertFalse(safe(["bash", "ci/wrap.sh"]))  # not listed
+        self.assertFalse(safe(["bash", "-c", "wrap.sh"], scripts))  # a command string: anything could be in it
+        self.assertFalse(safe(["bash", "deploy.sh"], scripts))
+        cfg = buildqd.Config({"restartable_scripts": ["wrap.sh"]}, 64 * GIB, 16)
+        self.assertEqual((cfg.restartable_scripts, cfg.summary()["restartable_scripts"]), ({"wrap.sh"}, ["wrap.sh"]))
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).restartable_scripts, frozenset())
+        with self.assertRaises(ValueError):
+            buildqd.Config({"restartable_scripts": ["../x.sh"]}, 64 * GIB, 16)
+
     def test_a_cancel_while_it_is_being_stopped_wins(self):
         (t,) = self.running(1)
         self.machine.mem_available = 1 * GIB

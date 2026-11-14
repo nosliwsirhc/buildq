@@ -251,6 +251,7 @@ DEFAULTS = {
     "ci_first": False,
     "make_room_for_ci": "0",
     "script_labels": [],
+    "restartable_scripts": [],
     "unwatched_seconds": 30,
     "history_runs": 30,
     "history_days": 30,
@@ -395,6 +396,11 @@ class Config:
                                                     for x in labels):
             raise ValueError("script_labels must be a list of script file names, such as [\"build.sh\"]")
         self.script_labels = frozenset(labels)
+        scripts = d["restartable_scripts"]
+        if not isinstance(scripts, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
+                                                     for x in scripts):
+            raise ValueError("restartable_scripts must be a list of script file names, such as [\"build.sh\"]")
+        self.restartable_scripts = frozenset(scripts)
         self.unwatched_seconds = number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)
         self.history_runs = number(d["history_runs"], "history_runs", 1, 1000, integer=True)
         self.history_days = number(d["history_days"], "history_days", 1, 3650)
@@ -490,6 +496,7 @@ class Config:
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
             "make_room_for_ci": self.make_room_for_ci, "script_labels": sorted(self.script_labels),
+            "restartable_scripts": sorted(self.restartable_scripts),
             "slice": self.slice,
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
@@ -1421,11 +1428,19 @@ def no_emit(args: list[str]) -> bool:
     return on
 
 
-def restart_safe(argv: list[str]) -> bool:
+def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> bool:
     """A command that can be stopped and started again from the beginning without doing anything
-    twice: a compile or a test run of cargo, dotnet, tsc, eslint or vitest. A script might upload
-    or push before it compiles, so it is stopped and failed instead (unless --restartable)."""
+    twice: a compile or a test run of cargo, dotnet, tsc, eslint or vitest, or a script named in
+    restartable_scripts (run directly, or straight after its interpreter: `bash wrap.sh …`). Any
+    other script might upload or push before it compiles, so it is stopped and failed instead
+    (unless --restartable)."""
     tool, args = _tool_and_args(argv)
+    if scripts:
+        if tool in scripts:
+            return True  # run directly: ./wrap.sh, /path/to/wrap.sh
+        if (tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS) and args[:1] \
+                and not args[0].startswith("-") and os.path.basename(args[0]) in scripts:
+            return True
     if tool == "cargo":
         words = command_words(["cargo", *args])
         return (words[1] if len(words) > 1 else "") in RESTART_CARGO
@@ -3681,7 +3696,7 @@ class Daemon:
         """Stop a build (to free its memory, or `why`); check() queues it again once it is gone, if it may be."""
         avail = fmt_size(self.machine.mem_available)
         stopped = f"stopped ({why})" if why else f"stopped to free memory (only {avail} was free)"
-        if not (t.restartable or restart_safe(t.argv)):
+        if not (t.restartable or restart_safe(t.argv, self.cfg.restartable_scripts)):
             t.shed_error = (f"{stopped}. It isn't started again by itself, as it might repeat what it had done (a "
                             "script, a push): run it again once the machine has room, or submit it with "
                             "--restartable if starting over is safe")
@@ -3742,7 +3757,7 @@ class Daemon:
             builds = [t for t in running if not t.flock and t.state == "running" and not t.from_ci
                       and not t.cancel_requested and not t.requeue_pending and t.started is not None
                       and self.weight(t) <= weight and t.ci_stops < self.CI_STOPS_MAX
-                      and (t.restartable or restart_safe(t.argv)) and t.env is not None
+                      and (t.restartable or restart_safe(t.argv, self.cfg.restartable_scripts)) and t.env is not None
                       and t.requeues - t.ci_stops < 3]
             gives = {t.id: t.mem_now + self.still_to_grow(t, now) for t in builds}  # what admission sets aside
             newest = sorted(builds, key=lambda t: t.started, reverse=True)

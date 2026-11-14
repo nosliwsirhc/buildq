@@ -37,8 +37,11 @@ your tool call's time limit.
   to the caller. After a timeout, wait on the ticket. Never start the same build again.
 - Commands run inside a build (a script the build runs) go straight through: they share the
   build's turn. `buildq submit` refuses there.
-- A script that only builds and runs tests can be marked `--restartable`. If the machine runs
-  short of memory, it is then started over instead of failed.
+- Submit a script that only builds and runs tests with `--restartable` (`heavy-run --restartable
+  bash run.sh`). buildq can't see inside a script, so without it a script stopped for memory fails
+  instead of being started over, and it can never be stopped to let a waiting CI job's build in.
+  Plain `cargo build`/`test`, `dotnet build`/`test`, `tsc`, `eslint` and `vitest` need nothing.
+  Never mark a script that pushes, uploads, deploys or sends anything.
 - When a dropped-off build fails, `buildq wait` ends with its last 20 lines of output: the error
   is usually there, with no need to ask for the log.
 

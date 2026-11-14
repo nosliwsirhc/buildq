@@ -77,6 +77,13 @@ make_room_for_ci = "0"
 # the lane's default.
 # script_labels = ["persistent-cargo-target.sh"]
 
+# Scripts (file names) that only build and run tests, so starting one over is safe: stopped for
+# memory, or to make room for a CI job's build, it is queued again instead of failed, as a plain
+# `cargo test` is, without each caller passing --restartable. Only when the script is run directly
+# or straight after its interpreter (`bash ci/wrap.sh …`), not inside `bash -c "…"`. List only
+# scripts that never push, upload or deploy.
+# restartable_scripts = ["persistent-cargo-target.sh"]
+
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its
 # client was killed); builds dropped off with `buildq submit` aren't.
 unwatched_seconds = 30
