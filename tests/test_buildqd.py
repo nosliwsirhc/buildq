@@ -2674,6 +2674,18 @@ class Cores(DaemonCase):
         self.assertEqual(buildqd.with_make_flags("s -- X=make\\ -j4", "-j2"), "s -j2 -- X=make\\ -j4")
         self.assertEqual(buildqd.with_make_flags("-- X=1", "-j2"), "-j2 -- X=1")
         self.assertIsNone(buildqd.without_fd_jobserver("-- X=--jobserver-auth=3,4"))  # a value, not an option
+        self.assertEqual(buildqd.split_make_flags("-I a\\ -- -- X=1"), ("-I a\\ --", "X=1"))  # an escaped space
+        self.assertEqual(buildqd.split_make_flags("-I a\\\\ -- X=1"), ("-I a\\\\", "X=1"))  # an escaped backslash
+        self.assertEqual(buildqd.split_make_flags("s --"), ("s", ""))
+        self.assertEqual(buildqd.split_make_flags("--foo X=a--"), ("--foo X=a--", None))
+
+    def test_a_j_in_a_kept_assignment_doesnt_stop_buildqs_jobserver(self):
+        for value in ("SUBMAKE=make\\ -j4", "X=--jobserver-auth=fifo:/x"):
+            t = self.submit(("make", "all"), env={"MAKEFLAGS": f"s -j4 --jobserver-auth=3,4 -- {value}"})
+            self.assertIsNotNone(t.jobserver)  # the caller's make ran in parallel; the -j is a value's
+            with open(os.path.join(t.dir, "parallel.json")) as f:
+                flags = json.load(f)["MAKEFLAGS"]
+            self.assertEqual(flags, f"s -j{t.want} --jobserver-auth=fifo:{t.jobserver} -- {value}")
 
     def test_a_fifo_jobserver_from_the_caller_is_kept(self):
         t = self.submit(env={"MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/outer-js"})

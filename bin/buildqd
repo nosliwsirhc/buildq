@@ -1034,11 +1034,13 @@ FD_JOBSERVER = re.compile(r"--jobserver-(?:auth|fds)=-?\d+,-?\d+")
 
 def split_make_flags(flags: str) -> tuple[str, str | None]:
     """Make flags split at their first `--`: the options before it, and the variable assignments
-    after it, kept exactly as written (escaped spaces and all), or None if there is no `--`."""
-    m = re.search(r"(?:^|\s)--(?:\s|$)", flags)
-    if not m:
-        return flags, None
-    return flags[:m.start()], flags[m.end():]
+    after it, kept exactly as written (escaped spaces and all), or None if there is no `--`. A `--`
+    after an escaped space (an odd number of backslashes before it) is part of a value, not the split."""
+    for m in re.finditer(r"(?:^|\s)--(?=\s|$)", flags):
+        before = flags[:m.start()]
+        if (len(before) - len(before.rstrip("\\"))) % 2 == 0:
+            return before, flags[m.end() + 1:]
+    return flags, None
 
 
 def without_fd_jobserver(flags: str) -> str | None:
@@ -4286,9 +4288,11 @@ class Daemon:
                 log(f"{t.id}: dropped the caller's jobserver ({', '.join(sorted(cleaned))}): its descriptors "
                     "don't reach the build")
             # The caller's own choice still wins: flags it set, or, where its dead jobserver was
-            # dropped, a -j or jobserver of its own left in them.
+            # dropped, a -j or jobserver of its own left in their options (an assignment after the
+            # `--`, such as SUBMAKE=make\ -j4, is a variable's value, not make's own setting).
             callers_own = any(k in env and str(env[k]).strip()
-                              and (k not in cleaned or re.search(r"(?:^|\s)-j|--jobserver", cleaned[k]))
+                              and (k not in cleaned
+                                   or re.search(r"(?:^|\s)-j|--jobserver", split_make_flags(cleaned[k])[0]))
                               for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
             if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
@@ -4298,8 +4302,8 @@ class Daemon:
                 t.tokens_out = t.js.out
             if t.jobserver and tool in ("make", "gmake", "ninja") and asks_for_jobs(t.argv[1:]):
                 t.exec_argv = without_jobs(t.argv)  # its -j would make it ignore the jobserver
-            # The caller's own settings win; the rest go in a file of their own, so a build that
-            # is queued again after a restart gets fresh ones.
+            # buildq's settings go in a file of their own, so a build that is queued again after a
+            # restart gets fresh ones.
             ours = self.build_env(t)
             # The caller's own settings win; an empty make variable is no setting (a make recipe
             # exports MAKEFLAGS= and MFLAGS=), so buildq's flags go in its place.
