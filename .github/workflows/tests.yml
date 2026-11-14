@@ -25,3 +25,50 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Example config loads
         run: python bin/buildqd --check-config --config config.example.toml
+
+  # The systemd paths (#6): builds as transient services in a slice, their limits, measuring them,
+  # pausing them, the slice guard, and make's fifo jobserver. The VM runs systemd; this gives the
+  # runner's user a user manager with the controllers delegated, and builds GNU make 4.4 (the
+  # image has 4.3, which has no fifo jobserver).
+  systemd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: A systemd user session with cpu, io, memory and pids delegated
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+          sudo loginctl enable-linger "$USER"
+          uid=$(id -u)
+          for _ in $(seq 1 60); do [ -S "/run/user/$uid/bus" ] && break; sleep 1; done
+          echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
+      - name: Check the session
+        run: |
+          systemctl --user show-environment >/dev/null
+          systemd-run --user --scope --quiet true
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+      - name: GNU make 4.4
+        run: |
+          mkdir -p "$RUNNER_TEMP/make" && cd "$RUNNER_TEMP/make"
+          curl -fsSL -o make.tar.gz https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz
+          echo "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3  make.tar.gz" | sha256sum -c -
+          tar xzf make.tar.gz && cd make-4.4.1
+          ./configure --prefix="$HOME/.local" --disable-nls >/dev/null && ./build.sh >/dev/null && ./make install >/dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Tests, with builds as systemd services
+        shell: bash  # (-eo pipefail: a failing suite fails the step through tee)
+        env:
+          BUILDQ_TEST_SCOPES: "1"
+        run: |
+          make --version | head -1
+          python3 --version
+          python3 -m unittest discover -s tests -v 2>&1 | tee "$RUNNER_TEMP/tests.log"
+      - name: The systemd and jobserver tests ran, not skipped
+        run: |
+          if grep -E "^test_.*\((test_end_to_end\.)?ScopeTests[^)]*\).* skipped|test_make_follows_its_jobserver.* skipped" "$RUNNER_TEMP/tests.log"; then
+            echo "::error::the systemd paths weren't exercised"; exit 1
+          fi
+          grep -c "ScopeTests" "$RUNNER_TEMP/tests.log"
+
