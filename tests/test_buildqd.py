@@ -2137,8 +2137,8 @@ class GitHubStatuses(DaemonCase):
         config = os.path.join(self.tmp.name, "check.toml")
         with open(config, "w") as f:
             f.write(f'gh = "{os.path.join(self.tmp.name, "no-such-gh")}"\n')
-        result = subprocess.run([sys.executable, os.path.join(os.path.dirname(buildqd.__file__), "buildqd"),
-                                 "--check-config", "--config", config], capture_output=True, text=True, timeout=60)
+        result = subprocess.run([sys.executable, BUILDQD, "--check-config", "--config", config],
+                                capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("isn't an executable file", result.stderr)
         self.assertEqual(json.loads(result.stdout)["gh"], os.path.join(self.tmp.name, "no-such-gh"))
