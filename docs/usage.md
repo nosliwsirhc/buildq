@@ -85,7 +85,7 @@ arguments name no path outside the tree:
 
 `--again` runs it regardless.
 
-## `run` and `submit`
+## `run` and `submit`: who the build belongs to
 
 A build started by `buildq run` belongs
 to that command: interrupting it (Ctrl-C, SIGTERM, SIGHUP) cancels the build, and `run` then ends

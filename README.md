@@ -18,11 +18,11 @@ buildq replaces the slot count with measurement.
 
 | | A fixed number of slots | buildq |
 | --- | --- | --- |
-| **When a build starts** | a slot is free | its expected peak memory fits in what's free, and there are cores for it |
+| **When a build starts** | a slot is free | its expected peak memory fits in what's free, and, while other builds run, there are cores for it |
 | **What it sees** | its own jobs | the whole machine: CI runners, containers, anything outside the queue |
 | **How big a build is** | every build is "one slot" | learned from that command's past runs |
-| **Cores per build** | whatever the build picks | sized to the build and the machine; cargo, make and ninja are resized while they run |
-| **When memory runs out anyway** | the machine stalls | buildq pauses its newest build, then stops one; a compile or test run is queued again at the front |
+| **Cores per build** | whatever the build picks | sized to the build and the machine; builds that use a jobserver (cargo, `make -j`, ninja) are resized while they run |
+| **When memory runs out anyway** | the machine stalls | buildq pauses its newest build where it runs, then stops one; a build that can safely start over is queued again at the front |
 
 ## How it works
 
@@ -30,43 +30,45 @@ buildq replaces the slot count with measurement.
 flowchart TB
     A["Coding agents"] --> Q
     T["You, in a terminal"] --> Q
-    C["CI jobs on self-hosted runners"] --> Q
-    Q["The queue: buildq submit · buildq run<br/>a repeat of a running build joins it"] --> D
+    C["CI steps that call buildq run"] --> Q
+    Q["The queue: buildq submit · buildq run<br/>a repeat of a queued or running build joins it"] --> D
     M["The whole machine<br/>/proc · PSI · build cgroups"] -.-> D
     D("Fits now?<br/>memory · cores · pressure · disk · job count · workspace") -- "yes" --> S
     D -. "not yet" .-> Q
-    S["A systemd service of its own in buildq.slice<br/>capped by its lane, measured<br/>cargo, make and ninja: cores resized while it runs"]
-    S -. "memory runs short: paused,<br/>or stopped and queued again" .-> Q
+    S["A systemd service of its own in buildq.slice<br/>capped by its lane and measured<br/>with a jobserver, its cores resized while it runs"]
+    S -. "memory short: paused in place" .-> S
+    S -. "memory still short: stopped;<br/>queued again if it can safely start over" .-> Q
     S -- "peak memory, cores, time" --> H[("History, per command")]
-    H -. "sizes the next run" .-> Q
+    H -. "sizes and orders the next run" .-> Q
 ```
 
 With a systemd user session, every build runs as a systemd service of its own, so it can be capped
-and measured. What it used is recorded under its command (repository, tool, subcommand, package), and
-the next run of that command is planned from it. The daemon re-plans every second and whenever a
+and measured. What it used is recorded under its command (repository, lane, tool, subcommand,
+package), and the next run of that command is planned from it. The daemon re-plans every second and whenever a
 build arrives or ends.
 
 ## What you get
 
 | Feature | What it does |
 | --- | --- |
-| **Admission by measurement** | A build starts when its expected peak memory fits in what is free, after setting aside room for running builds to grow into, and there are cores for it. [How it decides](docs/scheduling.md#when-a-build-starts) |
+| **Admission by measurement** | A build starts when its expected peak memory fits in what is free, after setting aside room for running builds to grow into. While other builds run, it also waits for free cores and low CPU pressure, unless its lane doesn't wait for CPU. [How it decides](docs/scheduling.md#when-a-build-starts) |
 | **Learned sizes** | Peak memory, peak cores and time are recorded per command, and the next run is planned with them. [Estimates](docs/scheduling.md#estimates) |
-| **Cores that follow the load** | Each build starts with as many cores as are free, between its lane's minimum and what its history says it can use. Cargo, make and ninja get a jobserver of their own, which buildq resizes while they run. [Cores](docs/scheduling.md#cores) |
-| **Quick builds first** | Lanes have priorities, and within a lane the build expected to finish soonest goes first. A front-end lane can have turns of its own and never wait for CPU. [Lanes](docs/scheduling.md#lanes) |
-| **CI first, if you want** | With `ci_first`, a CI job's step goes ahead of waiting builds of its priority or lower, so a release isn't cancelled at its job's time limit. [CI jobs](docs/ci.md) |
-| **Caps** | Lanes give their builds systemd limits (`MemoryHigh`, `MemoryMax`, CPU and IO weights). All builds share one slice whose limit follows what the machine has free, so when other work grows, builds are slowed or stopped, not the machine. |
-| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build, then stops one before the machine can stall. A compile or test run is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
-| **One build per source** | The same command on the same source joins the build already running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
-| **Fair shares** | At the same priority, the session with fewer builds running goes first. |
-| **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` behaves like running the command directly. [Using buildq](docs/usage.md) |
+| **Cores that follow the load** | Each build starts with as many cores as are free and memory allows, between its lane's minimum and what its history says it can use. Cargo, GNU make 4.4+ run with `-j`, and Ninja 1.13+ get a jobserver of their own, which buildq resizes while they run (unless the caller brought its own `MAKEFLAGS`). [Cores](docs/scheduling.md#cores) |
+| **Quick builds first** | Lanes have priorities. At the same priority, after fair shares, the build expected to finish soonest goes first. A front-end lane can have turns of its own and never wait for CPU. [Order](docs/scheduling.md#order), [Lanes](docs/scheduling.md#lanes) |
+| **CI first, if you want** | With `ci_first`, a GitHub Actions step goes first, and the room it needs is held from builds of its priority or lower, so a release isn't cancelled at its job's time limit. A build that has waited three times `starve_seconds` (30 minutes by default) still goes ahead of it. [CI jobs](docs/ci.md) |
+| **Caps** | Lanes give their builds systemd limits (`MemoryHigh`, `MemoryMax`, CPU and IO weights). All builds share one slice, and while the daemon runs it keeps the slice's `MemoryMax` at what builds hold plus what the machine has free, so when other work grows, builds are slowed or stopped, not the machine. |
+| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build where it runs, then, if memory keeps falling, stops one before the machine can stall. A build that can safely start over is queued again at the front: a cargo, dotnet, ninja, tsc, eslint or vitest compile or test run, or anything submitted with `--restartable`. Anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
+| **One build per source** | A repeat submission (the same command on the same source, in the same directory, lane, environment and settings) joins the build already queued or running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
+| **Fair shares** | At the same priority, the caller (a session, a CI runner) with fewer builds running goes first. |
+| **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` waits for it, streams its output and exits with its code; builds have no stdin or terminal. [Using buildq](docs/usage.md) |
 | **Visibility** | `buildq top` is a live view like btop. `buildq report --capacity` says what builds waited for, and SQLite analytics answer the rest. [Operating](docs/operations.md) |
 | **Small** | The Python 3.11 standard library, a POSIX shell script and three systemd user units. No root. |
 
 ## Quick start
 
 You need Linux with cgroup v2, Python 3.11 or newer, and a systemd user session. Without one,
-builds still queue, but run without limits and unmeasured.
+`install.sh` installs no units and doesn't start the daemon (start `buildqd` yourself), and builds
+still queue, but run without limits and unmeasured.
 
 ```sh
 git clone https://github.com/nosliwsirhc/buildq.git
@@ -83,13 +85,14 @@ cd buildq
 - installs `buildq.socket`, `buildq.service` and `buildq.slice` into `~/.config/systemd/user`, with a fixed memory backstop for all builds together (75%/85% of memory, in `buildq.slice.d`);
 - starts the daemon.
 
-While the daemon runs, it lowers that backstop to what the machine has free, never above it. To
-upgrade, run `install.sh` again: running builds carry on, and queued ones keep their place.
+While the daemon runs, it lowers the slice's `MemoryMax` to what builds hold plus what the machine
+has free, never above that backstop. To upgrade, run `install.sh` again: running builds carry on,
+and queued ones keep their place.
 
 On a build server, keep the daemon running while you're logged out with `loginctl enable-linger "$USER"`.
-`./install.sh --uninstall` removes everything except your configuration and history.
+`./install.sh --uninstall` removes everything except your configuration and state (history, tickets, analytics).
 
-Then drop off a build:
+Then drop off a build. This is from a machine whose configuration has a `heavy` lane, with history for the command; a fresh install has one `default` lane:
 
 ```console
 $ buildq submit -- cargo test -p api
@@ -166,8 +169,8 @@ ideas buildq has taken since (see [Credits](#credits)).
 
 | Tool | How it admits work | What it lacks here |
 | --- | --- | --- |
-| **[qex](https://github.com/stephenc/qex)** | The closest: a local job queue for coding agents that learns per-command sizes. It admits jobs by their claimed cores and memory against a budget, and checks free memory before each start. | It doesn't measure CPU load it didn't start, cap a job's memory, or size a job's parallelism. |
-| **Slurm** (single node) | It allocates the CPUs and memory a job *requests*. | A job that requests eight cores and uses one still holds eight, and Slurm doesn't see load it didn't schedule. It needs root and several daemons. |
+| **[qex](https://github.com/stephenc/qex)** | The closest: a local job queue for coding agents that learns per-command sizes. It admits jobs by their claimed cores and memory against a budget, checks free memory before each start, and passes the claimed cores to the job as hints. | It doesn't measure CPU load it didn't start, cap a job's memory, or resize a job's parallelism while it runs. |
+| **Slurm** (single node) | It allocates the CPUs and memory a job *requests*. | A job that requests eight cores and uses one still holds eight, and Slurm schedules by requests, not by the spare capacity it measures. It needs root and several daemons. |
 | **pueue**, **task-spooler**, **GNU parallel's `sem`** | They run up to a fixed number of jobs at once. | That is the slot model buildq replaces. |
 | **`batch`** (atd) | It starts queued jobs when the load average drops. | It runs them detached, with output by mail. |
 | **systemd on its own** | cgroup limits and weights | No queue. |
@@ -195,7 +198,7 @@ buildq takes ideas, and no code, from these projects. Thank you to their authors
   - socket activation;
   - `MemoryHigh` and `MemoryMax`;
   - `CPUWeight` and `IOWeight`;
-  - the freezer (`systemctl freeze`) that pauses a build.
+  - the cgroup freezer that pauses a build.
 
 ## Develop
 
