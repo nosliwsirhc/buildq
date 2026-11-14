@@ -208,7 +208,9 @@ once, but until it has waited `starve_seconds` its room binds only tickets of it
 lower, so a higher lane still starts in room that is free), its memory and minimum cores are
 subtracted for every ticket behind it, except tickets in lanes with `may_pass_held`. Room is never
 held for a ticket that couldn't fit even with every buildq build gone, so an oversized ticket can't
-stop the queue.
+stop the queue. A ticket kept out of its workspace holds nothing, except (with `ci_first`) one that
+has waited `starve_seconds` and is kept out only by a fresh CI ticket's hold on that workspace: it
+still holds its room and the workspace, so builds behind it can't pass it there.
 
 **Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped to
 free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` and `RUNNER_NAME`
