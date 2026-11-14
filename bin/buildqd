@@ -1596,24 +1596,35 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
     return tool in ("tsc", "vue-tsc", "eslint", "vitest")
 
 
-# Options that move a command to another folder, in any spelling: -C (env, make, cargo, git, ninja),
-# grouped (-iC, -sC) or with its value run on; --chdir (env, sudo); --directory (make).
-CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--chdir(=.*)?|--directory(=.*)?")
-OUTPUT_OPTIONS = ("--target-dir",)  # where a build writes, not what it reads: its value isn't checked
+# Options that move a command to another folder, or the folder its paths are read from: -C in any
+# spelling (env, make, cargo, git, ninja; grouped, -iC, or with its value run on); --chdir (env,
+# sudo) and --directory (make) with the prefixes GNU getopt takes for them (--ch, --dir); vitest's
+# --root and --dir, npm's --prefix, yarn's and bun's --cwd.
+CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--c(h(d(i(r)?)?)?)?(=.*)?|--di(r(e(c(t(o(r(y)?)?)?)?)?)?)?(=.*)?"
+                            r"|--(root|prefix|cwd)(=.*)?")
+OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, not what it reads: not checked
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
+PATH_SEPARATORS = re.compile(r"""[\s,;:='"()\[\]{}]+""")
 
 
-def path_pieces(arg: str) -> list[str]:
-    """Every part of a word that might name a path: the word itself, what follows each "=" in it
-    (an option's value, an assignment's, a --config entry's), and what runs on from a short option
-    (-p../x), with quotes, brackets and spaces around each taken off. Options and URLs aren't."""
-    pieces = [arg, *arg.split("=")[1:]]
-    if re.match(r"-[A-Za-z0-9]", arg):
-        pieces.append(arg[2:])
+def path_pieces(arg: str, tool: str = "") -> list[str]:
+    """Every part of a word that might name a path. The word is cut at anything that can separate
+    values inside it (spaces, commas, quotes, brackets, "=", ":"), so a list in a --config value or a
+    flag in RUSTFLAGS is seen piece by piece; a short option run on to a piece (-L../x) and a
+    response file's @ are taken off; option names and URLs (but file: ones) aren't paths. For dotnet,
+    an MSBuild switch (/p:…) is an option, not a path."""
+    if tool in ("dotnet", "msbuild"):
+        arg = re.sub(r"^/[A-Za-z]+(:|$)", "", arg)
+    arg = re.sub(r"file://", "", arg)
+    arg = re.sub(r"[a-z][a-z0-9+.-]*://\S*", " ", arg)
     out = []
-    for piece in pieces:
-        piece = piece.strip(" \t'\"{}[](),;")
-        if piece and not piece.startswith("-") and not re.match(r"[a-z][a-z0-9+.-]*://", piece):
+    for piece in PATH_SEPARATORS.split(arg):
+        piece = piece.lstrip("@")
+        if piece.startswith("--"):
+            continue  # an option's name (its value, after "=", is a piece of its own)
+        if piece.startswith("-"):
+            piece = piece[2:]  # -L../x: what runs on from it, if anything
+        if piece:
             out.append(piece)
     return out
 
@@ -1623,14 +1634,18 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     result for the same source answers for it. A path is any part of any word (path_pieces) with a
     slash or starting with . or ~, or one that names something that exists (`-p external`, a
     symlink), resolved through links from the build's folder. Two kinds match nothing:
-    - a command that moves to another folder (env -C, --chdir, make -C, sudo given options):
-      what its paths name there can't be told from here;
-    - one pointed elsewhere (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`).
-    An output folder (--target-dir, CARGO_TARGET_DIR) is where it writes, not what it reads.
+    - a command that moves to another folder, or the folder its paths are read from (env -C,
+      --chdir, make -C, vitest --root, sudo given options): what its paths name can't be told here;
+    - one pointed elsewhere (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`,
+      `--config 'paths=["../other"]'`, `RUSTFLAGS=-L/x`).
+    An output folder (--target-dir, CARGO_TARGET_DIR, eslint's --cache-location) is where it writes,
+    not what it reads. A word naming a system folder (`PATH=/usr/bin`) also matches nothing, which
+    costs a run, not a wrong answer.
     Source that no word names (a path dependency, a [patch] in a config file, a symlinked folder
     inside the tree) isn't seen: --again runs such a build regardless."""
     root = os.path.realpath(top)
     words = argv[1:]
+    tool = os.path.basename(strip_wrappers(argv)[0]) if strip_wrappers(argv) else ""
     if any(CHANGES_FOLDER.fullmatch(a) for a in words):
         return False
     if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
@@ -1645,7 +1660,7 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
             continue
         if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES):
             continue
-        for value in path_pieces(arg):
+        for value in path_pieces(arg, tool):
             candidate = os.path.join(cwd, os.path.expanduser(value))
             looks = "/" in value or value.startswith((".", "~"))
             if not looks and not os.path.lexists(candidate):

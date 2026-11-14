@@ -1054,19 +1054,32 @@ class SameSource(DaemonCase):
                      ["env", "--chdir=sub", "cargo", "test"], ["env", "-Csub", "env", "-Cexternal", "cargo", "test"],
                      ["env", "-iC../other", "cargo", "test"], ["make", "-sC../other", "test"],
                      ["make", "--directory=sub", "test"], ["sudo", "-D", "/r", "cargo", "test"],
-                     ["sudo", "-u", "x", "cargo", "test"]):
+                     ["sudo", "-u", "x", "cargo", "test"], ["vitest", "run", "--root", "sub", "--config", "external/v.ts"],
+                     ["pnpm", "--dir", "sub", "exec", "vitest", "run"], ["env", "--ch=sub", "cargo", "test"],
+                     ["make", "--dir=sub", "test"], ["npm", "--prefix", "sub", "test"], ["yarn", "--cwd", "sub", "test"]):
             self.assertFalse(inside(argv, "/r", "/r"), argv)
         # Any part of a word that might be a path is checked: after "=", run on, in quotes.
         for argv in (["cargo", "test", "-p../other=1"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"],
                      ["cargo", "check", "--config", 'patch.crates-io.foo.path="../../foo"'],
                      ["cargo", "check", "--config", "patch.crates-io.foo = { path = '/x/foo' }"],
-                     ["tsc", "--noEmit", "-p../other/tsconfig.json"]):
+                     ["tsc", "--noEmit", "-p../other/tsconfig.json"],
+                     # a value with several in it: cut at spaces, commas, quotes, brackets, ":"
+                     ["cargo", "check", "--config", 'paths=["vendor", "../other"]'],
+                     ["env", "RUSTFLAGS=-L../other", "cargo", "check"], ["env", "RUSTFLAGS=-L /x/lib", "cargo", "test"],
+                     ["cargo", "check", "--config", 'build.rustflags=["--sysroot", "/outside"]'],
+                     ["cargo", "check", "--config", 'registries.x.index="file:///x/index"'],
+                     ["dotnet", "test", "@../other/args.rsp"],
+                     ["env", "PATH=/usr/bin", "cargo", "test"]):  # (a system folder too: that costs a run, no more)
             self.assertFalse(inside(argv, "/r", "/r"), argv)
         # Output folders aren't what a check reads; options, URLs and test names aren't paths.
         for argv in (["cargo", "test", "--target-dir", "/cache/t"], ["cargo", "test", "--target-dir=/cache/t"],
                      ["env", "CARGO_TARGET_DIR=/cache/t", "cargo", "test"], ["cargo", "clippy", "--", "-D", "warnings"],
                      ["cargo", "test", "-p", "api", "-j8", "--", "-Dwarnings"], ["vitest", "run", "--shard=1/2"],
-                     ["sudo", "X=1", "cargo", "test"], ["cargo", "test", "--config", "registry.x=https://x.example/y"]):
+                     ["sudo", "X=1", "cargo", "test"], ["cargo", "test", "--config", "registry.x=https://x.example/y"],
+                     ["env", "RUSTFLAGS=-C target-cpu=native -D warnings", "cargo", "check"],
+                     ["dotnet", "test", "/p:Configuration=Release"], ["dotnet", "test", "-c", "Release", "-p:Configuration=Release"],
+                     ["eslint", ".", "--cache-location", "/cache/eslint"], ["cargo", "test", "foo::bar"],
+                     ["cargo", "nextest", "run", "--profile", "ci"], ["cargo", "check", "--config", 'paths=["vendor"]']):
             self.assertTrue(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
@@ -1515,7 +1528,7 @@ class SheddingMemory(DaemonCase):
                      ["timeout", "1h", "X=./deploy.sh", "cargo", "test"]):
             self.assertFalse(safe(argv), argv)
             self.assertFalse(buildqd.reusable_check(argv), argv)
-        for argv in (["sudo", "X=1", "cargo", "test"], ["env", "PATH=/usr/bin", "cargo", "test"]):
+        for argv in (["sudo", "X=1", "cargo", "test"], ["env", "RUST_LOG=debug", "cargo", "test"]):
             self.assertTrue(safe(argv), argv)
             self.assertTrue(buildqd.reusable_check(argv), argv)
         # `pnpm exec BIN` runs a binary, never a package script (pnpm.io/cli/exec); with any of

@@ -82,9 +82,12 @@ arguments name no path outside the tree:
   options: behind `ionice -c3` or `nice -n 5`, say, it isn't). The command is run, not read by a
   shell, so `X=1 cargo test` names a program called `X=1`: write `env X=1 cargo test`. `npx BIN`
   and `pnpm exec BIN` (with no pnpm options) are read as BIN. A check that moves to another folder
-  (`env -C`, `make -C`, `sudo -D`) or names a path outside the tree whose source was recorded
-  (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`) is never answered from an
-  earlier pass; an output folder (`--target-dir`, `CARGO_TARGET_DIR`) doesn't count. Source that no
+  or reads its paths from one (`env -C`, `make -C`, `sudo -D`, `vitest --root`) or names a path
+  outside the tree whose source was recorded, anywhere in a word (`--manifest-path
+  ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `--config 'paths=["../x"]'`)
+  is never answered from an earlier pass; nor is one naming a system folder (`PATH=/usr/bin`),
+  which costs a run, not a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`,
+  eslint's `--cache-location`) doesn't count. Source that no
   word names isn't seen (a path dependency outside the tree, a `[patch]` in a config file, a
   symlinked folder): `--again` runs such a build regardless. `run` prints that run's output
   and exits 0, and nothing runs. A build that makes files (cargo build, a bundle, docs) or a
