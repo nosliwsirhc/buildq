@@ -77,16 +77,20 @@ def ci_behind_agents() -> dict:
 
 
 def outgrows_estimate() -> dict:
-    """A build whose history says 4 GB grows to 22 GB (a full rebuild after incremental ones),
-    while others fill the machine around it."""
+    """Two builds whose history says 3 GB grow to 24 GB by mid-run (full rebuilds after incremental
+    ones), while a stream of 12 GB test builds keeps the machine full. The daemon re-plans a build
+    that passes its estimate (outgrown), which keeps the memory floor; without that, the machine
+    goes below it."""
     rng = random.Random(3)
-    jobs = [build(0, ("cargo", "build", "-p", "big"), 22, 1200, 10, repo="app", caller="session-0",
-                  workspace="wt-big", history=True, history_peak=4 * GIB)]
-    jobs += [build(30 + i * 20, ("cargo", "build", "-p", f"crate{i}"), rng.uniform(10, 14), rng.uniform(600, 900),
-                   rng.uniform(6, 8), repo="app", caller=f"session-{i + 1}", workspace=f"wt{i}", history=True)
-             for i in range(6)]
-    machine = dict(WORKSTATION, background_mem=40 * GIB)
-    return {"name": "outgrows-estimate", "about": "one build grows past its estimate on a full machine",
+    rising = (0.15, 0.25, 0.4, 0.6, 0.8, 1.0, 1.0, 1.0, 1.0, 0.5)
+    jobs = [build(k * 120, ("cargo", "build", "-p", f"big{k}"), 24, 1800, 8, shape=rising, repo="app",
+                  caller=f"session-big{k}", workspace=f"wt-big{k}", history=True, history_peak=3 * GIB)
+            for k in range(2)]
+    jobs += [build(30 + i * 45, ("cargo", "test", "-p", f"crate{i}"), rng.uniform(11.5, 12.5), 600, 2, shape=TESTS,
+                   repo="app", caller=f"session-{i}", workspace=f"wt{i}", history=True)
+             for i in range(20)]
+    machine = dict(WORKSTATION, background_mem=30 * GIB)
+    return {"name": "outgrows-estimate", "about": "two builds grow far past their estimates on a full machine",
             "machine": machine, "jobs": jobs, "seed_history": True}
 
 

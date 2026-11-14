@@ -27,6 +27,7 @@ import math
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time as real_time
@@ -39,6 +40,7 @@ import scenarios as builtin  # noqa: E402
 
 GIB = 1 << 30
 MIB = 1 << 20
+AVERAGE = 1 - math.exp(-1 / 10)  # one second's weight in a ten-second moving average
 EPOCH = 1_800_000_000.0  # the simulated clock starts here: a fixed instant, so runs repeat exactly
 CI_ENV = {"GITHUB_ACTIONS": "true"}
 DEFAULT_TIMEOUT = 50 * 60  # a CI job's time limit, unless the trace gives one
@@ -206,7 +208,7 @@ class Simulation:
         self.repo_of: dict[str, str] = {}
         self.cold_of: dict[str, bool] = {}
         self.events = {"machine_oom": 0, "own_cap_oom": 0, "stopped_seconds": 0.0, "cancelled_seconds": 0.0,
-                       "idle_core_seconds": 0.0, "ci_timed_out": 0, "min_available": None}
+                       "idle_core_seconds": 0.0, "ci_timed_out": 0, "min_available": None, "below_floor_s": 0}
         self.log_lines: list[str] = []
         self.submitting: tuple[dict, dict] | None = None
         config = os.path.join(state_dir, "config.toml")
@@ -234,6 +236,15 @@ class Simulation:
         mod.repo_name = lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd))
         mod.cargo_cold = lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False)
         mod.disk_space = lambda path: (1 << 50, 1 << 50)  # (free, size): plenty; there is no disk here
+        load = mod.load_config_file
+
+        def load_config_file(path, mem_total, ncpu):
+            cfg = load(path, mem_total, ncpu)
+            # Nothing reaches the host: no analytics writer, no on_finish command, no GitHub status.
+            cfg.metrics, cfg.on_finish, cfg.github_status = False, "", False
+            return cfg
+        mod.load_config_file = load_config_file
+        mod.Daemon.run_hooks = lambda daemon, t, now: None  # nor a ticket's own --notify
 
     def job_at(self, path: str | None) -> Job | None:
         if not path or not path.startswith("/sim/"):
@@ -270,7 +281,8 @@ class Simulation:
         return env
 
     def submit(self, spec: dict, n: int):
-        msg = {"argv": list(spec["argv"]), "cwd": self.workdir(spec, n), "lane": spec.get("lane"),
+        lane = spec.get("lane") if spec.get("lane") in self.daemon.cfg.lanes else None  # else the lane rules
+        msg = {"argv": list(spec["argv"]), "cwd": self.workdir(spec, n), "lane": lane,
                "env": self.env_of(spec), "caller": spec.get("caller", f"agent-{n}"),
                "name": spec.get("name", " ".join(spec["argv"])[:60])}
         if spec.get("restartable"):
@@ -312,23 +324,22 @@ class Simulation:
             self.end(job, None, discarded="cancelled" if cancelled else "stopped")
 
     def seed_history(self):
-        """Give each command of the scenario a history of its own, as a machine that has run them before."""
+        """Give each command of the scenario a history of three earlier runs of its size, as on a
+        machine that has built it before: with when they peaked and what they used after (from the
+        profile), so "past the peak" (release_after_peak) has the runs it reads."""
         seen = set()
         for n, spec in enumerate(self.scenario["jobs"]):
             if not spec.get("history", self.scenario.get("seed_history")):
                 continue
             cwd = self.workdir(spec, 10_000 + n)
-            lane = spec.get("lane") or self.daemon.cfg.lane_for(list(spec["argv"]))
+            lane = spec.get("lane") if spec.get("lane") in self.daemon.cfg.lanes else None
+            lane = lane or self.daemon.cfg.lane_for(list(spec["argv"]))
             key = self.mod.command_key(list(spec["argv"]), cwd, lane, self.daemon.cfg.script_labels)
             if key in seen:
                 continue
             seen.add(key)
-            peak = int(spec.get("history_peak", spec["peak_mem"]))
-            cores = max(1, math.ceil(float(spec.get("avg_cores") or 1)))
-            self.daemon.history.add({"key": key, "lane": lane, "t": round(self.clock.now), "wall": float(spec["wall"]),
-                                     "exit": 0, "peak_mem": peak, "peak_cores": float(spec.get("avg_cores") or 1),
-                                     "avg_cores": float(spec.get("avg_cores") or 1), "granted": cores,
-                                     "mem_cores": cores, "elastic": False, "cold": False, "oom": False})
+            for record in history_runs(spec, key, lane, self.clock.now, self.daemon.cfg.lanes[lane].cores):
+                self.daemon.history.add(record)
 
     # ---- the clock
 
@@ -368,11 +379,16 @@ class Simulation:
                 self.end(job, {"exit": int(job.spec.get("exit", 0))})
         live = [j for j in live if j.alive]
         self.machine.mem_available = max(0, self.machine.mem_total - used)
+        if self.machine.mem_available < self.daemon.cfg.mem_floor:
+            self.events["below_floor_s"] += 1  # what admission keeps free for everything else is gone
         low = self.events["min_available"]
         self.events["min_available"] = self.machine.mem_available if low is None else min(low, self.machine.mem_available)
         busy = self.background_cpu + sum(j.used_cores for j in live)
-        self.machine.busy = self.machine.busy_now = busy
-        self.machine.psi_cpu = 100.0 * max(0.0, demand - cap) / demand if demand > cap else 0.0
+        pressure = 100.0 * max(0.0, demand - cap) / demand if demand > cap else 0.0
+        # The daemon's busy cores and CPU pressure are ten-second averages (Machine.TAU, PSI avg10).
+        self.machine.busy += (busy - self.machine.busy) * AVERAGE
+        self.machine.busy_now = busy
+        self.machine.psi_cpu += (pressure - self.machine.psi_cpu) * AVERAGE
         queued = any(t.state == "queued" for t in self.daemon.tickets.values())
         if queued:
             self.events["idle_core_seconds"] += max(0.0, self.machine.ncpu * self.daemon.cfg.cpu_target - busy)
@@ -383,6 +399,9 @@ class Simulation:
             t = self.daemon.tickets.get(tid)
             if t is None or not spec.get("ci") or t.state in self.mod.FINISHED or t.cancel_requested:
                 continue
+            job = self.jobs.get(tid)
+            if job is not None and not job.alive and not job.discarded:
+                continue  # it finished this second; the daemon hasn't read its result yet
             if now - t.submitted >= float(spec.get("timeout_s", DEFAULT_TIMEOUT)):
                 self.events["ci_timed_out"] += 1
                 self.records[tid]["timed_out_queued"] = t.state == "queued"
@@ -425,10 +444,32 @@ class Simulation:
             rec["outcome"] = t.state
             rec["requeues"] = t.requeues
             rec["ci_stops"] = getattr(t, "ci_stops", 0)
+            rec["failed_stop"] = bool(t.shed_error)  # stopped for memory, and failed: it couldn't start over
+            rec["released"] = bool(getattr(t, "released", False))  # its hold let go past its peak
             rec["peak"] = max(int(t.mem_peak or 0), int(getattr(t, "attempts_peak", 0) or 0))
             d.close_jobserver(t)
         d.queries.shutdown()
         return summarize(self, s)
+
+
+def history_runs(spec: dict, key: str, lane: str, now: float, lane_cores: int) -> list[dict]:
+    """Three earlier runs of a build, as the daemon records them (see Daemon.finalize): granted its
+    lane's cores (or as many as it kept busy, if more), its peak measured with those."""
+    wall = float(spec["wall"])
+    avg = float(spec.get("avg_cores") or 1.0)
+    cores = max(1, math.ceil(avg), int(lane_cores))
+    peak = int(spec.get("history_peak", spec["peak_mem"]))
+    profile = spec.get("profile")
+    record = {"key": key, "lane": lane, "wall": wall, "exit": 0, "peak_mem": peak, "peak_cores": avg,
+              "avg_cores": avg, "granted": cores, "mem_cores": cores, "elastic": False, "cold": False, "oom": False,
+              "mem_high": 0}
+    if profile and "history_peak" not in spec:
+        top = max(range(len(profile)), key=lambda i: profile[i])
+        peak_at = wall * (top + 1) / len(profile)
+        later = [v for v in profile[top + 1:] if v]
+        record.update(peak_at=round(peak_at, 1), tail=(max(later) if later else 0) * MIB,
+                      peak_cpu=round(avg * peak_at, 1))
+    return [dict(record, t=round(now) - 3600 * (3 - i)) for i in range(3)]
 
 
 # ---- the summary
@@ -482,13 +523,16 @@ def summarize(sim: Simulation, seconds: int) -> dict:
                  **{f"lane:{lane}": wait_stats([r for r in records if r["lane"] == lane], end) for lane in lanes}},
         "ci_timed_out": sim.events["ci_timed_out"],
         "ci_timed_out_in_queue": sum(1 for r in records if r.get("timed_out_queued")),
-        "stops_for_memory": sum(max(0, (r.get("requeues") or 0) - (r.get("ci_stops") or 0)) for r in records),
+        "stops_for_memory": sum(max(0, (r.get("requeues") or 0) - (r.get("ci_stops") or 0)) + int(r.get("failed_stop", False))
+                                for r in records),
         "stops_for_ci": sum(r.get("ci_stops") or 0 for r in records),
         "stopped_run_s": round(sim.events["stopped_seconds"], 1),
         "cancelled_run_s": round(sim.events["cancelled_seconds"], 1),
         "oom_kills": {"own_cap": sim.events["own_cap_oom"], "machine": sim.events["machine_oom"]},
         "idle_core_s_while_waiting": round(sim.events["idle_core_seconds"], 1),
         "least_free_gib": round((sim.events["min_available"] or 0) / GIB, 1),
+        "below_floor_s": sim.events["below_floor_s"],
+        "released_after_peak": sum(1 for r in records if r.get("released")),
         "planned_over_peak": {"median": None if not ratios else round(percentile(ratios, 0.5), 2),
                               "under_planned": len(under)},
     }
@@ -507,7 +551,9 @@ def table(summary: dict) -> str:
                                                       f"{fmt_s(summary['cancelled_run_s'])}"),
              ("OOM kills (own cap / machine)", f"{summary['oom_kills']['own_cap']} / {summary['oom_kills']['machine']}"),
              ("idle core-seconds while waiting", f"{summary['idle_core_s_while_waiting']:.0f}"),
-             ("least memory free", f"{summary['least_free_gib']}G"),
+             ("least memory free, time below the floor", f"{summary['least_free_gib']}G, "
+                                                          f"{fmt_s(summary['below_floor_s'])}"),
+             ("holds let go past the peak", summary["released_after_peak"]),
              ("planned / peak (median), under-planned", f"{summary['planned_over_peak']['median']}, "
                                                         f"{summary['planned_over_peak']['under_planned']}"),
              ("outcomes", ", ".join(f"{k} {v}" for k, v in summary["outcomes"].items()))]
@@ -528,7 +574,9 @@ def fmt_s(seconds) -> str:
 
 # ---- running
 
-def load_scenario(name: str) -> dict:
+def load_scenario(name: str, seed_history: bool = False) -> dict:
+    """A built-in scenario, or a trace file. A trace starts with no history (every build planned at its
+    lane's default) unless seed_history gives each command three earlier runs of its own size."""
     if name in builtin.SCENARIOS:
         return builtin.SCENARIOS[name]()
     jobs = []
@@ -539,7 +587,8 @@ def load_scenario(name: str) -> dict:
     first = min((float(j["t"]) for j in jobs), default=0.0)
     for j in jobs:
         j["t"] = float(j["t"]) - first
-    return {"name": os.path.basename(name), "machine": dict(builtin.WORKSTATION), "jobs": jobs, "seed_history": False}
+    return {"name": os.path.basename(name), "machine": dict(builtin.WORKSTATION), "jobs": jobs,
+            "seed_history": seed_history}
 
 
 def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim", keep: str | None = None) -> tuple[dict, Simulation]:
@@ -556,7 +605,7 @@ def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim
 
 
 def cmd_run(args) -> int:
-    scenario = load_scenario(args.scenario)
+    scenario = load_scenario(args.scenario, args.seed_history)
     summary, sim = simulate(scenario, args.config, args.buildqd)
     if args.jobs:
         with open(args.jobs, "w") as f:
@@ -581,6 +630,7 @@ COMPARED = [  # (label, how to read it from a summary, lower is better)
     ("running time lost to stops", lambda s: s["stopped_run_s"], fmt_s),
     ("running time lost to cancels", lambda s: s["cancelled_run_s"], fmt_s),
     ("OOM kills", lambda s: s["oom_kills"]["own_cap"] + s["oom_kills"]["machine"], str),
+    ("time below the memory floor", lambda s: s["below_floor_s"], fmt_s),
     ("idle core-seconds while waiting", lambda s: s["idle_core_s_while_waiting"], lambda v: f"{v:.0f}"),
 ]
 
@@ -608,13 +658,15 @@ def cmd_compare(args) -> int:
     out = ["### buildq replay: head against base", ""]
     for name in names:
         try:
-            base, _ = simulate(load_scenario(name), args.base_config or args.config, args.base, name="buildqd_base")
+            base, _ = simulate(load_scenario(name, args.seed_history), args.base_config or args.config, args.base,
+                               name="buildqd_base")
         except ValueError as e:  # an older daemon that doesn't know a setting the configuration uses
             out += [f"#### {name}", "", f"The base daemon can't run this configuration ({e}); head only:", "",
-                    "```", table(simulate(load_scenario(name), args.config, args.head, name="buildqd_head")[0]),
+                    "```", table(simulate(load_scenario(name, args.seed_history), args.config, args.head,
+                                          name="buildqd_head")[0]),
                     "```", ""]
             continue
-        head, _ = simulate(load_scenario(name), args.config, args.head, name="buildqd_head")
+        head, _ = simulate(load_scenario(name, args.seed_history), args.config, args.head, name="buildqd_head")
         out += [compare_markdown(name, base, head), ""]
     text = "\n".join(out)
     print(text)
@@ -625,12 +677,17 @@ def cmd_compare(args) -> int:
 
 
 def cmd_check(args) -> int:
-    """Each scenario twice: the summaries must match byte for byte (CI's crash and determinism check)."""
+    """Each scenario twice, the second time in a process of its own with another hash seed: the
+    summaries must match byte for byte (CI's crash and determinism check)."""
     bad = 0
     for name in args.scenario or sorted(builtin.SCENARIOS):
-        a, _ = simulate(load_scenario(name), args.config, args.buildqd, name="buildqd_a")
-        b, _ = simulate(load_scenario(name), args.config, args.buildqd, name="buildqd_b")
-        same = json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+        a, _ = simulate(load_scenario(name, args.seed_history), args.config, args.buildqd, name="buildqd_a")
+        command = [sys.executable, os.path.abspath(__file__), "run", name, "--json", "--config", args.config,
+                   "--buildqd", args.buildqd] + (["--seed-history"] if args.seed_history else [])
+        seed = "0" if os.environ.get("PYTHONHASHSEED") != "0" else "1"
+        out = subprocess.run(command, env=dict(os.environ, PYTHONHASHSEED=seed), capture_output=True, text=True,
+                             check=True)
+        same = json.dumps(a, indent=1, sort_keys=True) == out.stdout.strip()
         print(f"{name}: {'same both times' if same else 'DIFFERENT between runs'}")
         bad += not same
     return 1 if bad else 0
@@ -654,6 +711,11 @@ def hashed(prefix: str, word: str) -> str:
 # test filter) is hashed.
 PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
     vitest tsc typecheck unittest pytest discover buildx compose image make ninja""".split())
+# Tools an anonymized trace names (a command's first word); any other first word is hashed.
+PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node vite vitest tsc vue-tsc eslint
+    playwright storybook python python3 pytest uv dotnet make gmake ninja cmake docker podman buildah bash sh
+    git go gradle mvn java""".split())
+PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 
 def export_rows(db: sqlite3.Connection, since: float | None, until: float | None, anonymize: bool) -> list[dict]:
@@ -707,8 +769,10 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
         if anonymize:
             entry["repo"] = hashed("r", entry["repo"])
             entry["caller"] = hashed("c", caller)
-            entry["argv"] = argv[:1] + [w if w.startswith("-") or w in PUBLIC_WORDS else hashed("w", w)
-                                        for w in argv[1:]]
+            entry["argv"] = [w if (w in PUBLIC_TOOLS if i == 0 else w.startswith("-") or w in PUBLIC_WORDS)
+                             else hashed("w", w) for i, w in enumerate(argv)]
+            if entry["lane"] and entry["lane"] not in PUBLIC_LANES:
+                entry["lane"] = hashed("l", entry["lane"])
             if "workspace" in entry:
                 entry["workspace"] = hashed("s", entry["workspace"])
             entry.pop("name", None)
@@ -745,6 +809,7 @@ def main(argv=None) -> int:
     r.add_argument("--json", action="store_true")
     r.add_argument("--jobs", help="write what happened to each build here (JSONL)")
     r.add_argument("--log", help="write the daemon's log here")
+    r.add_argument("--seed-history", action="store_true", help="a trace's commands start with a history of their size")
     c = sub.add_parser("compare", help="replay scenarios with two daemons (or two configs) and compare")
     c.add_argument("scenario", nargs="*")
     c.add_argument("--base", default=DEFAULT_BUILDQD)
@@ -752,10 +817,12 @@ def main(argv=None) -> int:
     c.add_argument("--config", default=DEFAULT_CONFIG, help="the head's configuration (and the base's, by default)")
     c.add_argument("--base-config")
     c.add_argument("--summary-file", help="also append the table here ($GITHUB_STEP_SUMMARY)")
+    c.add_argument("--seed-history", action="store_true")
     k = sub.add_parser("check", help="replay each scenario twice; fail if the summaries differ")
     k.add_argument("scenario", nargs="*")
     k.add_argument("--config", default=DEFAULT_CONFIG)
     k.add_argument("--buildqd", default=DEFAULT_BUILDQD)
+    k.add_argument("--seed-history", action="store_true")
     e = sub.add_parser("export", help="write a trace from a buildq metrics.db (never commit a real one)")
     e.add_argument("--db", required=True)
     e.add_argument("--since", help="epoch seconds, or YYYY-MM-DDTHH:MM local time")

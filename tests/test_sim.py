@@ -3,6 +3,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import io
 import sqlite3
 import sys
 import tempfile
@@ -56,8 +57,8 @@ class SimCase(unittest.TestCase):
         with open(CONFIG) as f:
             text = f.read()
         for key, value in changes.items():
-            line = next(l for l in text.splitlines() if l.startswith(f"{key} ="))
-            text = text.replace(line, f"{key} = {value}")
+            line = next((l for l in text.splitlines() if l.startswith(f"{key} =")), None)
+            text = text.replace(line, f"{key} = {value}") if line else f"{key} = {value}\n{text}"  # (before any table)
         path = os.path.join(self.tmp.name, f"config-{len(os.listdir(self.tmp.name))}.toml")
         with open(path, "w") as f:
             f.write(text)
@@ -150,6 +151,56 @@ class Replay(SimCase):
         self.assertFalse(summary["complete"])
         self.assertEqual(summary["makespan_s"], 60)
 
+    def test_re_planning_a_build_that_outgrows_its_estimate_keeps_the_floor(self):
+        results = {}
+        for outgrown in (True, False):
+            state = tempfile.mkdtemp(dir=self.tmp.name)
+            s = sim.Simulation(scenarios.outgrows_estimate(), CONFIG, BUILDQD, state, name=f"buildqd_og{outgrown}")
+            if not outgrown:
+                s.mod.Daemon.outgrown = lambda daemon, t: None  # a daemon without it
+            results[outgrown] = s.run()
+        self.assertEqual(results[True]["below_floor_s"], 0)
+        self.assertGreater(results[False]["below_floor_s"], 0)  # so a change that loses it shows
+
+    def test_past_the_peak_lets_holds_go(self):
+        on = self.run_sim(scenarios.ci_behind_agents()["jobs"])
+        off = self.run_sim(scenarios.ci_behind_agents()["jobs"], self.config(release_after_peak="false"))
+        self.assertGreater(on["released_after_peak"], 0)
+        self.assertEqual(off["released_after_peak"], 0)
+
+    def test_memory_running_short_stops_a_build_and_queues_it_again(self):
+        # Their history says 3 GB; they use 22 GB each, on a machine with room for two of them.
+        jobs = [scenarios.build(i * 5, ("cargo", "build", "-p", f"c{i}"), 22, 600, 4, shape=(0.2, 0.6, 1, 1, 1, 1, 1, 1, 1, 1),
+                                repo="app", caller=f"s{i}", workspace=f"w{i}", history=True, history_peak=3 * GIB)
+                for i in range(4)]
+        summary = self.run_sim(jobs, mem_total=80 * GIB, background_mem=0)
+        self.assertGreater(summary["stops_for_memory"], 0)
+        self.assertEqual(summary["oom_kills"]["machine"], 0)
+        self.assertEqual(summary["outcomes"], {"succeeded": 4})
+        off = self.run_sim(jobs, self.config(shed_memory="false"), mem_total=80 * GIB, background_mem=0)
+        self.assertGreater(off["oom_kills"]["machine"], 0)  # nothing gives memory back: the kernel kills
+
+    def test_compare_shows_the_head_alone_when_the_base_cant_load_the_configuration(self):
+        trace = os.path.join(self.tmp.name, "one.jsonl")
+        with open(trace, "w") as f:
+            f.write(json.dumps(scenarios.build(0, ("cargo", "build"), 2, 30, 2, repo="app")) + "\n")
+        with open(CONFIG) as f:
+            text = f.read()
+        bad = os.path.join(self.tmp.name, "unknown.toml")
+        with open(bad, "w") as f:
+            f.write("not_a_setting = 1\n" + text)
+        args = sim.argparse.Namespace(scenario=[trace], base=BUILDQD, head=BUILDQD, config=CONFIG, base_config=bad,
+                                      summary_file=None, seed_history=False)
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            sim.cmd_compare(args)
+        self.assertIn("can't run this configuration", out.getvalue())
+
+    def test_a_lane_the_configuration_doesnt_have_falls_to_the_lane_rules(self):
+        jobs = [scenarios.build(0, ("cargo", "check"), 1, 30, 1, lane="l123abc", repo="app")]
+        _, s = sim.simulate(scenario(jobs), CONFIG, BUILDQD, name="buildqd_lane")
+        (t,) = s.daemon.tickets.values()
+        self.assertEqual((t.lane, t.state), ("check", "succeeded"))
+
     def test_the_built_in_scenarios_load(self):
         for name, make in scenarios.SCENARIOS.items():
             s = make()
@@ -169,7 +220,11 @@ class Export(SimCase):
                 ("b", 2000, 960, "secretrepo|web|pnpm vitest", None, None, "web", "session-x", 0, 120.0, GIB,
                  None, 2.0, 1, "failed", None, 0, 120.0),
                 ("c", 3000, 1000, "secretrepo|heavy|python3 private_script.py", None, None, "heavy", "s", 0, 1000.0,
-                 GIB, json.dumps([1] * 10), 1.0, None, "cancelled", None, 2, None)]
+                 GIB, json.dumps([1] * 10), 1.0, None, "cancelled", None, 2, None),
+                ("d", 3100, 1010, "secretrepo|clientlane|deploy-acmeclient.sh acmeprod", None, None, "clientlane", "s",
+                 0, 10.0, GIB, None, 1.0, 0, "succeeded", None, 0, 10.0),
+                ("e", 3200, 1020, "secretrepo|heavy|make acme-firmware flash -j8", None, None, "heavy", "s", 0, 10.0,
+                 GIB, None, 1.0, 0, "succeeded", None, 0, 10.0)]
         db.executemany("INSERT INTO build (id, ended, submitted, key, label, name, lane, caller, from_ci, wall, "
                        "mem_peak, profile, avg_cores, exit, state, repo, requeues, attempt_wall) "
                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
@@ -177,7 +232,7 @@ class Export(SimCase):
 
     def test_a_metrics_db_becomes_a_trace(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=False)
-        self.assertEqual([e["t"] for e in out], [0.0, 60.0, 100.0])
+        self.assertEqual([e["t"] for e in out], [0.0, 60.0, 100.0, 110.0, 120.0])
         self.assertEqual(out[0]["argv"], ["cargo", "test", "-p", "private-crate"])
         self.assertEqual((out[0]["ci"], out[0]["lane"], out[0]["profile"]), (True, "heavy", [100, 200, 300]))
         self.assertEqual((out[1]["ci"], out[1]["exit"], out[1]["peak_mem"]), (False, 1, GIB))
@@ -189,8 +244,11 @@ class Export(SimCase):
     def test_anonymized_traces_name_nothing(self):
         out = sim.export_rows(self.metrics(), None, None, anonymize=True)
         text = json.dumps(out)
-        for word in ("secretrepo", "private-crate", "private_script", "runner-9", "session-x", "ci:", "someone"):
+        for word in ("secretrepo", "private-crate", "private_script", "runner-9", "session-x", "ci:", "someone",
+                     "acme", "clientlane"):
             self.assertNotIn(word, text)
+        self.assertEqual(out[4]["argv"][0], "make")  # a public tool
+        self.assertEqual(out[4]["argv"][3], "-j8")  # and options stay
         self.assertEqual(out[0]["argv"][:3], ["cargo", "test", "-p"])  # the tool, its subcommand and options stay
 
     def test_an_exported_trace_replays(self):
@@ -199,8 +257,8 @@ class Export(SimCase):
             for entry in sim.export_rows(self.metrics(), None, None, anonymize=True):
                 f.write(json.dumps(entry) + "\n")
         summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_trace")
-        self.assertEqual(summary["builds"], 3)
-        self.assertEqual(summary["outcomes"], {"failed": 2, "succeeded": 1})
+        self.assertEqual(summary["builds"], 5)
+        self.assertEqual(summary["outcomes"], {"failed": 2, "succeeded": 3})
 
 
 
