@@ -3173,6 +3173,14 @@ class Keys(unittest.TestCase):
         self.assertEqual(words("bash", "run.sh", "build"), "bash run.sh")
         self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh build"), self.words("bash", "-lc", "persistent-cargo-target.sh build"))
         self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")
+        # only a script that comes straight after the interpreter: not a command string or an option's value
+        self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh", "hunter"),
+                         self.words("bash", "-lc", "persistent-cargo-target.sh", "hunter"))
+        self.assertEqual(" ".join(buildqd.command_words(["node", "--require", "preload.js", "hunter"],
+                                                        frozenset({"preload.js"}))),
+                         self.words("node", "--require", "preload.js", "hunter"))
+        # a later -m doesn't stand in for the label
+        self.assertNotEqual(words(*wrapper, "architecture", "-m", "fast"), words(*wrapper, "rust-tests", "-m", "fast"))
 
     def test_labelled_scripts_are_configured(self):
         cfg = buildqd.Config({"script_labels": ["persistent-cargo-target.sh"]}, 64 * GIB, 16)

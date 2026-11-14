@@ -1192,12 +1192,12 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
             words += [os.path.basename(p) for p in pos[:1]] + module
             # A script named in script_labels takes a label as the argument right after it, naming
             # what it runs (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are
-            # different builds of different sizes). Only there, and only a plain lowercase word:
-            # nothing that could be a path, a value or a secret reaches a key.
-            if not module and pos[:1] and os.path.basename(pos[0]) in labels:
-                after = rest[rest.index(pos[0]) + 1:][:1]
-                if after and SCRIPT_WORD.fullmatch(after[0]):
-                    words.append(after[0])
+            # different builds of different sizes). Only when the script comes straight after the
+            # interpreter (`bash wrap.sh label`: not a command string, `-lc wrap.sh`, or an option's
+            # value, `--require wrap.js`), and only a plain lowercase word.
+            if rest[1:] and not rest[0].startswith("-") and os.path.basename(rest[0]) in labels \
+                    and SCRIPT_WORD.fullmatch(rest[1]):
+                words.append(rest[1])
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
     else:

@@ -571,9 +571,10 @@ repository, lane and command (`<repository>|<lane>|<command words>`, where the r
 name of its main checkout's folder, `filedrop` for a runner's `_work/filedrop/filedrop`), so run it
 from a checkout whose folder has the same name, with the same `--lane` and the same command. The
 command words are the tool and what it runs: cargo's subcommand and packages, a JS tool's script, a
-script's name. A script listed in `script_labels` also gets the argument right after it, when that is
-a plain lowercase word: `bash persistent-cargo-target.sh architecture`, for a wrapper whose runs
-differ by that label.
+script's name. A script listed in `script_labels` and run straight after its interpreter also gets
+the argument right after it, when that is a plain lowercase word: `bash persistent-cargo-target.sh
+architecture`, for a wrapper whose runs differ by that label. Listing a script trusts that argument
+to be a public label, since it is kept in the history.
 
 ## Limitations
 
