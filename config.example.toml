@@ -110,7 +110,7 @@ github_status = false
 metrics = true
 
 # Let go of the room held for a running build's peak once it is clearly past it, keeping what its
-# command's runs used after their peaks (README, "Past the peak"). "shadow" (the default) works it
+# command's runs used after their peaks (docs/scheduling.md, "Past the peak"). "shadow" (the default) works it
 # out and records it in the analytics without letting go: turn it on (true) once
 # `buildq report --capacity` shows no build going past what would have been kept. false: off.
 # A lane can opt out with release_after_peak = false (do that for docker build: dockerd holds the memory).
@@ -243,7 +243,7 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # match = "^(docker|podman) (build|buildx|compose)"
 # lane = "image"
 
-# CI steps that run through the queue (see "CI jobs" in the README) can have a lane of their own,
+# CI steps that run through the queue (see docs/ci.md) can have a lane of their own,
 # chosen with `buildq run --lane ci`:
 #
 # [lanes.ci]

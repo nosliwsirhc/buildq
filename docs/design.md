@@ -1,6 +1,6 @@
 # Design
 
-How buildq works inside. The README covers installing and using it.
+How buildq works inside. The [README](../README.md) covers installing it, and [Using buildq](usage.md) using it.
 
 ## The pieces
 
@@ -259,7 +259,7 @@ up to its want of whatever is free. *Want* comes from history:
 The largest want among recent runs counts, clamped to the lane's `min_cores` and `max_cores`. A
 cold cargo build wants `max_cores`. A rigid build gets no jobserver, and its minimum is its want.
 
-The cores reach the build through its environment (see the README), and, unless the caller brought
+The cores reach the build through its environment (see [Cores](scheduling.md#cores)), and, unless the caller brought
 its own `MAKEFLAGS`, through a jobserver: a FIFO in the ticket's directory, named in
 `CARGO_MAKEFLAGS` (and, for ninja and a `make -j`, in `MAKEFLAGS`, with the command's `-j` removed)
 as `--jobserver-auth=fifo:PATH`. It holds `granted − 1` tokens, since every client of a jobserver has
