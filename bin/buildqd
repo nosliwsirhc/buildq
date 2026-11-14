@@ -401,7 +401,7 @@ class Config:
                                                      for x in scripts):
             raise ValueError("restartable_scripts must be a list of script file names, such as "
                              "[\"run-api-tests.sh\"]")
-        tools = [x for x in scripts if x in NOT_SCRIPTS or re.fullmatch(r"python3(\.\d+)?", x)]
+        tools = [x for x in scripts if x in NOT_SCRIPTS or NOT_SCRIPT_PATTERN.fullmatch(x)]
         if tools:
             raise ValueError(f"restartable_scripts names scripts, not tools: {', '.join(sorted(tools))} "
                              "would make anything run with them restartable")
@@ -1207,7 +1207,11 @@ INTERPRETERS = {"python", "python3", "node", "deno", "ruby", "perl", "bun"}
 NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | {"env", "timeout", "git", "cargo", "rustc", "dotnet", "make",
                                                     "gmake", "ninja", "cmake", "docker", "podman", "buildah",
                                                     "npm", "pnpm", "yarn", "npx", "pnpx", "bunx", "kubectl", "aws",
-                                                    "gh", "ssh", "scp", "rsync", "curl", "wget"})
+                                                    "gh", "ssh", "scp", "rsync", "curl", "wget", "xargs",
+                                                    "parallel", "busybox", "uv", "uvx", "just", "mvn", "gradle",
+                                                    "gradlew", "go", "terraform", "pytest", "jest", "sbt"})
+# (and any versioned interpreter: python2, python3.12, pypy3, node22, ruby3 …; the list can't be complete)
+NOT_SCRIPT_PATTERN = re.compile(r"(python|pypy|node|ruby|perl|php|lua)[0-9.]*")
 JS_TOOLS = {"npm", "pnpm", "yarn", "npx", "pnpx", "bunx"}
 CARGO_VALUE_OPTIONS = {"--manifest-path", "--target-dir", "-j", "--jobs", "--color", "--config",
                        "-Z", "--profile", "--target", "-F", "--features", "--bin", "--test",
@@ -1225,13 +1229,21 @@ def strip_wrappers(argv: list[str]) -> list[str]:
         if ASSIGNMENT.match(t[0]):
             t = t[1:]
         elif head == "env":
+            # As GNU env reads it: options up to `--` or the first word that isn't one, then
+            # assignments, then the command. Only options without a value are read through; any
+            # other (-u NAME, -C DIR, -a NAME, -S STRING, grouped or abbreviated) leaves env as the
+            # command, unread, rather than risk taking an option's value for it.
             rest = t[1:]
-            while rest and (rest[0].startswith("-") or ASSIGNMENT.match(rest[0])):
+            while rest and rest[0].startswith("-") and rest[0] != "-":
                 option = rest.pop(0)
-                if option in ("-u", "--unset", "-C", "--chdir", "-P") and rest:
-                    rest.pop(0)  # its operand: a variable's name, a folder, a path (not the command)
-                elif option in ("-S", "--split-string") or option.startswith(("--split-string=", "-S")):
-                    return t  # the command is inside a string: leave it unread (env stays the tool)
+                if option == "--":
+                    break
+                if not (option in ("--ignore-environment", "--null", "--debug") or re.fullmatch(r"-[i0v]+", option)):
+                    return t
+            if rest[:1] == ["-"]:  # (env - …: the same as -i)
+                rest = rest[1:]
+            while rest and ASSIGNMENT.match(rest[0]):
+                rest = rest[1:]
             t = rest
         elif head == "timeout":
             t = t[1:]
@@ -1444,27 +1456,79 @@ def no_emit(args: list[str]) -> bool:
     return on
 
 
+SURE_WRAPPERS = {"nice", "ionice", "nohup", "setsid", "stdbuf", "time", "command", "exec", "sudo", "doas"}
+
+
+def plainly(argv: list[str]) -> list[str] | None:
+    """The command, if it can be read for certain: past leading assignments, `env` with nothing but
+    assignments, `timeout DURATION` and the wrappers in SURE_WRAPPERS, none of them given an
+    option. None for anything else, whose options might take a value that could be read as the
+    command (`env -iu wrap.sh bash deploy.sh` runs deploy.sh)."""
+    t = list(argv)
+    while t:
+        head = os.path.basename(t[0])
+        if ASSIGNMENT.match(t[0]):
+            t = t[1:]
+        elif head == "env":
+            t = t[1:]
+            while t and ASSIGNMENT.match(t[0]):
+                t = t[1:]
+            if t[:1] and t[0].startswith("-"):
+                return None
+        elif head == "timeout":
+            if len(t) < 3 or t[1].startswith("-"):
+                return None
+            t = t[2:]
+        elif head in SURE_WRAPPERS or head in WRAPPERS:
+            if head not in SURE_WRAPPERS or (t[1:2] and t[1].startswith("-")):
+                return None
+            t = t[1:]
+        else:
+            return t
+    return None
+
+
+def listed_script(argv: list[str], scripts) -> list[str] | bool | None:
+    """For a script named in restartable_scripts, read for certain (plainly) and run directly or
+    straight after its interpreter: True, or, if it runs the command after its `--` (a wrapper that
+    sets up a target folder, say), that command, which decides. None if it isn't one. A `--`
+    followed by an option (`run-tests.sh -- --nocapture`) passes arguments, not a command."""
+    t = plainly(argv)
+    if not t:
+        return None
+    tool, args = os.path.basename(t[0]), t[1:]
+    if tool in scripts:
+        script_args = args
+    elif (tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS) and args[:1] \
+            and not args[0].startswith("-") and os.path.basename(args[0]) in scripts:
+        script_args = args[1:]
+    else:
+        return None
+    if "--" in script_args:
+        command = script_args[script_args.index("--") + 1:]
+        if not command or not command[0].startswith("-"):
+            return command  # (empty: nothing to run, so no)
+    return True
+
+
 def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> bool:
     """A command that can be stopped and started again from the beginning without doing anything
     twice: a compile or a test run of cargo, dotnet, tsc, eslint or vitest, or a script named in
-    restartable_scripts (run directly, or straight after its interpreter: `bash wrap.sh …`). Any
+    restartable_scripts (see listed_script; a wrapper is only as safe as the command it runs). Any
     other script might upload or push before it compiles, so it is stopped and failed instead
     (unless --restartable)."""
-    tool, args = _tool_and_args(argv)
-    if scripts:
-        script_args = None
-        if tool in scripts:
-            script_args = args  # run directly: ./wrap.sh, /path/to/wrap.sh
-        elif (tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS) and args[:1] \
-                and not args[0].startswith("-") and os.path.basename(args[0]) in scripts:
-            script_args = args[1:]
-        if script_args is not None:
-            # A listed script that runs the command after its `--` (a wrapper that sets up a target
-            # folder, say) is only as safe as that command: `wrap.sh -- git push` isn't.
-            if "--" in script_args:
-                command = script_args[script_args.index("--") + 1:]
-                return bool(command) and restart_safe(command, scripts)
+    for _ in range(8):  # (a wrapper running a wrapper: at most this deep)
+        inner = listed_script(argv, scripts) if scripts else None
+        if inner is None:
+            break
+        if inner is True:
             return True
+        if not inner:
+            return False
+        argv = inner
+    else:
+        return False
+    tool, args = _tool_and_args(argv)
     if tool == "cargo":
         words = command_words(["cargo", *args])
         return (words[1] if len(words) > 1 else "") in RESTART_CARGO

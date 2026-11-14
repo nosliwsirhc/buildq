@@ -40,7 +40,8 @@ your tool call's time limit.
 - Submit a script that only builds and runs tests with `--restartable` (`buildq run --restartable --
   bash run.sh`, or the wrapper this machine's notes name). buildq can't see inside a script, so
   without it a script stopped for memory fails instead of being started over, and it can never be
-  stopped to let a waiting CI job's build in (unless this machine lists it in `restartable_scripts`).
+  stopped to let a waiting CI job's build in (unless this machine lists it in `restartable_scripts`;
+  this machine's notes below say which scripts, if any).
   Plain `cargo build`/`test`, `dotnet build`/`test`, `tsc`, `eslint` and `vitest` need nothing;
   package scripts (`pnpm test`, `npm run …`) are scripts. Mark one only after reading it and what it
   calls, and never one that pushes, commits, tags, uploads, deploys, sends, or changes anything outside

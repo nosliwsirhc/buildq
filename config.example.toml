@@ -83,8 +83,10 @@ make_room_for_ci = "0"
 # `cargo test` is, without each caller passing --restartable. Only when the script is run directly
 # or straight after its interpreter (`bash ci/wrap.sh …`), not inside `bash -c "…"`. A listed script
 # that runs the command after its `--` (a wrapper) counts only if that command does. By file name:
-# every script of that name counts, wherever it is. List only scripts that never push, commit,
-# upload, deploy, send or change anything outside their own build output; tool names are refused.
+# every script of that name counts, wherever it is; and only when buildq can read the command for
+# certain (a wrapper given options, such as `nice -n 5` or `env -u X`, isn't read through). List
+# only scripts that never push, commit, upload, deploy, send or change anything outside their own
+# build output. Common tool names are refused, but the list of them can't be complete.
 # restartable_scripts = ["persistent-cargo-target.sh"]
 
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its
