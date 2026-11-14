@@ -128,8 +128,9 @@ build (scripts that call them too), `false` for none. A build gets none when its
 recipe exports, is no setting), or when its history shows it ignores the job count. A jobserver an
 outer make passed by file descriptor (`--jobserver-auth=R,W`) doesn't count: those descriptors don't
 reach the build, so buildq drops it, with its `-j`, keeps the caller's other make flags (and any
-variable assignments after their `--`, as written), and gives the build its own, unless a `-j` or
-jobserver of the caller's is still left in those options (a `-j` inside an assignment, such as
+variable assignments after their `--`, as written; options are split into words as make splits
+them, so an escaped space in a directory name stays in its word), and gives the build its own,
+unless a `-j` or jobserver of the caller's is still left in those options (a `-j` inside an assignment, such as
 `SUBMAKE=make\ -j4`, is a value, not a setting). A make or ninja build
 whose caller's make ran in parallel that way gets buildq's jobserver in `MAKEFLAGS`, with or without
 a `-j` of its own. Every five seconds buildq hands idle cores to

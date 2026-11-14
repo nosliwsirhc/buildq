@@ -1044,6 +1044,14 @@ class InlineExecutor:
 
 MAKE_FLAG_VARS = ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")
 FD_JOBSERVER = re.compile(r"--jobserver-(?:auth|fds)=-?\d+,-?\d+")
+# A word of make flags as make splits them: whitespace ends a word unless a backslash escapes it (a
+# directory with a space in it is written `-Ia\ b`), and a backslash escapes the character after it.
+MAKE_WORD = re.compile(r"(?:\\[\s\S]|[^\s\\])+|\\")
+
+
+def make_words(flags: str) -> list[str]:
+    """Make flags split into words as make splits them (MAKE_WORD), each kept exactly as written."""
+    return MAKE_WORD.findall(flags)
 
 
 def split_make_flags(flags: str) -> tuple[str, str | None]:
@@ -1065,7 +1073,7 @@ def without_fd_jobserver(flags: str) -> str | None:
     instead. A fifo jobserver (fifo:PATH) can still be opened there, so it is left alone. Only the
     options before a `--` are looked at; the assignments after it are kept as they are."""
     options, assignments = split_make_flags(flags)
-    words = options.split()
+    words = make_words(options)  # (an escaped space or tab stays in its word, as written: #37)
     if not any(FD_JOBSERVER.fullmatch(w) for w in words):
         return None
     kept = " ".join(w for w in words if not FD_JOBSERVER.fullmatch(w) and not re.fullmatch(r"-j\d*", w))
@@ -1076,7 +1084,7 @@ def with_make_flags(flags: str, more: str) -> str:
     """Make flags with more options added: before a `--` and the variable assignments after it
     (kept exactly as written), or make would take the options for targets."""
     options, assignments = split_make_flags(flags)
-    head = " ".join(x for x in (options.strip(), more.strip()) if x)
+    head = " ".join(make_words(options) + make_words(more))  # (an escaped trailing space stays: #37)
     return head if assignments is None else f"{head} -- {assignments}".lstrip()
 
 
@@ -4435,7 +4443,8 @@ class Daemon:
             # `--`, such as SUBMAKE=make\ -j4, is a variable's value, not make's own setting).
             callers_own = any(k in env and str(env[k]).strip()
                               and (k not in cleaned
-                                   or re.search(r"(?:^|\s)-j|--jobserver", split_make_flags(cleaned[k])[0]))
+                                   or any(w.startswith(("-j", "--jobserver"))  # a whole word, not a path's (#37)
+                                          for w in make_words(split_make_flags(cleaned[k])[0])))
                               for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
             if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
