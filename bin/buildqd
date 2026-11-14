@@ -3707,11 +3707,7 @@ class Daemon:
         if any(t.cancel_requested and not t.flock for t in self.active()):
             return  # a cancelled build (a CI job past its time limit, say) is giving its memory back: wait for it
         running = self.active()
-        # Read again rather than this tick's sample: a build that ended in check() since has given its
-        # memory back, and stopping one for it would be for nothing.
-        read = getattr(self.machine, "read_available", None)
-        available = read() if read is not None else self.machine.mem_available
-        free_now = available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
+        free_now = None
         for ci in self.queue(now):
             if not (ci.from_ci and ci.short_by > 0 and now - ci.submitted >= wait
                     and not self.lane(ci.lane).may_pass_held  # it holds no room: what is freed could go elsewhere
@@ -3721,6 +3717,13 @@ class Daemon:
                 continue  # it waits partly behind agents' builds that have waited longer: they go first (#38)
             # What it lacks now, after the builds this pass started (one in a lane that passes held
             # room may have taken what was free), with the room still held ahead of it.
+            if free_now is None:
+                # Read again rather than this tick's sample (only once a CI build is due): a build that
+                # ended in check() since has given its memory back, and stopping one for it would be
+                # for nothing.
+                read = getattr(self.machine, "read_available", None)
+                available = read() if read is not None else self.machine.mem_available
+                free_now = available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
             short = ci.est_mem - (free_now - ci.short_hm)
             if short <= 0:
                 continue  # it fits: it starts on the next pass
