@@ -2103,6 +2103,34 @@ class GitHubStatuses(DaemonCase):
                 first = place(os.path.join(on_path, "gh"))
                 self.assertEqual(buildqd.find_gh(), first)  # PATH before both
 
+    def test_the_gh_setting_is_used_ahead_of_the_search(self):
+        script = os.path.join(self.tmp.name, "my-gh")
+        with open(script, "w") as f:
+            f.write(f"#!/bin/sh\necho \"$*\" >> {self.calls_file}\n")
+        os.chmod(script, 0o755)
+        self.daemon.gh = None  # nothing stood in: the configuration decides
+        self.daemon.cfg.gh = script
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        with mock.patch.object(buildqd, "find_gh", side_effect=AssertionError("searched")):
+            self.drain(self.now + 60)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("state=success", self.calls()[0])
+
+    def test_the_gh_setting_must_name_an_executable_by_its_full_path(self):
+        script = os.path.join(self.tmp.name, "gh")
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(script, 0o755)
+        self.assertEqual(buildqd.Config({"gh": script}, 64 * GIB, 16).gh, script)
+        self.assertEqual(buildqd.Config({"gh": script}, 64 * GIB, 16).summary()["gh"], script)
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).gh, "")
+        os.chmod(script, 0o644)
+        for bad in ("gh", "bin/gh", os.path.join(self.tmp.name, "missing"), script):
+            with self.assertRaises(ValueError, msg=bad):
+                buildqd.Config({"gh": bad}, 64 * GIB, 16)
+
     def test_gh_that_cant_run_is_logged_once_and_tried_again_later(self):
         self.daemon.gh = [os.path.join(self.tmp.name, "no-such-gh")]
         for argv in (("cargo", "test"), ("cargo", "check")):

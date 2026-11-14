@@ -82,7 +82,7 @@ cd buildq
 ```
 
 `install.sh` does the following:
-- puts `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` in `~/.local/bin` (`PREFIX` changes that);
+- puts `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` in `~/.local/bin` (`PREFIX` changes that), with the Python it checked written into them (`PYTHON` chooses it; a virtualenv's is replaced by the Python it was made from), so a different `python3` on `PATH` later can't break them;
 - writes `~/.config/buildq/config.toml` if there isn't one;
 - installs `buildq.socket`, `buildq.service` and `buildq.slice` into `~/.config/systemd/user`, with a fixed memory backstop for all builds together (75%/85% of memory, in `buildq.slice.d`);
 - starts the daemon.
@@ -157,6 +157,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | Limitation | What it means |
 | --- | --- |
 | **One machine and one user** | The socket is private to the user who runs the daemon. Several users each need their own daemon, and those daemons don't coordinate, though each sees the others' load in the machine-wide numbers. |
+| **The user is the trust boundary** | Every process of that user can submit, list, watch, cancel and pause every build, CI jobs under the same user included, and can read a queued build's environment until it starts. Where a CI runner runs code you don't trust, run it as a separate user (with its own daemon) rather than through this one. [Design, Security](docs/design.md#security) |
 | **Estimates, not guarantees** | A command that suddenly needs far more than before is planned by its history. Per-build `MemoryMax` and the slice backstop are what keep that from hurting the machine. |
 | **Sampling** | Memory is sampled once a second from the build's cgroup (anonymous memory, shared memory and unreclaimable kernel memory; page cache is left out because the kernel can take it back). A spike shorter than a second can be missed. |
 | **Work outside the build's cgroup** | Anything a build hands to a daemon runs in that daemon's cgroup: a test database in Docker, and above all `docker build`, whose compile runs in dockerd. It counts as machine load but not in the build's history, so give such commands a lane whose `min_mem` is what they really need, and route them there with a lane rule. (That is why the shims leave `docker` alone.) |

@@ -260,6 +260,7 @@ DEFAULTS = {
     "shed_memory": True,
     "reuse_window": "2h",
     "github_status": False,
+    "gh": "",
     "metrics": True,
     "release_after_peak": "shadow",
     "env": {},
@@ -397,6 +398,10 @@ class Config:
         self.shed_memory = boolean(d["shed_memory"], "shed_memory")
         self.reuse_window = parse_duration(d["reuse_window"]) if d["reuse_window"] not in (0, "0", "", None) else 0.0
         self.github_status = boolean(d["github_status"], "github_status")
+        gh = os.path.expanduser(str(d["gh"] or ""))
+        if gh and not (os.path.isabs(gh) and os.path.isfile(gh) and os.access(gh, os.X_OK)):
+            raise ValueError(f"gh must be the full path of an executable gh: {gh!r}")
+        self.gh = gh
         self.metrics = boolean(d["metrics"], "metrics")
         rap = d["release_after_peak"]
         self.release_after_peak = "shadow" if rap == "shadow" else boolean(rap, "release_after_peak")
@@ -470,7 +475,7 @@ class Config:
             "slice_guard": self.slice_guard,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
             "max_log": self.max_log, "shed_memory": self.shed_memory, "reuse_window": self.reuse_window,
-            "github_status": self.github_status, "metrics": self.metrics,
+            "github_status": self.github_status, "gh": self.gh, "metrics": self.metrics,
             "release_after_peak": self.release_after_peak,
             "lanes": {name: lane.summary() for name, lane in self.lanes.items()},
             "lane_rules": [[rule.pattern, lane] for rule, lane in self.lane_rules],
@@ -3715,7 +3720,7 @@ class Daemon:
             if any(p.get("where") == post.get("where") and (p.get("order") or [0, ""]) > (post.get("order") or [0, ""])
                    for p in self.status_posts):
                 continue  # a newer result for it is queued
-            command = [*(self.gh or [find_gh()]), "api", "--method", "POST", f"repos/{post['repo']}/statuses/{post['sha']}",
+            command = [*(self.gh or [self.cfg.gh or find_gh()]), "api", "--method", "POST", f"repos/{post['repo']}/statuses/{post['sha']}",
                        "-f", f"state={post['state']}", "-f", f"context={post['context']}",
                        "-f", f"description={post['description']}"]
             try:
@@ -3723,7 +3728,8 @@ class Daemon:
                                         start_new_session=True)
             except OSError as e:
                 if not self.gh_unrunnable:  # once, not once per result every ten minutes
-                    where = " (it isn't on PATH, in ~/.local/bin or in ~/bin)" if command[0] == "gh" else ""
+                    where = (" (it isn't on PATH, in ~/.local/bin or in ~/bin; the gh setting names it)"
+                             if command[0] == "gh" else "")
                     log(f"can't run gh to tell GitHub a build's result{where}: {e}")
                     self.gh_unrunnable = True
                 post["next"] = now + 600

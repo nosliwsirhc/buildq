@@ -20,7 +20,8 @@
 #                                installed: `buildq help agents` prints it.)
 #   ./install.sh --uninstall     stop and remove it all (keeps ~/.config/buildq and ~/.local/state/buildq)
 #
-# PREFIX (default ~/.local) sets where the programs go.
+# PREFIX (default ~/.local) sets where the programs go. PYTHON (default: python3 on PATH) sets the
+# interpreter they run with; it is written into them, so a different python3 on PATH later doesn't matter.
 set -euo pipefail
 
 prefix=${PREFIX:-$HOME/.local}
@@ -103,7 +104,7 @@ have_systemd() { command -v systemctl >/dev/null && systemctl --user show-enviro
 
 # Sets or clears build.rustc-wrapper in a cargo configuration, leaving everything else alone.
 rustc_wrapper() {
-  python3 - "$cargo_config" "$1" <<'EOF'
+  "${python:-python3}" - "$cargo_config" "$1" <<'EOF'
 import os, re, sys, tomllib
 path, wrapper = sys.argv[1], sys.argv[2]
 text = open(path).read() if os.path.exists(path) else ""
@@ -176,15 +177,31 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
-  { say "buildq needs Python 3.11 or newer."; exit 1; }
+# The interpreter the installed programs run with, written into their first line, so a different
+# python3 first on PATH later (a project's virtualenv) can't break them. PYTHON=... chooses it; a
+# virtualenv's is replaced by the Python it was made from, which outlives it. The path is kept as
+# found (/usr/bin/python3, not the python3.N it links to), so a distribution upgrade keeps it working.
+python=${PYTHON:-$(command -v python3 || true)}
+[[ -n "$python" && -x "$python" ]] || { say "buildq needs Python 3.11 or newer (no python3 found; PYTHON=... names one)."; exit 1; }
+python=$(cd "$(dirname "$python")" && pwd)/$(basename "$python")
+"$python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
+  { say "buildq needs Python 3.11 or newer ($python is older; PYTHON=... names another)."; exit 1; }
+base=$("$python" -c 'import os, sys; print(os.path.join(sys.base_prefix, "bin", "python3") if sys.prefix != sys.base_prefix else "")')
+if [[ -n "$base" ]]; then
+  [[ -x "$base" ]] || { say "$python is in a virtualenv, and its base Python ($base) isn't there; PYTHON=... names one."; exit 1; }
+  python=$base
+fi
 [[ -r /proc/stat && -r /proc/meminfo ]] || { say "buildq needs Linux (/proc/stat, /proc/meminfo)."; exit 1; }
 
 mkdir -p "$bindir" "$unitdir" "$confdir"
-for program in buildqd buildq buildq-shim buildq-rustc-guard; do
-  put 755 "$src/bin/$program" "$bindir/$program"
+staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
+trap 'rm -rf "$staged"' EXIT
+for program in buildqd buildq buildq-shim; do  # Python: run by the interpreter checked above
+  { printf '#!%s\n' "$python"; tail -n +2 "$src/bin/$program"; } >"$staged/$program"
+  put 755 "$staged/$program" "$bindir/$program"
 done
-say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir"
+put 755 "$src/bin/buildq-rustc-guard" "$bindir/buildq-rustc-guard"
+say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (Python: $python)"
 
 if [[ ! -e "$confdir/config.toml" ]]; then
   put 644 "$src/config.example.toml" "$confdir/config.toml"

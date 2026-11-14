@@ -719,6 +719,9 @@ descriptor exits once it has the lock, and on btrfs its device number differs fr
 ## Security
 
 The socket is in the user's runtime directory, mode 0600, and both ends check the peer's uid.
+That makes the user the trust boundary: every process the user runs can submit builds, and list,
+watch, cancel or pause any of them, its own or not, CI jobs under the same user included. A queued
+build's environment (`env.json`, mode 0600) is readable by any of them until the build starts.
 Everything the daemon writes is private to the user (umask 077). A build's environment is kept on
 disk only until its supervisor reads it. Status, logs and history show commands with `NAME=value`
 arguments and passwords in URLs hidden, and history keys hold no word that could be a secret. The
