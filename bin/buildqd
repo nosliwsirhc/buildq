@@ -1604,40 +1604,44 @@ CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--c(h(d(i(r)?)?)?)?(=.*)?|--di(r(
                             r"|--(root|prefix|cwd)(=.*)?")
 OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, not what it reads: not checked
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
-PATH_SEPARATORS = re.compile(r"""[\s,;:='"()\[\]{}]+""")
+# What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
+# expansion, structured values, URLs. A word with any of these can't be read for certain.
+UNREADABLE = re.compile(r"""[\\"'`$\[\]{}]|://""")
 
 
 def path_pieces(arg: str, tool: str = "") -> list[str]:
-    """Every part of a word that might name a path. The word is cut at anything that can separate
-    values inside it (spaces, commas, quotes, brackets, "=", ":"), so a list in a --config value or a
-    flag in RUSTFLAGS is seen piece by piece; a short option run on to a piece (-L../x) and a
-    response file's @ are taken off; option names and URLs (but file: ones) aren't paths. For dotnet,
-    an MSBuild switch (/p:…) is an option, not a path."""
+    """Every part of a plain word (see UNREADABLE) that might name a path: the word itself (a name
+    with a space in it, `external project/x`), what follows each "=" in it, and each part between
+    the separators a value may hold (spaces, ",", ";", ":", "="). A part that runs on from an option
+    counts from its first / . or ~ (-L../x, -isystem/x); a response file's @ is taken off. For
+    dotnet, an MSBuild switch (/p:…) is an option."""
     if tool in ("dotnet", "msbuild"):
-        arg = re.sub(r"^/[A-Za-z]+(:|$)", "", arg)
-    arg = re.sub(r"file://", "", arg)
-    arg = re.sub(r"[a-z][a-z0-9+.-]*://\S*", " ", arg)
-    out = []
-    for piece in PATH_SEPARATORS.split(arg):
+        arg = re.sub(r"^/[A-Za-z]+:", "", arg)
+    out = [] if arg.startswith("-") else [arg]
+    out += [arg[i + 1:] for i, c in enumerate(arg) if c == "="]
+    for piece in re.split(r"[\s,;:=]+", arg):
         piece = piece.lstrip("@")
         if piece.startswith("--"):
             continue  # an option's name (its value, after "=", is a piece of its own)
         if piece.startswith("-"):
-            piece = piece[2:]  # -L../x: what runs on from it, if anything
-        if piece:
-            out.append(piece)
-    return out
+            rest = piece[2:]
+            found = re.search(r"[/.~]", rest)
+            piece = rest[found.start():] if found else rest
+        out.append(piece)
+    return [p.lstrip("@") for p in out if p and not p.startswith("-")]
 
 
 def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     """Every path the command names is inside the tree whose source was recorded, so an earlier
     result for the same source answers for it. A path is any part of any word (path_pieces) with a
     slash or starting with . or ~, or one that names something that exists (`-p external`, a
-    symlink), resolved through links from the build's folder. Two kinds match nothing:
-    - a command that moves to another folder, or the folder its paths are read from (env -C,
-      --chdir, make -C, vitest --root, sudo given options): what its paths name can't be told here;
+    symlink), resolved through links from the build's folder. Three kinds match nothing:
+    - a command with a word buildq can't read for certain (UNREADABLE: quotes, escapes, brackets,
+      $, a URL; `--config 'paths=["../other"]'`): it is refused, not guessed at;
+    - one that moves to another folder, or the folder its paths are read from (env -C, --chdir,
+      make -C, vitest --root, sudo given options): what its paths name can't be told here;
     - one pointed elsewhere (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`,
-      `--config 'paths=["../other"]'`, `RUSTFLAGS=-L/x`).
+      `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`).
     An output folder (--target-dir, CARGO_TARGET_DIR, eslint's --cache-location) is where it writes,
     not what it reads. A word naming a system folder (`PATH=/usr/bin`) also matches nothing, which
     costs a run, not a wrong answer.
@@ -1646,8 +1650,12 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     root = os.path.realpath(top)
     words = argv[1:]
     tool = os.path.basename(strip_wrappers(argv)[0]) if strip_wrappers(argv) else ""
+    if any(UNREADABLE.search(a) for a in argv):
+        return False  # what it names can't be read for certain
     if any(CHANGES_FOLDER.fullmatch(a) for a in words):
         return False
+    if "-r" in words and "vitest" in (os.path.basename(a) for a in argv):
+        return False  # vitest's short --root
     if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
         return False  # sudo's options include -D, its own --chdir
     skip = False

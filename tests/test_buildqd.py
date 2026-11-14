@@ -1047,6 +1047,9 @@ class SameSource(DaemonCase):
         os.symlink(self.tmp.name, os.path.join(repo, "external"))  # a one-word path that leads outside
         self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "-p", "external"], repo, repo))
         self.assertTrue(buildqd.paths_inside(["cargo", "test", "test_name"], repo, repo))
+        os.symlink(self.tmp.name, os.path.join(repo, "ext deps"))  # a name with a space in it, leading outside
+        self.assertFalse(buildqd.paths_inside(["cargo", "test", "--manifest-path", "ext deps/Cargo.toml"], repo, repo))
+        self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "--project=ext deps/tsconfig.json"], repo, repo))
         inside = buildqd.paths_inside
         # A command that moves to another folder matches nothing, whatever it names after: what
         # `env -Csub env -Cexternal` or `--manifest-path external/…` finds there can't be told from here.
@@ -1069,17 +1072,32 @@ class SameSource(DaemonCase):
                      ["cargo", "check", "--config", 'build.rustflags=["--sysroot", "/outside"]'],
                      ["cargo", "check", "--config", 'registries.x.index="file:///x/index"'],
                      ["dotnet", "test", "@../other/args.rsp"],
-                     ["env", "PATH=/usr/bin", "cargo", "test"]):  # (a system folder too: that costs a run, no more)
+                     ["env", "PATH=/usr/bin", "cargo", "test"],  # (a system folder too: that costs a run, no more)
+                     ["env", "CFLAGS=-isystem/outside/include", "cargo", "check"], ["dotnet", "test", "/outside"],
+                     ["vitest", "run", "-r", "sub"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
+        # What a tool interprets rather than reads as it is (quotes, escapes, brackets, $, URLs) can't
+        # be read for certain: refused, not guessed at.
+        for argv in (["cargo", "check", "--config", 'patch."https://github.com/x/foo".foo.path="../foo"'],
+                     ["cargo", "check", "--config",
+                      'build.rustflags=["--remap-path-prefix=src=https://example.invalid","--sysroot","/outside"]'],
+                     ["cargo", "check", "--config", 'build.rustflags=["--sysroot","\\u002foutside"]'],
+                     ["cargo", "check", "--config", 'paths=["vendor"]'], ["cargo", "test", "--config", "registry.x=https://x.example/y"],
+                     ["cargo", "check", "--config", "registries.x.index=file://localhost/x"], ["vitest", "run", "-t", "^adds$"]):
             self.assertFalse(inside(argv, "/r", "/r"), argv)
         # Output folders aren't what a check reads; options, URLs and test names aren't paths.
         for argv in (["cargo", "test", "--target-dir", "/cache/t"], ["cargo", "test", "--target-dir=/cache/t"],
                      ["env", "CARGO_TARGET_DIR=/cache/t", "cargo", "test"], ["cargo", "clippy", "--", "-D", "warnings"],
                      ["cargo", "test", "-p", "api", "-j8", "--", "-Dwarnings"], ["vitest", "run", "--shard=1/2"],
-                     ["sudo", "X=1", "cargo", "test"], ["cargo", "test", "--config", "registry.x=https://x.example/y"],
+                     ["sudo", "X=1", "cargo", "test"],
                      ["env", "RUSTFLAGS=-C target-cpu=native -D warnings", "cargo", "check"],
                      ["dotnet", "test", "/p:Configuration=Release"], ["dotnet", "test", "-c", "Release", "-p:Configuration=Release"],
                      ["eslint", ".", "--cache-location", "/cache/eslint"], ["cargo", "test", "foo::bar"],
-                     ["cargo", "nextest", "run", "--profile", "ci"], ["cargo", "check", "--config", 'paths=["vendor"]']):
+                     ["cargo", "nextest", "run", "--profile", "ci"], ["vitest", "run", "-t", "adds 1 + 2"],
+                     ["dotnet", "test", "--logger", "console;verbosity=normal"],
+                     ["dotnet", "test", "--filter", "FullyQualifiedName~X&Category!=Slow"], ["eslint", ".", "--max-warnings=0"],
+                     ["cargo", "clippy", "--", "-W", "clippy::pedantic", "-Dclippy::all"], ["cargo", "test", "-F", "Cli"],
+                     ["cargo", "test", "--", "--test-threads=1"]):
             self.assertTrue(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):

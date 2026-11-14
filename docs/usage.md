@@ -84,9 +84,10 @@ arguments name no path outside the tree:
   and `pnpm exec BIN` (with no pnpm options) are read as BIN. A check that moves to another folder
   or reads its paths from one (`env -C`, `make -C`, `sudo -D`, `vitest --root`) or names a path
   outside the tree whose source was recorded, anywhere in a word (`--manifest-path
-  ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `--config 'paths=["../x"]'`)
-  is never answered from an earlier pass; nor is one naming a system folder (`PATH=/usr/bin`),
-  which costs a run, not a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`,
+  ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`)
+  is never answered from an earlier pass; nor is one with a word buildq can't read for certain
+  (quotes, escapes, brackets, `$` or a URL in it, as a `--config` TOML value has), or one naming a
+  system folder (`PATH=/usr/bin`): either costs a run, never a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`,
   eslint's `--cache-location`) doesn't count. Source that no
   word names isn't seen (a path dependency outside the tree, a `[patch]` in a config file, a
   symlinked folder): `--again` runs such a build regardless. `run` prints that run's output
