@@ -205,13 +205,16 @@ but not stop it. Memory has no such exception.
 
 **Making room for CI.** With `ci_first` and `make_room_for_ci`, a CI ticket that has waited that
 long and lacks memory that buildq builds hold (`short_by`, worked out as the queue is looked at:
-what it needs less what is free after the floor, growth and the room held for tickets ahead of it)
-stops running builds after each pass: not CI tickets' or flock slots', of its priority or lower,
+what it needs less what is free after the floor, growth and the room held for tickets ahead of it;
+worked out again after the pass, since a lane that passes held room may have started a build after
+it) stops running builds after each pass, unless its lane passes held room (it holds none): not CI tickets' or flock slots', of its priority or lower,
 restart-safe or `--restartable`, with their environment known, stopped this way fewer than twice.
 A build gives back what it uses plus what it may still grow into, as admission counts it. The
 newest whose share covers `short_by` is stopped, else the newest few whose shares do together;
 none if all of them wouldn't. Stopped builds take the requeue path, with `yields_to` naming the CI
-ticket, and these stops don't count toward the limit of three stops for memory. One CI ticket at a
+ticket: until it starts, or for 30 minutes, a stopped build doesn't start (whatever its lane), and
+counts neither as overdue nor as waited out. These stops don't count toward the limit of three stops
+for memory. One CI ticket at a
 time, not while builds stopped for one are still going, and not for the same CI ticket again within
 two minutes.
 
@@ -229,8 +232,8 @@ free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` 
 both set), goes first (unless its lane may pass held room). With `ci_first`, any ticket that has
 waited three times `starve_seconds`, or was queued again after being stopped, goes before all of
 those, so a stream of CI tickets can't keep it waiting for ever; among those, CI tickets get no
-preference. A ticket stopped to make room for a CI ticket (`make_room_for_ci`) is neither, and
-holds nothing, until that CI ticket has started. Then tickets go by priority (lane plus ticket, highest first), then, with `ci_first`,
+preference. A ticket stopped to make room for a CI ticket (`make_room_for_ci`) is neither, holds
+nothing and doesn't start, until that CI ticket has started (30 minutes at most). Then tickets go by priority (lane plus ticket, highest first), then, with `ci_first`,
 CI tickets first (one that has waited `starve_seconds` before newer ones; not in a lane that may pass
 held room), then by how many builds their
 caller has running (fewest first), then by

@@ -46,10 +46,11 @@ a CI job's build that has waited that long for memory that buildq's builds hold 
 the builds that can safely start over (a compile or test run, or one submitted `--restartable`), of
 its priority or lower and not a CI job's. It stops the one whose memory covers what the step lacks,
 or, if no one build does, the newest few that do together, and none if stopping all of them wouldn't
-make it fit. Each stopped build is queued again with its place, yields to that CI build until it
-has started, and then goes first; cargo keeps the crates it finished, so it repeats only the ones it
-was compiling. A build is stopped this way at most twice. Pausing a build wouldn't help: a paused
-build keeps its memory.
+make it fit. Each stopped build is queued again with its place and yields to that CI build: it
+doesn't start, whatever its lane, until that build has started (or for 30 minutes at most), and then
+goes first. cargo keeps the crates it finished, so it repeats only the ones it was compiling. A
+build is stopped this way at most twice, and never for a CI step in a lane with `may_pass_held`,
+which holds no room. Pausing a build wouldn't help: a paused build keeps its memory.
 
 ## A new step's first run
 

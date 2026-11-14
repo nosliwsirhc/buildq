@@ -54,8 +54,9 @@ ci_first = false
 # the newest builds that can safely start over (a compile or test run, or --restartable), of its
 # priority or lower and not a CI job's: the one whose memory covers what it lacks, else the newest
 # few that do together; none if all of them together wouldn't. Each is queued again, yields to that
-# build until it has started, then goes first; one build is stopped this way at most twice. Pausing
-# a build would free no memory. "0" (the default) never stops one for CI.
+# build (doesn't start) until it has started or for 30 minutes at most, then goes first; one build is
+# stopped this way at most twice. Not for a CI build in a lane with may_pass_held, which holds no
+# room. Pausing a build would free no memory. "0" (the default) never stops one for CI.
 make_room_for_ci = "0"
 
 # Scripts (file names) whose argument right after the script names what they run, so it joins the
