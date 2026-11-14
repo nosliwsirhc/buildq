@@ -1,0 +1,42 @@
+name: replay
+
+# The replay simulator (bench/sim.py, docs/benchmark.md): the built-in scenarios against the daemon,
+# twice, to check that a run repeats exactly; on a pull request, also main's daemon against this one,
+# with the table in the job summary. A slower or faster result never fails the job: only a crash or
+# a run that doesn't repeat does.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    env:
+      TMPDIR: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Each scenario twice, the same both times
+        run: python bench/sim.py check
+      - name: The base branch's daemon
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+      - name: This branch against the base
+        if: github.event_name == 'pull_request'
+        run: python bench/sim.py compare --base base/bin/buildqd --head bin/buildqd --summary-file "$GITHUB_STEP_SUMMARY"
+      - name: Results on main
+        if: github.event_name == 'push'
+        run: |
+          for s in $(python bench/sim.py scenarios | awk '{print $1}'); do
+            { echo "#### $s"; echo '```'; python bench/sim.py run "$s"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
