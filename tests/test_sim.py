@@ -350,6 +350,20 @@ class Export(SimCase):
         s.step()
         self.assertEqual(s.machine.busy_now, 4.0)  # vitest starts a worker per core all the same
 
+    def test_a_jobserver_doesnt_make_a_tool_hold_to_its_grant(self):
+        state = os.path.join(self.tmp.name, "grant")
+        os.makedirs(state)
+        specs = [scenarios.build(0, ("pnpm", "vitest"), 1, 60, 8, lane="heavy", repo="app"),  # gets a jobserver
+                 scenarios.build(0, ("cmake", "--build", "."), 1, 60, 8, repo="app"),
+                 scenarios.build(0, ("env", "X=1", "dotnet", "build"), 1, 60, 8, repo="app")]
+        s = sim.Simulation(scenario(specs), CONFIG, BUILDQD, state, name="buildqd_grant")
+        honors = []
+        for n, spec in enumerate(specs):
+            t = s.submit(spec, n)
+            honors.append((t.jobserver is not None, s.honors_grant(t)))
+        self.assertEqual(honors[0], (True, False))  # vitest ignores the jobserver it was handed
+        self.assertEqual([h for _, h in honors[1:]], [True, True])  # CMAKE_BUILD_PARALLEL_LEVEL, DOTNET_PROCESSOR_COUNT
+
     def test_a_replayed_build_is_cancelled_when_the_trace_says(self):
         job = dict(scenarios.build(0, ("cargo", "test"), 2, 600, 2, repo="app"), cancel_at=120)
         summary, s = sim.simulate(scenario([job]), CONFIG, BUILDQD, name="buildqd_cancel")

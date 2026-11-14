@@ -127,16 +127,13 @@ class Job:
     # Tools that hold to the cores buildq grants them: a jobserver's tokens, CARGO_BUILD_JOBS,
     # DOTNET_PROCESSOR_COUNT, make's -j. Others (vitest, node, a test runner) start a worker per core
     # the machine has, whatever they were granted, and run as they were recorded.
-    GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet"})
+    honors_grant = True  # set at launch (Simulation.honors_grant)
 
     def wanted_cores(self) -> float:
         if self.frozen:
             return 0.0
         avg = max(float(self.spec.get("avg_cores") or 1.0), 0.1)
-        argv = self.spec.get("argv") or [""]
-        if self.ticket.jobserver or os.path.basename(argv[0]) in self.GRANT_TOOLS:
-            return min(float(max(self.ticket.granted, 1)), avg)
-        return avg
+        return min(float(max(self.ticket.granted, 1)), avg) if self.honors_grant else avg
 
     def memory_at(self, progress: float) -> int:
         wall = max(float(self.spec["wall"]), 1.0)
@@ -314,7 +311,23 @@ class Simulation:
         if rec["first_start"] is None:
             rec["first_start"] = self.clock.now - EPOCH
         rec["planned"] = max(rec["planned"], int(ticket.est_mem))
-        self.jobs[ticket.id] = Job(ticket, self.specs[ticket.id], self.clock.now)
+        job = Job(ticket, self.specs[ticket.id], self.clock.now)
+        job.honors_grant = self.honors_grant(ticket)
+        self.jobs[ticket.id] = job
+
+    # Tools that hold to the cores buildq grants them: a jobserver's tokens or CARGO_BUILD_JOBS (cargo,
+    # make, ninja), DOTNET_PROCESSOR_COUNT, CMAKE_BUILD_PARALLEL_LEVEL. JS tools and test runners
+    # (vitest, eslint, node) start a worker per core the machine has, jobserver or not.
+    GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake"})
+    FREE_TOOLS = frozenset({"vitest", "eslint", "tsc", "vue-tsc", "node", "deno", "bun", "playwright", "jest"})
+
+    def honors_grant(self, ticket) -> bool:
+        tool, _ = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
+        if tool in self.GRANT_TOOLS:
+            return True
+        if tool in self.FREE_TOOLS or tool in self.mod.JS_TOOLS:
+            return False
+        return bool(ticket.jobserver)  # a script: under a jobserver, the cargo or make it runs holds to it
 
     def end(self, job: Job, result: dict | None, discarded: str | None = None):
         job.alive = False
@@ -403,6 +416,11 @@ class Simulation:
         if queued:
             self.events["idle_core_seconds"] += max(0.0, self.machine.ncpu * self.daemon.cfg.cpu_target - busy)
 
+    def refresh_memory(self):
+        """Free memory as it is now: after kills since this second's step (cancels), not at its start."""
+        used = self.background_mem + sum(j.mem for j in self.jobs.values() if j.alive)
+        self.machine.mem_available = max(0, self.machine.mem_total - used)
+
     def ci_timeouts(self, now: float):
         """A CI job that runs past its time limit is cancelled by GitHub, and its build with it."""
         for tid, spec in self.specs.items():
@@ -449,6 +467,7 @@ class Simulation:
                 i += 1
             self.ci_timeouts(now)
             self.trace_cancels(now)
+            self.refresh_memory()  # a build cancelled this second gave its memory back at once
             d.check(now)
             d.shed_memory(now)
             d.schedule(now)

@@ -3671,7 +3671,9 @@ class Daemon:
 
     def was_overdue(self, t: Ticket) -> bool:
         """It went before CI jobs' builds when it started: it had waited three times starve_seconds,
-        or it had been stopped once (see queue)."""
+        or it had been stopped once, and its lane doesn't pass held room (see queue)."""
+        if self.lane(t.lane).may_pass_held:
+            return False  # never overdue there: it gets no head start, and none to protect
         return t.requeues > 0 or (t.started is not None and t.started - t.submitted >= 3 * self.cfg.starve_seconds)
 
     def make_room_for_ci(self, now: float) -> None:
@@ -3695,6 +3697,8 @@ class Daemon:
             return  # builds stopped for a CI job's build are still going: their memory isn't free yet
         if any(now - made < self.ROOM_PAUSE for made in self.room_made.values()):
             return  # room was just made for one that is still queued: it starts first (what it frees may lag)
+        if any(t.cancel_requested and not t.flock for t in self.active()):
+            return  # a cancelled build (a CI job past its time limit, say) is giving its memory back: wait for it
         running = self.active()
         free_now = self.machine.mem_available - sum(self.still_to_grow(t, now) for t in running) - self.cfg.mem_floor
         for ci in self.queue(now):

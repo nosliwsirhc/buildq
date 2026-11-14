@@ -2896,6 +2896,27 @@ class MakeRoomForCI(DaemonCase):
         self.tick(301)
         self.assertEqual(self.runner.forced, [old.id])  # the other one, though older
 
+    def test_no_room_is_made_while_a_cancelled_build_gives_its_memory_back(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.daemon.cancel(old, self.now + 300)  # a CI job past its time limit, say: its build is stopping
+        self.tick(301)
+        self.assertNotIn(new.id, self.runner.forced)  # what the cancelled build frees may be enough
+
+    def test_a_build_that_waited_three_turns_is_protected_once_it_runs(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new = self.agents(12, 12)
+        new.submitted = new.started - 3 * self.daemon.cfg.starve_seconds  # it started after a long wait
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [old.id])
+
+    def test_a_lane_that_passes_held_room_has_no_overdue_builds(self):
+        self.daemon.cfg.lanes["web"].mem = 12 * GIB
+        (web,) = self.agents(12, argv=("vitest", "run"), lane="web")
+        web.requeues = 1
+        self.assertFalse(self.daemon.was_overdue(web))  # the queue gives it no head start, so no protection
+
     def test_the_make_room_options_are_read(self):
         cfg = buildqd.Config({}, 64 * GIB, 16)
         self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (True, 0.0))
