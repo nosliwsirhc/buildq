@@ -2258,13 +2258,15 @@ class CIFirst(DaemonCase):
         self.assertFalse(ci.held)
 
     def test_off_the_order_is_as_before_for_a_lane_that_passes_held_room(self):
-        older = self.submit(("pnpm", "test", "--long"), lane="web", mem="20G")
+        older = self.submit(("pnpm", "lint"), lane="web", mem="20G", caller="one")
         self.daemon.history.add({"key": older.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
                                  "wall": 600, "exit": 0})
         self.now += 301  # past starve_seconds, but a lane that passes held room never starves
-        newer = self.submit(("pnpm", "test", "--short"), lane="web", mem="20G")
+        newer = self.submit(("pnpm", "test"), lane="web", mem="20G", caller="two")
         self.daemon.history.add({"key": newer.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
                                  "wall": 10, "exit": 0})
+        self.daemon.schedule(self.now)
+        self.assertNotEqual(older.key, newer.key)
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [newer.id, older.id])
 
     def test_a_ci_build_goes_first_and_gets_room_held_at_once(self):
