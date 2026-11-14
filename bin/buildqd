@@ -3669,6 +3669,11 @@ class Daemon:
     CI_STOPS_MAX = 2  # times one build may be stopped to make room for CI jobs' builds
     ROOM_PAUSE = 120.0  # seconds after making room for a CI job's build, while it is queued, before more is made
 
+    def was_overdue(self, t: Ticket) -> bool:
+        """It went before CI jobs' builds when it started: it had waited three times starve_seconds,
+        or it had been stopped once (see queue)."""
+        return t.requeues > 0 or (t.started is not None and t.started - t.submitted >= 3 * self.cfg.starve_seconds)
+
     def make_room_for_ci(self, now: float) -> None:
         """A CI job's build that has waited make_room_for_ci for memory that builds of ours hold: stop
         the newest of the builds that can start over safely (a compile or test run, or --restartable),
@@ -3706,12 +3711,14 @@ class Daemon:
                 continue  # it fits: it starts on the next pass
             weight = self.weight(ci)
             spare = self.cfg.make_room_spare_after
+            protect = not self.cfg.make_room_behind_agents
             builds = [t for t in running if not t.flock and t.state == "running" and not t.from_ci
                       and not t.cancel_requested and not t.requeue_pending and t.started is not None
                       and self.weight(t) <= weight and t.ci_stops < self.CI_STOPS_MAX
                       and (t.restartable or restart_safe(t.argv)) and t.env is not None
                       and t.requeues - t.ci_stops < 3
-                      and not (spare and now - t.started - t.frozen_attempt >= spare)]  # far along: spared (#38)
+                      and not (spare and now - t.started - self.paused_for(t, now) >= spare)  # far along: spared
+                      and not (protect and self.was_overdue(t))]  # its turn came first (#38)
             gives = {t.id: t.mem_now + self.still_to_grow(t, now) for t in builds}  # what admission sets aside
             newest = sorted(builds, key=lambda t: t.started, reverse=True)
             chosen = next(([t] for t in newest if gives[t.id] >= short), None)

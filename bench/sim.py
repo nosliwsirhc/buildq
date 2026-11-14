@@ -124,11 +124,19 @@ class Job:
         self.discarded = False  # stopped or cancelled: gone without a last word
         self.last_mem = 0  # what it held in its last second, for the daemon's last look
 
+    # Tools that hold to the cores buildq grants them: a jobserver's tokens, CARGO_BUILD_JOBS,
+    # DOTNET_PROCESSOR_COUNT, make's -j. Others (vitest, node, a test runner) start a worker per core
+    # the machine has, whatever they were granted, and run as they were recorded.
+    GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet"})
+
     def wanted_cores(self) -> float:
         if self.frozen:
             return 0.0
         avg = max(float(self.spec.get("avg_cores") or 1.0), 0.1)
-        return min(float(max(self.ticket.granted, 1)), avg)
+        argv = self.spec.get("argv") or [""]
+        if self.ticket.jobserver or os.path.basename(argv[0]) in self.GRANT_TOOLS:
+            return min(float(max(self.ticket.granted, 1)), avg)
+        return avg
 
     def memory_at(self, progress: float) -> int:
         wall = max(float(self.spec["wall"]), 1.0)
@@ -376,8 +384,8 @@ class Simulation:
             limit = float(job.ticket.timeout or 0)
             if limit and self.clock.now - job.started >= limit:  # the supervisor's time limit
                 self.end(job, {"exit": 124, "timed_out": True})
-            elif job.progress >= float(job.spec["wall"]):
-                self.end(job, {"exit": int(job.spec.get("exit", 0))})
+            elif job.progress >= float(job.spec["wall"]) and not job.spec.get("unfinished"):
+                self.end(job, {"exit": int(job.spec.get("exit", 0))})  # (an unfinished one runs until it is cancelled)
         live = [j for j in live if j.alive]
         used = self.background_mem + sum(j.mem for j in live)  # what ended this second gave its memory back
         self.machine.mem_available = max(0, self.machine.mem_total - used)
@@ -800,12 +808,15 @@ def export_rows(db: sqlite3.Connection, since: float | None, until: float | None
         exit_code = int(r["exit"]) if r.get("exit") is not None else (0 if state == "succeeded" else 1)
         if cancelled and run is whole.get(r.get("key")):
             exit_code = 0  # it would have run as that whole run did; its cancel ends it (cancel_at)
+        unfinished = cancelled and run is not whole.get(r.get("key"))  # only as far as it got: never ends by itself
         entry = {"t": round(float(r["submitted"]) - first, 1), "repo": repo or "project", "lane": lane or None,
                  "argv": argv, "ci": bool(r.get("from_ci")), "caller": caller, "wall": round(wall, 1),
                  "avg_cores": round(float(avg), 2), "peak_mem": int(run["peak"]), "exit": exit_code,
                  "state": state or None}
         if cancelled and r.get("ended"):
             entry["cancel_at"] = round(max(0.0, float(r["ended"]) - float(r["submitted"])), 1)
+        if unfinished:
+            entry["unfinished"] = True
         if requeued:
             entry["requeued"] = requeued
         if profile:

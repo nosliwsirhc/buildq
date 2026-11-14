@@ -55,7 +55,8 @@ which holds no room. Pausing a build wouldn't help: a paused build keeps its mem
 
 Two settings tune it (#38). `make_room_behind_agents = false` leaves a CI step that waits partly
 behind agents' builds that have waited longer than it (and so go first) to wait its turn: stopping
-builds for it would mostly let those go first. `make_room_spare_after = "20m"` never stops a build
+builds for it would mostly let those go first. Those builds aren't stopped for a CI step once they
+start either. `make_room_spare_after = "20m"` never stops a build
 that has run that long, since starting it over would lose the most work. Compare them on your own
 builds with the replay simulator ([Benchmarking](benchmark.md)).
 

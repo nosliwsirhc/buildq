@@ -90,7 +90,7 @@ A trace file works as a scenario too: one build per line, in JSON.
 | `wall`, `avg_cores` | how long it ran, and how many cores it kept busy on average |
 | `peak_mem`, `profile` | its peak memory in bytes, and the most memory in each tenth of its run in MiB |
 | `workspace` | optional: a target folder it shares with other builds, which then take turns |
-| `cancel_at` | optional: cancel it this many seconds after its submission, as it was (#40) |
+| `cancel_at`, `unfinished` | optional: cancel it this many seconds after its submission, as it was (#40); and, with `unfinished`, it never ends by itself before that (only part of its run is known) |
 | `exit`, `restartable`, `timeout_s`, `cold` | optional: its exit code, `--restartable`, a CI job's time limit (default 50 minutes), and whether cargo builds from scratch |
 | `history`, `history_peak` | optional: give its command a history of three earlier runs, of `history_peak` bytes |
 | `state`, `requeued` | written by `export`, for information only: how the build ended, and how often it was stopped and queued again. The replay decides both for itself |
@@ -117,8 +117,9 @@ where the database keeps it (`workspace`, since #39), so builds that shared a ta
 turns in the replay as they did; from an older database they don't. A build that was
 cancelled replays as a whole run of its command did (the latest one in the trace that succeeded),
 cancelled the same time after its submission as it was (`cancel_at`), whether it was still queued
-or running then; with no such run in the trace, it runs as far as it got (or is left out, if it
-never ran). A build that was lost has no exit code, and replays as a failure; its `state` says what
+or running then; with no such run in the trace, it runs as far as it got and then holds there until
+its cancel (`unfinished`), or is left out if it never ran. Runs are matched by their history key, the
+command's words, so two builds of one crate with different feature flags count as the same command. A build that was lost has no exit code, and replays as a failure; its `state` says what
 it was.
 
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
@@ -141,8 +142,10 @@ simulation, and that part is simplified:
   source checks, wait messages, pruning, GitHub statuses, hooks and the analytics.
 - **The machine's readings:** busy cores and CPU pressure are ten-second averages, as the daemon's
   are; free memory is read each second.
-- **Cores:** a build keeps busy the cores it is granted, up to its recorded average, from its first
-  second. When builds want more cores than the machine has, everyone slows down evenly.
+- **Cores:** a build of a tool that holds to its grant (cargo, make, ninja, dotnet, or anything with a
+  jobserver) keeps busy the cores it is granted, up to its recorded average; any other tool (vitest,
+  node) keeps busy its recorded average whatever it was granted, as it starts a worker per core. From
+  its first second. When builds want more cores than the machine has, everyone slows down evenly.
 - **Run time:** a build has the recorded run's work to do. With fewer cores than it used, it takes
   longer in proportion; it never goes faster than it was recorded.
 - **Memory** follows the recorded profile over the run. A tenth with no sample in it (a short run

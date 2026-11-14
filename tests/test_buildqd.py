@@ -2879,6 +2879,23 @@ class MakeRoomForCI(DaemonCase):
         self.tick(302)
         self.assertEqual(self.runner.forced, [new.id])  # under 400: the newest is stopped as before
 
+    def test_time_paused_isnt_time_run(self):
+        self.daemon.cfg.make_room_spare_after = 200.0
+        old, new = self.agents(12, 12)
+        for t in (old, new):
+            t.frozen, t.frozen_at = True, self.now + 50  # paused since 50 s in: about 50 s of real work
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])  # not spared: a paused build hasn't run all that time
+
+    def test_with_behind_agents_off_a_build_that_went_first_isnt_stopped_once_it_runs(self):
+        self.daemon.cfg.make_room_behind_agents = False
+        old, new = self.agents(12, 12)
+        new.requeues = 1  # it had been stopped once, so it went before CI jobs' builds when it started
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [old.id])  # the other one, though older
+
     def test_the_make_room_options_are_read(self):
         cfg = buildqd.Config({}, 64 * GIB, 16)
         self.assertEqual((cfg.make_room_behind_agents, cfg.make_room_spare_after), (True, 0.0))

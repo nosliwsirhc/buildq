@@ -321,7 +321,34 @@ class Export(SimCase):
         out = sim.export_rows(db, None, None, anonymize=False)
         gone = out[1]
         self.assertEqual((gone["wall"], gone["peak_mem"], gone["cancel_at"], gone["exit"]), (400.0, 8 * GIB, 200.0, 0))
+        self.assertNotIn("unfinished", gone)  # a whole run of its command says how it would have gone
         self.assertNotIn("cancel_at", out[0])
+
+    def test_a_cancelled_build_known_only_in_part_never_ends_by_itself(self):
+        job = dict(scenarios.build(0, ("cargo", "test"), 2, 120, 2, repo="app"), cancel_at=300, unfinished=True)
+        summary, _ = sim.simulate(scenario([job]), CONFIG, BUILDQD, name="buildqd_unfinished")
+        self.assertEqual((summary["outcomes"], summary["cancelled_as_in_trace"]), ({"cancelled": 1}, 1))
+        self.assertAlmostEqual(summary["makespan_s"], 300, delta=5)
+
+    def test_a_build_cancelled_while_still_queued(self):
+        jobs = agents(6, 12, 900, step=1)  # the machine full for 15 minutes
+        jobs.append(dict(scenarios.build(10, ("cargo", "test", "-p", "late"), 12, 300, 2, repo="app", caller="z",
+                                         workspace="wz", history=True), cancel_at=120))
+        _, s = sim.simulate(scenario(jobs), CONFIG, BUILDQD, name="buildqd_qcancel")
+        late = next(r for r in s.records.values() if "late" in r["name"])
+        self.assertEqual((late["outcome"], late["first_start"], late.get("cancelled_by_trace")), ("cancelled", None, True))
+
+    def test_tools_that_ignore_their_grant_run_at_their_own_pace(self):
+        spec = scenarios.build(0, ("pnpm", "vitest"), 1, 60, 4, lane="web", repo="app", history=True)
+        state = os.path.join(self.tmp.name, "pace")
+        os.makedirs(state)
+        s = sim.Simulation(scenario([spec], background_cpu=0.0), CONFIG, BUILDQD, state, name="buildqd_pace")
+        s.submit(spec, 0)
+        (t,) = s.daemon.tickets.values()
+        t.granted = 1  # as on a full machine: the web lane starts it on one core
+        s.clock.now += 1
+        s.step()
+        self.assertEqual(s.machine.busy_now, 4.0)  # vitest starts a worker per core all the same
 
     def test_a_replayed_build_is_cancelled_when_the_trace_says(self):
         job = dict(scenarios.build(0, ("cargo", "test"), 2, 600, 2, repo="app"), cancel_at=120)
@@ -336,7 +363,7 @@ class Export(SimCase):
                 f.write(json.dumps(entry) + "\n")
         summary, _ = sim.simulate(sim.load_scenario(path), CONFIG, BUILDQD, name="buildqd_trace")
         self.assertEqual(summary["builds"], 5)
-        self.assertEqual(summary["outcomes"], {"failed": 2, "succeeded": 3})
+        self.assertEqual(summary["outcomes"], {"cancelled": 1, "failed": 1, "succeeded": 3})  # cancelled as it was
 
 
 
