@@ -80,9 +80,13 @@ arguments name no path outside the tree:
   `--fix`, `-u`, `--update-snapshots`, watch mode or `--no-run`, run directly or behind a wrapper
   buildq can read for certain (`env` with exact options, `timeout DURATION`, `nice`/`time` with no
   options: behind `ionice -c3` or `nice -n 5`, say, it isn't). The command is run, not read by a
-  shell, so `X=1 cargo test` names a program called `X=1`: write `env X=1 cargo test`. A check
-  pointed outside the tree whose source was recorded (`--manifest-path ../other/Cargo.toml`,
-  `env -C ../other`) is never answered from an earlier pass. `run` prints that run's output
+  shell, so `X=1 cargo test` names a program called `X=1`: write `env X=1 cargo test`. `npx BIN`
+  and `pnpm exec BIN` (with no pnpm options) are read as BIN. A check that moves to another folder
+  (`env -C`, `make -C`, `sudo -D`) or names a path outside the tree whose source was recorded
+  (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`) is never answered from an
+  earlier pass; an output folder (`--target-dir`, `CARGO_TARGET_DIR`) doesn't count. Source that no
+  word names isn't seen (a path dependency outside the tree, a `[patch]` in a config file, a
+  symlinked folder): `--again` runs such a build regardless. `run` prints that run's output
   and exits 0, and nothing runs. A build that makes files (cargo build, a bundle, docs) or a
   script runs again, with a note that it passed before: its output may have changed or gone since,
   and a script might do anything. `--reuse` takes the earlier pass for those too;

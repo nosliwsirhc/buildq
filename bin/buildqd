@@ -1500,6 +1500,12 @@ def sure_tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
     t = plainly(argv)
     if not t:
         return "", []
+    if os.path.basename(t[0]) == "pnpm" and t[1:2] == ["exec"]:
+        # A binary from node_modules/.bin, never a package script. pnpm's own options (before or
+        # after exec: a filter, -r, -c's shell) aren't read: none of them is a plain `pnpm exec BIN`.
+        if len(t) < 3 or t[2].startswith("-"):
+            return "", []
+        return os.path.basename(t[2]), t[3:]
     if os.path.basename(t[0]) in ("npx", "pnpx", "bunx"):
         t = [t[0]] + [a for a in t[1:] if a not in ("-y", "--yes", "--no-install")]
         return (os.path.basename(t[1]) if len(t) > 1 else ""), t[2:]
@@ -1590,29 +1596,63 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
     return tool in ("tsc", "vue-tsc", "eslint", "vitest")
 
 
+# Options that move a command to another folder, in any spelling: -C (env, make, cargo, git, ninja),
+# grouped (-iC, -sC) or with its value run on; --chdir (env, sudo); --directory (make).
+CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--chdir(=.*)?|--directory(=.*)?")
+OUTPUT_OPTIONS = ("--target-dir",)  # where a build writes, not what it reads: its value isn't checked
+OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
+
+
+def path_pieces(arg: str) -> list[str]:
+    """Every part of a word that might name a path: the word itself, what follows each "=" in it
+    (an option's value, an assignment's, a --config entry's), and what runs on from a short option
+    (-p../x), with quotes, brackets and spaces around each taken off. Options and URLs aren't."""
+    pieces = [arg, *arg.split("=")[1:]]
+    if re.match(r"-[A-Za-z0-9]", arg):
+        pieces.append(arg[2:])
+    out = []
+    for piece in pieces:
+        piece = piece.strip(" \t'\"{}[](),;")
+        if piece and not piece.startswith("-") and not re.match(r"[a-z][a-z0-9+.-]*://", piece):
+            out.append(piece)
+    return out
+
+
 def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
-    """Every path the command names is inside the tree whose source was recorded: an argument (or
-    an option's value) with a slash or starting with . or ~, and any that names something that
-    exists (`-p external`, a symlink), resolved through links, from wrappers' options too. A value
-    run on to a short option counts (`env -C../other`, `make -C../other`). A command pointed
-    elsewhere (`--manifest-path ../other/Cargo.toml`) builds source the record doesn't cover."""
+    """Every path the command names is inside the tree whose source was recorded, so an earlier
+    result for the same source answers for it. A path is any part of any word (path_pieces) with a
+    slash or starting with . or ~, or one that names something that exists (`-p external`, a
+    symlink), resolved through links from the build's folder. Two kinds match nothing:
+    - a command that moves to another folder (env -C, --chdir, make -C, sudo given options):
+      what its paths name there can't be told from here;
+    - one pointed elsewhere (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`).
+    An output folder (--target-dir, CARGO_TARGET_DIR) is where it writes, not what it reads.
+    Source that no word names (a path dependency, a [patch] in a config file, a symlinked folder
+    inside the tree) isn't seen: --again runs such a build regardless."""
     root = os.path.realpath(top)
-    for arg in argv[1:]:
-        if arg.startswith("-") and "=" in arg:
-            value = arg.split("=", 1)[1]
-        elif re.match(r"-[A-Za-z0-9].", arg):
-            value = arg[2:]  # -C../other: what it runs on to (-j8 and -Dwarnings are no paths)
-        else:
-            value = arg
-        if not value or value.startswith("-") or re.match(r"[a-z][a-z0-9+.-]*://", value):
-            continue  # an option, or a URL
-        candidate = os.path.join(cwd, os.path.expanduser(value))
-        looks = "/" in value or value.startswith((".", "~"))
-        if not looks and not os.path.lexists(candidate):
-            continue  # a word (a subcommand, a test name), not a path
-        path = os.path.realpath(candidate)
-        if path != root and not path.startswith(root + os.sep):
-            return False
+    words = argv[1:]
+    if any(CHANGES_FOLDER.fullmatch(a) for a in words):
+        return False
+    if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
+        return False  # sudo's options include -D, its own --chdir
+    skip = False
+    for arg in words:
+        if skip:
+            skip = False
+            continue
+        if arg in OUTPUT_OPTIONS:
+            skip = True
+            continue
+        if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES):
+            continue
+        for value in path_pieces(arg):
+            candidate = os.path.join(cwd, os.path.expanduser(value))
+            looks = "/" in value or value.startswith((".", "~"))
+            if not looks and not os.path.lexists(candidate):
+                continue  # a word (a subcommand, a test name), not a path
+            path = os.path.realpath(candidate)
+            if path != root and not path.startswith(root + os.sep):
+                return False
     return True
 
 

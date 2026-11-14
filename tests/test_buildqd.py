@@ -1047,12 +1047,27 @@ class SameSource(DaemonCase):
         os.symlink(self.tmp.name, os.path.join(repo, "external"))  # a one-word path that leads outside
         self.assertFalse(buildqd.paths_inside(["tsc", "--noEmit", "-p", "external"], repo, repo))
         self.assertTrue(buildqd.paths_inside(["cargo", "test", "test_name"], repo, repo))
-        # a wrapper's option and a value run on to a short option count too
-        self.assertFalse(buildqd.paths_inside(["env", "-C../other", "cargo", "test"], "/r", "/r"))
-        self.assertFalse(buildqd.paths_inside(["env", "-C", "../other", "cargo", "test"], "/r", "/r"))
-        self.assertFalse(buildqd.paths_inside(["env", "--chdir=../other", "cargo", "test"], "/r", "/r"))
-        self.assertFalse(buildqd.paths_inside(["make", "-C/elsewhere", "test"], "/r", "/r"))
-        self.assertTrue(buildqd.paths_inside(["env", "-Csub", "cargo", "test", "-j8", "--", "-Dwarnings"], "/r", "/r"))
+        inside = buildqd.paths_inside
+        # A command that moves to another folder matches nothing, whatever it names after: what
+        # `env -Csub env -Cexternal` or `--manifest-path external/…` finds there can't be told from here.
+        for argv in (["env", "-C../other", "cargo", "test"], ["env", "-C", "sub", "cargo", "test"],
+                     ["env", "--chdir=sub", "cargo", "test"], ["env", "-Csub", "env", "-Cexternal", "cargo", "test"],
+                     ["env", "-iC../other", "cargo", "test"], ["make", "-sC../other", "test"],
+                     ["make", "--directory=sub", "test"], ["sudo", "-D", "/r", "cargo", "test"],
+                     ["sudo", "-u", "x", "cargo", "test"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
+        # Any part of a word that might be a path is checked: after "=", run on, in quotes.
+        for argv in (["cargo", "test", "-p../other=1"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"],
+                     ["cargo", "check", "--config", 'patch.crates-io.foo.path="../../foo"'],
+                     ["cargo", "check", "--config", "patch.crates-io.foo = { path = '/x/foo' }"],
+                     ["tsc", "--noEmit", "-p../other/tsconfig.json"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
+        # Output folders aren't what a check reads; options, URLs and test names aren't paths.
+        for argv in (["cargo", "test", "--target-dir", "/cache/t"], ["cargo", "test", "--target-dir=/cache/t"],
+                     ["env", "CARGO_TARGET_DIR=/cache/t", "cargo", "test"], ["cargo", "clippy", "--", "-D", "warnings"],
+                     ["cargo", "test", "-p", "api", "-j8", "--", "-Dwarnings"], ["vitest", "run", "--shard=1/2"],
+                     ["sudo", "X=1", "cargo", "test"], ["cargo", "test", "--config", "registry.x=https://x.example/y"]):
+            self.assertTrue(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
         failed = self.submit(("cargo", "test"), source=SOURCE)
@@ -1503,6 +1518,15 @@ class SheddingMemory(DaemonCase):
         for argv in (["sudo", "X=1", "cargo", "test"], ["env", "PATH=/usr/bin", "cargo", "test"]):
             self.assertTrue(safe(argv), argv)
             self.assertTrue(buildqd.reusable_check(argv), argv)
+        # `pnpm exec BIN` runs a binary, never a package script (pnpm.io/cli/exec); with any of
+        # pnpm's own options (a filter, -r, -c's shell), before or after exec, it isn't read.
+        for argv in (["pnpm", "exec", "vitest", "run"], ["pnpm", "exec", "tsc", "--noEmit"]):
+            self.assertTrue(buildqd.reusable_check(argv), argv)
+            self.assertTrue(safe(argv), argv)
+        for argv in (["pnpm", "exec", "-c", "vitest run"], ["pnpm", "-r", "exec", "vitest", "run"],
+                     ["pnpm", "exec", "--filter", "x", "vitest", "run"], ["pnpm", "vitest", "run"], ["pnpm", "exec"]):
+            self.assertFalse(buildqd.reusable_check(argv), argv)
+            self.assertFalse(safe(argv), argv)
         # history keys and lanes still read env's exact forms (a decision to restart or reuse never does)
         words = buildqd.command_words
         self.assertEqual(words(["env", "-u", "CI", "pnpm", "test"]), words(["pnpm", "test"]))
