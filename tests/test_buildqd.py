@@ -817,30 +817,66 @@ class SameSource(DaemonCase):
     def test_a_retry_after_a_tool_timeout_keeps_the_place_in_the_queue(self):
         self.machine.mem_available = 15 * GIB  # nothing fits: everything waits
         work = self.workdir()
-        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first")
+        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
         self.now += 10
-        later = self.submit(("cargo", "build"), cwd=self.workdir(), submission="later")
-        self.daemon.drop_unwatched(self.now + 100)  # the run's client was killed: cancelled
-        self.now += 120
+        later = self.submit(("cargo", "build"), cwd=self.workdir(), submission="later", caller="other")
+        self.daemon.drop_unwatched(self.now + 100)  # the run's client was killed: cancelled, 110 s in
         self.assertTrue(first.cancel_requested)
-        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry")
-        self.assertEqual(retry.submitted, first.submitted)  # its place, not the back of the queue
+        self.now += 101  # the harness runs it again at once
+        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry", caller="agent")
+        self.assertEqual(retry.submitted, self.now - 110)  # as long a wait behind it, not the back
         self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [retry.id, later.id])
-        again = self.submit(("cargo", "test"), cwd=work, attach=True, submission="again")
-        self.assertGreater(again.submitted, first.submitted)  # a place is taken once
-        other = self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="other")
-        self.assertGreater(other.submitted, first.submitted)  # another directory: its own build
+        again = self.submit(("cargo", "test"), cwd=work, attach=True, submission="again", caller="agent")
+        self.assertEqual(again.submitted, self.now)  # a place is taken once
 
-    def test_a_vacated_place_isnt_kept_for_ever(self):
-        work = self.workdir()
+    def test_only_the_same_caller_takes_a_place(self):
         self.machine.mem_available = 15 * GIB
-        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first")
+        work = self.workdir()
+        self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
         self.daemon.drop_unwatched(self.now + 100)
+        self.now += 101
+        stranger = self.submit(("cargo", "test"), cwd=work, attach=True, submission="s", caller="someone-else")
+        self.assertEqual(stranger.submitted, self.now)
+
+    def test_a_build_that_was_running_leaves_no_place(self):
+        work = self.workdir()
+        ran = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
+        self.assertEqual(ran.state, "running")
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertTrue(ran.cancel_requested)
+        self.assertEqual(self.daemon.vacated, {})  # it had its turn
+
+    def test_a_client_stopped_by_sigterm_leaves_its_place(self):
+        self.machine.mem_available = 15 * GIB
+        work = self.workdir()
+        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
+
+        class Conn:
+            sent = []
+
+            def send(self, msg):
+                self.sent.append(msg)
+        self.daemon.handle_message({"op": "cancel", "ticket": first.id, "submission": "first", "vacate": True},
+                                   Conn(), self.now + 50)
+        self.assertTrue(first.cancel_requested)
+        self.now += 51
+        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry", caller="agent")
+        self.assertEqual(retry.submitted, self.now - 50)
+        plain = self.submit(("cargo", "test", "-p", "x"), cwd=work, attach=True, submission="p", caller="agent")
+        self.daemon.handle_message({"op": "cancel", "ticket": plain.id, "submission": "p"}, Conn(), self.now + 5)
+        self.assertEqual(self.daemon.vacated, {})  # Ctrl-C: a cancel meant as one leaves nothing
+
+    def test_the_longest_wait_is_kept_and_a_place_expires(self):
+        self.machine.mem_available = 15 * GIB
+        work = self.workdir()
+        old = self.submit(("cargo", "test"), cwd=work, attach=True, submission="old", caller="agent", again=True)
+        self.now += 500
+        new = self.submit(("cargo", "test"), cwd=work, attach=True, submission="new", caller="agent", again=True)
+        self.daemon.drop_unwatched(self.now + 100)  # both go together
+        self.assertEqual(self.daemon.vacated[(work, ("cargo", "test"), new.lane, "agent")][0], 600)
         self.daemon.drop_unwatched(self.now + 100 + buildqd.Daemon.VACATED_SECONDS + 1)
         self.assertEqual(self.daemon.vacated, {})
-        self.now += 1000
-        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry")
-        self.assertGreater(retry.submitted, first.submitted)
+        self.assertTrue(old.cancel_requested)
 
     def test_a_ticket_from_before_this_version_doesnt_break_the_tick(self):
         t = self.submit(("cargo", "test"), attach=True, submission="old")

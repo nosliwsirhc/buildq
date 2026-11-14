@@ -2772,7 +2772,8 @@ class Daemon:
         self.last_prune = -1e9
         self.last_rebalance = -1e9
         # The place in the queue of a `buildq run` build cancelled because its client went (a tool
-        # timeout), by (directory, command, lane): (submitted, kept until). The retry takes it (#7).
+        # timeout), by (directory, command, lane, caller): (seconds it waited, kept until). The retry
+        # takes it (#7). Kept in memory only: a daemon restart forgets them (the retry goes to the back).
         self.vacated: dict[tuple, tuple[float, float]] = {}
         self.guard_available: int | None = None  # MemAvailable when the slice was last guarded
         self.submissions: dict[str, str] = {}  # the client's submission id -> its ticket
@@ -3085,6 +3086,9 @@ class Daemon:
         t.notify = str(notify) if notify else None
         t.caller = sane_caller(msg.get("caller"))
         t.from_ci = bool(env.get("GITHUB_ACTIONS") and env.get("RUNNER_NAME"))  # (the shim's test, too)
+        # A place left by the same build of this caller's, cancelled when its `buildq run` went: taken
+        # here, so a retry that joins another build uses it up too.
+        place = self.vacated.pop((cwd, tuple(argv), lane_name, t.caller), None)
         source = sane_source(msg.get("source"))
         if source and source.get("repo") and paths_inside(argv, cwd, source["repo"]):
             settings = [t.timeout, t.umask, t.rlimits, t.cores_given, t.mem_given, self.cfg.env]
@@ -3130,10 +3134,10 @@ class Daemon:
             return None, f"can't create the ticket: {e}"
         t.env = job_env
         t.queued_at = t.wait_mark = now
-        place = self.vacated.pop((cwd, tuple(argv), lane_name), None)
-        if place and place[1] >= now and place[0] < t.submitted:
-            t.submitted = place[0]  # the retry of a run whose client went: its place in the queue
-            log(f"{tid} takes the place of the same build, cancelled when its `buildq run` went")
+        if place and place[1] >= now and place[0] > 0:
+            t.submitted = now - place[0]  # the retry of a run whose client went: as long a wait behind it
+            log(f"{tid} takes the place of the same build, cancelled when its `buildq run` went "
+                f"(it had waited {place[0]:.0f}s)")
         self.estimate(t, now)
         self.tickets[tid] = t
         self.save(t)
@@ -4212,11 +4216,12 @@ class Daemon:
     # ---- keeping all builds together inside what the machine has free
 
     def memory_moving(self) -> bool:
-        """Memory is short, under pressure, or has fallen a gigabyte since the slice was last
+        """Memory is short, under pressure ("full": a build held at its own MemoryHigh stalls only
+        "some"), or has fallen a gigabyte since the slice was last
         guarded: other work can outgrow a guard every REBALANCE_SECONDS, so it is guarded every
         tick (a second) until things settle."""
         m = self.machine
-        return (m.mem_available < 2 * self.cfg.mem_floor or m.psi_mem_some > 1.0
+        return (m.mem_available < 2 * self.cfg.mem_floor or m.psi_mem > 1.0
                 or (self.guard_available is not None and self.guard_available - m.mem_available >= GIB))
 
     def guard_slice(self, stopping: bool = False) -> None:
@@ -4952,6 +4957,22 @@ class Daemon:
             thread.join(timeout)
         self.metrics.stop(timeout)
 
+    def vacate(self, t: Ticket, now: float) -> None:
+        """A queued `buildq run` build whose client went (a harness's tool timeout, by SIGKILL, or
+        SIGTERM or SIGHUP) leaves its place for the retry, which a harness usually makes: the same
+        command, in the same directory and lane, from the same caller, within VACATED_SECONDS. The
+        place is the time it waited, so the retry doesn't go to the back of the queue, where under load
+        it could cycle without ever running (#7). A build that was running leaves none: it had its
+        turn, and one that can't finish within the tool's time limit mustn't come back first for ever."""
+        if t.state != "queued" or not t.attached:
+            return
+        key = (t.cwd, tuple(t.argv), t.lane, t.caller)
+        waited = max(0.0, now - t.submitted)
+        earlier = self.vacated.get(key)
+        if earlier and earlier[1] >= now:
+            waited = max(waited, earlier[0])  # the longest wait of the two
+        self.vacated[key] = (waited, now + self.VACATED_SECONDS)
+
     def drop_unwatched(self, now: float) -> None:
         """A build that `buildq run` submitted is meant to be followed. Once no one has followed it
         for unwatched_seconds (its client was killed, by an editor or a tool timeout), cancel it rather than let
@@ -4973,9 +4994,7 @@ class Daemon:
                 t.last_watched = now
             elif now - max([t.last_watched, *t.followed.values()]) > self.cfg.unwatched_seconds:
                 log(f"cancelling {t.id}: the `buildq run` that submitted it has gone")
-                # A harness that timed the tool call out usually runs it again: the retry gets this
-                # place, not the back of the queue, or under load it could cycle without running.
-                self.vacated[(t.cwd, tuple(t.argv), t.lane)] = (t.submitted, now + self.VACATED_SECONDS)
+                self.vacate(t, now)
                 self.cancel(t, now)
         for place, (_, until) in list(self.vacated.items()):
             if until < now:
@@ -5040,6 +5059,8 @@ class Daemon:
                             f"{t.id[:8]} is shared: {len(self.waiting(t, now))} submissions of the same build wait for it. "
                             "`buildq cancel --all` stops it for all of them")})
                         return
+                if msg.get("vacate") is True:  # the client was stopped (SIGTERM, SIGHUP), not interrupted
+                    self.vacate(t, now)
                 self.cancel(t, now)
                 self.schedule(now)
             elif t.state not in FINISHED:

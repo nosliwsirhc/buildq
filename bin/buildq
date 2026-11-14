@@ -552,7 +552,10 @@ class Follower:
                     return reraise(self.signals[0])
                 if cancel_sent is None:
                     cancel_sent = time.monotonic()
-                    reply = request({"op": "cancel", "ticket": self.row["id"], "submission": self.owner})
+                    # Ctrl-C means it; a SIGTERM or SIGHUP (a harness timing the call out) leaves its
+                    # place in the queue for the retry.
+                    reply = request({"op": "cancel", "ticket": self.row["id"], "submission": self.owner,
+                                     "vacate": self.signals[0] in (signal.SIGTERM, signal.SIGHUP)})
                     if reply is None:
                         note(f"couldn't reach the daemon to cancel {self.row['short']}; it may still run")
                         return reraise(self.signals[0])
