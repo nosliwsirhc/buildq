@@ -67,9 +67,9 @@ whenever a build arrives or ends.
 ## Quick start
 
 You need Linux with cgroup v2, Python 3.11 or newer, and a systemd user session. Without one,
-`install.sh` installs no units, shims or guard and doesn't start the daemon (start `buildqd`
-yourself), and builds still queue, but run without limits, unmeasured, and are never paused or
-stopped to free memory.
+`install.sh` installs only the programs: no units, shims or guard, and it doesn't start the daemon.
+buildq is built on systemd, so a daemon started by hand (`buildqd`) queues builds but runs them
+without limits, unmeasured, and never pauses or stops them to free memory.
 
 ```sh
 git clone https://github.com/nosliwsirhc/buildq.git

@@ -203,7 +203,11 @@ for option in "$@"; do
 done
 [[ $skill_linked == yes ]] || write_skill
 if ! have_systemd; then
-  say "no systemd user session here. Start the daemon yourself ($bindir/buildqd &), then run install.sh again with any options."
+  # buildq is built on systemd: each build is a service of its own, which is what measures it, caps
+  # its memory and lets the queue pause it. Without a user session there is nothing to install the
+  # units, the shims or the guard into, and running install.sh again won't change that.
+  say "no systemd user session here, and buildq needs one: each build runs as a systemd service, which is what measures it, caps its memory and lets the queue pause it."
+  say "installed only the programs, in $bindir: no units, shims or Rust guard, and the daemon isn't running. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
   exit 0
 fi
 
