@@ -204,15 +204,18 @@ Without the ramp term, a burst of submissions would all see the same idle machin
 but not stop it. Memory has no such exception.
 
 **Holding room.** Once a ticket has waited `starve_seconds` (a CI ticket with `ci_first`: at
-once), its memory and minimum cores are
+once, but until it has waited `starve_seconds` its room binds only tickets of its priority or
+lower, so a higher lane still starts in room that is free), its memory and minimum cores are
 subtracted for every ticket behind it, except tickets in lanes with `may_pass_held`. Room is never
 held for a ticket that couldn't fit even with every buildq build gone, so an oversized ticket can't
 stop the queue.
 
 **Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped to
 free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` and `RUNNER_NAME`
-both set), goes first (unless its lane may pass held room). Then tickets go by priority (lane plus
-ticket, highest first), then, with `ci_first`, CI tickets first, then by how many builds their
+both set), goes first (unless its lane may pass held room). With `ci_first`, a non-CI ticket that has
+waited three times `starve_seconds`, or was queued again after being stopped, goes before all of
+those, so a stream of CI tickets can't keep it waiting for ever. Then tickets go by priority (lane
+plus ticket, highest first), then, with `ci_first`, CI tickets first, then by how many builds their
 caller has running (fewest first), then by
 expected duration (the median wall time of the command's successful runs, or of all its runs if
 none succeeded; shortest first, unknown last), then by submission.

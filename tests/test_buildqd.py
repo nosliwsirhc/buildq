@@ -2284,14 +2284,68 @@ class CIFirst(DaemonCase):
         by_hand = self.submit(("cargo", "test"), mem="20G", env={"GITHUB_ACTIONS": "true"})
         self.assertFalse(by_hand.held)
 
-    def test_a_higher_lane_still_goes_first(self):
+    def higher_lane(self):
+        lane = self.daemon.cfg.lanes["web"]  # as a lane like dotnet: above heavy, doesn't pass held room
+        lane.priority, lane.may_pass_held = 50, False
+        return lane
+
+    def test_a_higher_lane_may_use_a_ci_jobs_held_room(self):
         self.daemon.cfg.ci_first = True
-        self.daemon.cfg.lanes["web"].priority = 100
-        self.daemon.cfg.lanes["web"].may_pass_held = False
-        web = self.submit(("pnpm", "build"), lane="web", mem="20G")
-        self.now += 301
+        self.higher_lane()
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
-        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [web.id, ci.id])
+        self.assertTrue(ci.held)
+        higher = self.submit(("dotnet", "build"), lane="web", cores=1)
+        self.assertEqual(higher.state, "running")  # the CI job's room binds its own priority and lower
+        same = self.submit(("cargo", "check"), cores=1)
+        self.assertEqual((same.state, same.reason),
+                         ("queued", "the room it needs is held for a CI job's build, which goes first"))
+
+    def test_a_ci_build_that_has_waited_its_turn_holds_room_from_every_lane(self):
+        self.daemon.cfg.ci_first = True
+        self.higher_lane()
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.now += 601  # starve_seconds: now it is starving like any other build
+        higher = self.submit(("dotnet", "build"), lane="web", cores=1)
+        self.assertTrue(ci.held)
+        self.assertEqual((higher.state, higher.reason),
+                         ("queued", "the room it needs is held for a build that has waited longer"))
+
+    def test_a_higher_lane_still_goes_first_when_both_have_waited(self):
+        self.daemon.cfg.ci_first = True
+        self.higher_lane()
+        higher = self.submit(("dotnet", "build"), lane="web", mem="20G")
+        self.now += 601
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [higher.id, ci.id])
+
+    def test_a_session_build_that_has_waited_much_longer_goes_before_ci(self):
+        self.daemon.cfg.ci_first = True
+        session = self.submit(mem="20G")
+        self.now += 3 * 600  # three times starve_seconds
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+        self.assertTrue(session.held)
+
+    def test_a_build_stopped_to_free_memory_goes_before_ci(self):
+        self.daemon.cfg.ci_first = True
+        stopped = self.submit(mem="20G")
+        stopped.requeues = 1
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [stopped.id, ci.id])
+
+    def test_a_ci_build_in_a_lane_that_passes_held_room_isnt_held(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.lanes["web"].mem = 20 * GIB
+        ci = self.submit(("pnpm", "test"), lane="web", env=self.CI)
+        self.assertEqual(ci.state, "queued")
+        self.assertFalse(ci.held)
+
+    def test_a_ci_build_that_could_never_fit_holds_nothing(self):
+        self.daemon.cfg.ci_first = True
+        huge = self.submit(("cargo", "test"), mem="100G", env=self.CI)
+        small = self.submit(("cargo", "check"), cores=1)
+        self.assertFalse(huge.held)
+        self.assertEqual(small.state, "running")
 
     def test_the_setting_is_read_and_shown(self):
         cfg = buildqd.Config({"ci_first": True}, 64 * GIB, 16)
