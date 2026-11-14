@@ -814,6 +814,83 @@ class SameSource(DaemonCase):
         self.daemon.drop_unwatched(self.now + 61)
         self.assertTrue(run.cancel_requested)
 
+    def test_a_retry_after_a_tool_timeout_keeps_the_place_in_the_queue(self):
+        self.machine.mem_available = 15 * GIB  # nothing fits: everything waits
+        work = self.workdir()
+        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
+        self.now += 10
+        later = self.submit(("cargo", "build"), cwd=self.workdir(), submission="later", caller="other")
+        self.daemon.drop_unwatched(self.now + 100)  # the run's client was killed: cancelled, 110 s in
+        self.assertTrue(first.cancel_requested)
+        self.now += 101  # the harness runs it again at once
+        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry", caller="agent")
+        self.assertEqual(retry.submitted, self.now - 110)  # as long a wait behind it, not the back
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [retry.id, later.id])
+        again = self.submit(("cargo", "test"), cwd=work, attach=True, submission="again", caller="agent")
+        self.assertEqual(again.submitted, self.now)  # a place is taken once
+
+    def test_only_the_same_caller_takes_a_place(self):
+        self.machine.mem_available = 15 * GIB
+        work = self.workdir()
+        self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
+        self.daemon.drop_unwatched(self.now + 100)
+        self.now += 101
+        stranger = self.submit(("cargo", "test"), cwd=work, attach=True, submission="s", caller="someone-else")
+        self.assertEqual(stranger.submitted, self.now)
+
+    def test_a_build_queued_again_after_a_memory_stop_leaves_no_place(self):
+        self.machine.mem_available = 15 * GIB
+        t = self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="first", caller="agent")
+        t.requeues = 1  # it ran, was stopped to free memory, and waits again
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertEqual(self.daemon.vacated, {})
+
+    def test_a_build_with_no_caller_leaves_no_place(self):
+        self.machine.mem_available = 15 * GIB
+        self.submit(("cargo", "test"), cwd=self.workdir(), attach=True, submission="first")  # no caller
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertEqual(self.daemon.vacated, {})
+
+    def test_a_build_that_was_running_leaves_no_place(self):
+        work = self.workdir()
+        ran = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
+        self.assertEqual(ran.state, "running")
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertTrue(ran.cancel_requested)
+        self.assertEqual(self.daemon.vacated, {})  # it had its turn
+
+    def test_a_client_stopped_by_sigterm_leaves_its_place(self):
+        self.machine.mem_available = 15 * GIB
+        work = self.workdir()
+        first = self.submit(("cargo", "test"), cwd=work, attach=True, submission="first", caller="agent")
+
+        class Conn:
+            sent = []
+
+            def send(self, msg):
+                self.sent.append(msg)
+        self.daemon.handle_message({"op": "cancel", "ticket": first.id, "submission": "first", "vacate": True},
+                                   Conn(), self.now + 50)
+        self.assertTrue(first.cancel_requested)
+        self.now += 51
+        retry = self.submit(("cargo", "test"), cwd=work, attach=True, submission="retry", caller="agent")
+        self.assertEqual(retry.submitted, self.now - 50)
+        plain = self.submit(("cargo", "test", "-p", "x"), cwd=work, attach=True, submission="p", caller="agent")
+        self.daemon.handle_message({"op": "cancel", "ticket": plain.id, "submission": "p"}, Conn(), self.now + 5)
+        self.assertEqual(self.daemon.vacated, {})  # Ctrl-C: a cancel meant as one leaves nothing
+
+    def test_the_longest_wait_is_kept_and_a_place_expires(self):
+        self.machine.mem_available = 15 * GIB
+        work = self.workdir()
+        old = self.submit(("cargo", "test"), cwd=work, attach=True, submission="old", caller="agent", again=True)
+        self.now += 500
+        new = self.submit(("cargo", "test"), cwd=work, attach=True, submission="new", caller="agent", again=True)
+        self.daemon.drop_unwatched(self.now + 100)  # both go together
+        self.assertEqual(self.daemon.vacated[(work, ("cargo", "test"), new.lane, "agent")][0], 600)
+        self.daemon.drop_unwatched(self.now + 100 + buildqd.Daemon.VACATED_SECONDS + 1)
+        self.assertEqual(self.daemon.vacated, {})
+        self.assertTrue(old.cancel_requested)
+
     def test_a_ticket_from_before_this_version_doesnt_break_the_tick(self):
         t = self.submit(("cargo", "test"), attach=True, submission="old")
         t.followed = {}  # saved by an earlier version: no follow history
@@ -2685,6 +2762,38 @@ class SliceGuard(DaemonCase):
         self.daemon.guard_slice(stopping=True)
         with open(os.path.join(slice_dir, "memory.max")) as f:
             self.assertEqual(int(f.read()), 40 * GIB)  # the configured limit back
+
+
+    def test_it_guards_every_tick_while_memory_is_short_or_falling(self):
+        self.daemon.runner = self.runner
+        self.daemon.cg_base = os.path.join(self.tmp.name, "cg")
+        slice_dir = os.path.join(self.daemon.cg_base, "buildq.slice")
+        os.makedirs(slice_dir)
+        with open(os.path.join(slice_dir, "memory.current"), "w") as f:
+            f.write(str(10 * GIB))
+        self.daemon.slice_limit = "max"
+        self.machine.mem_available = 100 * GIB
+        guarded = []
+        real = self.daemon.guard_slice
+        self.daemon.guard_slice = lambda stopping=False: (guarded.append(self.machine.mem_available), real(stopping))
+        self.machine.sample = lambda tick: None  # the test sets the numbers
+        start = time.monotonic()
+        with mock.patch.object(buildqd.time, "monotonic", side_effect=lambda: start + len(ticks)):
+            ticks = []
+            for available in (100, 100, 100, 98, 98, 98, 98):  # GiB: a 2G fall, then steady
+                self.machine.mem_available = available * GIB
+                ticks.append(available)
+                self.daemon.tick(self.now + len(ticks))
+        # the first tick rebalances (and guards); quiet ticks don't; a 2G fall guards, then steady
+        # ticks with plenty free wait for the next rebalance (five seconds on: the sixth tick)
+        self.assertEqual([g // GIB for g in guarded], [100, 98, 98])
+        guarded.clear()
+        self.daemon.cfg.mem_floor = 60 * GIB  # less than twice the floor free: short
+        for _ in range(3):
+            ticks.append(0)
+            with mock.patch.object(buildqd.time, "monotonic", return_value=start + 100 + len(ticks) * 0.0):
+                self.daemon.tick(self.now + len(ticks))
+        self.assertEqual(len(guarded), 3)  # every tick
 
 
 class MemoryWatch(DaemonCase):

@@ -2743,6 +2743,7 @@ class Ticket:
 
 class Daemon:
     REBALANCE_SECONDS = 5.0
+    VACATED_SECONDS = 600.0  # how long a cancelled `run` build's place is kept for its retry
 
     def __init__(self, config_path: str, state_dir: str, machine: Machine | None = None, runner=None):
         self.config_path = config_path
@@ -2770,6 +2771,11 @@ class Daemon:
         self.stopping = False
         self.last_prune = -1e9
         self.last_rebalance = -1e9
+        # The place in the queue of a `buildq run` build cancelled because its client went (a tool
+        # timeout), by (directory, command, lane, caller): (seconds it waited, kept until). The retry
+        # takes it (#7). Kept in memory only: a daemon restart forgets them (the retry goes to the back).
+        self.vacated: dict[tuple, tuple[float, float]] = {}
+        self.guard_available: int | None = None  # MemAvailable when the slice was last guarded
         self.submissions: dict[str, str] = {}  # the client's submission id -> its ticket
         self.slice_limit = None  # the slice's configured MemoryMax, read once systemd has the slice
         self.guard_failed = False
@@ -3080,6 +3086,9 @@ class Daemon:
         t.notify = str(notify) if notify else None
         t.caller = sane_caller(msg.get("caller"))
         t.from_ci = bool(env.get("GITHUB_ACTIONS") and env.get("RUNNER_NAME"))  # (the shim's test, too)
+        # A place left by the same build of this caller's, cancelled when its `buildq run` went: taken
+        # here, so a retry that joins another build uses it up too.
+        place = self.vacated.pop((cwd, tuple(argv), lane_name, t.caller), None) if t.caller else None
         source = sane_source(msg.get("source"))
         if source and source.get("repo") and paths_inside(argv, cwd, source["repo"]):
             settings = [t.timeout, t.umask, t.rlimits, t.cores_given, t.mem_given, self.cfg.env]
@@ -3125,6 +3134,10 @@ class Daemon:
             return None, f"can't create the ticket: {e}"
         t.env = job_env
         t.queued_at = t.wait_mark = now
+        if place and place[1] >= now and place[0] > 0:
+            t.submitted = now - place[0]  # the retry of a run whose client went: as long a wait behind it
+            log(f"{tid} takes the place of the same build, cancelled when its `buildq run` went "
+                f"(it had waited {place[0]:.0f}s)")
         self.estimate(t, now)
         self.tickets[tid] = t
         self.save(t)
@@ -4202,6 +4215,15 @@ class Daemon:
 
     # ---- keeping all builds together inside what the machine has free
 
+    def memory_moving(self) -> bool:
+        """Memory is short, under pressure ("full": a build held at its own MemoryHigh stalls only
+        "some"), or has fallen a gigabyte since the slice was last
+        guarded: other work can outgrow a guard every REBALANCE_SECONDS, so it is guarded every
+        tick (a second) until things settle."""
+        m = self.machine
+        return (m.mem_available < 2 * self.cfg.mem_floor or m.psi_mem > 1.0
+                or (self.guard_available is not None and self.guard_available - m.mem_available >= GIB))
+
     def guard_slice(self, stopping: bool = False) -> None:
         """Lower the slice's MemoryMax to what its builds hold plus what the machine has free above
         half of mem_floor, so all builds together can't take the machine below that: when other work
@@ -4224,6 +4246,7 @@ class Daemon:
             except (OSError, ValueError):
                 return
             value = held + max(2 * GIB, m.mem_available - self.cfg.mem_floor // 2)
+            self.guard_available = m.mem_available
             if self.slice_limit != "max":
                 value = min(value, int(self.slice_limit))
         try:
@@ -4782,6 +4805,8 @@ class Daemon:
             self.last_rebalance = tick
             self.rebalance(now)
             self.guard_slice()
+        elif self.memory_moving():
+            self.guard_slice()  # every tick while memory is short or falling fast (#5)
         self.watch_memory(tick)
         if self.source_checks or self.source_wanted:
             self.collect_source_checks(now)
@@ -4932,6 +4957,24 @@ class Daemon:
             thread.join(timeout)
         self.metrics.stop(timeout)
 
+    def vacate(self, t: Ticket, now: float) -> None:
+        """A queued `buildq run` build whose client went (a harness's tool timeout, by SIGKILL, or
+        SIGTERM or SIGHUP) leaves its place for the retry, which a harness usually makes: the same
+        command, in the same directory and lane, from the same caller, within VACATED_SECONDS. The
+        place is the time it waited, so the retry doesn't go to the back of the queue, where under load
+        it could cycle without ever running (#7). A build that was running leaves none: it had its
+        turn, and one that can't finish within the tool's time limit mustn't come back first for ever."""
+        if t.state != "queued" or not t.attached or not t.caller or t.requeues:
+            # (with no caller to tell whose retry it is, anyone could take it; and a build queued again
+            # after a memory stop had its turn: its "wait" would count the time it ran)
+            return
+        key = (t.cwd, tuple(t.argv), t.lane, t.caller)
+        waited = max(0.0, now - t.submitted)
+        earlier = self.vacated.get(key)
+        if earlier and earlier[1] >= now:
+            waited = max(waited, earlier[0])  # the longest wait of the two
+        self.vacated[key] = (waited, now + self.VACATED_SECONDS)
+
     def drop_unwatched(self, now: float) -> None:
         """A build that `buildq run` submitted is meant to be followed. Once no one has followed it
         for unwatched_seconds (its client was killed, by an editor or a tool timeout), cancel it rather than let
@@ -4953,7 +4996,11 @@ class Daemon:
                 t.last_watched = now
             elif now - max([t.last_watched, *t.followed.values()]) > self.cfg.unwatched_seconds:
                 log(f"cancelling {t.id}: the `buildq run` that submitted it has gone")
+                self.vacate(t, now)
                 self.cancel(t, now)
+        for place, (_, until) in list(self.vacated.items()):
+            if until < now:
+                del self.vacated[place]
 
     def send_waits(self, now: float) -> None:
         for position, t in enumerate(self.queue()):
@@ -5014,6 +5061,8 @@ class Daemon:
                             f"{t.id[:8]} is shared: {len(self.waiting(t, now))} submissions of the same build wait for it. "
                             "`buildq cancel --all` stops it for all of them")})
                         return
+                if msg.get("vacate") is True:  # the client was stopped (SIGTERM, SIGHUP), not interrupted
+                    self.vacate(t, now)
                 self.cancel(t, now)
                 self.schedule(now)
             elif t.state not in FINISHED:
