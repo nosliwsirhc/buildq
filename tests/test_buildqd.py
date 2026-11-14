@@ -2333,6 +2333,21 @@ class CIFirst(DaemonCase):
         ci = self.submit(("cargo", "test"), mem="20G", env=self.CI)
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [stopped.id, ci.id])
 
+    def test_a_ci_build_that_has_waited_goes_before_newer_quicker_ci_builds(self):
+        self.daemon.cfg.ci_first = True
+        old = self.submit(("cargo", "test", "-p", "long"), mem="20G", env=self.CI)
+        self.daemon.history.add({"key": old.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
+                                 "wall": 3000, "exit": 0})
+        self.now += 601
+        quick = self.submit(("cargo", "test", "-p", "short"), mem="20G", env=self.CI)
+        self.daemon.history.add({"key": quick.key, "t": self.now, "peak_mem": GIB, "peak_cores": 1.0,
+                                 "wall": 10, "exit": 0})
+        self.daemon.schedule(self.now)
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [old.id, quick.id])
+        self.finish(self.running)
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual(self.states(old, quick), ["running", "queued"])  # room for one: the older
+
     def test_a_ci_build_in_a_lane_that_passes_held_room_isnt_held(self):
         self.daemon.cfg.ci_first = True
         self.daemon.cfg.lanes["web"].mem = 20 * GIB

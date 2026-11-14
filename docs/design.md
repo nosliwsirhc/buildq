@@ -215,7 +215,8 @@ free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` 
 both set), goes first (unless its lane may pass held room). With `ci_first`, a non-CI ticket that has
 waited three times `starve_seconds`, or was queued again after being stopped, goes before all of
 those, so a stream of CI tickets can't keep it waiting for ever. Then tickets go by priority (lane
-plus ticket, highest first), then, with `ci_first`, CI tickets first, then by how many builds their
+plus ticket, highest first), then, with `ci_first`, CI tickets first (one that has waited
+`starve_seconds` before newer ones), then by how many builds their
 caller has running (fewest first), then by
 expected duration (the median wall time of the command's successful runs, or of all its runs if
 none succeeded; shortest first, unknown last), then by submission.

@@ -2879,8 +2879,8 @@ class Daemon:
     def queue(self, now: float | None = None) -> list[Ticket]:
         """Queued tickets in the order they get a turn: any that has waited starve_seconds (or, with
         ci_first, comes from a CI job) first, then the higher priority (the lane's plus the ticket's
-        own), CI jobs first at the same priority with ci_first, then the one expected to finish
-        soonest, then the oldest. With ci_first, a session's build that has waited three times
+        own), CI jobs first at the same priority with ci_first (one that has waited starve_seconds
+        before newer ones), then the one expected to finish soonest, then the oldest. With ci_first, a session's build that has waited three times
         starve_seconds, or was stopped to free memory, goes before all of those, so CI jobs can't
         keep it waiting for ever."""
         now = time.time() if now is None else now
@@ -2899,7 +2899,9 @@ class Daemon:
             starving = self.starving(t, now) and not passes
             overdue = (self.cfg.ci_first and not t.from_ci and not passes
                        and (now - t.submitted >= 3 * self.cfg.starve_seconds or t.requeues > 0))
-            return (not overdue, not starving, -self.weight(t), not ci)
+            # ...and a CI job's build that has waited out its turn goes before newer CI builds, or a
+            # stream of quicker CI builds could keep it waiting past its job's time limit.
+            return (not overdue, not starving, -self.weight(t), not ci, not self.waited_out(t, now))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
