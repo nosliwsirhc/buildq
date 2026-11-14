@@ -399,7 +399,12 @@ class Config:
         scripts = d["restartable_scripts"]
         if not isinstance(scripts, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
                                                      for x in scripts):
-            raise ValueError("restartable_scripts must be a list of script file names, such as [\"build.sh\"]")
+            raise ValueError("restartable_scripts must be a list of script file names, such as "
+                             "[\"run-api-tests.sh\"]")
+        tools = [x for x in scripts if x in NOT_SCRIPTS or re.fullmatch(r"python3(\.\d+)?", x)]
+        if tools:
+            raise ValueError(f"restartable_scripts names scripts, not tools: {', '.join(sorted(tools))} "
+                             "would make anything run with them restartable")
         self.restartable_scripts = frozenset(scripts)
         self.unwatched_seconds = number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)
         self.history_runs = number(d["history_runs"], "history_runs", 1, 1000, integer=True)
@@ -1197,6 +1202,12 @@ WRAPPERS = {"nice", "ionice", "nohup", "setsid", "stdbuf", "time", "command", "e
 VALUE_OPTIONS = {"-n", "-c", "-o", "-e", "-i", "-p", "-u", "-g", "-C"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 INTERPRETERS = {"python", "python3", "node", "deno", "ruby", "perl", "bun"}
+# Names restartable_scripts refuses: tools and wrappers, not scripts (listing `git` would make `git
+# push` restartable).
+NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | {"env", "timeout", "git", "cargo", "rustc", "dotnet", "make",
+                                                    "gmake", "ninja", "cmake", "docker", "podman", "buildah",
+                                                    "npm", "pnpm", "yarn", "npx", "pnpx", "bunx", "kubectl", "aws",
+                                                    "gh", "ssh", "scp", "rsync", "curl", "wget"})
 JS_TOOLS = {"npm", "pnpm", "yarn", "npx", "pnpx", "bunx"}
 CARGO_VALUE_OPTIONS = {"--manifest-path", "--target-dir", "-j", "--jobs", "--color", "--config",
                        "-Z", "--profile", "--target", "-F", "--features", "--bin", "--test",
@@ -1214,9 +1225,14 @@ def strip_wrappers(argv: list[str]) -> list[str]:
         if ASSIGNMENT.match(t[0]):
             t = t[1:]
         elif head == "env":
-            t = t[1:]
-            while t and (t[0].startswith("-") or ASSIGNMENT.match(t[0])):
-                t = t[1:]
+            rest = t[1:]
+            while rest and (rest[0].startswith("-") or ASSIGNMENT.match(rest[0])):
+                option = rest.pop(0)
+                if option in ("-u", "--unset", "-C", "--chdir", "-P") and rest:
+                    rest.pop(0)  # its operand: a variable's name, a folder, a path (not the command)
+                elif option in ("-S", "--split-string") or option.startswith(("--split-string=", "-S")):
+                    return t  # the command is inside a string: leave it unread (env stays the tool)
+            t = rest
         elif head == "timeout":
             t = t[1:]
             while t and t[0].startswith("-"):
@@ -1436,10 +1452,18 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
     (unless --restartable)."""
     tool, args = _tool_and_args(argv)
     if scripts:
+        script_args = None
         if tool in scripts:
-            return True  # run directly: ./wrap.sh, /path/to/wrap.sh
-        if (tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS) and args[:1] \
+            script_args = args  # run directly: ./wrap.sh, /path/to/wrap.sh
+        elif (tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS) and args[:1] \
                 and not args[0].startswith("-") and os.path.basename(args[0]) in scripts:
+            script_args = args[1:]
+        if script_args is not None:
+            # A listed script that runs the command after its `--` (a wrapper that sets up a target
+            # folder, say) is only as safe as that command: `wrap.sh -- git push` isn't.
+            if "--" in script_args:
+                command = script_args[script_args.index("--") + 1:]
+                return bool(command) and restart_safe(command, scripts)
             return True
     if tool == "cargo":
         words = command_words(["cargo", *args])
@@ -3699,7 +3723,8 @@ class Daemon:
         if not (t.restartable or restart_safe(t.argv, self.cfg.restartable_scripts)):
             t.shed_error = (f"{stopped}. It isn't started again by itself, as it might repeat what it had done (a "
                             "script, a push): run it again once the machine has room, or submit it with "
-                            "--restartable if starting over is safe")
+                            "--restartable if starting over is safe (or list the script in the machine's "
+                            "restartable_scripts)")
         elif t.env is None:
             t.shed_error = (f"{stopped}. Its environment is gone since the daemon restarted, so it isn't queued "
                             "again: run it again")

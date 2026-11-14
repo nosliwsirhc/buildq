@@ -1461,6 +1461,20 @@ class SheddingMemory(DaemonCase):
         self.assertFalse(safe(["bash", "ci/wrap.sh"]))  # not listed
         self.assertFalse(safe(["bash", "-c", "wrap.sh"], scripts))  # a command string: anything could be in it
         self.assertFalse(safe(["bash", "deploy.sh"], scripts))
+        self.assertFalse(safe(["bash", "-e", "wrap.sh"], scripts))  # an option before it: not straight after
+        self.assertFalse(safe(["python3", "-u", "tests.py"], scripts))
+        self.assertTrue(safe(["env", "FOO=1", "bash", "wrap.sh"], scripts))  # wrappers are seen through
+        self.assertTrue(safe(["nice", "-n", "5", "./wrap.sh"], scripts))
+        self.assertTrue(safe(["timeout", "1h", "bash", "wrap.sh"], scripts))
+        self.assertFalse(safe(["env", "-u", "wrap.sh", "bash", "deploy.sh"], scripts))  # -u's operand isn't the command
+        self.assertFalse(safe(["env", "-S", "bash wrap.sh"], scripts))  # a command string: unread
+        # a listed script that runs the command after its `--` is only as safe as that command
+        self.assertTrue(safe(["bash", "wrap.sh", "label", "12G", "--", "cargo", "check"], scripts))
+        self.assertFalse(safe(["bash", "wrap.sh", "label", "--", "git", "push"], scripts))
+        self.assertFalse(safe(["bash", "wrap.sh", "--"], scripts))
+        for tool in ("bash", "git", "cargo", "env", "python3.12"):
+            with self.assertRaises(ValueError, msg=tool):
+                buildqd.Config({"restartable_scripts": [tool]}, 64 * GIB, 16)
         cfg = buildqd.Config({"restartable_scripts": ["wrap.sh"]}, 64 * GIB, 16)
         self.assertEqual((cfg.restartable_scripts, cfg.summary()["restartable_scripts"]), ({"wrap.sh"}, ["wrap.sh"]))
         self.assertEqual(buildqd.Config({}, 64 * GIB, 16).restartable_scripts, frozenset())
@@ -2868,6 +2882,15 @@ class MakeRoomForCI(DaemonCase):
         self.assertEqual((first.state, second.state), ("queued", "queued"))
         self.assertEqual(self.runner.forced, [c.id])  # the second waits until the first has started
         del a, b
+
+    def test_a_listed_script_may_be_stopped_for_ci(self):
+        self.daemon.cfg.restartable_scripts = frozenset({"wrap.sh"})
+        (old, new) = self.agents(12, 12, argv=("bash", "wrap.sh", "tests"))
+        self.assertFalse(new.restartable)
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.daemon.cfg.restartable_scripts = frozenset()
 
     def test_stops_for_ci_dont_count_toward_the_limit_of_three(self):
         (t,) = self.agents(12)

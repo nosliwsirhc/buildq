@@ -34,7 +34,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | `--notify COMMAND` | a shell command to run when it finishes |
 | `--again` | run it even if the same command on the same source is queued, running, or passed within `reuse_window` |
 | `--reuse` | take an earlier pass of the same command on the same source as its result, even for a command that isn't a check |
-| `--restartable` | it is safe to stop and start over from the beginning (it only builds and tests): stopped to free memory, or to make room for a CI job's build, it is queued again instead of failed. A machine can name such scripts once in `restartable_scripts` |
+| `--restartable` | it is safe to stop and start over from the beginning (it only builds and tests): stopped to free memory, or to make room for a CI job's build, it is queued again instead of failed. A machine can name such scripts once in `restartable_scripts` (by file name: every script of that name counts, wherever it is) |
 
 A build runs with the environment, working directory, umask and resource limits (open files,
 stack, core size) of the command that submitted it, and no stdin or terminal. `buildq run` streams its
