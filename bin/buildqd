@@ -1180,7 +1180,17 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
     elif tool == "git":
         words += positionals(rest, {"-C", "-c", "--git-dir", "--work-tree"})[:1]
     elif tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS:
-        if "-c" in rest:
+        if rest[:1] and not rest[0].startswith("-") and os.path.basename(rest[0]) in labels:
+            # A script named in script_labels takes a label as the argument right after it, naming
+            # what it runs (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are
+            # different builds of different sizes). Only when the script comes straight after the
+            # interpreter (`bash wrap.sh label`: not a command string, `-lc wrap.sh`, or an option's
+            # value, `--require wrap.js`), whatever its own arguments are, and only a plain
+            # lowercase word.
+            words.append(os.path.basename(rest[0]))
+            if rest[1:] and SCRIPT_WORD.fullmatch(rest[1]):
+                words.append(rest[1])
+        elif "-c" in rest:
             words.append("-c")
             i = rest.index("-c")
             if i + 1 < len(rest):
@@ -1190,14 +1200,6 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
             pos = positionals(rest, {"-m"} if "python" in tool else set())
             module = option_values(rest, {"-m"})[:1] if "python" in tool else []  # (a script's own -m isn't a module)
             words += [os.path.basename(p) for p in pos[:1]] + module
-            # A script named in script_labels takes a label as the argument right after it, naming
-            # what it runs (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are
-            # different builds of different sizes). Only when the script comes straight after the
-            # interpreter (`bash wrap.sh label`: not a command string, `-lc wrap.sh`, or an option's
-            # value, `--require wrap.js`), and only a plain lowercase word.
-            if rest[1:] and not rest[0].startswith("-") and os.path.basename(rest[0]) in labels \
-                    and SCRIPT_WORD.fullmatch(rest[1]):
-                words.append(rest[1])
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
     else:

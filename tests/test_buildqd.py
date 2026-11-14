@@ -3181,6 +3181,8 @@ class Keys(unittest.TestCase):
                          self.words("node", "--require", "preload.js", "hunter"))
         # a script's own -m is neither a module nor a label
         self.assertEqual(words(*wrapper, "architecture", "-m", "fast"), "bash persistent-cargo-target.sh architecture")
+        # its own -c is its argument, not a command string
+        self.assertEqual(words(*wrapper, "architecture", "-c", "debug"), "bash persistent-cargo-target.sh architecture")
         # an option before the script turns the label off
         self.assertEqual(words("bash", "-e", *wrapper[1:], "architecture"), "bash persistent-cargo-target.sh")
 
