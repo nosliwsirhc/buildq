@@ -2372,6 +2372,22 @@ class CIFirst(DaemonCase):
         self.daemon.schedule(self.now + 31)
         self.assertEqual(self.states(old, fresh), ["running", "queued"])  # room for one: the older
 
+    def test_among_overdue_builds_ci_gets_no_preference(self):
+        self.daemon.cfg.ci_first = True
+        session = self.submit(mem="20G", caller="session")
+        self.now += 1
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI, caller="runner")
+        self.now += 3 * 300  # both have waited three turns: the plain order, the older first
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+
+    def test_a_ci_build_in_a_lane_that_passes_held_room_gets_no_head_start(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.lanes["web"].mem = 20 * GIB
+        session = self.submit(("pnpm", "build"), lane="web", caller="session")
+        self.now += 1
+        ci = self.submit(("pnpm", "test"), lane="web", env=self.CI, caller="runner")
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+
     def test_a_build_stopped_to_free_memory_goes_before_ci(self):
         self.daemon.cfg.ci_first = True
         stopped = self.submit(mem="20G")

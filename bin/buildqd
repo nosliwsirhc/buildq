@@ -2894,7 +2894,6 @@ class Daemon:
         def tier(t: Ticket):
             lane = self.cfg.lanes.get(t.lane)
             passes = bool(lane and lane.may_pass_held)
-            ci = self.cfg.ci_first and t.from_ci
             # A build that has waited starve_seconds goes ahead of everything else, or a stream of
             # quicker or higher builds could keep it waiting for ever. With ci_first a CI job's build
             # counts so at once, and any build that has waited much longer goes before it: a
@@ -2902,9 +2901,13 @@ class Daemon:
             starving = self.starving(t, now) and not passes
             overdue = (self.cfg.ci_first and not passes
                        and (now - t.submitted >= 3 * self.cfg.starve_seconds or t.requeues > 0))
-            # ...and a CI job's build that has waited out its turn goes before newer CI builds, or a
-            # stream of quicker CI builds could keep it waiting past its job's time limit.
-            return (not overdue, not starving, -self.weight(t), not ci, not (ci and self.waited_out(t, now)))
+            # A CI job's build goes before the others at its priority, and one that has waited out its
+            # turn before newer ones, or a stream of quicker CI builds could keep it waiting past its
+            # job's time limit. Not among overdue builds (they go in the plain order, or a backlog of
+            # CI builds could keep an overdue session's build waiting), nor in a lane that passes held
+            # room (it gets no head start there).
+            first = self.cfg.ci_first and t.from_ci and not passes and not overdue
+            return (not overdue, not starving, -self.weight(t), not first, not (first and self.waited_out(t, now)))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
