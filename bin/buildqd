@@ -398,9 +398,12 @@ class Config:
         self.shed_memory = boolean(d["shed_memory"], "shed_memory")
         self.reuse_window = parse_duration(d["reuse_window"]) if d["reuse_window"] not in (0, "0", "", None) else 0.0
         self.github_status = boolean(d["github_status"], "github_status")
+        # Only its form is checked here: a gh removed later (a version manager's upgrade) must not
+        # make the whole configuration, lanes and all, fail to load. Whether it runs is found out
+        # when a status is sent, and logged once.
         gh = os.path.expanduser(str(d["gh"] or ""))
-        if gh and not (os.path.isabs(gh) and os.path.isfile(gh) and os.access(gh, os.X_OK)):
-            raise ValueError(f"gh must be the full path of an executable gh: {gh!r}")
+        if gh and not os.path.isabs(gh):
+            raise ValueError(f"gh must be a full path (~ is expanded): {gh!r}")
         self.gh = gh
         self.metrics = boolean(d["metrics"], "metrics")
         rap = d["release_after_peak"]

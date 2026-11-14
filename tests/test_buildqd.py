@@ -2118,7 +2118,7 @@ class GitHubStatuses(DaemonCase):
         self.assertEqual(len(self.calls()), 1)
         self.assertIn("state=success", self.calls()[0])
 
-    def test_the_gh_setting_must_name_an_executable_by_its_full_path(self):
+    def test_the_gh_setting_must_be_a_full_path(self):
         script = os.path.join(self.tmp.name, "gh")
         with open(script, "w") as f:
             f.write("#!/bin/sh\n")
@@ -2126,8 +2126,10 @@ class GitHubStatuses(DaemonCase):
         self.assertEqual(buildqd.Config({"gh": script}, 64 * GIB, 16).gh, script)
         self.assertEqual(buildqd.Config({"gh": script}, 64 * GIB, 16).summary()["gh"], script)
         self.assertEqual(buildqd.Config({}, 64 * GIB, 16).gh, "")
-        os.chmod(script, 0o644)
-        for bad in ("gh", "bin/gh", os.path.join(self.tmp.name, "missing"), script):
+        missing = os.path.join(self.tmp.name, "missing")  # gone later: the configuration still loads
+        self.assertEqual(buildqd.Config({"gh": missing}, 64 * GIB, 16).gh, missing)
+        self.assertEqual(buildqd.Config({"gh": "~/bin/gh"}, 64 * GIB, 16).gh, os.path.expanduser("~/bin/gh"))
+        for bad in ("gh", "bin/gh"):
             with self.assertRaises(ValueError, msg=bad):
                 buildqd.Config({"gh": bad}, 64 * GIB, 16)
 

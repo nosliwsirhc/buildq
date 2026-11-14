@@ -178,19 +178,36 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 fi
 
 # The interpreter the installed programs run with, written into their first line, so a different
-# python3 first on PATH later (a project's virtualenv) can't break them. PYTHON=... chooses it; a
-# virtualenv's is replaced by the Python it was made from, which outlives it. The path is kept as
-# found (/usr/bin/python3, not the python3.N it links to), so a distribution upgrade keeps it working.
-python=${PYTHON:-$(command -v python3 || true)}
-[[ -n "$python" && -x "$python" ]] || { say "buildq needs Python 3.11 or newer (no python3 found; PYTHON=... names one)."; exit 1; }
-python=$(cd "$(dirname "$python")" && pwd)/$(basename "$python")
-"$python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
-  { say "buildq needs Python 3.11 or newer ($python is older; PYTHON=... names another)."; exit 1; }
-base=$("$python" -c 'import os, sys; print(os.path.join(sys.base_prefix, "bin", "python3") if sys.prefix != sys.base_prefix else "")')
-if [[ -n "$base" ]]; then
-  [[ -x "$base" ]] || { say "$python is in a virtualenv, and its base Python ($base) isn't there; PYTHON=... names one."; exit 1; }
-  python=$base
-fi
+# python3 first on PATH later (a project's virtualenv) can't break them. PYTHON=... chooses it (a
+# path, or a name looked up on PATH). What is written is the Python that really runs: a
+# virtualenv's is replaced by the Python it was made from, which outlives it, and a version
+# manager's shim (pyenv, asdf) by the Python it runs now. A plain path such as /usr/bin/python3 is
+# kept as found, not resolved to the python3.N it links to, so a distribution upgrade keeps it working.
+python=$(command -v -- "${PYTHON:-python3}" || true)
+[[ -n "$python" && -x "$python" ]] ||
+  { say "buildq needs Python 3.11 or newer (no ${PYTHON:-python3} found; PYTHON=... names one)."; exit 1; }
+python=$(CDPATH='' cd -- "$(dirname -- "$python")" >/dev/null && pwd)/$(basename -- "$python")
+chosen=$("$python" - <<'EOF'
+import os, sys
+if sys.version_info < (3, 11):
+    sys.exit(1)
+if sys.prefix != sys.base_prefix:  # a virtualenv: the Python it was made from
+    found = sys._base_executable
+    stable = os.path.join(os.path.dirname(found), "python3")
+    if stable != found and os.path.realpath(stable) == os.path.realpath(found):
+        found = stable  # the same program, by the name that outlives a version upgrade
+    print(found)
+else:
+    print(sys.executable)  # itself, or what a shim ran
+EOF
+) || { say "buildq needs Python 3.11 or newer ($python is older; PYTHON=... names another)."; exit 1; }
+case $chosen in
+  *[[:space:]]*) say "the Python to use ($chosen) has a space in its path, which a script's first line can't hold; PYTHON=... names another."; exit 1 ;;
+esac
+(( ${#chosen} < 250 )) || { say "the Python to use ($chosen) has too long a path for a script's first line; PYTHON=... names another."; exit 1; }
+[[ -x "$chosen" ]] && "$chosen" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
+  { say "buildq needs Python 3.11 or newer, and $python stands for $chosen, which isn't; PYTHON=... names another."; exit 1; }
+python=$chosen
 [[ -r /proc/stat && -r /proc/meminfo ]] || { say "buildq needs Linux (/proc/stat, /proc/meminfo)."; exit 1; }
 
 mkdir -p "$bindir" "$unitdir" "$confdir"
