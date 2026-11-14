@@ -1,5 +1,7 @@
 # CI jobs
 
+Queueing GitHub Actions steps on a self-hosted runner, `ci_first`, and a new step's first run.
+
 ## Queueing a workflow step
 
 The shims and the Rust guard let GitHub Actions jobs through, so CI runs beside the queue: counted
@@ -26,12 +28,14 @@ steps:
 - **GitHub statuses:** a build from an Actions job never posts a `buildq/…` success; the job reports
   its own result.
 
+On a runner without buildq (GitHub-hosted, or another machine), the step warns and runs as before.
+
 ## Waiting, cancelling and `ci_first`
 
-On a runner without buildq (GitHub-hosted, or another machine), the step warns and runs as before. While the queue is paused (`buildq pause`), such a step waits like any other build,
+While the queue is paused (`buildq pause`), a queued step waits like any other build,
 up to the job's timeout. Cancelling the job cancels the build. CI jobs share turns fairly with
 everything else (each runner is a caller of its own), unless `ci_first = true`: then a CI job's
-build goes first, with its room held from builds of its priority or lower from the start (see
+build gets a head start (not in a lane that may pass held room), with its room held from builds of its priority or lower from the start (see
 [Order](scheduling.md#order)). Turn it on when CI steps wait out their jobs' time limits on a
 busy machine. A `ci` lane can give them a priority or caps
 of their own (see [config.example.toml](../config.example.toml)).
@@ -40,7 +44,8 @@ of their own (see [config.example.toml](../config.example.toml)).
 
 A step's first run is planned at its lane's default memory, since its command has no history, and a
 run cancelled with its job teaches the history nothing. If a new step keeps timing out in the
-queue, run it once by hand so the history learns its real size. The history is kept per
+queue, run it once by hand through `buildq run` (the command alone teaches the queue nothing) so the
+history learns its real size. The history is kept per
 repository, lane and command (`<repository>|<lane>|<command words>`, where the repository is the
 name of its main checkout's folder, `filedrop` for a runner's `_work/filedrop/filedrop`), so run it
 from a checkout whose folder has the same name, with the same `--lane` and the same command. The

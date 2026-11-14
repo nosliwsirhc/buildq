@@ -1,6 +1,6 @@
 # Operating buildq
 
-Logs, files, restarts, the analytics, `buildq top`, reports and GitHub statuses.
+Logs, the memory watch, restarts, files, the analytics, `buildq top`, configuration errors, reboots, reports and GitHub statuses.
 
 ## Logs
 

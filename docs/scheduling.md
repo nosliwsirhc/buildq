@@ -121,7 +121,9 @@ beyond the first, passed in `CARGO_MAKEFLAGS` (cargo hands it to its build scrip
 and a `make -j`, in `MAKEFLAGS`, with the command's own `-j` removed, since make ignores a jobserver
 when given `-j` on its command line. A lane's `jobserver` setting says for
 which builds: `"tools"` (the default) when the command is cargo, make or ninja, `true` for every
-build (scripts that call them too), `false` for none. Every five seconds buildq hands idle cores to
+build (scripts that call them too), `false` for none. A build gets none when its caller set `MAKEFLAGS`,
+`CARGO_MAKEFLAGS` or `MFLAGS` (that jobserver is the caller's), or when its history shows it ignores
+the job count. Every five seconds buildq hands idle cores to
 builds that are using all of theirs, if the memory more cores need is free, and takes cores back when
 the machine is over its target or a queued build needs them. A build whose history shows it keeps
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to
