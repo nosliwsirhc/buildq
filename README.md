@@ -8,6 +8,9 @@ runs it when the machine has room, sized to fit.
 ![Linux, cgroup v2, systemd](https://img.shields.io/badge/linux-cgroup%20v2%20%C2%B7%20systemd-informational)
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+**Completely open source:** buildq is free software under the [MIT License](LICENSE), and all of it
+is in this repository.
+
 When several people, coding agents and CI runners share a build box, each starts compiles and test
 suites without knowing what the others are doing. Left alone, they pile on until the machine runs
 out of memory. Put behind a fixed number of slots, they wait in line while most of the cores sit
@@ -202,6 +205,11 @@ buildq takes ideas, and no code, from these projects. Thank you to their authors
   - `CPUWeight` and `IOWeight`;
   - the cgroup freezer that pauses a build.
 
+## Contributing
+
+Issues and pull requests are welcome. [Develop](#develop) has how to run the tests, and
+[docs/design.md](docs/design.md) how buildq works inside.
+
 ## Develop
 
 ```sh
@@ -214,4 +222,8 @@ The end-to-end tests start a private daemon on a temporary socket and never touc
 
 ## License
 
-[MIT](LICENSE)
+buildq is completely open source, under the [MIT License](LICENSE). You may use it, change it and
+share it, for any purpose, commercial or not, free of charge; the license asks only that its
+copyright and permission notice go with copies of it, and gives no warranty. Everything is in this
+repository, with nothing held back or sold separately: the daemon, the client, the shims, the Rust
+guard, the installer, the docs and the tests.
