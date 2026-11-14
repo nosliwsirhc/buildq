@@ -50,7 +50,7 @@ starve_seconds = 600
 # before it. Off by default.
 ci_first = false
 
-# With ci_first: once a CI job's build has waited this long for memory that builds of ours hold, stop
+# With ci_first: once a CI job's build has been queued this long and waits for memory that builds of ours hold, stop
 # the newest builds that can safely start over (a compile or test run, or --restartable), of its
 # priority or lower and not a CI job's: the one whose memory covers what it lacks, else the newest
 # few that do together; none if all of them together wouldn't. Each is queued again, yields to that

@@ -42,7 +42,8 @@ of their own (see [config.example.toml](../config.example.toml)).
 
 Going first can't free memory that running builds already use, so a CI step that needs a lot
 (a lint that peaks at 16 GB, say) can still wait out a long build. With `make_room_for_ci = "5m"`,
-a CI job's build that has waited that long for memory that buildq's builds hold stops the newest of
+a CI job's build that has been queued that long and is waiting for memory that buildq's builds hold
+stops the newest of
 the builds that can safely start over (a compile or test run, or one submitted `--restartable`), of
 its priority or lower and not a CI job's. It stops the one whose memory covers what the step lacks,
 or, if no one build does, the newest few that do together, and none if stopping all of them wouldn't

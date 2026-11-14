@@ -3515,7 +3515,7 @@ class Daemon:
             level=4)
 
     CI_STOPS_MAX = 2  # times one build may be stopped to make room for CI jobs' builds
-    ROOM_PAUSE = 120.0  # seconds before room is made again for the same CI job's build
+    ROOM_PAUSE = 120.0  # seconds after making room for a CI job's build, while it is queued, before more is made
 
     def make_room_for_ci(self, now: float) -> None:
         """A CI job's build that has waited make_room_for_ci for memory that builds of ours hold: stop
@@ -3656,15 +3656,15 @@ class Daemon:
         for_ci = bool(t.yields_to)  # stopped for a CI job's build (make_room_for_ci)
         if for_ci:
             t.ci_stops += 1
-            if not self.yielding(t, now):  # which has started since: nothing to yield to
+            if not self.yielding(t, now):  # it has started, left the queue or waited YIELD_MAX: nothing to yield to
                 t.yields_to = t.yield_until = None
         t.queued_at = t.wait_mark = now
         if self.yielding(t, now):
             t.reason_cat, t.reason = "held", ("stopped to make room for a CI job's build; it goes first once "
                                               "that has started")
         elif for_ci:
-            t.reason_cat, t.reason = "memory", ("stopped to make room for a CI job's build, which has started; it "
-                                                "goes first once there is room")
+            t.reason_cat, t.reason = "memory", ("stopped to make room for a CI job's build, which no longer needs "
+                                                "it; it goes first once there is room")
         else:
             t.reason_cat, t.reason = "memory", "stopped to free memory; it goes first once there is room"
         self.save(t)

@@ -1380,7 +1380,7 @@ def cmd_report(args) -> int:
         rows.append({
             "name": name, "runs": len(runs), "failed": sum(1 for r in runs if r.get("state") != "succeeded"),
             "killed_for_memory": sum(1 for r in runs if r.get("oom") or r.get("stopped_for_memory")),
-            "requeues": int(sum(num(runs, "requeues"))),
+            "requeues": int(sum(num(runs, "requeues"))), "ci_stops": int(sum(num(runs, "ci_stops"))),
             "over_memory_high": sum(1 for r in runs if r.get("mem_high_all", r.get("mem_high"))),
             "median_seconds": median(walls), "total_seconds": sum(walls),
             "median_wait_seconds": median(num(runs, "waited")), "peak_memory": max(num(runs, "peak_mem"), default=0),
@@ -1404,7 +1404,8 @@ def cmd_report(args) -> int:
               f"{r['killed_for_memory']:>6} {r['requeues']:>5}  {r['name']}")
     print("FAILED: didn't succeed (failed, cancelled, timed out or lost). HIGH: went over its MemoryHigh, where the "
           "kernel slows it. MEMWAIT: time spent waiting on memory in all. KILLED: killed for memory, or stopped to "
-          "free it. AGAIN: times stopped for memory and started over.")
+          "free it. AGAIN: times stopped and started over, for memory or (make_room_for_ci) to make room for a CI "
+          "job's build.")
     return 0
 
 

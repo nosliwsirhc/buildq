@@ -207,8 +207,10 @@ but not stop it. Memory has no such exception.
 long and lacks memory that buildq builds hold (`short_by`, worked out as the queue is looked at:
 what it needs less what is free after the floor, growth and the room held for tickets ahead of it;
 worked out again after the pass, since a lane that passes held room may have started a build after
-it) stops running builds after each pass, unless its lane passes held room (it holds none): not CI tickets' or flock slots', of its priority or lower,
-restart-safe or `--restartable`, with their environment known, stopped this way fewer than twice.
+it) stops running builds after each pass, unless its lane passes held room (it holds none). The wait
+counts from when the CI ticket was submitted. The builds it may stop are those not CI tickets' or flock slots', of its priority or lower,
+restart-safe or `--restartable`, with their environment known, stopped this way fewer than twice,
+and stopped for memory fewer than three times (a fourth stop would fail them).
 A build gives back what it uses plus what it may still grow into, as admission counts it. The
 newest whose share covers `short_by` is stopped, else the newest few whose shares do together;
 none if all of them wouldn't. Stopped builds take the requeue path, with `yields_to` naming the CI
@@ -590,7 +592,8 @@ shadow mode too: when, what would be kept, the most it used after, and whether a
 over), `past_peak_attempts`, `past_peak_over`, `past_peak_most_over`, `past_peak_freed` (GB-hours),
 `past_peak_unknown` and `past_peak_released` (the same over all its attempts), `observed_gap` (picked up after a
 restart), `cores_granted` (average), `avg_cores`,
-`peak_cores`, `cpu_seconds`, `requeues`, `paused`, `oom`, `mem_high`, `mem_wait`.
+`peak_cores`, `cpu_seconds`, `requeues`, `ci_stops` (of those, stops to make room for a CI build),
+`paused`, `oom`, `mem_high`, `mem_wait`.
 
 The profile comes from a trace kept while the build runs: the most memory in each ten seconds,
 with neighbours merged (and the step doubled) whenever it passes 720 points, so a long run's trace

@@ -2752,10 +2752,30 @@ class MakeRoomForCI(DaemonCase):
         self.runner.running.discard(new.id)
         self.daemon.check(self.now + 303)
         self.assertEqual((new.state, new.ci_stops, new.yields_to, new.yield_until), ("queued", 1, None, None))
-        self.assertIn("which has started", new.reason)
+        self.assertIn("no longer needs it", new.reason)
         with open(new.log) as f:
             self.assertIn("to make room for a CI job's build", f.read())
         self.assertTrue(self.daemon.waited_out(new, self.now + 303))  # it goes first now
+
+    def test_a_build_slow_to_die_isnt_followed_by_more_stops(self):
+        old, new = self.agents(12, 12)
+        self.ci_waiting()
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.tick(301 + self.daemon.ROOM_PAUSE + 60)  # still alive: what it frees isn't free yet
+        self.assertEqual(set(self.runner.forced), {new.id})
+        self.assertEqual(old.state, "running")
+
+    def test_a_ci_build_cancelled_before_the_stopped_build_is_gone(self):
+        old, new = self.agents(12, 12)
+        ci = self.ci_waiting()
+        self.tick(301)
+        self.daemon.cancel(ci, self.now + 302)
+        self.runner.running.discard(new.id)
+        self.daemon.check(self.now + 303)
+        self.assertEqual((new.state, new.ci_stops, new.yields_to), ("queued", 1, None))
+        self.assertIn("no longer needs it", new.reason)
+        del old
 
     def test_one_ci_build_at_a_time(self):
         a, b, c = self.agents(6, 6, 6)  # 17G free
