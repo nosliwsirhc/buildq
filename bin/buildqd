@@ -480,7 +480,7 @@ class Config:
     def lane_for(self, argv: list[str]) -> str:
         """The lane a command goes to when its caller names none: the first rule that matches
         its key words (`cargo test -p api`, `pnpm --filter web build`, ...), else default_lane."""
-        words = " ".join(command_words(argv))
+        words = " ".join(command_words(argv, self.script_labels))
         for rule, lane in self.lane_rules:
             if rule.search(words):
                 return lane
@@ -1198,7 +1198,7 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
                 words += [os.path.basename(w) for w in script[:2]]
         else:
             pos = positionals(rest, {"-m"} if "python" in tool else set())
-            module = option_values(rest, {"-m"})[:1] if "python" in tool else []  # (a script's own -m isn't a module)
+            module = option_values(rest, {"-m"})[:1] if "python" in tool else []  # (only python has -m modules)
             words += [os.path.basename(p) for p in pos[:1]] + module
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]

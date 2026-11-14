@@ -3191,6 +3191,11 @@ class Keys(unittest.TestCase):
         self.assertEqual(cfg.script_labels, frozenset({"persistent-cargo-target.sh"}))
         self.assertEqual(cfg.summary()["script_labels"], ["persistent-cargo-target.sh"])
         self.assertEqual(buildqd.Config({}, 64 * GIB, 16).script_labels, frozenset())
+        ruled = buildqd.Config(buildqd.tomllib.loads('script_labels = ["wrap.sh"]\n[[lane_rules]]\n'
+                                                     'match = "^bash wrap.sh architecture$"\nlane = "small"\n'
+                                                     '[lanes.default]\n[lanes.small]\n'), 64 * GIB, 16)
+        self.assertEqual(ruled.lane_for(["bash", "wrap.sh", "architecture"]), "small")  # rules see the label
+        self.assertEqual(ruled.lane_for(["bash", "wrap.sh", "rust-tests"]), "default")
         for bad in ("x.sh", ["a/b.sh"], [3]):
             with self.assertRaises(ValueError):
                 buildqd.Config({"script_labels": bad}, 64 * GIB, 16)
