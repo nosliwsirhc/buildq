@@ -1410,8 +1410,9 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
                 words += [os.path.basename(w) for w in script[:2]]
         else:
             pos = positionals(rest, {"-m"} if "python" in tool else set())
-            module = option_values(rest, {"-m"})[:1] if "python" in tool else []  # (only python has -m modules)
-            words += [os.path.basename(p) for p in pos[:1]] + module
+            # (only python has -m modules; written as `-m MODULE`, so a key keys back to itself, #49)
+            module = [f"-m {m}" for m in option_values(rest, {"-m"})[:1]] if "python" in tool else []
+            words += module + [os.path.basename(p) for p in pos[:1]]
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
     else:
@@ -1447,6 +1448,8 @@ def reusable_check(argv: list[str]) -> bool:
     tool, args = sure_tool_and_args(argv)  # (a wrapper with options: no tool, so no reuse)
     if any(WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
         return False
+    if tool == "vitest" and any(re.fullmatch(r"-[A-Za-z]*[uw][A-Za-z]*", a) for a in args):
+        return False  # -u or -w grouped with other flags (-ut adds: updates snapshots) (#50)
     if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
         return False  # `--reporter html`
     if tool == "dotnet" and any(re.match(r"-[ld](:|$)", a) or re.search(r"CollectCoverage", a) for a in args):
@@ -1604,6 +1607,11 @@ CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--c(h(d(i(r)?)?)?)?(=.*)?|--di(r(
                             r"|--(root|prefix|cwd)(=.*)?")
 OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, not what it reads: not checked
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
+# Variables that name tools, not source (where to find them, a compiler cache in front of rustc): a
+# check reads the tree it was run in whichever cargo or sccache runs it (#48). Any other wrapper
+# (RUSTC_WRAPPER=/x/w.sh) runs for every compile and might read anything, and CARGO_HOME's config
+# can point dependencies at a folder: those are still checked.
+TOOL_VARIABLE = re.compile(r"(PATH|RUSTUP_HOME)=.*|(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)=(.*/)?sccache")
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
 UNREADABLE = re.compile(r"""[\x00-\x1f\\"'`$\[\]{}]|://""")  # (and control characters: cargo splits at \x1f)
@@ -1634,6 +1642,18 @@ def path_pieces(arg: str, tool: str = "", operand: bool = False) -> list[str]:
     return [p.lstrip("@") for p in out if p and (operand or not p.startswith("-"))]
 
 
+def moving_words(argv: list[str]) -> list[str]:
+    """The words of a command that may move it to another folder (CHANGES_FOLDER): all but cargo's
+    own. After cargo's `--` come the test binary's or rustc's arguments (`-- -Cfoo`), and a word
+    that starts with one of cargo's options taking a value is that value (`-pCore`, `-Fcli`) (#48)."""
+    t = strip_wrappers(argv)
+    at = len(argv) - len(t)
+    if not t or os.path.basename(t[0]) != "cargo":
+        return argv[1:]
+    own = t[1: t.index("--")] if "--" in t else t[1:]
+    return argv[1:at] + [a for a in own if a[:2] not in ("-p", "-F", "-j", "-Z")]
+
+
 def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     """Every path the command names is inside the tree whose source was recorded, so an earlier
     result for the same source answers for it. A path is any part of any word (path_pieces) with a
@@ -1655,7 +1675,7 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     tool = os.path.basename(strip_wrappers(argv)[0]) if strip_wrappers(argv) else ""
     if any(UNREADABLE.search(a) for a in argv):
         return False  # what it names can't be read for certain
-    if any(CHANGES_FOLDER.fullmatch(a) for a in words):
+    if any(CHANGES_FOLDER.fullmatch(a) for a in moving_words(argv)):
         return False
     if "vitest" in (os.path.basename(a) for a in argv) and any(re.fullmatch(r"-[A-Za-z]*r(=.*)?", a) for a in words):
         return False  # vitest's short --root, grouped (-sr) or with its value (-r=..) too
@@ -1673,7 +1693,7 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
         if arg in OUTPUT_OPTIONS:
             skip = True
             continue
-        if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES):
+        if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES) or TOOL_VARIABLE.fullmatch(arg):
             continue
         for value in path_pieces(arg, tool, operands):
             candidate = os.path.join(cwd, os.path.expanduser(value))
@@ -4785,7 +4805,10 @@ class Daemon:
 
     def rebalance(self, now: float) -> None:
         """Every few seconds, hand idle cores to builds that would use them, and take cores back
-        when the machine is over its target or a queued build is waiting for cores."""
+        when the machine is over its target or a queued build is waiting for cores. A CI job's
+        build comes first both ways (#45): it has a time limit and holds up a release, and agents'
+        builds don't. It gets idle cores first, it is cut last, and one running below its lane's
+        usual cores, using all it has, takes cores from agents' builds above their minimum."""
         m, cfg = self.machine, self.cfg
         for t in self.active():
             if t.js is not None and not t.elastic and t.cg and fifo_in_use(t.cg, t.jobserver):
@@ -4805,7 +4828,7 @@ class Daemon:
         if spare >= 1 and free_mem > 0 and not waiting_for_memory:
             growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted
                               and (t.release_at is None or t.release_revoked)),
-                             key=lambda t: t.granted / max(t.want, 1))
+                             key=lambda t: (not t.from_ci, t.granted / max(t.want, 1)))
             for t in growers:
                 add = int(min(t.want - t.granted, math.floor(spare)))
                 while add >= 1 and self.mem_for(t, t.granted + add) - t.est_mem > free_mem:
@@ -4820,13 +4843,37 @@ class Daemon:
                     changed.append(t)
         elif spare <= -1:
             deficit = math.ceil(-spare)
-            for t in sorted(elastic, key=lambda t: t.granted - t.need, reverse=True):
+            for t in sorted(elastic, key=lambda t: (t.from_ci, -(t.granted - t.need))):
                 cut = min(t.granted - t.need, deficit)
                 if cut >= 1:
                     t.granted -= cut
                     deficit -= cut
                     changed.append(t)
                 if deficit <= 0:
+                    break
+        # A CI job's build below its lane's usual cores, and using all it has: cores move to it from
+        # agents' builds above their minimum (the most above first), up to those usual cores (more
+        # than that only from idle cores, above), as far as the memory more cores need is free.
+        # Nothing changes in all: the machine stays within its target.
+        def usual(t):
+            return min(t.want, self.lane(t.lane).cores)
+        for ci in sorted((t for t in elastic if t.from_ci and t.granted < usual(t)
+                          and t.cores_now >= 0.75 * t.granted), key=lambda t: t.granted / max(usual(t), 1)):
+            for donor in sorted((t for t in elastic if not t.from_ci and t.granted > t.need),
+                                key=lambda t: t.granted - t.need, reverse=True):
+                give = min(donor.granted - donor.need, usual(ci) - ci.granted)
+                while give >= 1 and self.mem_for(ci, ci.granted + give) - ci.est_mem > free_mem:
+                    give -= 1  # the memory more cores would need isn't free
+                if give < 1:
+                    break
+                new_mem = max(ci.est_mem, self.mem_for(ci, ci.granted + give))
+                free_mem -= new_mem - ci.est_mem
+                ci.est_mem = new_mem
+                donor.granted -= give
+                ci.granted += give
+                ci.max_granted = max(ci.max_granted, ci.granted)
+                changed += [t for t in (donor, ci) if t not in changed]
+                if ci.granted >= usual(ci):
                     break
         for t in elastic:
             before = t.js.out

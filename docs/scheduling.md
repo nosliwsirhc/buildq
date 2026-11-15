@@ -138,7 +138,11 @@ unless a `-j` or jobserver of the caller's is still left in those options (a `-j
 whose caller's make ran in parallel that way gets buildq's jobserver in `MAKEFLAGS`, with or without
 a `-j` of its own. Every five seconds buildq hands idle cores to
 builds that are using all of theirs, if the memory more cores need is free, and takes cores back when
-the machine is over its target or a queued build needs them. A build whose history shows it keeps
+the machine is over its target or a queued build needs them. A CI job's build comes first both ways
+(#45): it gets idle cores first and is cut last, and one running below its lane's usual `cores`
+while using all it has takes cores from agents' builds above their `min_cores` (the most above
+first), up to those usual cores. A CI build has a time limit and holds up a release; one held at
+its lane's minimum on a busy machine could otherwise run out of time. A build whose history shows it keeps
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to
 its lane's `max_cores`.
 

@@ -1085,7 +1085,8 @@ class SameSource(DaemonCase):
                      ["cargo", "check", "--config", 'build.rustflags=["--sysroot", "/outside"]'],
                      ["cargo", "check", "--config", 'registries.x.index="file:///x/index"'],
                      ["dotnet", "test", "@../other/args.rsp"],
-                     ["env", "PATH=/usr/bin", "cargo", "test"],  # (a system folder too: that costs a run, no more)
+                     ["env", "-C", "..", "cargo", "test"], ["cargo", "-C", "..", "test"],
+                     ["env", "--", "make", "-C", "../x"],  # (env's `--`, not cargo's: make still moves)
                      ["env", "CFLAGS=-isystem/outside/include", "cargo", "check"], ["dotnet", "test", "/outside"],
                      ["vitest", "run", "-r", "sub"]):
             self.assertFalse(inside(argv, "/r", "/r"), argv)
@@ -1110,7 +1111,10 @@ class SameSource(DaemonCase):
                      ["dotnet", "test", "--logger", "console;verbosity=normal"],
                      ["dotnet", "test", "--filter", "FullyQualifiedName~X&Category!=Slow"], ["eslint", ".", "--max-warnings=0"],
                      ["cargo", "clippy", "--", "-W", "clippy::pedantic", "-Dclippy::all"], ["cargo", "test", "-F", "Cli"],
-                     ["cargo", "test", "--", "--test-threads=1"]):
+                     ["cargo", "test", "--", "--test-threads=1"],
+                     # variables that name tools, not source, and cargo's own value options and `--` (#48)
+                     ["env", "PATH=/usr/bin:/bin", "cargo", "test"], ["env", "RUSTC_WRAPPER=/usr/bin/sccache", "cargo", "check"],
+                     ["cargo", "test", "-pCore"], ["cargo", "test", "-FCli"], ["cargo", "test", "--", "-Cfoo"]):
             self.assertTrue(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
@@ -1134,6 +1138,7 @@ class SameSource(DaemonCase):
 
     def test_which_commands_are_checks_and_which_start_over_safely(self):
         checks = [("cargo", "test", "-p", "api"), ("cargo", "+nightly", "check"), ("cargo", "nextest", "run"),
+                  ("vitest", "run", "-t", "adds"),
                   ("cargo", "clippy", "--", "-Dwarnings"), ("npx", "tsc", "--noEmit"), ("vitest", "run"),
                   ("eslint", "."), ("dotnet", "test")]
         not_checks = [("cargo", "build"), ("cargo", "doc"), ("cargo", "run"), ("cargo", "clippy", "--fix"),
@@ -1144,7 +1149,8 @@ class SameSource(DaemonCase):
                       ("dotnet", "test", "--logger", "trx"), ("dotnet", "test", "-l", "trx"),
                       ("vitest", "run", "--reporter", "html"), ("dotnet", "test", "--logger:trx"),
                       ("vitest", "run", "--coverage.enabled"),
-                      ("pnpm", "run", "build:deploy"), ("sh", "run-tests.sh"), ("git", "push"), ("make", "test")]
+                      ("pnpm", "run", "build:deploy"), ("sh", "run-tests.sh"), ("git", "push"), ("make", "test"),
+                      ("vitest", "run", "-ut", "adds"), ("vitest", "run", "-wt", "adds")]  # -u, -w grouped (#50)
         for argv in checks:
             self.assertTrue(buildqd.reusable_check(list(argv)), argv)
         for argv in not_checks:
@@ -3635,6 +3641,35 @@ class Jobservers(DaemonCase):
         self.assertEqual(t.js.out, 13)
 
 
+    def test_a_ci_build_short_of_cores_takes_them_from_agents_builds(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()  # a cold build: it wants 16
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        self.assertEqual(agent.granted, 12)  # 12 cores were free
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0  # the machine is at its target
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        self.assertTrue(ci.from_ci)
+        self.assertEqual(ci.state, "running")
+        start = ci.granted
+        self.assertLess(start, 8)
+        ci.elastic, ci.cores_now = True, float(start)  # using all it has
+        target = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.machine.busy = self.machine.busy_now = target  # no idle cores: they come from the agent's build
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual(ci.granted, 8)  # up to its lane's usual cores, not the 16 a cold build may want
+        self.assertEqual(agent.granted, 12 - (8 - start))  # from the agent's build, the machine still at its target
+        self.assertEqual((ci.js.out, agent.js.out), (7, agent.granted - 1))
+        ci.cores_now = 8.0
+        self.daemon.rebalance(self.now + 125)
+        self.assertEqual(ci.granted, 8)  # no more from agents: beyond its usual cores, only idle ones
+        self.machine.busy = self.machine.busy_now = target + 2  # over its target: agents' builds are cut first
+        self.daemon.rebalance(self.now + 130)
+        self.assertEqual(ci.granted, 8)
+        self.assertLess(agent.granted, 12 - (8 - start))
+
+
 class Recovery(DaemonCase):
     def test_a_resent_submission_gets_its_ticket_back(self):
         cwd = self.workdir()
@@ -3953,7 +3988,7 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("npx", "vitest", "run"), "npx vitest")
         self.assertEqual(self.words("git", "-C", "/x", "push", "--force-with-lease", "origin", "b"), "git push")
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
-        self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 pytest")
+        self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 -m pytest")  # (#49)
 
     def test_a_labelled_scripts_label_tells_its_builds_apart(self):
         labels = frozenset({"persistent-cargo-target.sh", "gen.py"})
@@ -3975,7 +4010,8 @@ class Keys(unittest.TestCase):
         # an unlisted script, -c, -lc and modules are keyed as before
         self.assertEqual(words("bash", "run.sh", "build"), "bash run.sh")
         self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh build"), self.words("bash", "-lc", "persistent-cargo-target.sh build"))
-        self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")
+        self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 -m unittest discover")
+        self.assertEqual(words("python3", "-m", "unittest", "discover"), "python3 -m unittest discover")  # keys back to itself (#49)
         # only a script that comes straight after the interpreter: not a command string or an option's value
         self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh", "hunter"),
                          self.words("bash", "-lc", "persistent-cargo-target.sh", "hunter"))
