@@ -1238,6 +1238,7 @@ CARGO_VALUE_OPTIONS = {"--manifest-path", "--target-dir", "-j", "--jobs", "--col
 JS_VALUE_OPTIONS = {"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 JOBSERVER_TOOLS = {"cargo", "make", "gmake", "ninja"}
+PYTHON_VALUE_OPTIONS = {"-m", "-c", "-W", "-X"}  # python's options that take the next word
 SAFE_WORD = re.compile(r"^@?[A-Za-z0-9_.,+:%/-]{1,64}$")  # "@scope/pkg" is an npm package, not an address
 
 
@@ -1409,9 +1410,19 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
                 script = [w for w in rest[i + 1].split() if not ASSIGNMENT.match(w)]
                 words += [os.path.basename(w) for w in script[:2]]
         else:
-            pos = positionals(rest, {"-m"} if "python" in tool else set())
-            # (only python has -m modules; written as `-m MODULE`, so a key keys back to itself, #49)
-            first = next((i for i, a in enumerate(rest) if not a.startswith("-") and (i == 0 or rest[i - 1] != "-m")), len(rest))
+            values = PYTHON_VALUE_OPTIONS if "python" in tool else set()
+            pos = positionals(rest, values)
+            # (only python has -m modules; written as `-m MODULE`, so a key keys back to itself, #49;
+            # only the interpreter's own -m, before the script: `script.py -m slow` is the script's)
+            first, i = len(rest), 0
+            while i < len(rest):
+                if rest[i] in values:
+                    i += 2
+                elif rest[i].startswith("-"):
+                    i += 1
+                else:
+                    first = i
+                    break
             module = [f"-m {m}" for m in option_values(rest[:first], {"-m"})[:1]] if "python" in tool else []
             words += module + [os.path.basename(p) for p in pos[:1]]
     elif tool in ("make", "gmake", "ninja"):
@@ -1609,10 +1620,13 @@ CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--c(h(d(i(r)?)?)?)?(=.*)?|--di(r(
 OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, not what it reads: not checked
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # Variables that name tools, not source (where to find them, a compiler cache in front of rustc): a
-# check reads the tree it was run in whichever cargo or sccache runs it (#48). Any other wrapper
+# check reads the tree it was run in whichever cargo or sccache runs it (#48). Only system and
+# installed-tool folders: a PATH into a sibling checkout may run a tool being built there. Any other wrapper
 # (RUSTC_WRAPPER=/x/w.sh) runs for every compile and might read anything, and CARGO_HOME's config
 # can point dependencies at a folder: those are still checked.
-TOOL_VARIABLE = re.compile(r"(PATH|RUSTUP_HOME)=.*|(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)="
+TOOL_FOLDER = r"(/usr(/local)?/s?bin|/s?bin|/home/[^/]+/\.cargo/bin|/home/[^/]+/\.local/bin)"
+TOOL_VARIABLE = re.compile(rf"PATH={TOOL_FOLDER}(:{TOOL_FOLDER})*|RUSTUP_HOME=/home/[^/]+/\.rustup|"
+                           r"(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)="
                            r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)")
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
@@ -1642,6 +1656,36 @@ def path_pieces(arg: str, tool: str = "", operand: bool = False) -> list[str]:
         else:
             out.append(piece)
     return [p.lstrip("@") for p in out if p and (operand or not p.startswith("-"))]
+
+
+def wrapper_settings(argv: list[str]) -> set[int]:
+    """Where in a command its wrappers set variables: env's assignments (after its options, as
+    env_command reads them) and sudo's VAR=value. None anywhere else: a command is run, not read by
+    a shell, so a word with "=" before it or after another wrapper (`nice PATH=../x/check.sh`) is a
+    program's path. None at all for a command that can't be read for certain (plainly)."""
+    if plainly(argv) is None:
+        return set()
+    out, i = set(), 0
+    while i < len(argv):
+        head = os.path.basename(argv[i])
+        if head == "env":
+            rest = env_command(argv[i + 1:])
+            command = len(argv) - len(rest)
+            k = command - 1
+            while k > i and "=" in argv[k] and not argv[k].startswith("-"):
+                out.add(k)  # the assignments: the words with "=" just before the command, after any options
+                k -= 1
+            i = command
+        elif head == "timeout":
+            i += 2
+        elif head in SURE_WRAPPERS:
+            i += 1
+            while head == "sudo" and i < len(argv) and ASSIGNMENT.match(argv[i]):
+                out.add(i)
+                i += 1
+        else:
+            break
+    return out
 
 
 def moving_words(argv: list[str]) -> list[str]:
@@ -1685,7 +1729,7 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
         return False  # sudo's options include -D, its own --chdir
     skip = operands = False
     named = [argv[0]] if "/" in argv[0] and not argv[0].startswith("/") else []  # ../other/check.sh
-    setting = set(range(1, len(argv) - len(strip_wrappers(argv))))  # where a wrapper's settings are (env X=1)
+    setting = wrapper_settings(argv)  # where a wrapper sets variables (env X=1, sudo X=1)
     for i, arg in [(0, a) for a in named] + list(enumerate(words, 1)):
         if skip:
             skip = False
@@ -4829,6 +4873,7 @@ class Daemon:
         spare = cpu_cap - max(m.busy, m.busy_now) - ramping - (waiting.need if waiting else 0)
         free_mem = m.mem_available - sum(self.still_to_grow(t, now) for t in self.active()) - cfg.mem_floor
         changed = []
+        idle_grown = 0  # cores handed out from measured idle ones this pass
         waiting_for_memory = any(t.reason_cat == "memory" for t in self.queue(now))
         if spare >= 1 and free_mem > 0 and not waiting_for_memory:
             growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted
@@ -4845,6 +4890,7 @@ class Daemon:
                     t.granted += add
                     t.max_granted = max(t.max_granted, t.granted)
                     spare -= add
+                    idle_grown += add
                     changed.append(t)
         elif spare <= -1:
             deficit = math.ceil(-spare)
@@ -4887,18 +4933,30 @@ class Daemon:
         # back. A build whose grant was cut gives its tokens back only as its jobs end, so tokens
         # moved to another build are issued as they come back, never before: the builds together
         # never hold more tokens than their grants.
+        # The count each ticket records (tokens_out, what a restart puts back) is never below what is
+        # out: a shrink is recorded after its tokens come back, a grower's before its tokens go out,
+        # so a crash between two saves leaves a count high (a token lost to that build), never low
+        # (a token issued twice).
         before = {t.id: t.js.out for t in elastic}
         for t in elastic:
             if t.js.out > t.granted - 1:
                 t.js.resize(t.granted - 1)
-        slack = sum(t.granted - 1 for t in elastic) - sum(t.js.out for t in elastic)
+                if t.js.out != before[t.id]:
+                    t.tokens_out = t.js.out
+                    self.save(t)
+        # What may go out: tokens that came back (grants together, less what is out), plus what
+        # idle cores paid for this pass. The idle cores were measured with every running job counted,
+        # those of a build still over its cut grant included, so they needn't wait for its jobs.
+        slack = max(0, sum(t.granted - 1 for t in elastic) - sum(t.js.out for t in elastic)) + idle_grown
         for t in sorted(elastic, key=lambda t: (not t.from_ci, t.granted / max(t.want, 1))):
             if t.js.out < t.granted - 1 and slack > 0:
-                was = t.js.out
-                t.js.resize(min(t.granted - 1, t.js.out + slack))
+                was, target = t.js.out, min(t.granted - 1, t.js.out + slack)
+                t.tokens_out = target
+                self.save(t)
+                t.js.resize(target)
                 slack -= t.js.out - was
         for t in elastic:
-            if t.js.out != before[t.id] or t in changed:
+            if t.tokens_out != t.js.out or t in changed:
                 t.tokens_out = t.js.out
                 self.save(t)
         for t in changed:

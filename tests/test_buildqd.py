@@ -1115,13 +1115,18 @@ class SameSource(DaemonCase):
                      ["cargo", "test", "--", "--test-threads=1"],
                      # variables that name tools, not source, and cargo's own value options and `--` (#48)
                      ["env", "PATH=/usr/bin:/bin", "cargo", "test"], ["env", "RUSTC_WRAPPER=/usr/bin/sccache", "cargo", "check"],
+                     ["env", "PATH=/home/u/.cargo/bin:/usr/local/bin:/usr/bin", "cargo", "test"],
+                     ["sudo", "PATH=/usr/bin", "cargo", "test"], ["env", "-i", "PATH=/usr/bin", "cargo", "test"],
                      ["cargo", "test", "-pCore"], ["cargo", "test", "-FCli"]):
             self.assertTrue(inside(argv, "/r", "/r"), argv)
         # ... but only where a wrapper sets them, and only cargo's own options: a script's argument
         # `PATH=…` is a path, and after cargo's `--` a custom test harness may take -C (#52 review)
         for argv in (["python3", "check.py", "PATH=../outside/input"], ["cargo", "test", "--", "-C..", "../outside/input"],
                      ["cargo", "test", "--", "-Cfoo"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"],
-                     ["env", "RUSTC_WRAPPER=/home/u/other/target/release/sccache", "cargo", "check"]):
+                     ["env", "RUSTC_WRAPPER=/home/u/other/target/release/sccache", "cargo", "check"],
+                     # a word with "=" that a wrapper runs, not sets: a program in a folder named `PATH=..`
+                     ["nice", "PATH=../../../outside/check.sh", "cargo", "test"], ["PATH=../x/check.sh", "cargo", "test"],
+                     ["env", "PATH=../tools/bin:/usr/bin", "cargo", "xyz"], ["env", "PATH=/home/u/Code/xyz/target/release", "cargo", "xyz"]):
             self.assertFalse(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
@@ -3678,6 +3683,24 @@ class Jobservers(DaemonCase):
         self.assertLess(agent.granted, 12 - (8 - start))
 
 
+    def test_idle_cores_dont_wait_for_a_cut_build_s_jobs(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        ci.elastic, ci.cores_now = True, float(ci.granted)
+        start = ci.js.out
+        held = os.read(agent.js.fd, agent.js.out)  # the agent's jobs hold every token it has
+        agent.granted, agent.cores_now = agent.need, 1.0  # cut (for another reason), its tokens not back yet
+        self.machine.busy = self.machine.busy_now = 12.0  # cores went idle elsewhere
+        self.daemon.rebalance(self.now + 120)
+        self.assertGreater(ci.granted - 1, start)
+        self.assertEqual(ci.js.out, ci.granted - 1)  # idle cores paid for it: its tokens went out at once
+        os.write(agent.js.fd, held)
+
     def test_tokens_moved_to_a_ci_build_are_issued_as_they_come_back(self):
         project = self.workdir("project")
         open(os.path.join(project, "Cargo.lock"), "w").close()
@@ -3694,8 +3717,26 @@ class Jobservers(DaemonCase):
         self.assertEqual((ci.granted, agent.granted), (8, 12 - (8 - start)))  # the grants move at once
         self.assertEqual((ci.js.out, agent.js.out), (start - 1, 11))  # but no token is issued before one comes back
         os.write(agent.js.fd, held)  # its jobs end and give the tokens back
+        # A crash once the grower's tokens are out, before its save after them: what it saved is
+        # never below what is out, so a restart can't issue them twice.
+        def saved(t):
+            with open(os.path.join(t.dir, "ticket.json")) as f:
+                return json.load(f)["tokens_out"]
+        save = self.daemon.save
+        def crashing(t):
+            if t is ci and ci.js.out > start - 1:
+                raise SystemExit("crash")
+            save(t)
+        with unittest.mock.patch.object(self.daemon, "save", side_effect=crashing):
+            try:
+                self.daemon.rebalance(self.now + 124)
+            except SystemExit:
+                pass  # (a save after its tokens went out: none is needed, as the count went first)
+        self.assertEqual(ci.js.out, 7)
+        self.assertGreaterEqual(saved(ci), ci.js.out)
         self.daemon.rebalance(self.now + 125)
         self.assertEqual((ci.js.out, agent.js.out), (7, agent.granted - 1))
+        self.assertEqual(saved(ci), 7)
         # While a build waits for memory, none is taken for more cores.
         ci.granted, agent.granted = ci.need, 12
         big = self.submit(("cargo", "build"), cwd=self.workdir("big"), mem="90G")
@@ -4031,6 +4072,7 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
         self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 -m pytest")  # (#49)
         self.assertEqual(self.words("python3", "script.py", "-m", "slow"), "python3 script.py")  # the script's own -m
+        self.assertEqual(self.words("python3", "-X", "dev", "-W", "error", "-m", "pytest"), "python3 -m pytest")
 
     def test_a_labelled_scripts_label_tells_its_builds_apart(self):
         labels = frozenset({"persistent-cargo-target.sh", "gen.py"})
