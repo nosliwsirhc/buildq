@@ -1643,15 +1643,15 @@ def path_pieces(arg: str, tool: str = "", operand: bool = False) -> list[str]:
 
 
 def moving_words(argv: list[str]) -> list[str]:
-    """The words of a command that may move it to another folder (CHANGES_FOLDER): all but cargo's
-    own. After cargo's `--` come the test binary's or rustc's arguments (`-- -Cfoo`), and a word
-    that starts with one of cargo's options taking a value is that value (`-pCore`, `-Fcli`) (#48)."""
+    """The words of a command that may move it to another folder (CHANGES_FOLDER): all but those of
+    cargo's own options that start with an option taking a value (`-pCore`, `-Fcli`: a package, a
+    feature) (#48). What follows cargo's `--` is still read: a custom test harness may take -C."""
     t = strip_wrappers(argv)
     at = len(argv) - len(t)
     if not t or os.path.basename(t[0]) != "cargo":
         return argv[1:]
-    own = t[1: t.index("--")] if "--" in t else t[1:]
-    return argv[1:at] + [a for a in own if a[:2] not in ("-p", "-F", "-j", "-Z")]
+    end = t.index("--") if "--" in t else len(t)
+    return argv[1:at] + [a for i, a in enumerate(t[1:], 1) if i >= end or a[:2] not in ("-p", "-F", "-j", "-Z")]
 
 
 def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
@@ -1683,7 +1683,8 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
         return False  # sudo's options include -D, its own --chdir
     skip = operands = False
     named = [argv[0]] if "/" in argv[0] and not argv[0].startswith("/") else []  # ../other/check.sh
-    for arg in named + words:
+    setting = set(range(1, len(argv) - len(strip_wrappers(argv))))  # where a wrapper's settings are (env X=1)
+    for i, arg in [(0, a) for a in named] + list(enumerate(words, 1)):
         if skip:
             skip = False
             continue
@@ -1693,8 +1694,10 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
         if arg in OUTPUT_OPTIONS:
             skip = True
             continue
-        if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES) or TOOL_VARIABLE.fullmatch(arg):
+        if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES):
             continue
+        if i in setting and TOOL_VARIABLE.fullmatch(arg):
+            continue  # a variable saying where tools are, set for the command (not an argument to it)
         for value in path_pieces(arg, tool, operands):
             candidate = os.path.join(cwd, os.path.expanduser(value))
             looks = "/" in value or value.startswith((".", "~"))
@@ -4858,7 +4861,9 @@ class Daemon:
         def usual(t):
             return min(t.want, self.lane(t.lane).cores)
         for ci in sorted((t for t in elastic if t.from_ci and t.granted < usual(t)
-                          and t.cores_now >= 0.75 * t.granted), key=lambda t: t.granted / max(usual(t), 1)):
+                          and t.cores_now >= 0.75 * t.granted
+                          and (t.release_at is None or t.release_revoked)),  # (its hold let go: as growth)
+                         key=lambda t: t.granted / max(usual(t), 1)):
             for donor in sorted((t for t in elastic if not t.from_ci and t.granted > t.need),
                                 key=lambda t: t.granted - t.need, reverse=True):
                 give = min(donor.granted - donor.need, usual(ci) - ci.granted)
@@ -4875,10 +4880,22 @@ class Daemon:
                 changed += [t for t in (donor, ci) if t not in changed]
                 if ci.granted >= usual(ci):
                     break
+        # Tokens: shrink first, then grow (a CI job's build first) only within what the shrinking gave
+        # back. A build whose grant was cut gives its tokens back only as its jobs end, so tokens
+        # moved to another build are issued as they come back, never before: the builds together
+        # never hold more tokens than their grants.
+        before = {t.id: t.js.out for t in elastic}
         for t in elastic:
-            before = t.js.out
-            t.js.resize(t.granted - 1)
-            if t.js.out != before or t in changed:
+            if t.js.out > t.granted - 1:
+                t.js.resize(t.granted - 1)
+        slack = sum(t.granted - 1 for t in elastic) - sum(t.js.out for t in elastic)
+        for t in sorted(elastic, key=lambda t: (not t.from_ci, t.granted / max(t.want, 1))):
+            if t.js.out < t.granted - 1 and slack > 0:
+                was = t.js.out
+                t.js.resize(min(t.granted - 1, t.js.out + slack))
+                slack -= t.js.out - was
+        for t in elastic:
+            if t.js.out != before[t.id] or t in changed:
                 t.tokens_out = t.js.out
                 self.save(t)
         for t in changed:

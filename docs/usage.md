@@ -89,8 +89,8 @@ arguments name no path outside the tree:
   (quotes, escapes, brackets, `$` or a URL in it, as a `--config` TOML value has): that costs a run,
   never a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`, eslint's
   `--cache-location`) doesn't count, nor do variables that say where tools are (`PATH`,
-  `RUSTUP_HOME`, `RUSTC_WRAPPER=…/sccache`), cargo's own `-p`/`-F` values run on (`-pCore`), or
-  what follows cargo's `--` (the test binary's arguments). Source that no
+  `RUSTUP_HOME`, `RUSTC_WRAPPER=…/sccache`) when a wrapper sets them (`env PATH=… cargo test`), or
+  cargo's own `-p`/`-F` values run on (`-pCore`). Source that no
   word names isn't seen (a path dependency outside the tree, a `[patch]` in a config file, a
   symlinked folder): `--again` runs such a build regardless. `run` prints that run's output
   and exits 0, and nothing runs. A build that makes files (cargo build, a bundle, docs) or a

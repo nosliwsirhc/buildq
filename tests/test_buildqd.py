@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -1114,8 +1115,13 @@ class SameSource(DaemonCase):
                      ["cargo", "test", "--", "--test-threads=1"],
                      # variables that name tools, not source, and cargo's own value options and `--` (#48)
                      ["env", "PATH=/usr/bin:/bin", "cargo", "test"], ["env", "RUSTC_WRAPPER=/usr/bin/sccache", "cargo", "check"],
-                     ["cargo", "test", "-pCore"], ["cargo", "test", "-FCli"], ["cargo", "test", "--", "-Cfoo"]):
+                     ["cargo", "test", "-pCore"], ["cargo", "test", "-FCli"]):
             self.assertTrue(inside(argv, "/r", "/r"), argv)
+        # ... but only where a wrapper sets them, and only cargo's own options: a script's argument
+        # `PATH=…` is a path, and after cargo's `--` a custom test harness may take -C (#52 review)
+        for argv in (["python3", "check.py", "PATH=../outside/input"], ["cargo", "test", "--", "-C..", "../outside/input"],
+                     ["cargo", "test", "--", "-Cfoo"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
         failed = self.submit(("cargo", "test"), source=SOURCE)
@@ -3668,6 +3674,32 @@ class Jobservers(DaemonCase):
         self.daemon.rebalance(self.now + 130)
         self.assertEqual(ci.granted, 8)
         self.assertLess(agent.granted, 12 - (8 - start))
+
+
+    def test_tokens_moved_to_a_ci_build_are_issued_as_they_come_back(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        start = ci.granted
+        ci.elastic, ci.cores_now = True, float(start)
+        held = os.read(agent.js.fd, agent.js.out)  # the agent's jobs hold every token it has
+        self.machine.busy = self.machine.busy_now = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual((ci.granted, agent.granted), (8, 12 - (8 - start)))  # the grants move at once
+        self.assertEqual((ci.js.out, agent.js.out), (start - 1, 11))  # but no token is issued before one comes back
+        os.write(agent.js.fd, held)  # its jobs end and give the tokens back
+        self.daemon.rebalance(self.now + 125)
+        self.assertEqual((ci.js.out, agent.js.out), (7, agent.granted - 1))
+        # A CI build whose hold was let go past its peak grows no further this way, as growth doesn't.
+        ci.granted = ci.need
+        ci.release_at, ci.release_revoked, ci.release_hold = 60.0, False, 64 * GIB  # (kept: it stays under it)
+        with unittest.mock.patch.object(self.daemon, "past_peak_hold", return_value=64 * GIB):  # (still released)
+            self.daemon.rebalance(self.now + 130)
+        self.assertEqual(ci.granted, ci.need)
 
 
 class Recovery(DaemonCase):

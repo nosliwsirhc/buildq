@@ -142,7 +142,9 @@ the machine is over its target or a queued build needs them. A CI job's build co
 (#45): it gets idle cores first and is cut last, and one running below its lane's usual `cores`
 while using all it has takes cores from agents' builds above their `min_cores` (the most above
 first), up to those usual cores. A CI build has a time limit and holds up a release; one held at
-its lane's minimum on a busy machine could otherwise run out of time. A build whose history shows it keeps
+its lane's minimum on a busy machine could otherwise run out of time. Jobserver tokens follow the
+grants without ever adding up to more: a build whose grant is cut gives its tokens back only as its
+jobs end, so the build that gained is issued them as they come back, not before. A build whose history shows it keeps
 using many more cores than it is given (it ignores the job count) is planned at what it uses, up to
 its lane's `max_cores`.
 
