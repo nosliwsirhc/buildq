@@ -1120,7 +1120,8 @@ class SameSource(DaemonCase):
         # ... but only where a wrapper sets them, and only cargo's own options: a script's argument
         # `PATH=…` is a path, and after cargo's `--` a custom test harness may take -C (#52 review)
         for argv in (["python3", "check.py", "PATH=../outside/input"], ["cargo", "test", "--", "-C..", "../outside/input"],
-                     ["cargo", "test", "--", "-Cfoo"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"]):
+                     ["cargo", "test", "--", "-Cfoo"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"],
+                     ["env", "RUSTC_WRAPPER=/home/u/other/target/release/sccache", "cargo", "check"]):
             self.assertFalse(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
@@ -1156,7 +1157,8 @@ class SameSource(DaemonCase):
                       ("vitest", "run", "--reporter", "html"), ("dotnet", "test", "--logger:trx"),
                       ("vitest", "run", "--coverage.enabled"),
                       ("pnpm", "run", "build:deploy"), ("sh", "run-tests.sh"), ("git", "push"), ("make", "test"),
-                      ("vitest", "run", "-ut", "adds"), ("vitest", "run", "-wt", "adds")]  # -u, -w grouped (#50)
+                      ("vitest", "run", "-ut", "adds"), ("vitest", "run", "-wt", "adds"),  # -u, -w grouped (#50)
+                      ("vitest", "run", "-u=true"), ("vitest", "run", "-tu=x")]
         for argv in checks:
             self.assertTrue(buildqd.reusable_check(list(argv)), argv)
         for argv in not_checks:
@@ -3694,6 +3696,13 @@ class Jobservers(DaemonCase):
         os.write(agent.js.fd, held)  # its jobs end and give the tokens back
         self.daemon.rebalance(self.now + 125)
         self.assertEqual((ci.js.out, agent.js.out), (7, agent.granted - 1))
+        # While a build waits for memory, none is taken for more cores.
+        ci.granted, agent.granted = ci.need, 12
+        big = self.submit(("cargo", "build"), cwd=self.workdir("big"), mem="90G")
+        self.assertEqual(big.reason_cat, "memory")  # it waits for memory
+        with unittest.mock.patch.object(self.daemon, "mem_for", lambda t, cores: t.est_mem + (cores - t.need) * GIB):
+            self.daemon.rebalance(self.now + 127)
+        self.assertEqual(ci.granted, ci.need)
         # A CI build whose hold was let go past its peak grows no further this way, as growth doesn't.
         ci.granted = ci.need
         ci.release_at, ci.release_revoked, ci.release_hold = 60.0, False, 64 * GIB  # (kept: it stays under it)
@@ -4021,6 +4030,7 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("git", "-C", "/x", "push", "--force-with-lease", "origin", "b"), "git push")
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
         self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 -m pytest")  # (#49)
+        self.assertEqual(self.words("python3", "script.py", "-m", "slow"), "python3 script.py")  # the script's own -m
 
     def test_a_labelled_scripts_label_tells_its_builds_apart(self):
         labels = frozenset({"persistent-cargo-target.sh", "gen.py"})

@@ -1411,7 +1411,8 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
         else:
             pos = positionals(rest, {"-m"} if "python" in tool else set())
             # (only python has -m modules; written as `-m MODULE`, so a key keys back to itself, #49)
-            module = [f"-m {m}" for m in option_values(rest, {"-m"})[:1]] if "python" in tool else []
+            first = next((i for i, a in enumerate(rest) if not a.startswith("-") and (i == 0 or rest[i - 1] != "-m")), len(rest))
+            module = [f"-m {m}" for m in option_values(rest[:first], {"-m"})[:1]] if "python" in tool else []
             words += module + [os.path.basename(p) for p in pos[:1]]
     elif tool in ("make", "gmake", "ninja"):
         words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
@@ -1448,7 +1449,7 @@ def reusable_check(argv: list[str]) -> bool:
     tool, args = sure_tool_and_args(argv)  # (a wrapper with options: no tool, so no reuse)
     if any(WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
         return False
-    if tool == "vitest" and any(re.fullmatch(r"-[A-Za-z]*[uw][A-Za-z]*", a) for a in args):
+    if tool == "vitest" and any(re.fullmatch(r"-[A-Za-z]*[uw][A-Za-z]*(=.*)?", a) for a in args):
         return False  # -u or -w grouped with other flags (-ut adds: updates snapshots) (#50)
     if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
         return False  # `--reporter html`
@@ -1611,7 +1612,8 @@ OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # check reads the tree it was run in whichever cargo or sccache runs it (#48). Any other wrapper
 # (RUSTC_WRAPPER=/x/w.sh) runs for every compile and might read anything, and CARGO_HOME's config
 # can point dependencies at a folder: those are still checked.
-TOOL_VARIABLE = re.compile(r"(PATH|RUSTUP_HOME)=.*|(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)=(.*/)?sccache")
+TOOL_VARIABLE = re.compile(r"(PATH|RUSTUP_HOME)=.*|(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)="
+                           r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)")
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
 UNREADABLE = re.compile(r"""[\x00-\x1f\\"'`$\[\]{}]|://""")  # (and control characters: cargo splits at \x1f)
@@ -1666,8 +1668,8 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     - one pointed elsewhere (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`,
       `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`).
     An output folder (--target-dir, CARGO_TARGET_DIR, eslint's --cache-location) is where it writes,
-    not what it reads. A word naming a system folder (`PATH=/usr/bin`) also matches nothing, which
-    costs a run, not a wrong answer.
+    not what it reads, and nor are variables saying where tools are (TOOL_VARIABLE) where a wrapper
+    sets them.
     Source that no word names (a path dependency, a [patch] in a config file, a symlinked folder
     inside the tree) isn't seen: --again runs such a build regardless."""
     root = os.path.realpath(top)
@@ -4867,7 +4869,8 @@ class Daemon:
             for donor in sorted((t for t in elastic if not t.from_ci and t.granted > t.need),
                                 key=lambda t: t.granted - t.need, reverse=True):
                 give = min(donor.granted - donor.need, usual(ci) - ci.granted)
-                while give >= 1 and self.mem_for(ci, ci.granted + give) - ci.est_mem > free_mem:
+                room = 0 if waiting_for_memory else free_mem  # (none taken from a build waiting for memory)
+                while give >= 1 and self.mem_for(ci, ci.granted + give) - ci.est_mem > room:
                     give -= 1  # the memory more cores would need isn't free
                 if give < 1:
                     break
