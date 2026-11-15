@@ -3514,13 +3514,16 @@ class Daemon:
     def position(self, t: Ticket) -> int | None:
         return self.queue().index(t) if t.state == "queued" else None
 
-    def save(self, t: Ticket) -> None:
+    def save(self, t: Ticket) -> bool:
+        """Write the ticket to disk; False if that failed (a full disk, say), which is logged."""
         if not t.dir:
-            return
+            return True
         try:
             write_json(os.path.join(t.dir, "ticket.json"), t.record())
+            return True
         except OSError as e:
             log(f"can't save ticket {t.id}: {e}")
+            return False
 
     def broadcast(self, t: Ticket, now: float) -> None:
         conns = self.watchers.get(t.id)
@@ -4944,15 +4947,18 @@ class Daemon:
                 if t.js.out != before[t.id]:
                     t.tokens_out = t.js.out
                     self.save(t)
-        # What may go out: tokens that came back (grants together, less what is out), plus what
-        # idle cores paid for this pass. The idle cores were measured with every running job counted,
-        # those of a build still over its cut grant included, so they needn't wait for its jobs.
-        slack = max(0, sum(t.granted - 1 for t in elastic) - sum(t.js.out for t in elastic)) + idle_grown
+        # What may go out: what the grants together allow (grants less what is out, tokens held over
+        # a cut grant counted against it), or what idle cores paid for this pass if that is more,
+        # not both (the grants already include it). The idle cores were measured with every running
+        # job counted, those of a build still over its cut grant included, so those needn't wait.
+        slack = max(sum(t.granted - 1 for t in elastic) - sum(t.js.out for t in elastic), idle_grown)
         for t in sorted(elastic, key=lambda t: (not t.from_ci, t.granted / max(t.want, 1))):
             if t.js.out < t.granted - 1 and slack > 0:
                 was, target = t.js.out, min(t.granted - 1, t.js.out + slack)
                 t.tokens_out = target
-                self.save(t)
+                if not self.save(t):  # its count isn't on disk: a restart could issue these twice
+                    t.tokens_out = was
+                    continue
                 t.js.resize(target)
                 slack -= t.js.out - was
         for t in elastic:

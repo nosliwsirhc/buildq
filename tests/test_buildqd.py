@@ -3701,6 +3701,41 @@ class Jobservers(DaemonCase):
         self.assertEqual(ci.js.out, ci.granted - 1)  # idle cores paid for it: its tokens went out at once
         os.write(agent.js.fd, held)
 
+    def test_idle_cores_pay_for_a_token_once(self):
+        # One idle core and a transfer in the same pass: the CI build gets one token for the idle
+        # core, not one more for the grant that core already raised (#52 review round 3).
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        ci.elastic, ci.cores_now = True, float(ci.granted)
+        start = ci.js.out
+        held = os.read(agent.js.fd, agent.js.out)  # the agent's jobs hold every token it has
+        target = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.machine.busy = self.machine.busy_now = target - 1.5  # one idle core
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual(ci.granted, 8)
+        self.assertEqual(ci.js.out, start + 1)  # one token: the idle core's
+        # The next pass: idle cores raise the agent's grant while the CI build is still owed tokens.
+        # The CI build gets no more than those idle cores paid for (Opus, #52 review round 3).
+        agent.cores_now = 12.0
+        self.machine.busy = self.machine.busy_now = target - 2.5  # two idle cores
+        was = ci.js.out
+        self.daemon.rebalance(self.now + 122)
+        self.assertLessEqual(ci.js.out - was, 2)
+        self.assertLessEqual(sum(t.js.out for t in (agent, ci)), 11 + was + 2)
+        # A token whose count couldn't be saved doesn't go out.
+        was = ci.js.out
+        with unittest.mock.patch.object(self.daemon, "save", return_value=False):
+            os.write(agent.js.fd, held)  # the agent's jobs end
+            self.daemon.rebalance(self.now + 125)
+        self.assertEqual(ci.js.out, was)
+        self.daemon.rebalance(self.now + 130)
+        self.assertEqual(ci.js.out, 7)
+
     def test_tokens_moved_to_a_ci_build_are_issued_as_they_come_back(self):
         project = self.workdir("project")
         open(os.path.join(project, "Cargo.lock"), "w").close()
@@ -3726,7 +3761,7 @@ class Jobservers(DaemonCase):
         def crashing(t):
             if t is ci and ci.js.out > start - 1:
                 raise SystemExit("crash")
-            save(t)
+            return save(t)
         with unittest.mock.patch.object(self.daemon, "save", side_effect=crashing):
             try:
                 self.daemon.rebalance(self.now + 124)
