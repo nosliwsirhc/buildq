@@ -4836,11 +4836,19 @@ class Top(unittest.TestCase):
         self.assertEqual(before[-2:], [20.0, 5.0])  # the average in each minute; the newest still filling
         self.assertEqual(hist.buckets(1, 30, 1794600079.0), before)  # nothing moves within a step
         self.assertEqual(hist.buckets(1, 30, 1794600121.0)[-3:], [20.0, 5.0, None])  # a new step: one along
+        sparse = buildq.TopHistory()  # a sample every 40 s, steps of 20 s: the line between, not gaps
+        for t, busy in ((0, 8.0), (40, 16.0)):
+            s3 = dict(snap, time=1794600000.0 + t)
+            s3["machine"] = dict(snap["machine"], busy=busy)
+            sparse.add(s3)
+        steps = sparse.buckets(1, 90, 1794600040.0)
+        self.assertEqual(steps[-3:], [8.0, 14.0, 16.0])  # the middle step is 30 s along a 40 s line
 
     def test_braille_has_two_steps_a_cell_and_a_baseline(self):
         self.assertEqual(buildq.braille_rows([0, 4], 1, 4, baseline=False), ["\u28b8"])  # right column full
         self.assertEqual(buildq.braille_rows([4, 4], 1, 4, baseline=False), ["\u28ff"])
-        self.assertEqual(buildq.braille_rows([None, None], 2, 4), ["\u2800", "\u28c0"])  # one baseline dot each
+        self.assertEqual(buildq.braille_rows([0, 0], 2, 4), ["\u2800", "\u28c0"])  # a baseline dot each
+        self.assertEqual(buildq.braille_rows([None, None], 2, 4), ["\u2800", "\u2800"])  # no data: blank, as btop
         self.assertEqual(buildq.braille_rows([2, 6], 2, 8, baseline=False), ["\u28a0", "\u28fc"])  # 2 and 4 dots low, 0 and 2 high
         self.assertEqual(buildq.gradient_style(0, 8), "cpu0")
         self.assertEqual(buildq.gradient_style(7, 8), "cpu7")  # green at the bottom, red at the top
@@ -5206,7 +5214,7 @@ class Top(unittest.TestCase):
         class Curses:
             A_BOLD, A_REVERSE, A_DIM, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE, COLOR_MAGENTA = \
                 1 << 21, 1 << 18, 1 << 20, 6, 2, 3, 1, 4, 5
-            COLOR_WHITE, COLORS = 7, 8
+            COLOR_WHITE, COLOR_BLACK, COLORS = 7, 0, 8
             error = Exception
 
             def has_colors(self):
@@ -5228,6 +5236,7 @@ class Top(unittest.TestCase):
         self.assertEqual(calls.count("pair"), 9)
         self.assertNotEqual(coloured["ok"], 0)
         self.assertEqual(coloured["dim"], 0)  # nothing to read in blue
+        self.assertNotEqual(coloured["sel_bad"], coloured["sel"])  # a warning on the bar: its own background
         rich = Curses()
         rich.COLORS = 256
         calls.clear()
@@ -5247,6 +5256,11 @@ class Top(unittest.TestCase):
         self.assertNotEqual(few["ok"], 0)
         Exhausted.COLOR_PAIRS = 8
         self.assertEqual(buildq.init_colours(Exhausted(), wanted=True).get("ok", 0), 0)  # too few for that too: plain
+        direct = Curses()
+        direct.COLORS, direct.COLOR_PAIRS = 0x1000000, 0x10000  # xterm-direct: numbers are RGB, not indexes
+        calls.clear()
+        self.assertEqual(buildq.init_colours(direct, wanted=True)["dim"], 0)  # the eight colours' theme
+        self.assertEqual(calls.count("pair"), 9)
 
     def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
         import curses

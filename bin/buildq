@@ -2295,6 +2295,18 @@ class TopHistory:
                 sums[i] += smp[field]
                 counts[i] += 1
         out = [sums[i] / counts[i] if counts[i] else None for i in range(n)]
+        live = [(smp[0], smp[field]) for smp in self.samples]
+        if len(live) > 1:  # (samples further apart than a step: draw the line between them, not gaps)
+            j = 0
+            for i in range(n):
+                mid = (first + i + 0.5) * width
+                if out[i] is not None:
+                    continue
+                while j + 1 < len(live) and live[j + 1][0] < mid:
+                    j += 1
+                if j + 1 < len(live) and live[j][0] <= mid and live[j + 1][0] - live[j][0] <= 180:
+                    (t0, v0), (t1, v1) = live[j], live[j + 1]
+                    out[i] = v0 + (v1 - v0) * (mid - t0) / (t1 - t0) if t1 > t0 else v0
         points = [(m[0], m[field]) for m in self.minutes]
         if points and self.samples:
             points.append((self.samples[0][0], self.samples[0][field]))
@@ -2350,7 +2362,9 @@ BRAILLE_RIGHT = (0, 0x80, 0xA0, 0xB0, 0xB8)  # dots 8, 6, 5, 4: the right column
 def graph_dots(v, row: int, height: int, top: float, baseline: bool) -> int:
     """How many of a cell column's four dots value v fills in row `row` (0 at the bottom) of a graph
     `height` rows tall scaled to `top`; with a baseline, the bottom row always has one."""
-    if v is None or not top:
+    if v is None:
+        return 0  # no data: blank, as btop draws it
+    if not top:
         d = 0
     else:
         low, high = top * row / height, top * (row + 1) / height
@@ -2443,10 +2457,10 @@ def draw_cpu(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: TopHis
     rows = graph_rows(hist, 1, gw, gh, cores, now)
     for r, line in enumerate(rows):
         mark = str(cores) if r == 0 else "0" if r == gh - 1 and gh > 1 else ""
-        c.put(y + 1 + r, x + 1, mark.rjust(label - 1) + " ", "faint")
+        c.put(y + 1 + r, x + 1, mark.rjust(label - 1) + " ", "dim")
         c.put(y + 1 + r, x + 1 + label, line, gradient_style(gh - 1 - r, gh))
     if axis:
-        c.put(y + 1 + gh, x + 1 + label, time_axis(gw), "faint")
+        c.put(y + 1 + gh, x + 1 + label, time_axis(gw), "dim")
 
 
 def wrap_spans(parts: list, width: int) -> list[list]:
@@ -2741,7 +2755,7 @@ def draw_timeline(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: T
     for r, line in enumerate(graph_rows(hist, 3, gw, 3, total, now)):
         c.put(iy + r, ix, ("memory" if r == 1 else "").ljust(label), "dim")
         c.put(iy + r, ix + label + 1, line, "mem")
-    c.put(iy + 3, ix + label + 1, time_axis(gw), "faint")
+    c.put(iy + 3, ix + label + 1, time_axis(gw), "dim")
     live = []
     for row in ov.get("running") or []:
         start = row.get("started") or now - (row.get("elapsed") or 0)
@@ -3026,7 +3040,8 @@ def init_colours(curses, wanted: bool) -> dict:
         rich = len({fg for fg, _ in TOP_COLOURS_256.values()}) + 3  # the pairs btop's theme takes
         if limit < 9:  # not even the eight colours' pairs: plain text
             return plain
-        if getattr(curses, "COLORS", 8) >= 256 and limit >= rich:
+        palette = getattr(curses, "COLORS", 8)
+        if 256 <= palette < 0x1000000 and limit >= rich:  # (a direct-colour terminal's numbers are RGB)
             for style, (fg, strong) in TOP_COLOURS_256.items():
                 colours[style] = pair(fg) | (bold if strong else 0)
             colours["sel"] = pair(255, SELECTED_BG_256) | bold
@@ -3041,7 +3056,9 @@ def init_colours(curses, wanted: bool) -> dict:
                            box_mem=pair(yellow) | dim, box_proc=pair(red) | dim, box_net=pair(magenta) | dim,
                            mem=pair(green), held=pair(yellow), other=pair(magenta), room=pair(cyan) | bold,
                            ci=pair(magenta) | bold, sel=pair(white, curses.COLOR_BLUE) | bold,
-                           sel_bad=pair(red, curses.COLOR_BLUE) | bold, sel_warn=pair(yellow, curses.COLOR_BLUE) | bold)
+                           # (red or yellow on blue reads at 1:1 on some palettes: the warning is the cell's
+                           # background instead)
+                           sel_bad=pair(white, red) | bold, sel_warn=pair(curses.COLOR_BLACK, yellow))
             for i in range(8):
                 colours[f"cpu{i}"] = pair(green if i < 3 else yellow if i < 6 else red)
     except (curses.error, ValueError):  # (ValueError: a pair number past what the terminal has)
@@ -3256,6 +3273,9 @@ def cmd_top(args) -> int:
     why = None
     try:
         code, why = curses_with_fallback(run, curses.wrapper)
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b[?2026l")  # (synchronized output off, whatever ended the session)
+            sys.stdout.flush()
         if code is not None:
             return code
         sizes.stop()
