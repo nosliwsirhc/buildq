@@ -52,8 +52,11 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
 `buildq top` is a live view of the queue, like `btop`, in boxed panels:
 - **CPU** (beside MEMORY on a terminal 110 columns or wider; otherwise a bar in the title line):
   the last half hour as a graph, with busy cores against the queue's target and CPU pressure.
-  Its first minutes come from the analytics (`metrics.db`, the busiest moment of each minute), so
-  it isn't empty when top starts.
+  Drawn as btop draws its graphs: braille, two steps to a cell, coloured by row from green at the
+  bottom to red at the top. Steps are fixed to the clock and hold the average of their samples, so
+  the graph moves half a cell as each step closes. Its first minutes come from the analytics
+  (`metrics.db`, each minute's average, as a line between minutes), so it isn't empty when top
+  starts; where there is no data at all it is blank.
 - **MEMORY, as a ledger:** one bar where every part of the machine's memory has its place: each
   running build's use (`▓`) and what is held for it to grow into (`▒`), everything else (`█`), the
   floor (`░`) and the room a new build can start in (`■`). When more is held than is free, it says
@@ -103,6 +106,10 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
 - **Small screens:** the selected build always stays in view. An open detail pane gets up to half
   of what is left, then the machine's panels, then the rest of the builds. Under 18 rows the
   machine's panels give way, and the title line says CPU and memory instead.
+- **Colours:** btop's Default theme (from btop's source, Apache-2.0) on a 256-colour terminal:
+  readable text in light grey, darker greys only for decoration, panel frames in btop's box colours,
+  and the selected row as one dark-red bar with white text. On 8 colours, btop's TTY theme, with
+  nothing to read in blue. Built for a dark background, as btop is.
 - **Terminals:**
   - it draws with ASCII when the terminal isn't UTF-8 (`LC_ALL=C`), as curses itself writes;
   - `NO_COLOR` turns colour off; every part also has its own glyph, so nothing depends on colour;

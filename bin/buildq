@@ -2146,14 +2146,15 @@ def shared_folders(snap: dict) -> set[str]:
 # colours; with no colour, the glyphs alone say what each part is.
 
 BOX = {"tl": "╭", "tr": "╮", "bl": "╰", "br": "╯", "h": "─", "v": "│"}
-TOP = {"used": "▓", "held": "▒", "other": "█", "floor": "░", "room": "■", "spark": "▁▂▃▄▅▆▇█", "core": "▮", "nocore": "▯",
+TOP = {"braille": True, "used": "▓", "held": "▒", "other": "█", "floor": "░", "room": "■", "spark": "▁▂▃▄▅▆▇█", "core": "▮", "nocore": "▯",
        "wait": "▇", "dot": "·", "flag": "⚑", "next": "◀", "big": "█", "mid": "▓", "small": "▒"}
 TOP_SPAN = 1800.0  # the graphs' half hour, in seconds
 
 
 def use_ascii_top() -> None:
     BOX.update(tl="+", tr="+", bl="+", br="+", h="-", v="|")
-    TOP.update(used="#", held="=", other="%", floor=".", room="*", spark=" .:-=+*#", core="#", nocore=".", wait="=", dot=".",
+    TOP.update(braille=False, used="#", held="=", other="%", floor=".", room="*", spark=" .:-=+*#", core="#", nocore=".",
+               wait="=", dot=".",
                flag="!", next="<", big="#", mid="=", small="-")
 
 
@@ -2201,7 +2202,7 @@ class Canvas:
             used += self.put(y, x + used, text, style, room)
         return used
 
-    def box(self, y: int, x: int, h: int, w: int, title=(), style: str = "dim") -> None:
+    def box(self, y: int, x: int, h: int, w: int, title=(), style: str = "box") -> None:
         if h < 2 or w < 4:
             return
         self.put(y, x, BOX["tl"] + BOX["h"] * (w - 2) + BOX["tr"], style)
@@ -2215,6 +2216,13 @@ class Canvas:
 
     def lines(self) -> list[str]:
         return ["".join(row).rstrip() for row in self.chars]
+
+    def select(self, y: int, x0: int, x1: int) -> None:
+        """Paint cells x0..x1 of row y as selected, as btop does a selected row: one bar across it,
+        where a warning keeps its own colour on the bar."""
+        for x in range(max(0, x0), min(self.width, x1)):
+            st = self.styles[y][x]
+            self.styles[y][x] = "sel_bad" if st == "bad" else "sel_warn" if st == "warn" else "sel"
 
     def runs(self, y: int) -> list[tuple[str, str]]:
         """Row y as (text, style) runs."""
@@ -2234,6 +2242,7 @@ class TopHistory:
 
     def __init__(self):
         self.samples: collections.deque = collections.deque()
+        self.minutes: list = []  # the analytics' minutes before the first sample, at each minute's middle
 
     def add(self, snap: dict) -> None:
         m, ov = snap["machine"], snap.get("overview") or {}
@@ -2247,7 +2256,7 @@ class TopHistory:
             self.samples.popleft()
 
     def backfill(self, path: str, now: float) -> None:
-        if self.samples or not os.path.exists(path):
+        if self.samples or self.minutes or not os.path.exists(path):
             return
         try:
             import sqlite3
@@ -2256,8 +2265,8 @@ class TopHistory:
             try:
                 cols = {r[1] for r in db.execute("PRAGMA table_info(minute)")}
                 pick = lambda *names: next((n for n in names if n in cols), "NULL")  # noqa: E731
-                # (the busiest moment of each minute: the graph shows the most in each column)
-                rows = db.execute(f"SELECT t, {pick('cpu_busy_max', 'cpu_busy')}, {pick('cores')}, {pick('mem_total')}, "
+                # (each minute's average: the graph shows the average of each step, as btop does)
+                rows = db.execute(f"SELECT t, {pick('cpu_busy')}, {pick('cores')}, {pick('mem_total')}, "
                                   f"{pick('mem_available')}, {pick('builds_mem_avg', 'builds_mem')}, {pick('growth')} "
                                   "FROM minute WHERE t >= ? ORDER BY t", (now - TOP_SPAN,)).fetchall()
             finally:
@@ -2266,19 +2275,57 @@ class TopHistory:
             return
         for t, busy, cores, total, avail, used, held in rows:
             if None not in (t, busy, total, avail):
-                self.samples.append((t + 30, busy, cores or 1, total - avail, used or 0, held or 0, total))
+                self.minutes.append((t + 30, busy, cores or 1, total - avail, used or 0, held or 0, total))
 
-    def columns(self, field: int, width: int, now: float) -> list:
-        """A sample's `field` in `width` columns over the half hour: the most in each, the last value
-        carried across columns no sample fell in; None before the first."""
-        out: list = [None] * width
-        for s in self.samples:
-            i = int((s[0] - (now - TOP_SPAN)) / TOP_SPAN * width)
-            if 0 <= i < width and (out[i] is None or s[field] > out[i]):
-                out[i] = s[field]
-        last = None
-        for i, v in enumerate(out):
-            out[i] = last = v if v is not None else last
+    def buckets(self, field: int, n: int, now: float) -> list:
+        """A sample's `field` in `n` steps over the half hour, oldest first: the average of the samples
+        in each. The steps are fixed to the clock, not to now, so a finished step never changes and
+        the graph moves one step at a time; the newest is the one still filling. Before the first
+        sample, steps come from the analytics' minutes, drawn as a line between them (and on to the
+        first sample) rather than as flat minutes. None where there is nothing to show."""
+        if n <= 0:
+            return []
+        width = TOP_SPAN / n
+        newest = int(now // width)
+        first = newest - n + 1
+        sums, counts = [0.0] * n, [0] * n
+        for smp in self.samples:
+            i = int(smp[0] // width) - first
+            if 0 <= i < n:
+                sums[i] += smp[field]
+                counts[i] += 1
+        out = [sums[i] / counts[i] if counts[i] else None for i in range(n)]
+        live = [(smp[0], smp[field]) for smp in self.samples]
+        if len(live) > 1:  # (samples further apart than a step: draw the line between them, not gaps)
+            j = 0
+            for i in range(n):
+                mid = (first + i + 0.5) * width
+                if out[i] is not None:
+                    continue
+                while j + 1 < len(live) and live[j + 1][0] < mid:
+                    j += 1
+                if j + 1 < len(live) and live[j][0] <= mid and live[j + 1][0] - live[j][0] <= 180:
+                    (t0, v0), (t1, v1) = live[j], live[j + 1]
+                    out[i] = v0 + (v1 - v0) * (mid - t0) / (t1 - t0) if t1 > t0 else v0
+        points = [(m[0], m[field]) for m in self.minutes]
+        if points and self.samples:
+            points.append((self.samples[0][0], self.samples[0][field]))
+        start = self.samples[0][0] if self.samples else now + width
+        for i in range(n):
+            mid = (first + i + 0.5) * width
+            if out[i] is not None or mid >= start or not points:
+                continue
+            for (t0, v0), (t1, v1) in zip(points, points[1:]):
+                if t0 <= mid <= t1 and t1 - t0 <= 180:  # (no line across a gap in the analytics)
+                    out[i] = v0 + (v1 - v0) * (mid - t0) / (t1 - t0) if t1 > t0 else v0
+                    break
+        own: dict = {}  # a lone analytics minute (no neighbour to draw a line to) in its own step
+        for t, v in points[:len(self.minutes)]:
+            i = int(t // width) - first
+            if 0 <= i < n and out[i] is None and t < start:
+                own.setdefault(i, []).append(v)
+        for i, vals in own.items():
+            out[i] = sum(vals) / len(vals)
         return out
 
 
@@ -2306,6 +2353,50 @@ def finished_builds(path: str, now: float, skip=()) -> list[dict]:
                     "started": max(float(submitted), float(ended) - ran), "peak": peak or 0, "from_ci": bool(ci),
                     "state": state or ""})
     return out
+
+
+BRAILLE_LEFT = (0, 0x40, 0x44, 0x46, 0x47)  # dots 7, 3, 2, 1: a left column of 0 to 4 dots, from the bottom
+BRAILLE_RIGHT = (0, 0x80, 0xA0, 0xB0, 0xB8)  # dots 8, 6, 5, 4: the right column
+
+
+def graph_dots(v, row: int, height: int, top: float, baseline: bool) -> int:
+    """How many of a cell column's four dots value v fills in row `row` (0 at the bottom) of a graph
+    `height` rows tall scaled to `top`; with a baseline, the bottom row always has one."""
+    if v is None:
+        return 0  # no data: blank, as btop draws it
+    if not top:
+        d = 0
+    else:
+        low, high = top * row / height, top * (row + 1) / height
+        d = 4 if v >= high else 0 if v <= low else min(4, int((v - low) / (high - low) * 4 + 0.6))
+    return max(d, 1) if baseline and row == 0 else d
+
+
+def braille_rows(values: list, height: int, top: float, baseline: bool = True) -> list[str]:
+    """Steps as `height` rows of braille, top row first, two steps to a cell (btop's graphs): the
+    newest step is the right half of the last cell, so the graph moves half a cell at a time."""
+    if len(values) % 2:
+        values = [None] + list(values)
+    rows = []
+    for i in range(height):
+        r = height - 1 - i
+        rows.append("".join(chr(0x2800 + BRAILLE_LEFT[graph_dots(a, r, height, top, baseline)]
+                                + BRAILLE_RIGHT[graph_dots(b, r, height, top, baseline)])
+                            for a, b in zip(values[::2], values[1::2])))
+    return rows
+
+
+def graph_rows(hist: "TopHistory", field: int, cells: int, height: int, top: float, now: float) -> list[str]:
+    """A graph `cells` wide: braille (two steps a cell), or in ASCII one step a cell."""
+    if TOP["braille"]:
+        return braille_rows(hist.buckets(field, 2 * cells, now), height, top)
+    return spark_rows(hist.buckets(field, cells, now), height, top)
+
+
+def gradient_style(row: int, height: int) -> str:
+    """The CPU graph's colour for a row (0 at the bottom): green low, yellow, red at the top, by row as
+    btop colours its graphs."""
+    return f"cpu{round(row * 7 / max(1, height - 1))}"
 
 
 def spark_rows(values: list, height: int, top: float) -> list[str]:
@@ -2356,18 +2447,18 @@ def draw_cpu(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: TopHis
                                   [(" (measuring)", "dim")])
     if busy is not None and len(f"CPU {sep} {busy:.1f} of {cores} busy {sep} target {goal} {sep} pressure 0.0%") > w - 6:
         title = [("CPU", "title"), (f" {sep} {busy:.1f} of {cores} busy {sep} target {goal}", "")]
-    c.box(y, x, h, w, title)
+    c.box(y, x, h, w, title, "box_cpu")
     ih, iw = h - 2, w - 2
     label = len(str(cores)) + 1
     gw, axis = iw - label - 1, ih >= 4
     gh = ih - (1 if axis else 0)
     if gw < 8 or gh < 1:
         return
-    rows = spark_rows(hist.columns(1, gw, now), gh, cores)
+    rows = graph_rows(hist, 1, gw, gh, cores, now)
     for r, line in enumerate(rows):
         mark = str(cores) if r == 0 else "0" if r == gh - 1 and gh > 1 else ""
         c.put(y + 1 + r, x + 1, mark.rjust(label - 1) + " ", "dim")
-        c.put(y + 1 + r, x + 1 + label, line, "cpu")
+        c.put(y + 1 + r, x + 1 + label, line, gradient_style(gh - 1 - r, gh))
     if axis:
         c.put(y + 1 + gh, x + 1 + label, time_axis(gw), "dim")
 
@@ -2419,7 +2510,7 @@ def memory_panel(snap: dict, running: list, queued: list, w: int, holds: dict):
              (f" {sep} {fmt_size(avail)} free", "")]
     parts = [(size, glyph, style) for row in running
              for size, glyph, style in ((holds[row["id"]][0], TOP["used"], "mem"), (holds[row["id"]][1], TOP["held"], "held"))]
-    parts += [(other, TOP["other"], "other"), (floor, TOP["floor"], "dim"), (max(room, 0), TOP["room"], "room")]
+    parts += [(other, TOP["other"], "other"), (floor, TOP["floor"], "faint"), (max(room, 0), TOP["room"], "room")]
     bar_cells = ledger_cells(parts, total, w)
     lines = [[(f"builds {fmt_size(builds_used)} ", "mem"), (f"+{fmt_size(held_total)} held", "held"),
               (f" {sep} other {fmt_size(other)}", "other"), (f" {sep} floor {fmt_size(floor)}", "dim"),
@@ -2466,7 +2557,7 @@ def memory_panel(snap: dict, running: list, queued: list, w: int, holds: dict):
 
 def draw_memory(c: Canvas, y: int, x: int, h: int, w: int, panel) -> None:
     title, bar_cells, lines = panel
-    c.box(y, x, h, w, title)
+    c.box(y, x, h, w, title, "box_mem")
     if h < 3 or w < 12:
         return
     c.spans(y + 1, x + 1, bar_cells, w - 2)
@@ -2505,7 +2596,7 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
                  narrow: bool, holds: dict) -> None:
     ov, sep = snap.get("overview") or {}, GLYPHS["sep"]
     jobs = (ov.get("config") or {}).get("max_jobs")
-    c.box(y, x, h, w, [(f"{len(running)} running" + (f" of {jobs}" if jobs else ""), "title")])
+    c.box(y, x, h, w, [(f"{len(running)} running" + (f" of {jobs}" if jobs else ""), "title")], "box_proc")
     iy, ix, ih, iw = y + 1, x + 1, h - 2, w - 2
     if ih < 1:
         return
@@ -2562,19 +2653,20 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
         tone = "bad" if some >= 10 or row.get("frozen") else "warn" if some >= 1 or (plan and mem_now > plan) else ""
         c.line_style[ry] = tone
         chosen = row["id"] == selected
-        parts = [(GLYPHS["mark"] if chosen else " ", "sel" if chosen else ""), (" ", ""),
-                 (cell(row["short"], 9), tone or ("sel" if chosen else ""))]
+        parts = [(GLYPHS["mark"] if chosen else " ", ""), (" ", ""), (cell(row["short"], 9), tone)]
         if not narrow:
             parts += [(" " + cell(row["lane"], 6) + " " + cell(fmt_age(row.get("elapsed") or 0), 6, True), "")]
-        parts += [(" ", ""), (TOP["core"] * filled, "cpu"), (TOP["nocore"] * (6 - filled), "dim"),
+        parts += [(" ", ""), (TOP["core"] * filled, "cpu3"), (TOP["nocore"] * (6 - filled), "faint"),
                   (cell(f" {'-' if used is None else format(used, '4.1f')}/{given}", 10), ""),
                   (" ", ""), (TOP["used"] * cells_now, "mem"), (TOP["held"] * cells_held, "held"),
-                  (TOP["dot"] * (8 - cells_now - cells_held), "dim"),
+                  (TOP["dot"] * (8 - cells_now - cells_held), "faint"),
                   (cell(f" {fmt_size(mem_now)}/{fmt_size(peak)}/{fmt_size(plan)}", 18), "warn" if tone == "warn" else "")]
         parts += [(" " + cell(values[n], cw, True), "") for n, cw in shown]
         label = row.get("label") or ""
         parts += [("  ", ""), ("CI " if row.get("from_ci") else "", "ci"), (fit(clean(label), cmdw), "")]
         c.spans(ry, ix, parts, iw)
+        if chosen:
+            c.select(ry, ix, ix + iw)
     if len(running) > slots:
         c.put(iy + 1 + slots, ix, f"  {GLYPHS['more']} {start} above, {len(running) - start - slots} below (up/down)",
               "dim", iw)
@@ -2594,7 +2686,7 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
         title.append((f" {sep} all for {next(iter(reasons))}", "dim"))
     if in_line:
         title.append((f" {sep} {in_line} in line", "dim"))
-    c.box(y, x, h, w, title)
+    c.box(y, x, h, w, title, "box_proc")
     iy, ix, ih, iw = y + 1, x + 1, h - 2, w - 2
     if ih < 1:
         return
@@ -2632,7 +2724,7 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
 
 
 def draw_lanes(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running: list, queued: list) -> None:
-    c.box(y, x, h, w, "LANES")
+    c.box(y, x, h, w, "LANES", "box_net")
     lanes: dict[str, list] = {}
     for row in running:
         lanes.setdefault(row["lane"], [0, 0, 0.0])[0] += 1
@@ -2652,7 +2744,7 @@ def draw_lanes(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running: l
 def draw_timeline(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: TopHistory, finished: list,
                   now: float) -> None:
     ov, sep = snap.get("overview") or {}, GLYPHS["sep"]
-    c.box(y, x, h, w, [("TIMELINE", "title"), (f" {sep} the last 30 minutes", "")])
+    c.box(y, x, h, w, [("TIMELINE", "title"), (f" {sep} the last 30 minutes", "")], "box_cpu")
     iy, ix, ih, iw = y + 1, x + 1, h - 2, w - 2
     label = 26
     gw = iw - label - 1
@@ -2660,7 +2752,7 @@ def draw_timeline(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: T
         c.put(iy, ix, "too small for the timeline", "dim", iw)
         return
     total = (snap["machine"].get("mem_total") or 1)
-    for r, line in enumerate(spark_rows(hist.columns(3, gw, now), 3, total)):
+    for r, line in enumerate(graph_rows(hist, 3, gw, 3, total, now)):
         c.put(iy + r, ix, ("memory" if r == 1 else "").ljust(label), "dim")
         c.put(iy + r, ix + label + 1, line, "mem")
     c.put(iy + 3, ix + label + 1, time_axis(gw), "dim")
@@ -2810,7 +2902,8 @@ def render_screen(snap: dict, width: int, height: int, *, view: str = "main", se
         if pane_h:
             py = run_y + run_h
             row = next((r for r in running if r["id"] == selected), {})
-            c.box(py, 0, pane_h, width, [(f"{selected} ", "title"), (fit(clean(row.get("name") or ""), width - 50), "dim")])
+            c.box(py, 0, pane_h, width, [(f"{selected} ", "title"), (fit(clean(row.get("name") or ""), width - 50), "dim")],
+                  "box_proc")
             for n, text in enumerate(pane[:pane_h - 2]):
                 c.put(py + 1 + n, 1, "  " + text, "", width - 2)
         by = 1 + top_h + run_h + pane_h
@@ -2906,11 +2999,28 @@ def colour_wanted(env=None) -> bool:
     return not (env if env is not None else os.environ).get("NO_COLOR")
 
 
+# btop's Default theme (aristocratos/btop, src/btop_theme.cpp, Apache-2.0), as xterm-256 colours:
+# indexes 16 to 255 are the same on every terminal, unlike 0 to 15, which its theme sets. Readable text
+# is a light grey (btop's main_fg); the dim greys are for decoration only (graph labels, empty cells),
+# never for something to read. Built for a dark background, as btop is. Each style: (colour, bold).
+TOP_COLOURS_256 = {
+    "head": (255, True), "title": (255, True), "ok": (48, False), "warn": (220, False), "bad": (167, True),
+    "dim": (245, False), "faint": (241, False), "box": (102, False), "box_cpu": (102, False),
+    "box_mem": (101, False), "box_proc": (138, False), "box_net": (103, False),
+    "mem": (193, False), "held": (222, False), "other": (182, False), "room": (123, True), "ci": (146, True),
+    "cpu0": (151, False), "cpu1": (151, False), "cpu2": (186, False), "cpu3": (186, False),
+    "cpu4": (180, False), "cpu5": (180, False), "cpu6": (174, False), "cpu7": (167, False),
+}
+SELECTED_BG_256 = 52  # btop's selected_bg (#6a2f2f), darker for contrast: white on it reads at 12:1
+
+
 def init_colours(curses, wanted: bool) -> dict:
-    """The colour (and bold) for each kind of line. The terminal's own foreground and background stay
-    (use_default_colors), with colour or not: curses.wrapper has started colour, and without that call
-    the screen would turn white on black. With NO_COLOR, only bold is kept, for the headings."""
-    plain = {"": 0, "head": curses.A_BOLD, "title": curses.A_BOLD, "sel": curses.A_REVERSE}
+    """The colour (and bold) for each kind of text. The terminal's own background stays
+    (use_default_colors): curses.wrapper has started colour, and without that call the screen would
+    turn white on black. On a 256-colour terminal, btop's Default theme; on 8 colours, its TTY theme's
+    choices. With NO_COLOR, only bold, and the selected row in reverse video."""
+    rev, bold = curses.A_REVERSE, curses.A_BOLD
+    plain = {"": 0, "head": bold, "title": bold, "sel": rev, "sel_bad": rev | bold, "sel_warn": rev | bold}
     colours = dict(plain)
     try:
         if not curses.has_colors():
@@ -2918,19 +3028,44 @@ def init_colours(curses, wanted: bool) -> dict:
         curses.use_default_colors()
         if not wanted:
             return colours
-        # Six colours from the terminal's own palette; what each part is also shows in its glyph
-        # (TOP), so no meaning rests on colour alone.
-        pairs = {}
-        for i, (name, fg) in enumerate((("cyan", curses.COLOR_CYAN), ("green", curses.COLOR_GREEN),
-                                         ("yellow", curses.COLOR_YELLOW), ("red", curses.COLOR_RED),
-                                         ("blue", curses.COLOR_BLUE), ("magenta", curses.COLOR_MAGENTA)), start=1):
-            curses.init_pair(i, fg, -1)
-            pairs[name] = curses.color_pair(i)
-        bold = curses.A_BOLD
-        colours.update(head=pairs["cyan"] | bold, title=pairs["cyan"] | bold, ok=pairs["green"], warn=pairs["yellow"],
-                       bad=pairs["red"] | bold, dim=pairs["blue"], cpu=pairs["cyan"], mem=pairs["green"],
-                       held=pairs["yellow"], other=pairs["magenta"], room=pairs["yellow"] | bold, ci=pairs["magenta"] | bold)
-    except curses.error:
+        pairs: dict = {}
+        limit = getattr(curses, "COLOR_PAIRS", 64) - 1  # (pair 0 is the terminal's own)
+
+        def pair(fg: int, bg: int = -1) -> int:
+            if (fg, bg) not in pairs:
+                n = len(pairs) + 1
+                curses.init_pair(n, fg, bg)
+                pairs[(fg, bg)] = curses.color_pair(n)
+            return pairs[(fg, bg)]
+        rich = len({fg for fg, _ in TOP_COLOURS_256.values()}) + 3  # the pairs btop's theme takes
+        if limit < 9:  # not even the eight colours' pairs: plain text
+            return plain
+        palette = getattr(curses, "COLORS", 8)
+        try:
+            direct = getattr(curses, "tigetflag", lambda name: -1)("RGB") > 0
+        except curses.error:
+            direct = False
+        if 256 <= palette < 0x1000000 and not direct and limit >= rich:  # (direct colour: numbers are RGB)
+            for style, (fg, strong) in TOP_COLOURS_256.items():
+                colours[style] = pair(fg) | (bold if strong else 0)
+            colours["sel"] = pair(255, SELECTED_BG_256) | bold
+            colours["sel_bad"] = pair(210, SELECTED_BG_256) | bold
+            colours["sel_warn"] = pair(222, SELECTED_BG_256) | bold
+        else:  # btop's TTY theme: the terminal's own eight, nothing read in blue
+            white, green, yellow, red, magenta, cyan = (curses.COLOR_WHITE, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+                                                        curses.COLOR_RED, curses.COLOR_MAGENTA, curses.COLOR_CYAN)
+            dim = curses.A_DIM
+            colours.update(head=pair(white) | bold, title=pair(white) | bold, ok=pair(green), warn=pair(yellow),
+                           bad=pair(red) | bold, dim=0, faint=dim, box=dim, box_cpu=pair(green) | dim,
+                           box_mem=pair(yellow) | dim, box_proc=pair(red) | dim, box_net=pair(magenta) | dim,
+                           mem=pair(green), held=pair(yellow), other=pair(magenta), room=pair(cyan) | bold,
+                           ci=pair(magenta) | bold, sel=pair(white, curses.COLOR_BLUE) | bold,
+                           # (red or yellow on blue reads at 1:1 on some palettes: the warning is the cell's
+                           # background instead)
+                           sel_bad=pair(white, red) | bold, sel_warn=pair(curses.COLOR_BLACK, yellow))
+            for i in range(8):
+                colours[f"cpu{i}"] = pair(green if i < 3 else yellow if i < 6 else red)
+    except (curses.error, ValueError):  # (ValueError: a pair number past what the terminal has)
         return plain  # no default colours on this terminal: plain text
     return colours
 
@@ -3051,6 +3186,15 @@ def cmd_top(args) -> int:
         except curses.error:
             pass
         encoding = getattr(screen, "encoding", None) or "ascii"  # what curses really writes
+
+        def sync(begin: bool) -> None:
+            """Synchronized output (DEC mode 2026, as btop wraps each frame): the terminal shows the
+            frame whole; one that doesn't know the mode ignores it."""
+            try:
+                sys.stdout.write("\x1b[?2026h" if begin else "\x1b[?2026l")
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
         if wants_ascii(encoding):
             use_ascii()
         screen.timeout(100)
@@ -3098,7 +3242,12 @@ def cmd_top(args) -> int:
                         except (curses.error, UnicodeError):
                             pass
                         x += text_width(text)
-                screen.refresh()
+                screen.noutrefresh()
+                sync(True)
+                try:
+                    curses.doupdate()
+                finally:
+                    sync(False)  # (or the terminal waits out its timeout for the frame's end)
                 dirty, drawn_at = False, time.monotonic()
             key = screen.getch()
             if key == -1:
@@ -3127,7 +3276,15 @@ def cmd_top(args) -> int:
 
     why = None
     try:
-        code, why = curses_with_fallback(run, curses.wrapper)
+        try:
+            code, why = curses_with_fallback(run, curses.wrapper)
+        finally:  # (synchronized output off, whatever ended the session: Ctrl-C and signals too)
+            try:
+                if sys.stdout.isatty():
+                    sys.stdout.write("\x1b[?2026l")
+                    sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
         if code is not None:
             return code
         sizes.stop()

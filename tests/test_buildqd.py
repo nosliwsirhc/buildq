@@ -4796,25 +4796,67 @@ class Top(unittest.TestCase):
         path = os.path.join(self.enterContext(tempfile.TemporaryDirectory()), "metrics.db")
         import sqlite3
         db = sqlite3.connect(path)
-        db.execute("CREATE TABLE minute (t REAL, cpu_busy REAL, cores INTEGER, mem_total INTEGER, mem_available INTEGER,"
-                   " builds_mem INTEGER, growth INTEGER)")
+        db.execute("CREATE TABLE minute (t REAL, cpu_busy REAL, cpu_busy_max REAL, cores INTEGER, mem_total INTEGER,"
+                   " mem_available INTEGER, builds_mem INTEGER, growth INTEGER)")
         now = 1794600000.0
-        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?)",
-                       [(now - 3600, 31.0, 32, 128 * GIB, 64 * GIB, GIB, 0),  # older than the graph
-                        (now - 600, 16.0, 32, 128 * GIB, 64 * GIB, GIB, 0), (now - 300, 32.0, 32, 128 * GIB, 64 * GIB, GIB, 0)])
+        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?,?)",
+                       [(now - 3600, 31.0, 32.0, 32, 128 * GIB, 64 * GIB, GIB, 0),  # older than the graph
+                        (now - 600, 16.0, 30.0, 32, 128 * GIB, 64 * GIB, GIB, 0),
+                        (now - 540, 24.0, 30.0, 32, 128 * GIB, 64 * GIB, GIB, 0),
+                        (now - 480, 32.0, 32.0, 32, 128 * GIB, 64 * GIB, GIB, 0)])
         db.commit()
         db.close()
         hist = buildq.TopHistory()
         hist.backfill(path, now)
-        self.assertEqual(len(hist.samples), 2)
-        cols = hist.columns(1, 30, now)
-        self.assertEqual(cols[:19], [None] * 19)  # nothing before the first minute
-        self.assertEqual((cols[20], cols[-1]), (16.0, 32.0))  # then the busiest in each column, carried on
+        self.assertEqual((len(hist.minutes), len(hist.samples)), (3, 0))
+        steps = hist.buckets(1, 30, now)  # minute steps; each minute's row stands at its middle
+        self.assertEqual(steps[:19], [None] * 19)  # nothing before the first minute
+        self.assertEqual(steps[19:22], [16.0, 24.0, 32.0])  # each minute's average (not its busiest moment)
+        self.assertEqual(steps[22:], [None] * 8)  # and no plateau carried on after the last
+        half = hist.buckets(1, 60, now)  # half-minute steps: a line between the minutes, not flat steps
+        self.assertEqual((half[40], half[41]), (18.0, 22.0))  # a straight line between the minutes
+        lone = buildq.TopHistory()
+        lone.minutes = [(now - 870, 12.0, 32, 64 * GIB, GIB, 0, 128 * GIB)]  # one minute, no neighbours
+        self.assertIn(12.0, lone.buckets(1, 30, now))
         hist.backfill(path, now)
-        self.assertEqual(len(hist.samples), 2)  # only once
+        self.assertEqual(len(hist.minutes), 3)  # only once
         buildq.TopHistory().backfill(os.path.join(os.path.dirname(path), "missing.db"), now)  # no analytics: empty
         lines, _ = self.draw(self.snap(), width=150, hist=hist)
-        self.assertTrue(any("█" in t and "-30m" not in t and "│32" in t.replace(" ", "") for t, _ in lines))
+        graph = [t for t, _ in lines if "│32" in t.replace(" ", "")]
+        self.assertTrue(graph and any("\u2801" <= ch <= "\u28ff" for ch in graph[0]))  # braille, as btop draws
+
+    def test_steps_are_fixed_to_the_clock_and_averaged(self):
+        hist = buildq.TopHistory()
+        snap = self.snap()
+        for t, busy in ((0, 10.0), (20, 30.0), (70, 5.0)):
+            s2 = dict(snap, time=1794600000.0 + t)
+            s2["machine"] = dict(snap["machine"], busy=busy)
+            hist.add(s2)
+        before = hist.buckets(1, 30, 1794600075.0)
+        self.assertEqual(before[-2:], [20.0, 5.0])  # the average in each minute; the newest still filling
+        self.assertEqual(hist.buckets(1, 30, 1794600079.0), before)  # nothing moves within a step
+        self.assertEqual(hist.buckets(1, 30, 1794600121.0)[-3:], [20.0, 5.0, None])  # a new step: one along
+        sparse = buildq.TopHistory()  # a sample every 40 s, steps of 20 s: the line between, not gaps
+        for t, busy in ((0, 8.0), (40, 16.0)):
+            s3 = dict(snap, time=1794600000.0 + t)
+            s3["machine"] = dict(snap["machine"], busy=busy)
+            sparse.add(s3)
+        steps = sparse.buckets(1, 90, 1794600040.0)
+        self.assertEqual(steps[-3:], [8.0, 14.0, 16.0])  # the middle step is 30 s along a 40 s line
+
+    def test_braille_has_two_steps_a_cell_and_a_baseline(self):
+        self.assertEqual(buildq.braille_rows([0, 4], 1, 4, baseline=False), ["\u28b8"])  # right column full
+        self.assertEqual(buildq.braille_rows([4, 4], 1, 4, baseline=False), ["\u28ff"])
+        self.assertEqual(buildq.braille_rows([0, 0], 2, 4), ["\u2800", "\u28c0"])  # a baseline dot each
+        self.assertEqual(buildq.braille_rows([None, None], 2, 4), ["\u2800", "\u2800"])  # no data: blank, as btop
+        self.assertEqual(buildq.braille_rows([2, 6], 2, 8, baseline=False), ["\u28a0", "\u28fc"])  # 2 and 4 dots low, 0 and 2 high
+        self.assertEqual(buildq.gradient_style(0, 8), "cpu0")
+        self.assertEqual(buildq.gradient_style(7, 8), "cpu7")  # green at the bottom, red at the top
+        buildq.use_ascii()
+        hist = buildq.TopHistory()
+        hist.add(self.snap())
+        rows = buildq.graph_rows(hist, 1, 10, 3, 32, self.snap()["time"])
+        "".join(rows).encode("ascii")  # one step a cell, in ASCII, without braille
 
     def test_the_timeline_and_the_help(self):
         snap = self.snap()
@@ -4942,8 +4984,11 @@ class Top(unittest.TestCase):
         c, _ = buildq.render_screen(self.snap(), 200, 40, selected="a" * 36)
         y = next(i for i, t in enumerate(c.lines()) if "▶ aaaaaaaa" in t)
         x = c.lines()[y].index("aaaaaaaa")
-        self.assertEqual(c.styles[y][x], "bad")  # under memory pressure, selected or not
-        self.assertEqual(c.styles[y][x - 2], "sel")  # the marker says it is selected
+        self.assertEqual(c.styles[y][x], "sel_bad")  # under memory pressure on the selection bar
+        self.assertEqual(c.styles[y][x - 2], "sel")  # the bar runs across the row, as btop's
+        self.assertEqual(c.styles[y][c.lines()[y].index("cargo test")], "sel")
+        other = next(i for i, t in enumerate(c.lines()) if "bbbbbbbb" in t and "/" in t)
+        self.assertNotIn("sel", c.styles[other])
 
     def test_every_filesystem_has_its_line(self):
         snap = self.snap()
@@ -4983,7 +5028,7 @@ class Top(unittest.TestCase):
         db.close()
         hist = buildq.TopHistory()
         hist.backfill(path, now)  # no growth, no builds_mem: what there is still fills the graph
-        self.assertEqual([s[1] for s in hist.samples], [12.0])
+        self.assertEqual([m[1] for m in hist.minutes], [12.0])
         done = buildq.finished_builds(path, now, skip={"3" * 36})
         self.assertEqual([(d["short"], d["started"], d["from_ci"]) for d in done], [("11111111", now - 900, True)])
 
@@ -5167,8 +5212,9 @@ class Top(unittest.TestCase):
         calls = []
 
         class Curses:
-            A_BOLD, A_REVERSE, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE, COLOR_MAGENTA = \
-                1 << 21, 1 << 18, 6, 2, 3, 1, 4, 5
+            A_BOLD, A_REVERSE, A_DIM, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE, COLOR_MAGENTA = \
+                1 << 21, 1 << 18, 1 << 20, 6, 2, 3, 1, 4, 5
+            COLOR_WHITE, COLOR_BLACK, COLORS = 7, 0, 8
             error = Exception
 
             def has_colors(self):
@@ -5186,9 +5232,39 @@ class Top(unittest.TestCase):
         self.assertEqual(calls, ["default"])  # the terminal's own colours, not white on black
         self.assertEqual((plain[""], plain["head"]), (0, Curses.A_BOLD))  # headings keep their bold
         calls.clear()
-        coloured = buildq.init_colours(Curses(), wanted=True)
-        self.assertEqual(calls.count("pair"), 6)
+        coloured = buildq.init_colours(Curses(), wanted=True)  # 8 colours: btop's TTY theme
+        self.assertEqual(calls.count("pair"), 9)
         self.assertNotEqual(coloured["ok"], 0)
+        self.assertEqual(coloured["dim"], 0)  # nothing to read in blue
+        self.assertNotEqual(coloured["sel_bad"], coloured["sel"])  # a warning on the bar: its own background
+        rich = Curses()
+        rich.COLORS = 256
+        calls.clear()
+        coloured = buildq.init_colours(rich, wanted=True)  # btop's Default theme
+        self.assertEqual(calls.count("pair"), len({fg for fg, _ in buildq.TOP_COLOURS_256.values()}) + 3)
+        self.assertTrue(coloured["sel"] & Curses.A_BOLD)
+        self.assertNotEqual(coloured["dim"], coloured["faint"])
+        class Exhausted(Curses):  # real curses raises ValueError past the terminal's pairs
+            COLORS, COLOR_PAIRS = 256, 16
+
+            def init_pair(self, n, *a):
+                if n >= self.COLOR_PAIRS:
+                    raise ValueError("Color pair is greater than COLOR_PAIRS-1")
+                calls.append("pair")
+        few = buildq.init_colours(Exhausted(), wanted=True)  # too few pairs for btop's theme: its TTY theme
+        self.assertEqual(few["dim"], 0)
+        self.assertNotEqual(few["ok"], 0)
+        Exhausted.COLOR_PAIRS = 8
+        self.assertEqual(buildq.init_colours(Exhausted(), wanted=True).get("ok", 0), 0)  # too few for that too: plain
+        direct = Curses()
+        direct.COLORS, direct.COLOR_PAIRS = 0x1000000, 0x10000  # xterm-direct: numbers are RGB, not indexes
+        calls.clear()
+        self.assertEqual(buildq.init_colours(direct, wanted=True)["dim"], 0)  # the eight colours' theme
+        self.assertEqual(calls.count("pair"), 9)
+        capped = Curses()
+        capped.COLORS, capped.COLOR_PAIRS = 32767, 0x10000  # direct colour capped by an older ncurses
+        capped.tigetflag = lambda name: 1 if name == "RGB" else -1
+        self.assertEqual(buildq.init_colours(capped, wanted=True)["dim"], 0)
 
     def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
         import curses
