@@ -235,6 +235,8 @@ def fmt_size(n: float) -> str:
 # --------------------------------------------------------------------------------------------
 # Configuration
 
+CI_LONG_WAITS = 12  # times starve_seconds a build may queue before it goes ahead of CI jobs' builds past ci_deadline
+
 DEFAULTS = {
     "max_jobs": 4,
     "cpu_target": 0.9,
@@ -250,6 +252,7 @@ DEFAULTS = {
     "starve_seconds": 600,
     "ci_first": False,
     "make_room_for_ci": "0",
+    "ci_deadline": "0",
     "make_room_behind_agents": True,
     "make_room_spare_after": "0",
     "script_labels": [],
@@ -391,6 +394,17 @@ class Config:
         self.ci_first = boolean(d["ci_first"], "ci_first")
         room = d["make_room_for_ci"]
         self.make_room_for_ci = 0.0 if room in (0, "0", "", None, False) else parse_duration(room)
+        due = d["ci_deadline"]
+        self.ci_deadline = 0.0 if due in (0, "0", "", None, False) else parse_duration(due)
+        if self.ci_deadline and not self.ci_first:
+            raise ValueError("ci_deadline needs ci_first = true: it says when a CI job's build stops yielding to "
+                             "builds that have waited longer")
+        if self.ci_deadline and self.ci_deadline < self.starve_seconds:
+            raise ValueError("ci_deadline must be at least starve_seconds: a CI job's build past it has waited out "
+                             "its turn too, so its room and its workspace bind every lane")
+        if self.ci_deadline and self.ci_deadline >= CI_LONG_WAITS * self.starve_seconds:
+            raise ValueError(f"ci_deadline must be under {CI_LONG_WAITS} times starve_seconds: builds that have "
+                             "queued that long go before CI jobs' builds again, which would undo it")
         if self.make_room_for_ci and not self.ci_first:
             raise ValueError("make_room_for_ci needs ci_first = true: without it a CI job's build holds no room, "
                              "so the memory freed for it could go to another build")
@@ -515,6 +529,7 @@ class Config:
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
             "make_room_for_ci": self.make_room_for_ci, "make_room_behind_agents": self.make_room_behind_agents,
+            "ci_deadline": self.ci_deadline,
             "scale_mem_with_cores": self.scale_mem_with_cores,
             "make_room_spare_after": self.make_room_spare_after, "script_labels": sorted(self.script_labels),
             "restartable_scripts": sorted(self.restartable_scripts),
@@ -3322,6 +3337,7 @@ class Daemon:
         self.memory_thread_failed = False
         self.last_freeze = self.last_kill = -1e9
         self.room_made: dict[str, float] = {}  # a CI job's build -> when builds were last stopped for it
+        self.partly_made: set[str] = set()  # CI jobs' builds that builds were stopped for though not enough
         self.started_at = time.time()
         self.avail_seen: collections.deque = collections.deque()  # (time, memory available) of the last 10 s
         self.submit_outcome: dict = {}  # how the last submission was answered: joined, reused, passed before
@@ -3493,7 +3509,9 @@ class Daemon:
 
         With ci_first, any build that has waited three times starve_seconds, or was stopped to free
         memory, goes before all of those, so CI jobs (in a higher lane, for a CI job's build) can't
-        keep it waiting for ever."""
+        keep it waiting for ever. With ci_deadline, a CI job's build that has waited that long goes
+        before even those, the oldest first; a build that has waited CI_LONG_WAITS times starve_seconds
+        goes before even that, so CI jobs can't keep it waiting for ever either."""
         now = time.time() if now is None else now
 
         # Fair shares: at the same priority, a caller (a session, a CI runner) with fewer builds
@@ -3516,7 +3534,15 @@ class Daemon:
             # CI builds could keep an overdue session's build waiting), nor in a lane that passes held
             # room (it gets no head start there).
             first = self.cfg.ci_first and t.from_ci and not passes and not overdue
-            return (not overdue, not starving, -self.weight(t), not first, not (first and self.waited_out(t, now)))
+            # A CI job's build near its job's time limit goes before all of them, the oldest first (the
+            # nearest to its limit, whatever its lane); a build that has waited CI_LONG_WAITS times
+            # starve_seconds (two hours here) goes before even that, so a stream of CI jobs can't keep
+            # it waiting for ever, while a release's steps still go first in any likely queue.
+            due = self.ci_due(t, now)
+            queued = t.wait_total + max(0.0, now - (t.queued_at or t.submitted))  # (its queued time, not its runs)
+            long = overdue and not t.from_ci and queued >= CI_LONG_WAITS * self.cfg.starve_seconds
+            return (not long, not due, t.submitted if due else 0.0, not overdue, not starving, -self.weight(t),
+                    not first, not (first and self.waited_out(t, now)))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
@@ -3553,6 +3579,17 @@ class Daemon:
             return False
         ci = self.tickets.get(t.yields_to)
         return ci is not None and ci.state == "queued"
+
+
+    def ci_due(self, t: Ticket, now: float) -> bool:
+        """A CI job's build that has waited ci_deadline: its job has a time limit that counts the wait
+        (GitHub cancels a step still queued), so from here it goes before everything, builds that have
+        waited three times starve_seconds included, and its room binds every lane. A release's step
+        waited 47 minutes of 50, and a scan 30 of 30, behind such builds (2026-11-15/16; #60)."""
+        if not (self.cfg.ci_deadline and self.cfg.ci_first and t.from_ci) or self.yielding(t, now):
+            return False
+        lane = self.cfg.lanes.get(t.lane)
+        return not (lane and lane.may_pass_held) and now - t.submitted >= self.cfg.ci_deadline
 
     def starving(self, t: Ticket, now: float) -> bool:
         """It has waited out its turn, or (with ci_first) it comes from a CI job, which has a time
@@ -4104,6 +4141,7 @@ class Daemon:
         builds stopped for the last are still going, nor within ROOM_PAUSE of making room for one
         that is still queued."""
         wait = self.cfg.make_room_for_ci
+        self.partly_made = {k for k in self.partly_made if k in self.tickets and self.tickets[k].state == "queued"}
         self.room_made = {k: v for k, v in self.room_made.items()
                           if k in self.tickets and self.tickets[k].state == "queued"}
         if not wait or self.stopping or self.paused is not None:
@@ -4156,7 +4194,14 @@ class Daemon:
                     if total >= short:
                         break
                 else:
-                    continue  # stopping every one of them wouldn't make it fit
+                    if not (chosen and self.ci_due(ci, now)) or ci.id in self.partly_made or total < short / 2:
+                        continue  # stopping every one of them wouldn't make it fit (or, past its deadline,
+                        # wouldn't free half of it: the rest is held by builds that can't be stopped)
+                    # Past its deadline: stop them all the same. What they free is held for it (its
+                    # room binds every lane, and they yield to it), so it starts as soon as the rest
+                    # frees, rather than when its job is cancelled. Once only: if what they freed went
+                    # elsewhere (a lane that passes held room), stopping more would lose work for nothing.
+                    self.partly_made.add(ci.id)
             self.room_made[ci.id] = now
             waited = f"{(now - ci.submitted) / 60:.0f} min"
             for t in chosen:  # (counted in ci_stops once it is gone: it may yet finish by itself)
@@ -4820,7 +4865,7 @@ class Daemon:
             if holds and not passes and self.starving(t, now):
                 t.held = True
                 cores = t.need if lane.waits_for_cpu else 0  # it would start without that room
-                if self.waited_out(t, now):
+                if self.waited_out(t, now) or self.ci_due(t, now):
                     held_mem += t.est_mem
                     held_cpu += cores
                     held_n_mem += 1

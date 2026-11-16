@@ -2828,6 +2828,44 @@ class CIFirst(DaemonCase):
         self.daemon.schedule(self.now + 31)
         self.assertEqual(self.states(old, fresh), ["running", "queued"])  # room for one: the older
 
+    def test_a_ci_build_near_its_deadline_goes_before_overdue_builds(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.ci_deadline = 1200.0
+        session = self.submit(mem="20G", caller="session")
+        self.now += 1
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI, caller="runner")
+        self.now += 3 * 300  # both overdue: the plain order, the older first
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+        self.now += 1200 - 3 * 300  # the CI job's build has waited ci_deadline: its job's limit is near
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, session.id])
+        self.daemon.schedule(self.now)
+        self.assertTrue(ci.held)
+        self.now += 12 * 300 - 1201  # the session's build has now waited twelve times starve_seconds
+        self.assertEqual([x.id for x in self.daemon.queue(self.now)], [session.id, ci.id])  # it goes first again
+        self.daemon.cfg.ci_deadline = 0.0  # off: as before
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+        self.daemon.cfg.ci_deadline = 1200.0
+        self.finish(self.running)  # room for one: the long-queued build starts, ahead of the due CI build
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual(self.states(session, ci), ["running", "queued"])
+        self.assertEqual(buildqd.Config({"ci_first": True, "ci_deadline": "20m"}, 64 * GIB, 16).ci_deadline, 1200.0)
+        with self.assertRaises(ValueError):
+            buildqd.Config({"ci_deadline": "20m"}, 64 * GIB, 16)  # it needs ci_first
+        with self.assertRaises(ValueError):
+            buildqd.Config({"ci_first": True, "ci_deadline": "5m", "starve_seconds": 600}, 64 * GIB, 16)  # under starve
+        with self.assertRaises(ValueError):
+            buildqd.Config({"ci_first": True, "ci_deadline": "20m", "starve_seconds": 60}, 64 * GIB, 16)  # undone
+
+    def test_due_ci_builds_go_oldest_first_whatever_their_lane(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.ci_deadline = 1200.0
+        self.higher_lane()
+        heavy = self.submit(("cargo", "test"), mem="20G", env=self.CI, caller="runner-1")
+        self.now += 60
+        higher = self.submit(("dotnet", "build"), lane="web", mem="20G", env=self.CI, caller="runner-2")
+        self.now += 1200  # both past the deadline; the heavy one nearer its job's limit
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [heavy.id, higher.id])
+
     def test_among_overdue_builds_ci_gets_no_preference(self):
         self.daemon.cfg.ci_first = True
         session = self.submit(mem="20G", caller="session")
@@ -2982,6 +3020,36 @@ class MakeRoomForCI(DaemonCase):
         self.tick(301)
         self.assertEqual(self.runner.forced, [c.id, b.id])
         self.assertEqual(a.state, "running")
+
+    def test_past_its_deadline_builds_are_stopped_even_for_part_of_it(self):
+        self.agents(6, argv=("bash", "run.sh"))  # a script: it can't be started over
+        self.agents(2, 2)
+        self.machine.mem_available = 21 * GIB  # 11G free; ours use 10G, 6G of it the script's
+        self.ci_waiting("16G")  # lacks 5G: the two that can start over give only 4G
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])  # not yet: it would be work lost for nothing
+        self.daemon.cfg.ci_deadline = 1200.0
+        self.tick(1201)
+        self.assertEqual(len(self.runner.forced), 2)  # near its job's limit: what they free is held for it
+
+    def test_past_its_deadline_builds_are_stopped_for_part_of_it_once(self):
+        self.daemon.cfg.ci_deadline = 1200.0
+        self.agents(6, argv=("bash", "run.sh"))
+        self.agents(2, 2)
+        self.machine.mem_available = 21 * GIB
+        ci = self.ci_waiting("16G")
+        self.daemon.partly_made.add(ci.id)  # builds were stopped for part of it once already, and the room went
+        self.tick(1201)
+        self.assertEqual(self.runner.forced, [])  # no more work lost for nothing
+
+    def test_past_its_deadline_a_stop_must_free_at_least_half_of_what_it_lacks(self):
+        self.daemon.cfg.ci_deadline = 1200.0
+        self.agents(6, argv=("bash", "run.sh"))  # a script: it can't be started over
+        self.agents(1)
+        self.machine.mem_available = 18 * GIB  # 8G free; ours use 7G, 6G of it the script's
+        self.ci_waiting("13G")  # lacks 5G: the one that can start over gives 1G, under half
+        self.tick(1201)
+        self.assertEqual(self.runner.forced, [])
 
     def test_nothing_is_stopped_when_stopping_all_would_not_make_it_fit(self):
         self.agents(2, 2)
