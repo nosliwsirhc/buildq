@@ -2840,11 +2840,27 @@ class CIFirst(DaemonCase):
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, session.id])
         self.daemon.schedule(self.now)
         self.assertTrue(ci.held)
+        session.ci_passed = 2  # two due CI builds have started ahead of it: its turn again
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
+        session.ci_passed = 0
         self.daemon.cfg.ci_deadline = 0.0  # off: as before
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
         self.assertEqual(buildqd.Config({"ci_first": True, "ci_deadline": "20m"}, 64 * GIB, 16).ci_deadline, 1200.0)
         with self.assertRaises(ValueError):
             buildqd.Config({"ci_deadline": "20m"}, 64 * GIB, 16)  # it needs ci_first
+        with self.assertRaises(ValueError):
+            buildqd.Config({"ci_first": True, "ci_deadline": "5m", "starve_seconds": 600}, 64 * GIB, 16)  # under starve
+
+    def test_due_ci_builds_that_start_count_against_overdue_builds_waits(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.ci_deadline = 1200.0
+        session = self.submit(mem="20G", caller="session")
+        self.now += 1
+        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI, caller="runner")
+        self.now += 1201
+        self.finish(self.running)  # room for one
+        self.daemon.schedule(self.now + 31)
+        self.assertEqual((ci.state, session.state, session.ci_passed), ("running", "queued", 1))
 
     def test_among_overdue_builds_ci_gets_no_preference(self):
         self.daemon.cfg.ci_first = True
@@ -3011,6 +3027,13 @@ class MakeRoomForCI(DaemonCase):
         self.daemon.cfg.ci_deadline = 1200.0
         self.tick(1201)
         self.assertEqual(len(self.runner.forced), 2)  # near its job's limit: what they free is held for it
+        for t in list(self.runner.running):  # gone; something else takes the room (a lane that passes held room)
+            self.runner.running.discard(t)
+        self.daemon.check(self.now + 1202)
+        self.agents(2, 2)
+        self.machine.mem_available = 21 * GIB
+        self.tick(1202 + self.daemon.ROOM_PAUSE + 1)
+        self.assertEqual(len(self.runner.forced), 2)  # once only for part of it: no more work lost for nothing
 
     def test_nothing_is_stopped_when_stopping_all_would_not_make_it_fit(self):
         self.agents(2, 2)

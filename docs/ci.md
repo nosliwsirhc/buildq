@@ -60,8 +60,10 @@ goes before CI jobs' builds, so in a long queue a CI step could wait behind many
 job was cancelled. `ci_deadline = "20m"` stops that: a CI job's build that has waited that long goes
 before every other build, its room binds every lane, and with `make_room_for_ci` it stops the newest
 builds that can start over even when they free only part of what it lacks (what they free is held
-for it, so it starts as soon as the rest frees). Set it below the shortest CI job time limit, less the
-step's own run time.
+for it, so it starts as soon as the rest frees), once for each such build: if what they freed went
+elsewhere, stopping more would lose work for nothing. So a stream of CI jobs can't keep a build
+waiting for ever, an overdue build that two of them have started ahead of goes first again. Set it
+below the shortest CI job time limit, less the step's own run time, and at least `starve_seconds`.
 
 Two settings tune it (#38). `make_room_behind_agents = false` leaves a CI step that waits partly
 behind agents' builds that have waited longer than it (and so go first) to wait its turn: stopping

@@ -397,6 +397,9 @@ class Config:
         if self.ci_deadline and not self.ci_first:
             raise ValueError("ci_deadline needs ci_first = true: it says when a CI job's build stops yielding to "
                              "builds that have waited longer")
+        if self.ci_deadline and self.ci_deadline < self.starve_seconds:
+            raise ValueError("ci_deadline must be at least starve_seconds: a CI job's build past it has waited out "
+                             "its turn too, so its room and its workspace bind every lane")
         if self.make_room_for_ci and not self.ci_first:
             raise ValueError("make_room_for_ci needs ci_first = true: without it a CI job's build holds no room, "
                              "so the memory freed for it could go to another build")
@@ -2909,7 +2912,7 @@ class Ticket:
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
                "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "ended_rule", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
-               "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
+               "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues", "ci_passed",
                "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
@@ -3038,6 +3041,7 @@ class Ticket:
         self.frozen = False  # paused to give the machine its memory back
         self.frozen_at = None
         self.requeues = 0  # times it was stopped to free memory and queued again
+        self.ci_passed = 0  # CI jobs' builds past ci_deadline that started ahead of it while it was overdue
         self.ci_stops = 0  # of those, the times it was stopped to make room for a CI job's build
         self.yields_to: str | None = None  # the CI job's build it was last stopped for: it doesn't go before it
         self.yield_until: float | None = None  # ...for at most this long
@@ -3329,6 +3333,7 @@ class Daemon:
         self.memory_thread_failed = False
         self.last_freeze = self.last_kill = -1e9
         self.room_made: dict[str, float] = {}  # a CI job's build -> when builds were last stopped for it
+        self.partly_made: set[str] = set()  # CI jobs' builds that builds were stopped for though not enough
         self.started_at = time.time()
         self.avail_seen: collections.deque = collections.deque()  # (time, memory available) of the last 10 s
         self.submit_outcome: dict = {}  # how the last submission was answered: joined, reused, passed before
@@ -3523,8 +3528,12 @@ class Daemon:
             # CI builds could keep an overdue session's build waiting), nor in a lane that passes held
             # room (it gets no head start there).
             first = self.cfg.ci_first and t.from_ci and not passes and not overdue
-            due = self.ci_due(t, now)  # a CI job's build near its job's time limit: before all of them
-            return (not due, not overdue, not starving, -self.weight(t), not first, not (first and self.waited_out(t, now)))
+            due = self.ci_due(t, now)  # a CI job's build near its job's time limit: before all of them,
+            # except an overdue build that two of them have already passed (CI_PASSES_MAX): so a stream of
+            # CI jobs can't keep it waiting for ever, while a release's few steps still go first
+            passed = overdue and not t.from_ci and t.ci_passed >= self.CI_PASSES_MAX
+            return (not (due or passed), not overdue, not starving, -self.weight(t), not first,
+                    not (first and self.waited_out(t, now)))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
@@ -3561,6 +3570,8 @@ class Daemon:
             return False
         ci = self.tickets.get(t.yields_to)
         return ci is not None and ci.state == "queued"
+
+    CI_PASSES_MAX = 2  # due CI jobs' builds that may start ahead of an overdue build before it goes first again
 
     def ci_due(self, t: Ticket, now: float) -> bool:
         """A CI job's build that has waited ci_deadline: its job has a time limit that counts the wait
@@ -4122,6 +4133,7 @@ class Daemon:
         builds stopped for the last are still going, nor within ROOM_PAUSE of making room for one
         that is still queued."""
         wait = self.cfg.make_room_for_ci
+        self.partly_made = {k for k in self.partly_made if k in self.tickets and self.tickets[k].state == "queued"}
         self.room_made = {k: v for k, v in self.room_made.items()
                           if k in self.tickets and self.tickets[k].state == "queued"}
         if not wait or self.stopping or self.paused is not None:
@@ -4174,11 +4186,13 @@ class Daemon:
                     if total >= short:
                         break
                 else:
-                    if not (chosen and self.ci_due(ci, now)):
+                    if not (chosen and self.ci_due(ci, now)) or ci.id in self.partly_made:
                         continue  # stopping every one of them wouldn't make it fit
                     # Past its deadline: stop them all the same. What they free is held for it (its
                     # room binds every lane, and they yield to it), so it starts as soon as the rest
-                    # frees, rather than when its job is cancelled.
+                    # frees, rather than when its job is cancelled. Once only: if what they freed went
+                    # elsewhere (a lane that passes held room), stopping more would lose work for nothing.
+                    self.partly_made.add(ci.id)
             self.room_made[ci.id] = now
             waited = f"{(now - ci.submitted) / 60:.0f} min"
             for t in chosen:  # (counted in ci_stops once it is gone: it may yet finish by itself)
@@ -4822,7 +4836,12 @@ class Daemon:
                 while granted > t.need and self.mem_for(t, granted) > free_mem - hm:
                     granted -= 1  # more cores would need more memory than is free
                 t.est_mem = self.mem_for(t, granted)
+                due = self.ci_due(t, now)
                 self.start(t, now, granted)
+                if due:  # it went ahead of every overdue build still waiting: count it against their wait
+                    for o in self.queue(now):
+                        if not o.from_ci and now - o.submitted >= 3 * cfg.starve_seconds:
+                            o.ci_passed += 1
                 if t.state in FINISHED:
                     continue
                 free_mem -= t.est_mem
