@@ -608,15 +608,15 @@ one take turns; `repo` is its source repository when it sent one),
 and `plan_cores` (the peak behind the plan and the cores it was measured at), `outgrown_at` (when the
 last attempt first used more than `start_plan`), `breached_at` (when it first used more than its
 running plan, which more cores may have raised under `"always"`: a real breach), `breaches` (attempts
-that did), `max_cores` (the most cores the last started attempt was given), `rigid` (at its start)
-and `cold`; `end_rule` (the setting when it ended: a row whose `start_rule` differs straddled a
-change), and `peak_swap` and `tail_used` (its swap at its peak, and its memory and swap together
+that did), `max_cores` (the most cores the last started attempt was given), `rigid` (at its start;
+empty for a build that never started) and `cold`; `end_rule` (the setting when that attempt ended: a
+row whose `start_rule` differs straddled a change), and `peak_swap` and `tail_used` (its swap at its peak, and its memory and swap together
 from thirty seconds after it: what "past the peak" would have had to keep, #56).
 
 The profile comes from a trace kept while the build runs: the most memory in each ten seconds,
 with neighbours merged (and the step doubled) whenever it passes 720 points, so a long run's trace
 stays bounded. A build picked up after a daemon restart ran unwatched for a while, so its
-`peak_at`, `tail` and profile are left empty (in the history too). `waited_by` and its last mark are
+`peak_at`, `tail`, `peak_swap`, `tail_used` and profile are left empty (in the history too). `waited_by` and its last mark are
 saved with the ticket, and queued tickets are saved at shutdown.
 
 Once an hour (by the monotonic clock), the writer rolls minutes into hours, from the newest hour

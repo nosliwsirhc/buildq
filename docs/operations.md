@@ -84,7 +84,8 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   waiting for memory says how much the free room lacks ("short"). `⚑ in line` marks a build that
   room is kept for, because it has waited long or is a CI job's build: builds behind it don't take
   that room, and one whose own room is free says how many builds in line hold room that binds it
-  ("behind N in line": a CI job's build binds only builds of its priority or lower). When more builds wait than fit, the box's bottom border says how many more.
+  ("behind N in line": a CI job's build binds only builds of its priority or lower). When more
+  builds wait than fit, the box's bottom border says how many more.
 - **LANES** (on a wide terminal): what each lane has running and waiting.
 - **The timeline** (`t`): the last half hour, a row per build, newest at the bottom: `·` while it
   waited, a bar while it ran (darker for more memory; green if it succeeded, red if it failed or was

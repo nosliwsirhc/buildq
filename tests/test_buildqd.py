@@ -1802,7 +1802,15 @@ class Analytics(DaemonCase):
         self.daemon.cancel(t, self.now + 100)
         row = self.db().execute("SELECT * FROM build WHERE id = ?", (t.id,)).fetchone()
         self.assertEqual((row["start_plan"], row["max_cores"], row["rigid"]), (plan, cores, 0))  # the attempt that ran
-        self.assertEqual((row["start_rule"], row["end_rule"]), ("always", "never"))  # it straddled a change
+        self.assertEqual((row["start_rule"], row["end_rule"]), ("always", "always"))  # it ended before the change
+        self.daemon.cfg.scale_mem_with_cores = "always"
+        self.machine.mem_available = 200 * GIB
+        u = self.submit()
+        self.assertEqual(u.state, "running")
+        self.daemon.cfg.scale_mem_with_cores = "never"  # changed while it runs
+        self.finish(u, after=110)
+        row = self.db().execute("SELECT start_rule, end_rule FROM build WHERE id = ?", (u.id,)).fetchone()
+        self.assertEqual(tuple(row), ("always", "never"))  # it straddled the change
 
     def test_a_running_build_saved_by_an_older_daemon_keeps_its_rigidity(self):
         t = self.submit()
@@ -1811,6 +1819,11 @@ class Analytics(DaemonCase):
         rec.update(rigid=True, state="running", started=self.now)
         loaded = buildqd.Ticket.from_record(rec, t.dir)
         self.assertTrue(loaded.start_rigid)
+        rec.update(state="queued", started=None, start_rule="always")  # queued again before the upgrade
+        self.assertTrue(buildqd.Ticket.from_record(rec, t.dir).start_rigid)
+        rec.update(tail_used="lots", peak_swap=None, breached_at="x")  # a damaged file: numbers only
+        loaded = buildqd.Ticket.from_record(rec, t.dir)
+        self.assertEqual((loaded.tail_used, loaded.peak_swap, loaded.breached_at), (0, 0, None))
 
     def test_the_start_fields_are_one_attempt_on_one_clock(self):
         t = self.submit()
@@ -4883,6 +4896,12 @@ class Top(unittest.TestCase):
         self.assertIn("2 in line, with room kept for them", text)
         self.assertNotIn("223G", text)  # room kept, summed over everyone in line, would read as more than the machine
         self.assertNotIn("next", text)
+
+    def test_behind_is_the_daemons_count_when_it_gives_one(self):
+        snap = self.queue_in_a_jam(self.snap())
+        snap["overview"]["queued"][4]["behind"] = 1  # two in line ahead, but only one binds it (#62)
+        row = next(t for t, _ in self.draw(snap, width=260)[0] if "gggggggg" in t)
+        self.assertIn("behind 1 in line", row)
 
     def test_a_jam_on_a_normal_terminal_still_lists_waiting_builds(self):
         snap = self.queue_in_a_jam(self.snap())

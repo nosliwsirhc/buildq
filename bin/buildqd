@@ -2900,7 +2900,7 @@ class Ticket:
     PERSIST = ("id", "name", "argv", "cwd", "lane", "key", "label", "notify", "submitted", "priority", "timeout",
                "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
-               "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
+               "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "ended_rule", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
                "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
                "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
@@ -2946,6 +2946,7 @@ class Ticket:
         self.start_base_cores = 0
         self.start_rigid = False  # ... and whether it ignored its core count then
         self.started_max_cores = 0  # the most cores the last started attempt was given (requeue zeroes max_granted)
+        self.ended_rule = None  # scale_mem_with_cores when that attempt was stopped and queued again
         self.peak_swap = 0  # swap at its memory peak (not kept across attempts)
         self.tail_used = 0  # the most memory and swap together from half a minute after its peak
         self.behind = 0  # (not kept) builds in line whose room binds this one, while it is held behind them
@@ -3106,8 +3107,12 @@ class Ticket:
             if k in rec:
                 setattr(t, k, rec[k])
         t.take_waits(0, 0, 0)  # numbers only, whatever the file said
-        if "start_rigid" not in rec and t.started:  # (saved by an older daemon while running: #63)
+        if "start_rigid" not in rec and (t.started or t.start_rule):  # (saved by an older daemon: #63)
             t.start_rigid = bool(t.rigid)
+        for name in ("peak_swap", "tail_used", "start_plan", "start_cores", "started_max_cores", "breaches",
+                     "start_base", "start_base_cores"):
+            setattr(t, name, int(sane_count(getattr(t, name)) or 0))
+        t.outgrown_at, t.breached_at = sane_count(t.outgrown_at), sane_count(t.breached_at)
         waited = t.waited_by if isinstance(t.waited_by, dict) else {}
         t.waited_by = {str(k): v for k, v in ((k, sane_count(v)) for k, v in waited.items()) if v is not None}
         t.peak_at = sane_count(t.peak_at) or 0.0
@@ -4223,6 +4228,7 @@ class Daemon:
         t.state, t.started, t.running_since, t.result_seen, t.stop_sent = "queued", None, None, None, None
         t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = None
         t.started_max_cores = t.max_granted  # (the row describes the last attempt that started)
+        t.ended_rule = self.cfg.scale_mem_with_cores
         t.granted = t.max_granted = t.tokens_out = 0
         t.measured = t.elastic = t.frozen = t.requeue_pending = False
         t.frozen_at = None
@@ -4875,7 +4881,7 @@ class Daemon:
         t.granted = t.max_granted = granted
         t.growth_now = t.est_mem  # (all of its plan, until the queue next works out what it uses)
         t.start_plan, t.start_cores, t.outgrown_at, t.breached_at = t.est_mem, granted, None, None
-        t.start_rule = self.cfg.scale_mem_with_cores
+        t.start_rule, t.ended_rule = self.cfg.scale_mem_with_cores, None
         t.start_base, t.start_base_cores, t.start_rigid = t.mem_base, t.mem_cores, t.rigid
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
         t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
@@ -5187,13 +5193,17 @@ class Daemon:
         if t.breached_at is None and t.started:  # (past the plan it holds now: a breach under any setting)
             t.breached_at = self.attempt_seconds(t, now)
             t.breaches += 1
-            self.save(t)  # (a restart before the next save would lose when; #63)
+            breached = True
+        else:
+            breached = False
         lane = self.lane(t.lane)
         cap = lane.mem_cap if self.runner_of(t).name == "systemd" else None
         raised = cap if cap and cap > t.mem_now else int(t.mem_now * 1.5)
         if raised > t.est_mem:
             log(f"{t.id} passed its estimate ({fmt_size(t.est_mem)}); planning it at {fmt_size(raised)}")
             t.est_mem = raised
+        if breached:
+            self.save(t)  # (when, and the raised plan: a restart before the next save would lose both; #63)
 
     def check_starting(self, t: Ticket, now: float) -> bool:
         """Move a starting build on; True once it runs."""
@@ -5423,8 +5433,9 @@ class Daemon:
             "start_plan": t.start_plan or None, "start_cores": t.start_cores or None, "outgrown_at": t.outgrown_at,
             "plan_base": t.start_base or None, "plan_cores": t.start_base_cores or None, "cold": int(bool(t.cold)),
             "breached_at": t.breached_at, "breaches": t.breaches, "start_rule": t.start_rule,
-            "end_rule": self.cfg.scale_mem_with_cores if t.start_rule else None,
-            "max_cores": t.max_granted or t.started_max_cores or None, "rigid": int(bool(t.start_rigid)),
+            "end_rule": (t.ended_rule or self.cfg.scale_mem_with_cores) if t.start_rule else None,
+            "max_cores": t.max_granted or t.started_max_cores or None,
+            "rigid": int(bool(t.start_rigid)) if t.start_rule else None,
             "peak_swap": t.peak_swap if whole else None, "tail_used": t.tail_used if whole else None,
             "waited_by": json.dumps(t.waited_by, separators=(",", ":"), sort_keys=True),
             "est_mem": t.est_mem, "est_src": t.est_src, "mem_peak": max(t.mem_peak, t.attempts_peak),

@@ -2582,7 +2582,8 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
 
 def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: list) -> None:
     """The waiting builds, in the order they get a turn. Each says what it needs and why it waits:
-    what the free room lacks, or how many builds in line are ahead of it."""
+    what the free room lacks, or how many builds in line hold room that binds it (the daemon's
+    count; an older daemon's: every one ahead)."""
     sep = GLYPHS["sep"]
     budget = ((snap.get("overview") or {}).get("budget") or {})
     room = budget.get("free_mem") or 0
