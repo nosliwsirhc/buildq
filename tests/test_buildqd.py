@@ -1787,6 +1787,44 @@ class Analytics(DaemonCase):
         self.assertEqual((row["plan_base"], row["plan_cores"], row["cold"]), (t.mem_base, t.mem_cores, 0))
         self.assertEqual((row["start_rule"], row["max_cores"], row["rigid"]), ("always", cores, 0))
 
+    def test_a_requeued_build_cancelled_before_it_runs_again_keeps_its_last_attempt(self):
+        t = self.submit()
+        cores, plan = t.granted, t.est_mem
+        t.measured, t.mem_now = True, plan + GIB
+        self.daemon.outgrown(t, self.now + 60)
+        with open(os.path.join(t.dir, "ticket.json")) as f:
+            self.assertEqual(json.load(f)["breached_at"], 60.0)  # saved at once (#63)
+        self.daemon.requeue(t, self.now + 90)
+        self.assertEqual((t.state, t.max_granted), ("queued", 0))
+        t.rigid = True  # estimated again while it waits
+        self.daemon.cfg.scale_mem_with_cores = "never"  # and the setting changed meanwhile
+        self.machine.mem_available = GIB  # (so it doesn't start again)
+        self.daemon.cancel(t, self.now + 100)
+        row = self.db().execute("SELECT * FROM build WHERE id = ?", (t.id,)).fetchone()
+        self.assertEqual((row["start_plan"], row["max_cores"], row["rigid"]), (plan, cores, 0))  # the attempt that ran
+        self.assertEqual((row["start_rule"], row["end_rule"]), ("always", "always"))  # it ended before the change
+        self.daemon.cfg.scale_mem_with_cores = "always"
+        self.machine.mem_available = 200 * GIB
+        u = self.submit()
+        self.assertEqual(u.state, "running")
+        self.daemon.cfg.scale_mem_with_cores = "never"  # changed while it runs
+        self.finish(u, after=110)
+        row = self.db().execute("SELECT start_rule, end_rule FROM build WHERE id = ?", (u.id,)).fetchone()
+        self.assertEqual(tuple(row), ("always", "never"))  # it straddled the change
+
+    def test_a_running_build_saved_by_an_older_daemon_keeps_its_rigidity(self):
+        t = self.submit()
+        rec = t.record()
+        rec.pop("start_rigid")
+        rec.update(rigid=True, state="running", started=self.now)
+        loaded = buildqd.Ticket.from_record(rec, t.dir)
+        self.assertTrue(loaded.start_rigid)
+        rec.update(state="queued", started=None, start_rule="always")  # queued again before the upgrade
+        self.assertTrue(buildqd.Ticket.from_record(rec, t.dir).start_rigid)
+        rec.update(tail_used="lots", peak_swap=None, breached_at="x")  # a damaged file: numbers only
+        loaded = buildqd.Ticket.from_record(rec, t.dir)
+        self.assertEqual((loaded.tail_used, loaded.peak_swap, loaded.breached_at), (0, 0, None))
+
     def test_the_start_fields_are_one_attempt_on_one_clock(self):
         t = self.submit()
         plan, base, base_cores = t.est_mem, t.mem_base, t.mem_cores
@@ -2211,6 +2249,14 @@ class Analytics(DaemonCase):
                 t.measure(self.now + second)
         self.assertEqual((t.mem_peak, t.peak_at), (8 * GIB, 10.0))
         self.assertEqual(t.tail, 4 * GIB)  # 3G at 20s is within half a minute of the peak
+        u = self.submit()
+        u.started, u.cg = self.now, "/nonexistent"
+        for second, gib, swap in ((0, 1, 0), (10, 8, GIB), (50, 2, 5 * GIB), (70, 3, 1 * GIB)):
+            with mock.patch.object(buildqd, "cgroup_stats", return_value=(0, gib * GIB, 0)), \
+                    mock.patch.object(buildqd, "cgroup_memory_waits", return_value=None), \
+                    mock.patch.object(buildqd, "cgroup_swap", return_value=swap):
+                u.measure(self.now + second)
+        self.assertEqual((u.peak_swap, u.tail, u.tail_used), (GIB, 3 * GIB, 7 * GIB))  # 2G resident + 5G swapped (#56)
         for second in range(0, 200000, 7):
             t.note_trace(float(second), GIB)
         self.assertLessEqual(len(t.trace), t.TRACE_POINTS + 1)
@@ -2719,6 +2765,7 @@ class CIFirst(DaemonCase):
         same = self.submit(("cargo", "check"), cores=1)
         self.assertEqual((same.state, same.reason),
                          ("queued", "the room it needs is held for a CI job's build, which goes first"))
+        self.assertEqual(same.row(self.now)["behind"], 1)  # the CI job's hold binds its own priority (#62)
 
     def test_a_ci_build_that_has_waited_its_turn_holds_room_from_every_lane(self):
         self.daemon.cfg.ci_first = True
@@ -2729,6 +2776,7 @@ class CIFirst(DaemonCase):
         self.assertTrue(ci.held)
         self.assertEqual((higher.state, higher.reason),
                          ("queued", "the room it needs is held for a build that has waited longer"))
+        self.assertEqual(higher.row(self.now)["behind"], 1)  # the one long wait binds every lane (#62)
         self.assertEqual(higher.row(self.now)["held_for"], "memory")
 
     def test_a_higher_lane_still_goes_first_when_both_have_waited(self):
@@ -4848,6 +4896,12 @@ class Top(unittest.TestCase):
         self.assertIn("2 in line, with room kept for them", text)
         self.assertNotIn("223G", text)  # room kept, summed over everyone in line, would read as more than the machine
         self.assertNotIn("next", text)
+
+    def test_behind_is_the_daemons_count_when_it_gives_one(self):
+        snap = self.queue_in_a_jam(self.snap())
+        snap["overview"]["queued"][4]["behind"] = 1  # two in line ahead, but only one binds it (#62)
+        row = next(t for t, _ in self.draw(snap, width=260)[0] if "gggggggg" in t)
+        self.assertIn("behind 1 in line", row)
 
     def test_a_jam_on_a_normal_terminal_still_lists_waiting_builds(self):
         snap = self.queue_in_a_jam(self.snap())

@@ -119,7 +119,8 @@ at the start of its last attempt (`start_plan`, `start_cores`, `start_rule`, wit
 `plan_cores`, `max_cores`, `rigid` and `cold`), when it first used more than that plan
 (`outgrown_at`), and when it first used more than the plan it held then (`breached_at`; under
 `"always"` more cores raise the plan, so only this is a breach under both settings), with how many
-attempts did (`breaches`). What `"never"` would have planned is `plan_base`; what `"always"` would
+attempts did (`breaches`), and the setting when that attempt ended (`end_rule`: a row whose
+`start_rule` differs straddled a change, so leave it out of a comparison). What `"never"` would have planned is `plan_base`; what `"always"` would
 have planned is about `plan_base` × cores ÷ `plan_cores` (capped at the lane's `MemoryMax`, and not
 for a rigid build), an estimate, since it would also have started some builds on fewer cores. A cargo build whose target
 directory has no build yet counts as a full build, at least the lane's default. A run that a signal
