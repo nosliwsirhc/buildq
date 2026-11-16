@@ -4776,7 +4776,13 @@ class Top(unittest.TestCase):
         self.assertIn("▓▓▒····· 4.0G", row)  # 4G used and 3G held of 20G; the rest let go
         text = "\n".join(t for t, _ in lines)
         self.assertIn("builds 5.0G +8.0G held", text)
-        del a["growth"], b["growth"]  # an older daemon: its total shared out by the plans
+        a["released"] = b["released"] = False  # nothing let go: each row shows the rest of its plan held
+        row = next(t for t, _ in self.draw(snap, width=200, height=40)[0] if "bbbbbbbb" in t and "/" in t)
+        self.assertIn("▓▒▒▒▒▒▒▒", row)
+        del a["growth"], b["growth"], a["released"], b["released"]  # an older daemon: its total shared out by the plans
+        lines, _ = self.draw(snap, width=200, height=40)
+        row = next(t for t, _ in lines if "aaaaaaaa" in t and "/" in t)
+        self.assertIn("·", row)  # (its share of the 8G held, not the whole rest of its 20G plan)
         holds = buildq.build_holds(snap, buildq.running_order(snap, "age"))
         self.assertAlmostEqual(sum(h for _, h in holds.values()), 8 * GIB, delta=2)  # (rounded down per build)
 

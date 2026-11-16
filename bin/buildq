@@ -2546,7 +2546,8 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
         used = s.get("cores")
         filled = 0 if used is None else round(min(1.0, used / max(given, 1)) * 6)
         mem_now, growth = holds.get(row["id"], (s.get("mem", row.get("mem_now") or 0) or 0, 0))
-        if not row.get("released"):  # (nothing let go: the rest of its plan is held, whatever the samples' timing)
+        if row.get("released") is False:  # (nothing let go: the rest of its plan is held, whatever the samples'
+            # timing; an older daemon doesn't say, and then its total, shared out, stands)
             growth = max(growth, (row.get("est_mem") or 0) - mem_now)
         peak, plan = max(row.get("mem_peak") or 0, mem_now), row.get("est_mem") or 0
         cells_now = round(min(1.0, mem_now / plan) * 8) if plan else 0  # its plan: ▓ used, ▒ held, · let go
