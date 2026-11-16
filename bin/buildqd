@@ -2985,6 +2985,7 @@ class Ticket:
         self.short_hm = 0.0  # (not kept) the room held ahead of it then, which it couldn't use
         self.short_agents = 0.0  # (not kept) of that, the room held for agents' builds (not CI jobs')
         self.short_by = 0.0  # (not kept) the memory it lacked when the queue was last looked at
+        self.growth_now = 0  # (not kept) what is held for it to grow into, as the queue last worked it out
         self.requeue_pending = False  # being stopped, to be queued again
         self.shed_error = None  # why it can't be queued again once stopped
         self.restartable = False  # its caller says it can start over from the beginning safely
@@ -3192,6 +3193,9 @@ class Ticket:
             # for `buildq top`: where to read it, and what it fills
             "cg": self.cg, "write_dirs": self.write_dirs, "disk_paths": self.disk_paths, "swap_now": self.swap_now, "waited_by": self.waited_by,
             "peak_at": round(self.peak_at, 1), "release_at": self.release_at, "release_hold": self.release_hold,
+            "released": bool(self.released and not self.release_revoked),
+            "growth": int(self.growth_now) if self.state in ("starting", "running") else 0,
+            "short_by": int(max(0.0, self.short_by)) if self.state == "queued" else 0,
         }
 
 
@@ -4588,7 +4592,9 @@ class Daemon:
             if t.state == "queued":
                 self.add_wait(t, now)
         running = self.active()
-        growth = sum(self.still_to_grow(t, now) for t in running)
+        for t in running:
+            t.growth_now = self.still_to_grow(t, now)
+        growth = sum(t.growth_now for t in running)
         ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in running
                       if t.started and now - t.started < cfg.ramp_seconds)
         # Cores that resizable builds could hand back, down to their minimum.

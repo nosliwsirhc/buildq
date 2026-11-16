@@ -52,19 +52,24 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
 `buildq top` is a live view of the queue, like `btop`, in boxed panels:
 - **CPU** (beside MEMORY on a terminal 110 columns or wider; otherwise a bar in the title line):
   the last half hour as a graph, with busy cores against the queue's target and CPU pressure.
-  Its first minutes come from the analytics (`metrics.db`), so it isn't empty when top starts.
+  Its first minutes come from the analytics (`metrics.db`, the busiest moment of each minute), so
+  it isn't empty when top starts.
 - **MEMORY, as a ledger:** one bar where every part of the machine's memory has its place: each
   running build's use (`▓`) and what is held for it to grow into (`▒`), everything else (`█`), the
-  floor (`░`) and the room a new build can start in (`■`). Below it:
-  - the next waiting build's need, and how far short of the room it is;
+  floor (`░`) and the room a new build can start in (`■`). When more is held than is free, it says
+  "over by" instead of the room. Below it:
+  - how many builds wait, how many of them for memory and how far short the closest is, and the
+    room kept for the builds that have waited longest (see Waiting);
   - swap and memory pressure;
   - who uses the machine: buildq's builds, CI runners, containers and your apps, each with its
     cores, memory and swap, and I/O pressure;
+  - buildq's builds together: their memory pressure and disk reads and writes;
   - one DISK line per filesystem builds write to (`/` always): free space against `disk_floor`,
     worked out for that filesystem, with read and write rates.
 - **Running, one row per build:**
   - its cores used out of those given (`▮▯`);
-  - its memory now, its peak and its plan (`▓` now, `▒` up to the peak, `░` the rest of the plan);
+  - its memory now, its peak and its plan; the bar is its plan: `▓` what it uses, `▒` what is held for
+    it to grow into, `·` what was let go after its peak;
   - as width allows: the space its folders take, its own memory pressure (how much the kernel is
     slowing it), its disk read and write rates (I/O through dm-crypt or LVM counted once; a
     mirror's writes count each copy, and a filesystem in a loop file counts twice) and its swap;
@@ -75,11 +80,14 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   du -sx` in the background, each at most every five minutes. "≥" means only in part, "…" not
   yet, "?" it couldn't be, and "*" a folder another running build shares.
 - **Waiting:** each waiting build with a bar of how long it has waited against the longest wait,
-  what it needs, `◀ next` on the one that starts next, `⚑ room held` where its room is already
-  held for it (a CI step), how far short of the room it is, and why it waits.
+  what it needs, how much memory it lacks, and why it waits, in the daemon's words. `⚑ in line`
+  marks a build that has waited long: room is kept for it, so builds behind it wait, and what it
+  lacks counts the room kept for builds ahead of it. The panel's title says how much is kept in all.
 - **LANES** (on a wide terminal): what each lane has running and waiting.
 - **The timeline** (`t`): the last half hour, a row per build, newest at the bottom: `·` while it
-  waited, a bar while it ran (darker for more memory), under a graph of the machine's memory.
+  waited, a bar while it ran (darker for more memory; green if it succeeded, red if it failed),
+  under a graph of the machine's memory. The running and waiting builds always have a row; when
+  there are more than fit, the oldest finished ones go first.
 - **Keys:**
   - `s` sorts by age, CPU, memory, I/O or disk;
   - ↑↓ (or `j`/`k`) select a build: the selection stays on that build when the order changes,
@@ -88,12 +96,14 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   - Enter shows its plan, pressure, waits and folders;
   - `l` shows the end of its output (with Enter, the newest lines are kept);
   - `t` the timeline and back, `?` what each key and glyph means, `q` quits.
-- **Small screens:** under 18 rows, the machine's panels give way to the builds, and the title
-  line says CPU and memory instead.
+- **Small screens:** the selected build always stays in view. An open detail pane gets up to half
+  of what is left, then the machine's panels, then the rest of the builds. Under 18 rows the
+  machine's panels give way, and the title line says CPU and memory instead.
 - **Terminals:**
   - it draws with ASCII when the terminal isn't UTF-8 (`LC_ALL=C`), as curses itself writes;
   - `NO_COLOR` turns colour off; every part also has its own glyph, so nothing depends on colour;
-  - the "updated" time at the bottom turns yellow when the screen is more than three refreshes old;
+  - the "updated" time at the bottom counts from the daemon's last answer, and turns yellow when
+    that is more than three refreshes old;
   - a terminal this machine has no terminfo entry for (Ghostty or kitty over SSH, say) is drawn as
     `xterm-256color`, and on exit it says how to install the real entry;
   - with no usable terminal at all (`TERM` unset or `dumb`, or `--once`, or output to a pipe) it

@@ -188,6 +188,18 @@ class DaemonCase(unittest.TestCase):
 
 
 class Admission(DaemonCase):
+    def test_the_status_says_what_each_build_holds_and_lacks(self):
+        self.machine.mem_available = 50 * GIB  # 40G above the 10G floor: two 20G builds
+        a, b, c = (self.submit() for _ in range(3))
+        a.mem_now = 5 * GIB
+        self.daemon.schedule(self.now + 1)
+        ov = self.daemon.overview(self.now + 1)
+        rows = {r["id"]: r for r in ov["running"] + ov["queued"]}
+        self.assertEqual((rows[a.id]["growth"], rows[b.id]["growth"]), (15 * GIB, 20 * GIB))
+        self.assertFalse(rows[a.id]["released"])
+        self.assertEqual(rows[c.id]["short_by"], c.est_mem - (50 * GIB - 35 * GIB - 10 * GIB))
+        self.assertEqual(rows[a.id]["short_by"], 0)
+
     def test_memory_decides_how_many_start(self):
         self.machine.mem_available = 50 * GIB  # 40G above the 10G floor: two 20G builds
         tickets = [self.submit() for _ in range(3)]
@@ -4551,7 +4563,8 @@ class Top(unittest.TestCase):
                          "/: 1000G free of 1860G · floor 372G · read 18M/s · write 45M/s", "CI 6.0c 8.0G",
                          "other 3.0c", "pressure: io -", "2 running", "1 waiting", "aaaaaaaa", "1.5/8", "4.0G/18G/20G",
                          "≥41G", "cargo test --locked·red", "memory 2m00s", "would keep 2.0G", "cccccccc",
-                         "MEMORY", "CPU", "LANES", "▓ used", "▒ held for growth", "◀ next"):
+                         "MEMORY", "CPU", "LANES", "▓ used", "▒ held for growth", "builds together",
+                         "2.0G is free after the 16G floor"):
             self.assertIn(expected, text)
         self.assertNotIn("\x1b", text)
         self.assertEqual(order, ["a" * 36, "b" * 36])
@@ -4671,12 +4684,131 @@ class Top(unittest.TestCase):
         self.assertNotIn("╭─ CPU", narrow)
         self.assertIn("CPU ", narrow.splitlines()[0])  # a bar in the title line instead
         self.assertIn("MEMORY", narrow)
-        for width in (50, 79, 90, 110, 150, 300):
-            for height in (12, 17, 24, 40):
-                lines, _ = self.draw(self.snap(), width=width, height=height, selected="a" * 36, detail=True, log_lines=["x"] * 30)
-                self.assertEqual(len(lines), height, (width, height))
-                self.assertTrue(all(buildq.text_width(t) <= width for t, _ in lines), (width, height))
-                self.assertIn("aaaaaaaa", "\n".join(t for t, _ in lines), (width, height))
+        many = self.snap()
+        many["overview"]["running"] = [dict(many["overview"]["running"][1], id=f"{i:036d}", short=f"{i:08d}",
+                                            elapsed=i) for i in range(40)]
+        for snap, pick, short in ((self.snap(), "a" * 36, "aaaaaaaa"), (many, f"{7:036d}", "00000007")):
+            for width in (50, 79, 80, 90, 100, 110, 150, 300):
+                for height in range(12, 41):
+                    for detail, log in ((False, None), (True, None), (True, [f"line {i}" for i in range(30)])):
+                        lines, _ = self.draw(snap, width=width, height=height, selected=pick, detail=detail, log_lines=log)
+                        where = (width, height, detail, bool(log), len(snap["overview"]["running"]))
+                        self.assertEqual(len(lines), height, where)
+                        self.assertTrue(all(buildq.text_width(t) <= width for t, _ in lines), where)
+                        self.assertIn(short, self.marked(lines), where)  # the selected build is in view
+                        if log and any("the end of" in t for t, _ in lines):
+                            self.assertIn("line 29", "\n".join(t for t, _ in lines), where)  # the newest kept
+                        borders = [i for i, (t, _) in enumerate(lines) if t.startswith("╰")]
+                        tops = [i for i, (t, _) in enumerate(lines) if t.startswith("╭")]
+                        self.assertEqual(len(borders), len(tops), where)  # no box drawn over another
+
+    def test_every_wait_says_why_and_what_it_lacks(self):
+        snap = self.snap()
+        snap["overview"]["budget"].update(free_mem=-6 * GIB, held_mem=40 * GIB)
+        snap["overview"]["queued"] = [
+            {"short": "cccccccc", "lane": "heavy", "waited": 400, "est_mem": 20 * GIB, "held": True, "waiting_for": "held",
+             "short_by": 26 * GIB, "reason": "the room it needs is held for a build that has waited longer"},
+            {"short": "dddddddd", "lane": "heavy", "waited": 300, "est_mem": 2 * GIB, "held": False, "waiting_for": "cpu",
+             "short_by": 0, "reason": "needs 8 cores; 2.0 of 28.8 are free (20.0 busy, 0.0 expected from builds just started)"},
+            {"short": "eeeeeeee", "lane": "heavy", "waited": 200, "est_mem": 300 * GIB, "held": False, "waiting_for": "too-big",
+             "short_by": 0, "reason": "needs 300G of memory, more than this machine has; cancel it or give its lane a smaller MemoryMax"},
+            {"short": "ffffffff", "lane": "web", "waited": 100, "est_mem": 4 * GIB, "held": False, "waiting_for": "memory",
+             "short_by": 10 * GIB, "reason": "needs 4.0G of memory; 0M is free after the 16G floor"}]
+        lines, _ = self.draw(snap, width=260)
+        rows = {m: next(t for t, _ in lines if m in t and "needs" in t) for m in ("cccccccc", "dddddddd", "eeeeeeee", "ffffffff")}
+        self.assertIn("⚑ in line", rows["cccccccc"])
+        self.assertIn("26G short", rows["cccccccc"])  # the daemon's figure, the room kept for others counted
+        self.assertIn("needs 8 cores; 2.0 of 28.8 are free", rows["dddddddd"])  # not hidden for starting "needs"
+        self.assertNotIn("short", rows["dddddddd"])
+        self.assertIn("cancel it or give its lane a smaller MemoryMax", rows["eeeeeeee"])
+        self.assertIn("0M is free after the 16G floor", rows["ffffffff"])
+        self.assertNotIn("needs 4.0G of memory;", rows["ffffffff"])  # (said in its column)
+        text = "\n".join(t for t, _ in lines)
+        self.assertIn("over by 6.0G", text)  # more held than free: not "room 0M"
+        self.assertIn("2 for memory, the closest 10G short", text)
+        self.assertIn("40G kept for the longest waits", text)
+        self.assertNotIn("next", text.split("1 waiting")[-1] if "1 waiting" in text else text.split("4 waiting")[1])
+
+    def test_each_build_is_drawn_holding_what_the_daemon_holds_for_it(self):
+        snap = self.snap()
+        a, b = snap["overview"]["running"]
+        snap["builds"]["b" * 36]["mem"] = GIB
+        a.update(est_mem=20 * GIB, growth=3 * GIB, released=True)  # let go of after its peak: 3G kept, not 16G
+        b.update(est_mem=6 * GIB, growth=5 * GIB)
+        snap["overview"]["budget"]["growth_reserved"] = 8 * GIB
+        holds = buildq.build_holds(snap, buildq.running_order(snap, "age"))
+        self.assertEqual(holds, {"a" * 36: (4 * GIB, 3 * GIB), "b" * 36: (GIB, 5 * GIB)})
+        lines, _ = self.draw(snap, width=200, height=40)
+        row = next(t for t, _ in lines if "aaaaaaaa" in t and "/" in t)
+        self.assertIn("▓▓▒····· 4.0G", row)  # 4G used and 3G held of 20G; the rest let go
+        text = "\n".join(t for t, _ in lines)
+        self.assertIn("builds 5.0G +8.0G held", text)
+        del a["growth"], b["growth"]  # an older daemon: its total shared out by the plans
+        holds = buildq.build_holds(snap, buildq.running_order(snap, "age"))
+        self.assertAlmostEqual(sum(h for _, h in holds.values()), 8 * GIB, delta=2)  # (rounded down per build)
+
+    def test_the_selected_build_keeps_its_warning(self):
+        c, _ = buildq.render_screen(self.snap(), 200, 40, selected="a" * 36)
+        y = next(i for i, t in enumerate(c.lines()) if "▶ aaaaaaaa" in t)
+        x = c.lines()[y].index("aaaaaaaa")
+        self.assertEqual(c.styles[y][x], "bad")  # under memory pressure, selected or not
+        self.assertEqual(c.styles[y][x - 2], "sel")  # the marker says it is selected
+
+    def test_every_filesystem_has_its_line(self):
+        snap = self.snap()
+        snap["machine"]["filesystems"].append({"mount": "/var/lib/containers", "device": "sdb1", "free": 10 * GIB,
+                                               "size": 500 * GIB, "floor": 100 * GIB, "read": 0, "write": 0})
+        for width, height in ((150, 0), (150, 40), (90, 40), (90, 0)):
+            text = "\n".join(t for t, _ in self.draw(snap, width=width, height=height)[0])
+            self.assertIn("DISK /:", text, (width, height))
+            self.assertIn("DISK /var/lib/containers: 10G free of 500G", text, (width, height))
+
+    def test_a_wide_character_cut_in_half_leaves_no_half(self):
+        c = buildq.Canvas(10, 1)
+        c.put(0, 0, "日本語")
+        c.put(0, 1, "x")  # over the right half of 日
+        c.put(0, 4, "y")  # over the left half of 語
+        self.assertEqual(c.lines()[0], " x本y")
+        self.assertEqual(sum(buildq.text_width(t) for t, _ in c.runs(0)), 10)
+        c = buildq.Canvas(6, 1)
+        c.put(0, 0, "a日b")
+        c.put(0, 0, "語")  # a wide one over a narrow one and the left half of another
+        self.assertEqual(sum(buildq.text_width(t) for t, _ in c.runs(0)), 6)
+
+    def test_older_analytics_and_finished_builds(self):
+        import sqlite3
+        path = os.path.join(self.enterContext(tempfile.TemporaryDirectory()), "metrics.db")
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE minute (t REAL, cpu_busy REAL, cores INTEGER, mem_total INTEGER, mem_available INTEGER)")
+        now = 1794600000.0
+        db.execute("INSERT INTO minute VALUES (?,?,?,?,?)", (now - 300, 12.0, 32, 128 * GIB, 64 * GIB))
+        db.execute("CREATE TABLE build (id TEXT, lane TEXT, submitted INTEGER, ended INTEGER, attempt_wall REAL, wall REAL,"
+                   " mem_peak INTEGER, from_ci INTEGER, state TEXT)")
+        db.executemany("INSERT INTO build VALUES (?,?,?,?,?,?,?,?,?)", [
+            ("1" * 36, "heavy", now - 1200, now - 600, 300.0, 400.0, 20 * GIB, 1, "failed"),
+            ("2" * 36, "web", now - 7200, now - 7000, 100.0, 100.0, GIB, 0, "succeeded"),  # ended before the half hour
+            ("3" * 36, "web", now - 900, now - 100, None, 50.0, GIB, 0, "succeeded")])
+        db.commit()
+        db.close()
+        hist = buildq.TopHistory()
+        hist.backfill(path, now)  # no growth, no builds_mem: what there is still fills the graph
+        self.assertEqual([s[1] for s in hist.samples], [12.0])
+        done = buildq.finished_builds(path, now, skip={"3" * 36})
+        self.assertEqual([(d["short"], d["started"], d["from_ci"]) for d in done], [("11111111", now - 900, True)])
+
+    def test_the_timeline_keeps_the_running_builds(self):
+        snap = self.snap()
+        finished = [{"short": f"{i:08d}", "lane": "check", "submitted": snap["time"] - 1700 + i, "started": snap["time"] - 1600 + i,
+                     "ended": snap["time"] - 1000 + i, "peak": GIB, "from_ci": False, "state": "failed" if i == 59 else "succeeded"}
+                    for i in range(60)]
+        lines, _ = self.draw(snap, width=120, height=20, view="timeline", finished=finished)
+        text = "\n".join(t for t, _ in lines)
+        for short in ("aaaaaaaa", "bbbbbbbb", "cccccccc", "00000059"):
+            self.assertIn(short, text)  # the running and waiting builds, then the newest finished ones
+        self.assertIn("not shown", text)
+        c, _ = buildq.render_screen(snap, 120, 20, view="timeline", finished=finished)
+        y = next(i for i, t in enumerate(c.lines()) if "00000059" in t)
+        self.assertIn("bad", c.styles[y][27:])  # a failed build isn't drawn as a success
 
     def test_with_no_daemon_it_still_shows_the_machine(self):
         snap = self.snap()

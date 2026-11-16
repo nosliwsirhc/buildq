@@ -2137,7 +2137,7 @@ def shared_folders(snap: dict) -> set[str]:
     return shared
 
 
-# ---- buildq top: panels on a canvas (docs/usage.md, "buildq top")
+# ---- buildq top: panels on a canvas (docs/operations.md, "buildq top")
 #
 # The home screen is a control room: the CPU over the last half hour, memory as a ledger (where all of
 # it goes: each running build's use and what is held for it to grow into, other work, the floor, the
@@ -2181,9 +2181,14 @@ class Canvas:
             if col + w > end:
                 break
             if col >= 0:
-                self.chars[y][col], self.styles[y][col] = ch, style
+                row = self.chars[y]
+                if row[col] == "" and col > 0:  # over the right half of a wide character: its left goes too
+                    row[col - 1] = " "
+                if col + w < self.width and row[col + w] == "":  # over the left half: its right goes too
+                    row[col + w] = " "
+                row[col], self.styles[y][col] = ch, style
                 if w == 2:
-                    self.chars[y][col + 1], self.styles[y][col + 1] = "", style
+                    row[col + 1], self.styles[y][col + 1] = "", style
             col += w
         return col - x
 
@@ -2250,9 +2255,11 @@ class TopHistory:
             db = sqlite3.connect(f"file:{urllib.parse.quote(path)}?mode=ro", uri=True, timeout=1)
             try:
                 cols = {r[1] for r in db.execute("PRAGMA table_info(minute)")}
-                builds = "builds_mem_avg" if "builds_mem_avg" in cols else "builds_mem"
-                rows = db.execute(f"SELECT t, cpu_busy, cores, mem_total, mem_available, {builds}, growth FROM minute "
-                                  "WHERE t >= ? ORDER BY t", (now - TOP_SPAN,)).fetchall()
+                pick = lambda *names: next((n for n in names if n in cols), "NULL")  # noqa: E731
+                # (the busiest moment of each minute: the graph shows the most in each column)
+                rows = db.execute(f"SELECT t, {pick('cpu_busy_max', 'cpu_busy')}, {pick('cores')}, {pick('mem_total')}, "
+                                  f"{pick('mem_available')}, {pick('builds_mem_avg', 'builds_mem')}, {pick('growth')} "
+                                  "FROM minute WHERE t >= ? ORDER BY t", (now - TOP_SPAN,)).fetchall()
             finally:
                 db.close()
         except Exception:  # (an older or busy analytics file: the graphs fill as top runs)
@@ -2365,63 +2372,105 @@ def draw_cpu(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: TopHis
         c.put(y + 1 + gh, x + 1 + label, time_axis(gw), "dim")
 
 
-def draw_memory(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running: list, queued: list) -> None:
+def wrap_spans(parts: list, width: int) -> list[list]:
+    """A line of (text, style) spans as lines of at most `width` cells, broken before a separator
+    (" · "); a continued line is indented. A piece longer than a line is left for the panel to cut."""
+    sep = f" {GLYPHS['sep']} "
+    pieces = [((sep if i else "") + bit, style) for text, style in parts for i, bit in enumerate(text.split(sep))]
+    lines: list[list] = []
+    line, used = [], 0
+    for text, style in pieces:
+        if line and used + text_width(text) > width and text.startswith(sep):
+            lines.append(line)
+            text = "  " + text[len(sep):]
+            line, used = [], 0
+        line.append((text, style))
+        used += text_width(text)
+    return lines + ([line] if line else [])
+
+
+def build_holds(snap: dict, running: list) -> dict:
+    """Each running build's (memory it uses, memory held for it to grow into). The daemon says what
+    it holds for each (a build past its peak may have been let go of); an older daemon doesn't, and
+    then what it holds in all is shared out by the builds' plans."""
+    budget = ((snap.get("overview") or {}).get("budget") or {})
+    stats = snap.get("builds", {})
+    used = {r["id"]: (stats.get(r["id"]) or {}).get("mem", r.get("mem_now") or 0) or 0 for r in running}
+    if all("growth" in r for r in running):
+        return {r["id"]: (used[r["id"]], max(0, r.get("growth") or 0)) for r in running}
+    raw = {r["id"]: max(0, (r.get("est_mem") or 0) - used[r["id"]]) for r in running}
+    total, held = sum(raw.values()), budget.get("growth_reserved") or 0
+    return {k: (used[k], int(raw[k] * held / total) if total else 0) for k in raw}
+
+
+def memory_panel(snap: dict, running: list, queued: list, w: int, holds: dict):
+    """The MEMORY panel's title, its ledger bar and its lines (each a list of spans), for an inside
+    width of w. The ledger has a place for all the machine's memory: each running build's use and
+    what is held for it to grow into, other work, the floor and the room (where a new build starts)."""
     m, ov, sep = snap["machine"], snap.get("overview") or {}, GLYPHS["sep"]
     total, avail = m.get("mem_total") or 1, m.get("mem_available") or 0
     budget, cfg = ov.get("budget") or {}, ov.get("config") or {}
-    floor, held_total = cfg.get("mem_floor") or 0, budget.get("growth_reserved") or 0
-    room = max(budget.get("free_mem") or 0, 0)
-    stats = snap.get("builds", {})
-    per = []
-    for row in running:
-        used = (stats.get(row["id"]) or {}).get("mem", row.get("mem_now") or 0) or 0
-        per.append([used, max(0, (row.get("est_mem") or 0) - used)])
-    raw = sum(p[1] for p in per)
-    for p in per:  # (what the daemon holds, past-the-peak releases counted, shared as the plans say)
-        p[1] = int(p[1] * held_total / raw) if raw else 0
-    builds_used = sum(p[0] for p in per)
+    floor = cfg.get("mem_floor") or 0
+    room = budget.get("free_mem") or 0  # (below 0: more is held than is free)
+    builds_used = sum(u for u, _ in holds.values())
+    held_total = sum(h for _, h in holds.values())
     other = max(0, total - avail - builds_used)
-    c.box(y, x, h, w, [("MEMORY", "title"), (f" {sep} {fmt_size(total - avail)} used {sep} {fmt_size(avail)} free", "")])
-    iy, ix, ih, iw = y + 1, x + 1, h - 2, w - 2
-    if ih < 1 or iw < 10:
-        return
-    parts = [(size, glyph, style) for used, held in per
-             for size, glyph, style in ((used, TOP["used"], "mem"), (held, TOP["held"], "held"))]
-    parts += [(other, TOP["other"], "other"), (floor, TOP["floor"], "dim"), (room, TOP["room"], "room")]
-    c.spans(iy, ix, ledger_cells(parts, total, iw), iw)
+    title = [("MEMORY", "title"), (f" {sep} {fmt_size(total - avail)} used", level(1 - avail / total)),
+             (f" {sep} {fmt_size(avail)} free", "")]
+    parts = [(size, glyph, style) for row in running
+             for size, glyph, style in ((holds[row["id"]][0], TOP["used"], "mem"), (holds[row["id"]][1], TOP["held"], "held"))]
+    parts += [(other, TOP["other"], "other"), (floor, TOP["floor"], "dim"), (max(room, 0), TOP["room"], "room")]
+    bar_cells = ledger_cells(parts, total, w)
     lines = [[(f"builds {fmt_size(builds_used)} ", "mem"), (f"+{fmt_size(held_total)} held", "held"),
               (f" {sep} other {fmt_size(other)}", "other"), (f" {sep} floor {fmt_size(floor)}", "dim"),
-              (f" {sep} room {fmt_size(room)}", "room")],
+              (f" {sep} room {fmt_size(room)}", "room") if room >= 0 else (f" {sep} over by {fmt_size(-room)}", "bad")],
              [(f"{TOP['used']} used  ", "mem"), (f"{TOP['held']} held for growth  ", "held"),
               (f"{TOP['other']} other work  ", "other"), (f"{TOP['floor']} floor  ", "dim"), (f"{TOP['room']} room", "room")]]
     if queued:
-        need = queued[0].get("est_mem") or 0
-        short = need - room
-        lines.append([(f"{len(queued)} waiting {sep} next needs {fmt_size(need)}", "warn"),
-                      (f" {sep} {fmt_size(short)} short" if short > 0 else f" {sep} fits", "dim")])
-    elif builds_used and held_total:
-        lines.append([(f"held {fmt_size(held_total)} for builds using {fmt_size(builds_used)}", "dim")])
+        line = [(f"{len(queued)} waiting", "warn")]
+        for_mem = [r for r in queued if r.get("waiting_for") in ("memory", "held")]
+        if for_mem:
+            shorts = [r["short_by"] for r in for_mem if r.get("short_by")]
+            line.append((f" {sep} {len(for_mem)} for memory"
+                         + (f", the closest {fmt_size(min(shorts))} short" if shorts else ""), "dim"))
+        if budget.get("held_mem"):
+            line.append((f" {sep} {fmt_size(budget['held_mem'])} kept for the longest waits", "dim"))
+        lines.append(line)
     pm = m.get("psi_memory", {})
     swap = (f"swap {fmt_size(m['swap_used'])} of {fmt_size(m['swap_total'])} {sep} " if m.get("swap_total") else "")
     lines.append([(f"{swap}pressure {pct(pm, 'some')} some, {pct(pm, 'full')} full", "dim")])
     groups, who = snap["groups"], []
-    for name, label in (("builds", "builds"), ("ci", "CI"), ("containers", "containers"), ("apps", "apps")):
+    named = ("builds", "ci", "containers", "apps")
+    for name, label in zip(named, ("builds", "CI", "containers", "apps")):
         g = groups.get(name)
         if g:
-            who.append(f"{label} {g['cores']:.1f}c {fmt_size(g['mem'])}" if g.get("known") else f"{label} - {fmt_size(g['mem'])}")
-            who[-1] += f" +{fmt_size(g['swap'])} swap" if g["swap"] else ""
-    named = ("builds", "ci", "containers", "apps")
+            who.append((f"{label} {g['cores']:.1f}c {fmt_size(g['mem'])}" if g.get("known") else f"{label} - {fmt_size(g['mem'])}")
+                       + (f" +{fmt_size(g['swap'])} swap" if g["swap"] else ""))
     if m.get("busy") is not None and all(groups.get(n, {}).get("known") for n in named):
         who.append(f"other {max(0.0, m['busy'] - sum(groups[n]['cores'] for n in named if n in groups)):.1f}c")
-    lines.append([("who: " + f" {sep} ".join(who) + f" {sep} pressure: io {pct(m.get('psi_io', {}), 'some')}", "dim")])
+    lines.append([("who: " + f" {sep} ".join(who + [f"pressure: io {pct(m.get('psi_io', {}), 'some')}"]), "dim")])
+    b = groups.get("builds")
+    if b and b.get("known"):
+        bp = b.get("psi_mem") or {}
+        lines.append([(f"builds together: memory pressure {pct(bp, 'some')} some, {pct(bp, 'full')} full {sep} read "
+                       f"{rate_text(b.get('read_rate'))} {sep} write {rate_text(b.get('write_rate'))}", "dim")])
     for fs in m.get("filesystems") or []:
         bad = fs["floor"] and fs["free"] < fs["floor"]
         lines.append([(f"DISK {fs['mount']}: {fmt_size(fs['free'])} free of {fmt_size(fs['size'])}"
                        + (f" {sep} floor {fmt_size(fs['floor'])}" if fs["floor"] else "")
                        + f" {sep} read {rate_text(fs.get('read'))} {sep} write {rate_text(fs.get('write'))}",
                        "bad" if bad else "dim")])
-    for i, parts_ in enumerate(lines[:ih - 1]):
-        c.spans(iy + 1 + i, ix, parts_, iw)
+    return title, bar_cells, [wrapped for line in lines for wrapped in wrap_spans(line, w)]
+
+
+def draw_memory(c: Canvas, y: int, x: int, h: int, w: int, panel) -> None:
+    title, bar_cells, lines = panel
+    c.box(y, x, h, w, title)
+    if h < 3 or w < 12:
+        return
+    c.spans(y + 1, x + 1, bar_cells, w - 2)
+    for i, parts in enumerate(lines[:h - 3]):
+        c.spans(y + 2 + i, x + 1, parts, w - 2)
 
 
 def detail_lines(snap: dict, row: dict, shared: set) -> list[str]:
@@ -2452,7 +2501,7 @@ def detail_lines(snap: dict, row: dict, shared: set) -> list[str]:
 
 
 def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running: list, selected: str | None,
-                 narrow: bool) -> None:
+                 narrow: bool, holds: dict) -> None:
     ov, sep = snap.get("overview") or {}, GLYPHS["sep"]
     jobs = (ov.get("config") or {}).get("max_jobs")
     c.box(y, x, h, w, [(f"{len(running)} running" + (f" of {jobs}" if jobs else ""), "title")])
@@ -2486,7 +2535,7 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
         return
     start, slots = 0, len(running)
     if len(running) > room:
-        slots = max(1, room - 1)  # one line says what is above and below
+        slots = room - 1 if room >= 2 else room  # one line says what is above and below
         index = order.index(selected) if selected in order else 0
         start = min(max(0, index - slots + 1), len(running) - slots)
     for n, row in enumerate(running[start:start + slots]):
@@ -2495,10 +2544,10 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
         given = row.get("granted") or 0
         used = s.get("cores")
         filled = 0 if used is None else round(min(1.0, used / max(given, 1)) * 6)
-        mem_now = s.get("mem", row.get("mem_now") or 0) or 0
+        mem_now, growth = holds.get(row["id"], (s.get("mem", row.get("mem_now") or 0) or 0, 0))
         peak, plan = max(row.get("mem_peak") or 0, mem_now), row.get("est_mem") or 0
-        cells_now = round(min(1.0, mem_now / plan) * 8) if plan else 0
-        cells_peak = max(cells_now, round(min(1.0, peak / plan) * 8)) if plan else 0
+        cells_now = round(min(1.0, mem_now / plan) * 8) if plan else 0  # its plan: ▓ used, ▒ held, · let go
+        cells_held = max(0, round(min(1.0, (mem_now + growth) / plan) * 8) - cells_now) if plan else 0
         size, mark = build_disk(snap, row)
         disk = mark if size is None else (mark if mark == GLYPHS["atleast"] else "") + fmt_size(size) + (
             "*" if any(f in shared for f in folders_in(snap, row)) else "")
@@ -2510,13 +2559,13 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
         c.line_style[ry] = tone
         chosen = row["id"] == selected
         parts = [(GLYPHS["mark"] if chosen else " ", "sel" if chosen else ""), (" ", ""),
-                 (cell(row["short"], 9), "sel" if chosen else tone)]
+                 (cell(row["short"], 9), tone or ("sel" if chosen else ""))]
         if not narrow:
             parts += [(" " + cell(row["lane"], 6) + " " + cell(fmt_age(row.get("elapsed") or 0), 6, True), "")]
         parts += [(" ", ""), (TOP["core"] * filled, "cpu"), (TOP["nocore"] * (6 - filled), "dim"),
                   (cell(f" {'-' if used is None else format(used, '4.1f')}/{given}", 10), ""),
-                  (" ", ""), (TOP["used"] * cells_now, "mem"), (TOP["held"] * (cells_peak - cells_now), "held"),
-                  (TOP["floor"] * (8 - cells_peak), "dim"),
+                  (" ", ""), (TOP["used"] * cells_now, "mem"), (TOP["held"] * cells_held, "held"),
+                  (TOP["dot"] * (8 - cells_now - cells_held), "dim"),
                   (cell(f" {fmt_size(mem_now)}/{fmt_size(peak)}/{fmt_size(plan)}", 18), "warn" if tone == "warn" else "")]
         parts += [(" " + cell(values[n], cw, True), "") for n, cw in shown]
         label = row.get("label") or ""
@@ -2529,11 +2578,14 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
 
 def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: list) -> None:
     sep = GLYPHS["sep"]
-    room = max(((snap.get("overview") or {}).get("budget") or {}).get("free_mem") or 0, 0)
+    budget = ((snap.get("overview") or {}).get("budget") or {})
+    room = budget.get("free_mem") or 0
     reasons = {row.get("waiting_for") or "" for row in queued}
     title = [(f"{len(queued)} waiting", "warn" if queued else "title")]
     if len(reasons) == 1 and queued and next(iter(reasons)):
         title.append((f" {sep} all for {next(iter(reasons))}", "dim"))
+    if budget.get("held_mem"):
+        title.append((f" {sep} {fmt_size(budget['held_mem'])} kept for the longest waits", "dim"))
     c.box(y, x, h, w, title)
     iy, ix, ih, iw = y + 1, x + 1, h - 2, w - 2
     if ih < 1:
@@ -2548,16 +2600,20 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
         waited, need = row.get("waited") or 0, row.get("est_mem") or 0
         cells = max(1, round(waited / longest * 10))
         parts = [(TOP["wait"] * cells + " " * (10 - cells), "warn" if row.get("held") else "dim"),
-                 (" " + fmt_age(waited).rjust(6), ""), (" " + row["short"], "title" if n == 0 else ""),
+                 (" " + fmt_age(waited).rjust(6), ""), (" " + row["short"], "title"),
                  (" " + fit(row["lane"], lane_w).ljust(lane_w), "dim"), (f" needs {fmt_size(need):>6}", "")]
-        if n == 0:
-            parts.append((f" {TOP['next']} next", "ok"))
-        if row.get("held"):
-            parts.append((f" {TOP['flag']} room held", "warn"))
-        elif need > room:
-            parts.append((f" {fmt_size(need - room)} short", "dim"))
+        if row.get("held"):  # it has waited long: room is kept for it, and builds behind it wait
+            parts.append((f" {TOP['flag']} in line", "warn"))
+        # What it lacks: the daemon's figure, counting the room kept for longer waits (an older
+        # daemon doesn't say: then what the room lacks)
+        short = row["short_by"] if "short_by" in row else (
+            need - room if row.get("waiting_for") in ("memory", "held") else 0)
+        if short > 0:
+            parts.append((f" {fmt_size(short)} short", "dim"))
         reason = clean(row.get("reason") or "")
-        if reason and not reason.startswith("needs "):  # (what it needs is said already)
+        said = f"needs {fmt_size(need)} of memory; "  # (the column says that much already)
+        reason = reason[len(said):] if reason.startswith(said) else reason
+        if reason:
             parts.append(("  " + reason, "dim"))
         c.spans(iy + n, ix, parts, iw)
     if len(shown) < len(queued):
@@ -2597,52 +2653,60 @@ def draw_timeline(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: T
         c.put(iy + r, ix, ("memory" if r == 1 else "").ljust(label), "dim")
         c.put(iy + r, ix + label + 1, line, "mem")
     c.put(iy + 3, ix + label + 1, time_axis(gw), "dim")
-    rows = []
+    live = []
     for row in ov.get("running") or []:
         start = row.get("started") or now - (row.get("elapsed") or 0)
-        rows.append({"short": row["short"], "lane": row["lane"], "submitted": row.get("submitted") or start,
+        live.append({"short": row["short"], "lane": row["lane"], "submitted": row.get("submitted") or start,
                      "started": start, "ended": None, "peak": row.get("mem_peak") or 0, "from_ci": row.get("from_ci")})
     for row in ov.get("queued") or []:
-        rows.append({"short": row["short"], "lane": row["lane"], "submitted": row.get("submitted") or now - (row.get("waited") or 0),
+        live.append({"short": row["short"], "lane": row["lane"], "submitted": row.get("submitted") or now - (row.get("waited") or 0),
                      "started": None, "ended": None, "peak": 0, "from_ci": row.get("from_ci"), "held": row.get("held")})
-    rows += finished
-    rows.sort(key=lambda r: r["submitted"])
-    room = ih - 6
-    more = max(0, len(rows) - room)
-    rows = rows[more:]  # the newest
+    room = ih - 5  # (the graph, its axis and the legend)
+    done = sorted(finished, key=lambda r: r["submitted"])
+    if len(live) > room:  # the running and waiting builds first; the most recently submitted of them
+        live = sorted(live, key=lambda r: r["submitted"])[len(live) - room:]
+    keep = done[max(0, len(done) - (room - len(live))):] if room > len(live) else []
+    more = len(done) - len(keep) + (len(ov.get("running") or []) + len(ov.get("queued") or []) - len(live))
+    rows = sorted(live + keep, key=lambda r: r["submitted"])
     col = lambda t: min(gw - 1, max(0, int((t - (now - TOP_SPAN)) / TOP_SPAN * gw)))  # noqa: E731
+    big, mid = total / 8, total / 20  # (a darker bar for more memory: 16G and 6.4G on a 128G machine)
     for n, r in enumerate(rows):
         ry = iy + 4 + n
         c.spans(ry, ix, [("CI " if r.get("from_ci") else "   ", "ci"), (r["short"], ""), (" " + fit(r["lane"], 8), "dim")], label)
-        line = [" "] * gw
-        styles = [""] * gw
+        line, styles = [" "] * gw, [""] * gw
         until = r["started"] if r["started"] is not None else now
         for i in range(col(r["submitted"]), col(until) + (0 if r["started"] is not None else 1)):
             line[i], styles[i] = TOP["dot"], "warn" if r.get("held") else "dim"
         if r["started"] is not None:
             peak = r.get("peak") or 0
-            glyph = TOP["big"] if peak >= 16 * GIB else TOP["mid"] if peak >= 6 * GIB else TOP["small"]
+            glyph = TOP["big"] if peak >= big else TOP["mid"] if peak >= mid else TOP["small"]
+            state = r.get("state")
+            tone = ("mem" if r["ended"] is None else "ok" if state == "succeeded" else "dim" if state == "cancelled"
+                    else "bad")
             for i in range(col(r["started"]), col(r["ended"] if r["ended"] is not None else now) + 1):
-                line[i], styles[i] = glyph, "mem" if r["ended"] is None else "dim" if r.get("state") == "cancelled" else "ok"
+                line[i], styles[i] = glyph, tone
         for i, (ch, st) in enumerate(zip(line, styles)):
             if ch != " ":
                 c.put(ry, ix + label + 1 + i, ch, st)
-    legend = [(f"{TOP['dot']} waiting  ", "dim"), (f"{TOP['big']} running now  ", "mem"), (f"{TOP['big']} finished  ", "ok"),
-              (f"(darker {TOP['big']} {TOP['mid']} {TOP['small']}: more memory)  ", "dim")]
+    legend = [(f"{TOP['dot']} waiting  ", "dim"), (f"{TOP['big']} running  ", "mem"), (f"{TOP['big']} done  ", "ok"),
+              (f"{TOP['big']} failed  ", "bad"), (f"(darker {TOP['big']} {TOP['mid']} {TOP['small']}: more memory)", "dim")]
     if more:
-        legend.insert(0, (f"{GLYPHS['more']} {more} earlier  ", "dim"))
+        legend.insert(0, (f"{GLYPHS['more']} {more} not shown  ", "dim"))
     c.spans(iy + ih - 1, ix, legend, iw)
 
 
 def draw_help(c: Canvas) -> None:
     lines = [("q", "quit"), ("up/down, j/k", "select a running build"), ("enter, d", "its detail"),
              ("l", "the end of its output"), ("s", "sort: age, cpu, mem, io, disk"), ("t", "the timeline, and back"),
-             ("?", "this help"), ("", ""),
+             ("?", "this help (any key closes it)"), ("", ""),
              (TOP["used"], "memory a build uses"), (TOP["held"], "held for it to grow into (its plan, from past runs)"),
-             (TOP["floor"], "the floor: kept free for everything else"), (TOP["room"], "room: what a new build can start in"),
-             (TOP["core"] + TOP["nocore"], "cores in use / given"), (TOP["flag"], "room is held for it: it goes first"),
-             (TOP["next"], "the next build to start")]
-    w = min(c.width - 4, 66)
+             (TOP["dot"], "in a build's row: its plan, let go after its peak"),
+             (TOP["other"], "memory other work uses"), (TOP["floor"], "the floor: kept free for everything else"),
+             (TOP["room"], "room: what a new build can start in"),
+             (TOP["core"] + TOP["nocore"], "cores in use / given"),
+             (TOP["flag"], "waited long: in line, with room kept for it"),
+             ("short", "what it lacks, counting room kept for longer waits")]
+    w = min(c.width - 4, 70)
     h = min(c.height - 2, len(lines) + 2)
     y, x = max(0, (c.height - h) // 2), max(0, (c.width - w) // 2)
     for row in range(y, y + h):
@@ -2655,8 +2719,11 @@ def draw_help(c: Canvas) -> None:
 def render_screen(snap: dict, width: int, height: int, *, view: str = "main", selected: str | None = None,
                   sort: str = "age", detail: bool = False, log_lines: list[str] | None = None,
                   hist: TopHistory | None = None, finished: list | None = None, show_help: bool = False,
-                  stale: bool = False) -> tuple[Canvas, list[str]]:
-    """The screen (height 0: as tall as everything needs) and the running builds' ids in screen order."""
+                  stale: bool = False, answered_at: float | None = None) -> tuple[Canvas, list[str]]:
+    """The screen (height 0: as tall as everything needs) and the running builds' ids in screen order.
+    On a fixed height, room goes first to one running build and the waiting panel's box, then to an
+    open detail pane (up to half of what is left), the machine's panels, the rest of the pane, the
+    rest of the running builds, and the waiting list."""
     hist = hist if hist is not None else TopHistory()
     now = snap["time"]
     ov, m, sep = snap.get("overview"), snap["machine"], GLYPHS["sep"]
@@ -2665,6 +2732,7 @@ def render_screen(snap: dict, width: int, height: int, *, view: str = "main", se
     if selected not in order:
         selected = order[0] if order else None
     queued = list((ov or {}).get("queued") or [])
+    holds = build_holds(snap, running)
     info: list[str] = []
     if detail and selected:
         row = next(r for r in running if r["id"] == selected)
@@ -2673,37 +2741,46 @@ def render_screen(snap: dict, width: int, height: int, *, view: str = "main", se
     pane = info + log
     natural = not height
     wide, narrow = width >= 110, width < 80
-    top_h = 9 if natural else min(9, max(6, height // 4))
-    if not wide:
-        top_h = max(top_h, 7)
-    if not natural and height < 18:
-        top_h = 0  # a short screen keeps the builds; the header says the machine
-    run_need, wait_need = max(3, len(running) + 3), (len(queued) + 2 if queued else 3)
+    cpu_w = width * 2 // 5 if wide else 0
+    panel = memory_panel(snap, running, queued, width - cpu_w - 2, holds)
+    top_need = max(7, len(panel[2]) + 3)
+    run_need = 3 + len(running)
+    wait_need = len(queued) + 2 if queued else 3
+    pane_want = len(pane) + 2 if pane else 0
     if natural:
-        pane_h = len(pane) + 2 if pane else 0
-        bottom_h = wait_need
-        height = 1 + top_h + run_need + pane_h + bottom_h + 1
+        top_h, pane_h, run_h, bottom_h = top_need, pane_want, run_need, wait_need
+        height = 1 + top_h + run_h + pane_h + bottom_h + 1
     else:
-        pane_h = min(len(pane) + 2, max(0, (height - top_h - 2) // 2)) if pane else 0
+        run_min = 3 if not running else 4 if len(running) == 1 else 5  # (a build, and what is above and below)
+        rest = height - 2 - run_min - 3
+        pane_h = min(pane_want, max(0, rest) // 2)
+        rest -= pane_h
+        top_h = min(top_need, rest) if height >= 18 else 0
+        top_h = top_h if top_h >= 7 else 0  # (a panel too short to say anything)
+        rest -= top_h
+        more = min(pane_want - pane_h, rest)
+        pane_h, rest = pane_h + more, rest - more
+        if pane_h < 3:  # (no room for a line inside its box)
+            rest, pane_h = rest + pane_h, 0
+        run_h = run_min + min(rest, max(0, run_need - run_min))
+        rest -= run_h - run_min
+        bottom_h = 3 + max(0, rest)  # the waiting list, and anything left over
         if pane and len(pane) > pane_h - 2 and log:  # keep the newest log lines, and as much detail as fits
-            keep = max(0, pane_h - 2 - min(len(log), max(2, (pane_h - 2) // 2)))
-            pane = info[:keep] + log[:1] + log[1:][-(pane_h - 2 - keep - 1):] if pane_h - 2 - keep > 1 else info[:pane_h - 2]
-        rest = height - 2 - top_h - pane_h  # for the running builds and the waiting ones
-        if run_need + wait_need <= rest:
-            bottom_h = rest - run_need  # what is left shows more of the waiting list
-        else:
-            bottom_h = max(3, min(wait_need, rest - max(4, min(run_need, rest - rest // 3))))
+            inside = pane_h - 2
+            keep = max(0, inside - min(len(log), max(2, inside // 2)))
+            pane = info[:keep] + log[:1] + log[1:][-(inside - keep - 1):] if inside - keep > 1 else info[:inside]
     c = Canvas(width, height)
     stamp = time.strftime("%H:%M:%S", time.localtime(now))
     state = ("daemon not answering" if ov is None else
              f"PAUSED: {(ov.get('paused') or {}).get('reason') or ''}" if ov.get("paused") else f"buildqd {ov.get('version', '')}")
     head = [("buildq top", "title"), (f"  {stamp}  ", ""), (state, "bad" if ov is None or ov.get("paused") else "dim")]
-    if not wide and m.get("busy") is not None:
+    if not (wide and top_h) and m.get("busy") is not None:
         cores = m.get("cores") or 1
         head += [(f"   CPU {bar(m['busy'] / cores, 10)} {m['busy']:.1f} of {cores} busy", level(m["busy"] / cores))]
-    if height and height < 18 and m.get("mem_total"):
-        free = max(((ov or {}).get("budget") or {}).get("free_mem") or 0, 0)
-        head += [(f"   MEM {fmt_size(m['mem_total'] - (m.get('mem_available') or 0))} used {sep} room {fmt_size(free)}", "")]
+    if not top_h and m.get("mem_total"):
+        room = ((ov or {}).get("budget") or {}).get("free_mem") or 0
+        head += [(f"   MEM {fmt_size(m['mem_total'] - (m.get('mem_available') or 0))} used {sep} "
+                  + (f"room {fmt_size(room)}" if room >= 0 else f"over by {fmt_size(-room)}"), "")]
     c.spans(0, 0, head, width)
     if width < 50 or height < 12:
         c.put(1, 0, f"buildq top needs at least 50x12 (this is {width}x{height})", "warn")
@@ -2714,28 +2791,25 @@ def render_screen(snap: dict, width: int, height: int, *, view: str = "main", se
         draw_timeline(c, 1, 0, height - 2, width, snap, hist, finished or [], now)
     else:
         if top_h and wide:
-            cpu_w = width * 2 // 5
             draw_cpu(c, 1, 0, top_h, cpu_w, snap, hist, now)
-            draw_memory(c, 1, cpu_w, top_h, width - cpu_w, snap, running, queued)
-        elif top_h:
-            draw_memory(c, 1, 0, top_h, width, snap, running, queued)
+        if top_h:
+            draw_memory(c, 1, cpu_w, top_h, width - cpu_w, panel)
         run_y = 1 + top_h
-        run_h = height - run_y - bottom_h - pane_h - 1
-        draw_running(c, run_y, 0, max(3, run_h), width, snap, running, selected, narrow)
+        draw_running(c, run_y, 0, run_h, width, snap, running, selected, narrow, holds)
         if pane_h:
-            py = run_y + max(3, run_h)
+            py = run_y + run_h
             row = next((r for r in running if r["id"] == selected), {})
             c.box(py, 0, pane_h, width, [(f"{selected} ", "title"), (fit(clean(row.get("name") or ""), width - 50), "dim")])
             for n, text in enumerate(pane[:pane_h - 2]):
                 c.put(py + 1 + n, 1, "  " + text, "", width - 2)
-        by = height - bottom_h - 1
-        if wide and bottom_h >= 3:
+        by = 1 + top_h + run_h + pane_h
+        if wide:
             lanes_w = 46
             draw_waiting(c, by, 0, bottom_h, width - lanes_w, snap, queued)
             draw_lanes(c, by, width - lanes_w, bottom_h, lanes_w, snap, running, queued)
         else:
             draw_waiting(c, by, 0, bottom_h, width, snap, queued)
-    age = max(0.0, time.time() - now)
+    age = max(0.0, time.time() - (answered_at if answered_at is not None else now))
     when = f"updated {fmt_age(age)} ago" if age >= 1 else "updated now"
     items = ["q quit", "? help", "t timeline", "up/down select", "enter detail", f"s sort ({sort})", "l log"]
     while len(items) > 2 and len(f" {sep} ".join(items)) > width - len(when) - 3:
@@ -2974,7 +3048,7 @@ def cmd_top(args) -> int:
         sorts = ["age", "cpu", "mem", "io", "disk"]
         sort, selected, detail, logs, view, show_help = "age", None, False, False, "main", False
         snap, seen, order, dirty = None, -1, [], True
-        hist, finished, finished_at = TopHistory(), [], 0.0
+        hist, finished, finished_at, answered_at, drawn_at = TopHistory(), [], 0.0, None, 0.0
         hist.backfill(os.path.join(state_dir(), "metrics.db"), time.time())
         if not fetcher.thread.is_alive():
             fetcher.start()
@@ -2984,6 +3058,10 @@ def cmd_top(args) -> int:
             if snap is None or version != seen:
                 snap, seen, dirty = sampler.snapshot(status), version, True
                 hist.add(snap)
+                if snap["overview"] is not None:
+                    answered_at = snap["time"]
+            if time.monotonic() - drawn_at >= 1.0:
+                dirty = True  # ("updated … ago" counts on, and turns yellow once the daemon is late)
             if view == "timeline" and time.monotonic() - finished_at > 10:
                 live = {r["id"] for r in ((snap["overview"] or {}).get("running") or []) + ((snap["overview"] or {}).get("queued") or [])}
                 finished, finished_at, dirty = finished_builds(os.path.join(state_dir(), "metrics.db"), snap["time"], live), time.monotonic(), True
@@ -2993,7 +3071,8 @@ def cmd_top(args) -> int:
                 log = tail_lines(row.get("log")) if logs and row else None
                 canvas, order = render_screen(snap, max(width, 20), max(height, 5), view=view, selected=selected, sort=sort,
                                               detail=detail, log_lines=log, hist=hist, finished=finished,
-                                              show_help=show_help, stale=time.time() - snap["time"] > 3 * args.interval + 2)
+                                              show_help=show_help, answered_at=answered_at,
+                                              stale=answered_at is not None and time.time() - answered_at > 3 * args.interval + 2)
                 if order and selected not in order:
                     selected = order[0]  # (kept while the daemon doesn't answer: it comes back to the same build)
                 screen.erase()
@@ -3009,14 +3088,14 @@ def cmd_top(args) -> int:
                             pass
                         x += text_width(text)
                 screen.refresh()
-                dirty = False
+                dirty, drawn_at = False, time.monotonic()
             key = screen.getch()
             if key == -1:
                 continue
             dirty = True
             if key in (ord("q"), ord("Q")):
                 return 0
-            if show_help:
+            if show_help and key != curses.KEY_RESIZE:
                 show_help = False  # any key closes the help
                 continue
             if key == ord("s"):
