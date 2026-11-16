@@ -235,6 +235,8 @@ def fmt_size(n: float) -> str:
 # --------------------------------------------------------------------------------------------
 # Configuration
 
+CI_LONG_WAITS = 12  # times starve_seconds a build may queue before it goes ahead of CI jobs' builds past ci_deadline
+
 DEFAULTS = {
     "max_jobs": 4,
     "cpu_target": 0.9,
@@ -400,6 +402,9 @@ class Config:
         if self.ci_deadline and self.ci_deadline < self.starve_seconds:
             raise ValueError("ci_deadline must be at least starve_seconds: a CI job's build past it has waited out "
                              "its turn too, so its room and its workspace bind every lane")
+        if self.ci_deadline and self.ci_deadline >= CI_LONG_WAITS * self.starve_seconds:
+            raise ValueError(f"ci_deadline must be under {CI_LONG_WAITS} times starve_seconds: builds that have "
+                             "queued that long go before CI jobs' builds again, which would undo it")
         if self.make_room_for_ci and not self.ci_first:
             raise ValueError("make_room_for_ci needs ci_first = true: without it a CI job's build holds no room, "
                              "so the memory freed for it could go to another build")
@@ -3534,7 +3539,8 @@ class Daemon:
             # starve_seconds (two hours here) goes before even that, so a stream of CI jobs can't keep
             # it waiting for ever, while a release's steps still go first in any likely queue.
             due = self.ci_due(t, now)
-            long = overdue and not t.from_ci and now - t.submitted >= self.CI_LONG_WAITS * self.cfg.starve_seconds
+            queued = t.wait_total + max(0.0, now - (t.queued_at or t.submitted))  # (its queued time, not its runs)
+            long = overdue and not t.from_ci and queued >= CI_LONG_WAITS * self.cfg.starve_seconds
             return (not long, not due, t.submitted if due else 0.0, not overdue, not starving, -self.weight(t),
                     not first, not (first and self.waited_out(t, now)))
 
@@ -3574,7 +3580,6 @@ class Daemon:
         ci = self.tickets.get(t.yields_to)
         return ci is not None and ci.state == "queued"
 
-    CI_LONG_WAITS = 12  # times starve_seconds after which a build goes before CI jobs' builds past ci_deadline
 
     def ci_due(self, t: Ticket, now: float) -> bool:
         """A CI job's build that has waited ci_deadline: its job has a time limit that counts the wait

@@ -57,15 +57,15 @@ which holds no room. Pausing a build wouldn't help: a paused build keeps its mem
 A CI job's time limit counts the time its step waits in the queue: GitHub cancels a step still
 queued, and with it the run. With `ci_first`, a build that has waited three times `starve_seconds`
 goes before CI jobs' builds, so in a long queue a CI step could wait behind many of them until its
-job was cancelled. `ci_deadline = "20m"` stops that: a CI job's build that has waited that long goes
-before every other build (the oldest first), its room binds every lane that doesn't pass held room,
-and with `make_room_for_ci` it stops the newest builds that can start over even when they free only
-part of what it lacks (at least half) (what they free is held
-for it, so it starts as soon as the rest frees), once for each such build: if what they freed went
-elsewhere, stopping more would lose work for nothing. So a stream of CI jobs can't keep a build
-waiting for ever, a build that has waited twelve times `starve_seconds` (two hours at 600) goes before
-it. Set it
-below the shortest CI job time limit, less the step's own run time, and at least `starve_seconds`.
+job was cancelled. `ci_deadline = "20m"` stops that. A CI job's build that has waited that long goes before every
+other build, the oldest first; its room binds every lane that doesn't pass held room; and with
+`make_room_for_ci` it stops the newest builds that can start over even when they free only part of
+what it lacks, if at least half. What they free is held for it, so it starts as soon as the rest
+frees. That happens once for each such build: if what was freed went elsewhere, stopping more would
+lose work for nothing. So that a stream of CI jobs can't keep a build waiting for ever, a build that
+has queued twelve times `starve_seconds` (two hours at 600; not a CI job's, not in a lane that passes
+held room, not yielding) goes before it. Set `ci_deadline` below the shortest CI job time limit, less
+the step's own run time; it must be at least `starve_seconds` and under twelve times it.
 
 Two settings tune it (#38). `make_room_behind_agents = false` leaves a CI step that waits partly
 behind agents' builds that have waited longer than it (and so go first) to wait its turn: stopping

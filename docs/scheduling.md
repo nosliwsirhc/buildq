@@ -31,7 +31,7 @@ still start in room that is free (until the CI build has really waited `starve_s
 build that has waited three times `starve_seconds`, or was stopped to free memory, goes before
 those (a CI build in a lane with `may_pass_held` gets no head start, like any build there), unless a
 CI build has waited `ci_deadline` (see [CI jobs](ci.md)): that goes first, the oldest first, except
-before a build that has waited twelve times `starve_seconds` (two hours at 600), which goes before it;
+before a build that has queued twelve times `starve_seconds` (two hours at 600), which goes before it;
 and except
 one stopped to make room for a CI build (`make_room_for_ci`, see [CI jobs](ci.md)): until that CI
 build has started (30 minutes at most), it doesn't start, go before it or hold room. After that, the higher priority
