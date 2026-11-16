@@ -273,6 +273,7 @@ DEFAULTS = {
     "gh": "",
     "metrics": True,
     "release_after_peak": "shadow",
+    "scale_mem_with_cores": "always",
     "env": {},
     "lanes": {"default": {"cores": 4, "mem": "4G", "properties": {"MemoryHigh": "40%", "MemoryMax": "50%"}}},
     "lane_rules": [],
@@ -399,9 +400,10 @@ class Config:
         spare = d["make_room_spare_after"]
         self.make_room_spare_after = 0.0 if spare in (0, "0", "", None, False) else parse_duration(spare)
         labels = d["script_labels"]
-        if not isinstance(labels, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
+        if not isinstance(labels, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.:+-]+", x)
                                                     for x in labels):
-            raise ValueError("script_labels must be a list of script file names, such as [\"build.sh\"]")
+            raise ValueError("script_labels must be a list of script file names or package scripts, such as "
+                             "[\"build.sh\", \"verify:push\"]")
         self.script_labels = frozenset(labels)
         scripts = d["restartable_scripts"]
         if not isinstance(scripts, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
@@ -442,6 +444,11 @@ class Config:
         self.metrics = boolean(d["metrics"], "metrics")
         rap = d["release_after_peak"]
         self.release_after_peak = "shadow" if rap == "shadow" else boolean(rap, "release_after_peak")
+        scale = d["scale_mem_with_cores"]
+        scale = {True: "always", False: "never"}.get(scale, scale) if isinstance(scale, bool) else scale
+        if scale not in ("always", "never"):
+            raise ValueError("scale_mem_with_cores must be always or never")
+        self.scale_mem_with_cores = scale
         if not isinstance(d["lanes"], dict) or not d["lanes"]:
             raise ValueError("lanes must define at least one lane")
         self.lanes = {str(n): Lane(str(n), lane, mem_total, ncpu) for n, lane in d["lanes"].items()}
@@ -508,6 +515,7 @@ class Config:
             "cpu_psi_block": self.cpu_psi_block, "mem_psi_block": self.mem_psi_block,
             "ramp_seconds": self.ramp_seconds, "starve_seconds": self.starve_seconds, "ci_first": self.ci_first,
             "make_room_for_ci": self.make_room_for_ci, "make_room_behind_agents": self.make_room_behind_agents,
+            "scale_mem_with_cores": self.scale_mem_with_cores,
             "make_room_spare_after": self.make_room_spare_after, "script_labels": sorted(self.script_labels),
             "restartable_scripts": sorted(self.restartable_scripts),
             "slice": self.slice,
@@ -1386,10 +1394,24 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
                   if f in rest]
     elif tool in JS_TOOLS:
         words += [f"--filter {f}" for f in sorted(set(option_values(rest, {"--filter", "-F"})))]
-        pos = positionals(rest, JS_VALUE_OPTIONS)
-        if pos[:1] and pos[0] in ("run", "run-script", "exec", "x", "dlx"):
-            pos = pos[1:]
-        words += pos[:1]
+        at, skip = [], False  # where each positional word is (not an option's value)
+        for i, arg in enumerate(rest):
+            if skip:
+                skip = False
+            elif arg.startswith("-"):
+                skip = arg in JS_VALUE_OPTIONS
+            else:
+                at.append(i)
+        verb = rest[at[0]] if at and rest[at[0]] in ("run", "run-script", "exec", "x", "dlx") else None
+        if verb:
+            at = at[1:]
+        words += [rest[i] for i in at[:1]]
+        # A package script in script_labels takes a label too (`verify:push docs`): the word right after
+        # it, not an option's value; only a script it runs, not a binary (exec, x, dlx).
+        if at and rest[at[0]] in labels and verb not in ("exec", "x", "dlx"):
+            after = rest[at[0] + 1:][:1]
+            if after and SCRIPT_WORD.fullmatch(after[0]):
+                words.append(after[0])
     elif tool == "git":
         words += positionals(rest, {"-C", "-c", "--git-dir", "--work-tree"})[:1]
     elif tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS:
@@ -2247,6 +2269,19 @@ BUILD_COLUMNS = [
     ("ci_stops", "INTEGER"),  # of its requeues, the times it was stopped to make room for a CI job's build
     ("attempt_wall", "REAL"),  # its last attempt's wall time, which its profile and avg_cores describe
     ("workspace", "TEXT"),  # what it wrote to (target folder or worktree): builds sharing one take turns
+    # Its last attempt's memory plan at the start (est_mem is the plan at the end, raised if it passed
+    # it or grew its cores), the cores it started with, when it first used more than that plan
+    # (seconds into the attempt), and what the plan was made of: the peak behind it, the cores that
+    # peak was measured at, and whether it was a cold cargo build. With these, what another
+    # scale_mem_with_cores would have planned, and how often a plan was too small, can be counted.
+    ("start_plan", "INTEGER"), ("start_cores", "INTEGER"), ("outgrown_at", "REAL"), ("plan_base", "INTEGER"),
+    ("plan_cores", "INTEGER"), ("cold", "INTEGER"),
+    # When its last attempt first used more than its running plan (est_mem then, which more cores may
+    # have raised under "always": a real breach, re-planned at its cap), how many of its attempts did,
+    # the setting its last attempt started under, the most cores it was given, and whether it ignores
+    # its core count (rigid: its plan isn't scaled).
+    ("breached_at", "REAL"), ("breaches", "INTEGER"), ("start_rule", "TEXT"), ("max_cores", "INTEGER"),
+    ("rigid", "INTEGER"),
 ]
 CI_UNITS = ("actions.runner.*", "gha-*", "*-runner-*", "gitlab-runner*")  # CI runner services, by unit name
 
@@ -2862,7 +2897,7 @@ class Ticket:
     PERSIST = ("id", "name", "argv", "cwd", "lane", "key", "label", "notify", "submitted", "priority", "timeout",
                "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
-               "need", "rigid", "est_mem", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
+               "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
                "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
                "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
@@ -2898,6 +2933,14 @@ class Ticket:
         self.exec_argv = None  # what actually runs, when it differs from argv
         self.grant_area = 0.0  # core-seconds given, for the time-weighted grant
         self.cold = False
+        self.start_plan = 0  # its memory plan when this attempt started, and the cores it started with
+        self.start_cores = 0
+        self.outgrown_at = None  # seconds into this attempt when it first used more than start_plan
+        self.breached_at = None  # ... and more than its running plan (est_mem then)
+        self.breaches = 0  # attempts in which it used more than its running plan
+        self.start_rule = None  # scale_mem_with_cores when this attempt started
+        self.start_base = 0  # and the peak and cores its plan was made of then (a waiting build is estimated again)
+        self.start_base_cores = 0
         self.seq = next(_seq)
         self.dir = directory
         self.cores_given = None
@@ -3561,9 +3604,15 @@ class Daemon:
     def mem_for(self, t: Ticket, cores: int) -> int:
         """The memory a build needs with `cores` cores. Builds that run more compilers at once need
         more memory, so past the cores its history was measured at, the estimate grows in
-        proportion, up to the lane's MemoryMax where that is enforced."""
+        proportion, up to the lane's MemoryMax where that is enforced. With scale_mem_with_cores =
+        "never" it doesn't: on this workstation's history, a warm build's peak rarely grew with its
+        cores, and far less than in proportion when it did (a median x1.0; a few commands x1.2 to
+        x1.6 at 4 to 8 times the cores). A build that outgrows its plan is planned at its lane's
+        MemoryMax from then on (outgrown)."""
         base = t.mem_base
         if t.rigid or cores <= t.mem_cores:
+            return base
+        if self.cfg.scale_mem_with_cores == "never":
             return base
         scaled = int(base * cores / t.mem_cores)
         lane = self.lane(t.lane)
@@ -4802,6 +4851,9 @@ class Daemon:
         t.yields_to = t.yield_until = None  # running again: a later stop for memory isn't one for that CI job's build
         t.granted = t.max_granted = granted
         t.growth_now = t.est_mem  # (all of its plan, until the queue next works out what it uses)
+        t.start_plan, t.start_cores, t.outgrown_at, t.breached_at = t.est_mem, granted, None, None
+        t.start_rule = self.cfg.scale_mem_with_cores
+        t.start_base, t.start_base_cores = t.mem_base, t.mem_cores
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
         t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
         env_path = os.path.join(t.dir, "env.json")
@@ -5037,7 +5089,7 @@ class Daemon:
         for t in self.active():
             if t.flock:
                 t.measure(now)
-                self.outgrown(t)
+                self.outgrown(t, now)
                 continue
             if t.state == "starting" and not self.check_starting(t, now):
                 continue
@@ -5058,7 +5110,7 @@ class Daemon:
                 else:
                     self.requeue(t, now)
                 continue
-            self.outgrown(t)
+            self.outgrown(t, now)
             if t.last_grant_t is not None and not t.frozen:
                 t.grant_area += t.granted * max(0.0, now - t.last_grant_t)
             t.last_grant_t = now
@@ -5095,12 +5147,23 @@ class Daemon:
                         f"the build ended without reporting an exit status ({verdict or 'killed?'})")
                     self.finalize(t, now, None, lost=True, oom=oom, error=error)
 
-    def outgrown(self, t: Ticket) -> None:
+    def attempt_seconds(self, t: Ticket, now: float | None) -> float:
+        """Seconds into this attempt, pauses left out: the clock attempt_wall and the profile use."""
+        now = time.time() if now is None else now
+        return round(max(0.0, now - t.started - self.paused_for(t, now)), 1)
+
+    def outgrown(self, t: Ticket, now: float | None = None) -> None:
         """A build that passes its estimate was underestimated (a full rebuild where history saw
         incremental ones, say). From then on, plan it at its lane's enforced MemoryMax, or at half as
         much again as it holds, so the room it may still grow into stays held."""
+        if t.measured and t.outgrown_at is None and t.started and t.start_plan and t.mem_now > t.start_plan:
+            # (against the plan it started with: a growth in cores may have raised est_mem since)
+            t.outgrown_at = self.attempt_seconds(t, now)
         if not t.measured or t.mem_now <= t.est_mem:
             return
+        if t.breached_at is None and t.started:  # (past the plan it holds now: a breach under any setting)
+            t.breached_at = self.attempt_seconds(t, now)
+            t.breaches += 1
         lane = self.lane(t.lane)
         cap = lane.mem_cap if self.runner_of(t).name == "systemd" else None
         raised = cap if cap and cap > t.mem_now else int(t.mem_now * 1.5)
@@ -5331,6 +5394,10 @@ class Daemon:
             "repo": (t.source or {}).get("repo") or t.workspace, "state": t.state, "exit": t.exit,
             "from_ci": int(bool(t.from_ci)), "wall": round(wall + t.attempts_wall, 1), "waited": round(t.wait_total, 1),
             "attempt_wall": round(wall, 1), "workspace": t.workspace,
+            "start_plan": t.start_plan or None, "start_cores": t.start_cores or None, "outgrown_at": t.outgrown_at,
+            "plan_base": t.start_base or None, "plan_cores": t.start_base_cores or None, "cold": int(bool(t.cold)),
+            "breached_at": t.breached_at, "breaches": t.breaches, "start_rule": t.start_rule,
+            "max_cores": t.max_granted or None, "rigid": int(bool(t.rigid)),
             "waited_by": json.dumps(t.waited_by, separators=(",", ":"), sort_keys=True),
             "est_mem": t.est_mem, "est_src": t.est_src, "mem_peak": max(t.mem_peak, t.attempts_peak),
             "peak_at": round(t.peak_at, 1) if whole else None, "tail": t.tail if whole else None,

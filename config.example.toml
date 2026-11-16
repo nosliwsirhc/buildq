@@ -81,9 +81,11 @@ make_room_behind_agents = true
 # and starting it over would throw the most work away. "0" (the default) spares none.
 make_room_spare_after = "0"
 
-# Scripts (file names) whose argument right after the script names what they run, so it joins the
-# history key: `bash ci/wrap.sh lint …` and `bash ci/wrap.sh tests …` are then sized apart. Only
-# when the script comes straight after its interpreter (no option before it), and only a plain
+# Scripts (file names, or package scripts such as "verify:push") whose argument right after the
+# script names what they run, so it joins the history key and lane rules see it: `bash ci/wrap.sh
+# lint …` and `bash ci/wrap.sh tests …` are then sized apart, and `pnpm run verify:push docs` can have
+# a lane rule of its own. A file name only when the script comes straight after its interpreter (no
+# option before it), and only a plain
 # lowercase word (letters, - and _, at most 24). List only scripts whose first argument is a public
 # label: it is kept in the history. Each label starts with no history: its first run is planned at
 # the lane's default.
@@ -163,6 +165,11 @@ metrics = true
 # `buildq report --capacity` shows no build going past what would have been kept. false: off.
 # A lane can opt out with release_after_peak = false (do that for docker build: dockerd holds the memory).
 release_after_peak = "shadow"
+
+# Whether a build given more cores than its history was measured at is planned at proportionally
+# more memory: "always" (the default), or "never" (a warm build's peak rarely grows with its cores;
+# one that outgrows its plan is re-planned at its lane's MemoryMax). docs/scheduling.md, "Estimates".
+# scale_mem_with_cores = "always"
 
 # A shell command run when any build finishes, with BUILDQ_TICKET, BUILDQ_STATE, BUILDQ_EXIT,
 # BUILDQ_OOM, BUILDQ_LABEL, BUILDQ_NAME, BUILDQ_CWD and BUILDQ_LOG set. Example:

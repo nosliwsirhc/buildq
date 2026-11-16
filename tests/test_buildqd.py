@@ -1768,6 +1768,40 @@ class Analytics(DaemonCase):
         self.assertEqual(len(json.loads(row["profile"])), 10)
         self.assertEqual(row["state"], "succeeded")
 
+    def test_the_plan_a_build_started_with_and_when_it_passed_it(self):
+        t = self.submit()
+        self.assertEqual(t.state, "running")
+        plan, cores = t.est_mem, t.granted
+        t.est_mem = plan + 4 * GIB  # raised since it started (it grew its cores, say)
+        t.measured, t.mem_now = True, plan + GIB  # past its start plan, within the raised one
+        self.daemon.outgrown(t, self.now + 90)
+        self.assertEqual(t.est_mem, plan + 4 * GIB)  # nothing to re-plan
+        t.mem_now = plan + 5 * GIB
+        self.daemon.outgrown(t, self.now + 200)  # past the raised plan too: re-planned; the first time counts
+        self.assertGreater(t.est_mem, plan + 4 * GIB)
+        self.finish(t)
+        row = self.db().execute("SELECT * FROM build WHERE id = ?", (t.id,)).fetchone()
+        self.assertEqual((row["start_plan"], row["start_cores"], row["outgrown_at"]), (plan, cores, 90.0))
+        self.assertEqual((row["breached_at"], row["breaches"]), (200.0, 1))  # past the plan it held: at 200 s, not 90
+        self.assertGreater(row["est_mem"], plan)
+        self.assertEqual((row["plan_base"], row["plan_cores"], row["cold"]), (t.mem_base, t.mem_cores, 0))
+        self.assertEqual((row["start_rule"], row["max_cores"], row["rigid"]), ("always", cores, 0))
+
+    def test_the_start_fields_are_one_attempt_on_one_clock(self):
+        t = self.submit()
+        plan, base, base_cores = t.est_mem, t.mem_base, t.mem_cores
+        t.frozen_attempt = 200.0  # paused 200 s of it
+        t.measured, t.mem_now = True, plan + GIB
+        self.daemon.outgrown(t, self.now + 300)
+        self.assertEqual((t.outgrown_at, t.breached_at), (100.0, 100.0))  # 100 s of running, as attempt_wall counts
+        t.mem_base, t.mem_cores = base // 2, base_cores * 2  # estimated again later (while queued again, say)
+        self.finish(t)
+        row = self.db().execute("SELECT * FROM build WHERE id = ?", (t.id,)).fetchone()
+        self.assertEqual((row["plan_base"], row["plan_cores"]), (base, base_cores))  # the plan it started with
+        u = self.submit()
+        self.finish(u)
+        self.assertIsNone(self.db().execute("SELECT outgrown_at FROM build WHERE id = ?", (u.id,)).fetchone()[0])
+
     def history_of(self, key, runs, peak_at=100.0, tail=2 * GIB, peak=18 * GIB, wall=600.0, exit=0, **more):
         for i in range(runs):
             self.daemon.history.add({"key": key, "lane": "heavy", "t": self.now - 1000 + i, "wall": wall,
@@ -3410,14 +3444,23 @@ class Cores(DaemonCase):
 
 
 class Memory(DaemonCase):
-    def test_more_cores_need_more_memory(self):
+    def test_more_cores_need_more_memory_unless_told_never(self):
         t = self.submit()
         self.daemon.history.add({"key": t.key, "t": self.now, "peak_mem": 8 * GIB, "peak_cores": 2.0, "granted": 2})
         self.daemon.estimate(t, self.now)
         base = t.mem_base
         self.assertEqual(self.daemon.mem_for(t, 2), base)
-        self.assertEqual(self.daemon.mem_for(t, 3), int(base * 3 / 2))
+        self.assertEqual(self.daemon.mem_for(t, 3), int(base * 3 / 2))  # "always", the default
         self.assertEqual(self.daemon.mem_for(t, 16), 26 * GIB)  # no more than the enforced cap
+        self.daemon.cfg.scale_mem_with_cores = "never"
+        self.assertEqual((self.daemon.mem_for(t, 3), self.daemon.mem_for(t, 16)), (base, base))
+        self.daemon.cfg.scale_mem_with_cores = "always"
+        self.assertEqual(buildqd.Config({}, 64 * GIB, 16).scale_mem_with_cores, "always")
+        self.assertEqual(buildqd.Config({"scale_mem_with_cores": True}, 64 * GIB, 16).scale_mem_with_cores, "always")
+        self.assertEqual(buildqd.Config({"scale_mem_with_cores": False}, 64 * GIB, 16).scale_mem_with_cores, "never")
+        for wrong in ("cold", "sometimes"):
+            with self.assertRaises(ValueError):
+                buildqd.Config({"scale_mem_with_cores": wrong}, 64 * GIB, 16)
 
     def test_the_grant_is_cut_to_what_memory_allows(self):
         tree = self.workdir("tree")
@@ -3446,6 +3489,36 @@ class Memory(DaemonCase):
         self.daemon.rebalance(self.now + 120)
         self.assertLess(t.granted, 16)  # 16 cores would need 26G, 6G more than it holds
         self.assertLessEqual(t.est_mem - 20 * GIB, 3 * GIB)
+
+
+    def seen_at_8_cores(self):
+        tree = self.workdir("tree")
+        first = self.submit(cwd=tree)
+        self.daemon.history.add({"key": first.key, "t": self.now, "peak_mem": 4 * GIB, "peak_cores": 8.0, "granted": 8})
+        self.finish(first)
+        return tree
+
+    def test_with_never_a_build_starts_with_all_its_cores_when_memory_is_tight(self):
+        tree = self.seen_at_8_cores()
+        self.daemon.cfg.scale_mem_with_cores = "never"
+        self.machine.mem_available = 15 * GIB  # 5G above the floor: scaled to 12 cores it would need 7.3G
+        t = self.submit(cwd=tree)
+        self.assertEqual((t.state, t.granted), ("running", 12))
+        self.assertLessEqual(t.est_mem, 5 * GIB)
+
+    def test_with_never_growing_a_build_costs_no_memory(self):
+        tree = self.seen_at_8_cores()
+        self.daemon.cfg.scale_mem_with_cores = "never"
+        self.machine.busy = self.machine.busy_now = 24.0
+        t = self.submit(cwd=tree)
+        start_cores, plan = t.granted, t.est_mem
+        self.assertLess(start_cores, 12)
+        t.elastic, t.cores_now = True, float(start_cores)
+        self.machine.busy = self.machine.busy_now = 8.0
+        self.machine.mem_available = 10 * GIB + plan + GIB // 2  # half a gigabyte free past its plan and the floor
+        self.daemon.rebalance(self.now + 120)
+        self.assertGreater(t.granted, start_cores)
+        self.assertEqual(t.est_mem, plan)
 
 
 class Outgrowing(DaemonCase):
@@ -4184,6 +4257,31 @@ class Keys(unittest.TestCase):
         for bad in ("x.sh", ["a/b.sh"], [3]):
             with self.assertRaises(ValueError):
                 buildqd.Config({"script_labels": bad}, 64 * GIB, 16)
+
+    def test_a_listed_package_script_keeps_its_label(self):
+        cfg = buildqd.Config(buildqd.tomllib.loads(
+            'script_labels = ["verify:push"]\n'
+            '[[lane_rules]]\nmatch = "^(pnpm|npm|yarn) .*(verify:push|verify-push) docs\\\\b"\nlane = "light"\n'
+            '[[lane_rules]]\nmatch = "^(pnpm|npm|yarn) .*(verify:push|verify-push)"\nlane = "heavy"\n'
+            '[lanes.default]\n[lanes.light]\n[lanes.heavy]\n'), 64 * GIB, 16)
+        self.assertEqual(cfg.lane_for(["pnpm", "run", "verify:push", "docs", "origin/main", "HEAD"]), "light")
+        self.assertEqual(cfg.lane_for(["/usr/bin/pnpm", "verify:push", "docs"]), "light")
+        self.assertEqual(cfg.lane_for(["pnpm", "run", "verify:push", "api", "a", "b"]), "heavy")
+        self.assertEqual(cfg.lane_for(["pnpm", "run", "verify:push", "documentation"]), "heavy")
+        self.assertEqual(buildqd.command_words(["pnpm", "run", "verify:push", "full", "a"], cfg.script_labels),
+                         ["pnpm", "verify:push", "full"])  # its own history, too
+        self.assertEqual(buildqd.command_words(["pnpm", "run", "verify:push", "docs"], frozenset()),
+                         ["pnpm", "verify:push"])  # unlisted: as before
+        self.assertEqual(buildqd.command_words(["pnpm", "run", "verify:push", "abc123"], cfg.script_labels),
+                         ["pnpm", "verify:push"])  # only a plain lowercase word
+        self.assertEqual(buildqd.command_words(["pnpm", "run", "verify:push", "--reporter", "dot", "docs"], cfg.script_labels),
+                         ["pnpm", "verify:push"])  # not an option's value
+        self.assertEqual(cfg.lane_for(["pnpm", "--filter", "web", "verify:push", "docs"]), "light")
+        listed = frozenset({"build"})
+        self.assertEqual(buildqd.command_words(["pnpm", "--filter", "build", "build", "docs"], listed),
+                         ["pnpm", "--filter build", "build", "docs"])  # the script, not the filter's value
+        for verb in ("exec", "dlx", "x"):  # a binary, not a package script: as before
+            self.assertEqual(buildqd.command_words(["pnpm", verb, "build", "docs"], listed), ["pnpm", "build"], verb)
 
     def test_keys_hold_no_urls_but_keep_npm_scopes(self):
         self.assertNotIn("token", self.words("wget", "https://files.example/private-access-token"))
