@@ -157,7 +157,7 @@ class Replay(SimCase):
             state = tempfile.mkdtemp(dir=self.tmp.name)
             s = sim.Simulation(scenarios.outgrows_estimate(), CONFIG, BUILDQD, state, name=f"buildqd_og{outgrown}")
             if not outgrown:
-                s.mod.Daemon.outgrown = lambda daemon, t: None  # a daemon without it
+                s.mod.Daemon.outgrown = lambda daemon, t, now=None: None  # a daemon without it
             results[outgrown] = s.run()
         self.assertEqual(results[True]["below_floor_s"], 0)
         self.assertGreater(results[False]["below_floor_s"], 0)  # so a change that loses it shows

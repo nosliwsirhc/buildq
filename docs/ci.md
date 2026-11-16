@@ -74,6 +74,9 @@ command words are the tool and what it runs: cargo's subcommand and packages, a 
 script's name. A script listed in `script_labels` and run straight after its interpreter also gets
 the argument right after it, when that is a plain lowercase word (letters, `-` and `_`, at most 24;
 no digits): `bash persistent-cargo-target.sh architecture`, for a wrapper whose runs differ by that
-label. An option before the script (`bash -e wrap.sh …`) turns it off. Listing a script trusts that
+label. An option before the script (`bash -e wrap.sh …`) turns it off. A package script listed
+there (`verify:push`) keeps the word right after it the same way (`pnpm run verify:push docs`), so a
+lane rule can tell its runs apart; not after an option (`verify:push --reporter dot docs`) or a `--`
+(`npm run verify:push -- docs`), which keep only the script's name. Listing a script trusts that
 argument to be a public label, since it is kept in the history, and each label then starts with no
 history of its own: its first run is planned at the lane's default.

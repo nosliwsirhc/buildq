@@ -603,7 +603,12 @@ restart), `cores_granted` (average), `avg_cores`,
 `attempt_wall` (the last attempt's wall time, which `profile` and `avg_cores` describe; `wall` counts
 every attempt), `workspace` (what it wrote to, its `CARGO_TARGET_DIR` or worktree: builds that share
 one take turns; `repo` is its source repository when it sent one),
-`paused`, `oom`, `mem_high`, `mem_wait`.
+`paused`, `oom`, `mem_high`, `mem_wait`, and for judging `scale_mem_with_cores`: `start_plan`,
+`start_cores` and `start_rule` (the last attempt's plan, cores and setting at its start), `plan_base`
+and `plan_cores` (the peak behind the plan and the cores it was measured at), `outgrown_at` (when the
+last attempt first used more than `start_plan`), `breached_at` (when it first used more than its
+running plan, which more cores may have raised under `"always"`: a real breach), `breaches` (attempts
+that did), `max_cores` (the most cores it was given), `rigid` and `cold`.
 
 The profile comes from a trace kept while the build runs: the most memory in each ten seconds,
 with neighbours merged (and the step doubled) whenever it passes 720 points, so a long run's trace
