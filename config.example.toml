@@ -81,8 +81,8 @@ make_room_behind_agents = true
 # including ones that have waited three times starve_seconds (the oldest such build first), its room
 # binds every lane that doesn't pass held room, and with make_room_for_ci it stops the newest builds
 # that can start over even when they free only part (at least half) of what it lacks (once for it). Its job's time limit counts the wait: GitHub cancels a step still
-# queued, and with it the release (a scan waited 30 of its 30 minutes, 2026-11-16). An overdue build
-# that two such CI builds have started ahead of goes first again. Set it below the shortest CI job
+# queued, and with it the release (a scan waited 30 of its 30 minutes, 2026-11-16). A build that has
+# waited twelve times starve_seconds goes before it, so CI can't keep it waiting for ever. Set it below the shortest CI job
 # time limit, less the step's run time, and at least starve_seconds. "0" (the default) never.
 # ci_deadline = "20m"
 

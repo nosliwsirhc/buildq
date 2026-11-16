@@ -2840,9 +2840,8 @@ class CIFirst(DaemonCase):
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [ci.id, session.id])
         self.daemon.schedule(self.now)
         self.assertTrue(ci.held)
-        session.ci_passed = 2  # two due CI builds have started ahead of it: its turn again
-        self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
-        session.ci_passed = 0
+        self.now += 12 * 300 - 1201  # the session's build has now waited twelve times starve_seconds
+        self.assertEqual([x.id for x in self.daemon.queue(self.now)], [session.id, ci.id])  # it goes first again
         self.daemon.cfg.ci_deadline = 0.0  # off: as before
         self.assertEqual([t.id for t in self.daemon.queue(self.now)], [session.id, ci.id])
         self.assertEqual(buildqd.Config({"ci_first": True, "ci_deadline": "20m"}, 64 * GIB, 16).ci_deadline, 1200.0)
@@ -2860,17 +2859,6 @@ class CIFirst(DaemonCase):
         higher = self.submit(("dotnet", "build"), lane="web", mem="20G", env=self.CI, caller="runner-2")
         self.now += 1200  # both past the deadline; the heavy one nearer its job's limit
         self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [heavy.id, higher.id])
-
-    def test_due_ci_builds_that_start_count_against_overdue_builds_waits(self):
-        self.daemon.cfg.ci_first = True
-        self.daemon.cfg.ci_deadline = 1200.0
-        session = self.submit(mem="20G", caller="session")
-        self.now += 1
-        ci = self.submit(("cargo", "test"), mem="20G", env=self.CI, caller="runner")
-        self.now += 1201
-        self.finish(self.running)  # room for one
-        self.daemon.schedule(self.now + 31)
-        self.assertEqual((ci.state, session.state, session.ci_passed), ("running", "queued", 1))
 
     def test_among_overdue_builds_ci_gets_no_preference(self):
         self.daemon.cfg.ci_first = True

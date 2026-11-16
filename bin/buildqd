@@ -2912,7 +2912,7 @@ class Ticket:
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
                "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "ended_rule", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
-               "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues", "ci_passed",
+               "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
                "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
                "extra_notify",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
@@ -3041,7 +3041,6 @@ class Ticket:
         self.frozen = False  # paused to give the machine its memory back
         self.frozen_at = None
         self.requeues = 0  # times it was stopped to free memory and queued again
-        self.ci_passed = 0  # CI jobs' builds past ci_deadline that started ahead of it while it was overdue
         self.ci_stops = 0  # of those, the times it was stopped to make room for a CI job's build
         self.yields_to: str | None = None  # the CI job's build it was last stopped for: it doesn't go before it
         self.yield_until: float | None = None  # ...for at most this long
@@ -3506,8 +3505,8 @@ class Daemon:
         With ci_first, any build that has waited three times starve_seconds, or was stopped to free
         memory, goes before all of those, so CI jobs (in a higher lane, for a CI job's build) can't
         keep it waiting for ever. With ci_deadline, a CI job's build that has waited that long goes
-        before even those, the oldest first, until two such builds have started ahead of an overdue
-        build (CI_PASSES_MAX): then that build goes first again."""
+        before even those, the oldest first; a build that has waited CI_LONG_WAITS times starve_seconds
+        goes before even that, so CI jobs can't keep it waiting for ever either."""
         now = time.time() if now is None else now
 
         # Fair shares: at the same priority, a caller (a session, a CI runner) with fewer builds
@@ -3530,13 +3529,14 @@ class Daemon:
             # CI builds could keep an overdue session's build waiting), nor in a lane that passes held
             # room (it gets no head start there).
             first = self.cfg.ci_first and t.from_ci and not passes and not overdue
-            due = self.ci_due(t, now)  # a CI job's build near its job's time limit: before all of them,
-            # except an overdue build that two of them have already passed (CI_PASSES_MAX): so a stream of
-            # CI jobs can't keep it waiting for ever, while a release's few steps still go first
-            passed = overdue and not t.from_ci and t.ci_passed >= self.CI_PASSES_MAX
-            # (among those, the oldest first: the nearest to its job's time limit, whatever its lane)
-            return (not (due or passed), t.submitted if (due or passed) else 0.0, not overdue, not starving,
-                    -self.weight(t), not first, not (first and self.waited_out(t, now)))
+            # A CI job's build near its job's time limit goes before all of them, the oldest first (the
+            # nearest to its limit, whatever its lane); a build that has waited CI_LONG_WAITS times
+            # starve_seconds (two hours here) goes before even that, so a stream of CI jobs can't keep
+            # it waiting for ever, while a release's steps still go first in any likely queue.
+            due = self.ci_due(t, now)
+            long = overdue and not t.from_ci and now - t.submitted >= self.CI_LONG_WAITS * self.cfg.starve_seconds
+            return (not long, not due, t.submitted if due else 0.0, not overdue, not starving, -self.weight(t),
+                    not first, not (first and self.waited_out(t, now)))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
@@ -3574,7 +3574,7 @@ class Daemon:
         ci = self.tickets.get(t.yields_to)
         return ci is not None and ci.state == "queued"
 
-    CI_PASSES_MAX = 2  # due CI jobs' builds that may start ahead of an overdue build before it goes first again
+    CI_LONG_WAITS = 12  # times starve_seconds after which a build goes before CI jobs' builds past ci_deadline
 
     def ci_due(self, t: Ticket, now: float) -> bool:
         """A CI job's build that has waited ci_deadline: its job has a time limit that counts the wait
@@ -4840,12 +4840,7 @@ class Daemon:
                 while granted > t.need and self.mem_for(t, granted) > free_mem - hm:
                     granted -= 1  # more cores would need more memory than is free
                 t.est_mem = self.mem_for(t, granted)
-                due = self.ci_due(t, now)
                 self.start(t, now, granted)
-                if due:  # it went ahead of every overdue build still waiting: count it against their wait
-                    for o in self.queue(now):
-                        if not o.from_ci and now - o.submitted >= 3 * cfg.starve_seconds:
-                            o.ci_passed += 1
                 if t.state in FINISHED:
                     continue
                 free_mem -= t.est_mem

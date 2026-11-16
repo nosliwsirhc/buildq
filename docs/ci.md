@@ -63,7 +63,8 @@ and with `make_room_for_ci` it stops the newest builds that can start over even 
 part of what it lacks (at least half) (what they free is held
 for it, so it starts as soon as the rest frees), once for each such build: if what they freed went
 elsewhere, stopping more would lose work for nothing. So a stream of CI jobs can't keep a build
-waiting for ever, an overdue build that two of them have started ahead of goes first again. Set it
+waiting for ever, a build that has waited twelve times `starve_seconds` (two hours at 600) goes before
+it. Set it
 below the shortest CI job time limit, less the step's own run time, and at least `starve_seconds`.
 
 Two settings tune it (#38). `make_room_behind_agents = false` leaves a CI step that waits partly
