@@ -2543,12 +2543,13 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
         return
     longest = max((row.get("waited") or 0) for row in queued) or 1
     shown = queued if len(queued) <= ih else queued[:max(0, ih - 1)]
+    lane_w = min(12, max(text_width(clean(row["lane"])) for row in shown)) if shown else 7
     for n, row in enumerate(shown):
         waited, need = row.get("waited") or 0, row.get("est_mem") or 0
         cells = max(1, round(waited / longest * 10))
         parts = [(TOP["wait"] * cells + " " * (10 - cells), "warn" if row.get("held") else "dim"),
                  (" " + fmt_age(waited).rjust(6), ""), (" " + row["short"], "title" if n == 0 else ""),
-                 (" " + fit(row["lane"], 7).ljust(7), "dim"), (f" needs {fmt_size(need):>6}", "")]
+                 (" " + fit(row["lane"], lane_w).ljust(lane_w), "dim"), (f" needs {fmt_size(need):>6}", "")]
         if n == 0:
             parts.append((f" {TOP['next']} next", "ok"))
         if row.get("held"):
