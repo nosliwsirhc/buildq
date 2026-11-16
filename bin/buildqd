@@ -2079,10 +2079,12 @@ class History:
         self.lines = sum(len(self._retained(k)) for k in self.by_key)
 
     @staticmethod
-    def shaped(r: dict) -> bool:
+    def shaped(r: dict, throttled_ok: bool = False) -> bool:
         """A run that says when it peaked and what it used after: it succeeded, wasn't killed for
-        memory, ran a minute or more, and its peak came before its last minute and last tenth."""
-        return (r.get("exit") == 0 and not r.get("oom") and not r.get("mem_high") and r.get("peak_at") is not None
+        memory, ran a minute or more, and its peak came before its last minute and last tenth. One
+        slowed at its MemoryHigh doesn't count, unless throttled_ok."""
+        return (r.get("exit") == 0 and not r.get("oom") and (throttled_ok or not r.get("mem_high"))
+                and r.get("peak_at") is not None
                 and r.get("tail") is not None and r.get("peak_cpu") is not None and (r.get("wall") or 0) >= 60
                 and r["wall"] - r["peak_at"] >= max(60.0, 0.1 * r["wall"]))
 
@@ -2092,9 +2094,14 @@ class History:
         used after its peak, the peak behind the estimate, and the cores that peak was measured
         with, and the most CPU-seconds any had used by its peak. None unless the run behind the
         estimate and `need` recent runs are `shaped`, no recent successful run peaked at its end
-        (such a command's runs say nothing about after a peak), and no run in the window was killed
-        for memory (the clearest sign that a later phase can be bigger). Failed runs teach nothing
-        here either: a failure may have skipped a later, bigger phase."""
+        above what would be kept (such a command's runs say nothing about after a peak; one that
+        never used more than that is no sign against it), and no run in the window was killed for
+        memory (the clearest sign that a later phase can be bigger). Failed runs teach nothing here
+        either: a failure may have skipped a later, bigger phase. A run slowed at its MemoryHigh (the
+        machine was short, and buildq's slice guard throttled it) says nothing either way about its
+        shape: it is neither one of the runs read nor one that peaked at its end. The run behind the
+        estimate may be one, when it is otherwise shaped: its peak and what it used after were
+        still measured (#56: 8 of the release Rust step's 25 runs were, which turned this off for it)."""
         cutoff = now - cfg.history_days * 86400
         recent = [r for r in self.by_key.get(key, ()) if r["t"] >= cutoff][-cfg.history_runs:]
         window = [r for r in self._retained(key) if r["t"] >= cutoff] or recent
@@ -2102,14 +2109,18 @@ class History:
             return None
         top = max(window, key=lambda r: r["peak_mem"])
         known = [r for r in recent if self.shaped(r)]
-        ended_at_peak = [r for r in recent if r.get("exit") == 0 and not r.get("oom") and not self.shaped(r)
-                         and r.get("peak_at") is not None and (r.get("wall") or 0) >= 60]
-        if len(known) < need or not self.shaped(top) or ended_at_peak or any(r.get("oom") for r in window):
+        if len(known) < need or not self.shaped(top, throttled_ok=True) or any(r.get("oom") for r in window):
             return None
         runs = known + ([top] if all(r is not top for r in known) else [])
+        tail = max(r["tail"] for r in runs)
+        hold = int(tail * 1.1)  # what past_peak_hold keeps
+        ended_at_peak = [r for r in recent if r.get("exit") == 0 and not r.get("oom") and not r.get("mem_high")
+                         and not self.shaped(r) and r.get("peak_at") is not None and (r.get("wall") or 0) >= 60
+                         and r["peak_mem"] > hold]
+        if ended_at_peak:
+            return None
         cores = int(top.get("mem_cores") or top.get("granted") or 0)
-        return (max(r["peak_at"] for r in runs), max(r["tail"] for r in runs), int(top["peak_mem"]), cores,
-                max(r["peak_cpu"] for r in runs))
+        return (max(r["peak_at"] for r in runs), tail, int(top["peak_mem"]), cores, max(r["peak_cpu"] for r in runs))
 
     def estimate(self, key: str, lane: Lane, cfg: Config, ncpu: int, cap_enforced: bool, cold: bool,
                  now: float) -> Estimate:

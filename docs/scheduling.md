@@ -72,9 +72,10 @@ A build keeps room held for its expected peak until it ends. A `cargo test`
 whose compile peaked at 18 GB holds that through an hour of tests at 2 GB. `release_after_peak`
 lets go of most of it once the build is clearly past its peak, keeping what its command's runs
 used after their peaks, plus a tenth. All of these must hold for 30 seconds:
-- The runs behind the estimate (the biggest, and at least three recent ones) all succeeded, weren't
-  slowed at their `MemoryHigh`, and say when they peaked. None of them peaked in its last minute or
-  last tenth, and no run in the estimate's window was killed for memory.
+- The runs behind the estimate (the biggest, and at least three recent ones) all succeeded and say
+  when they peaked. None of them peaked in its last minute or last tenth above what would be kept,
+  and no run in the estimate's window was killed for memory. A run slowed at its `MemoryHigh` (the
+  machine was short, so buildq throttled it) counts neither way, except that the biggest may be one.
 - This run has gone a quarter longer than the latest of those peaks and a minute more, and done a
   quarter more CPU work than any of them had by its peak (so a run on fewer cores waits for its
   peak). Its own peak was a minute or more ago.

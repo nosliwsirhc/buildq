@@ -2101,6 +2101,36 @@ class Analytics(DaemonCase):
         self.history_of(t.key, 1, peak_at=570.0, tail=0)  # one run peaked in its last half minute
         self.assertEqual(self.settle_release(t, 900), (18 * GIB, 18 * GIB))
 
+    def test_runs_slowed_at_their_memory_high_count_neither_way(self):
+        t = self.past_its_peak()
+        self.history_of(t.key, 3)
+        self.history_of(t.key, 2, peak_at=570.0, mem_high=4000)  # throttled while memory was short (#56)
+        self.assertEqual(self.settle_release(t, 900)[1], int(2 * GIB * 1.1) - 2 * GIB)  # released all the same
+        u = self.past_its_peak()
+        self.history_of(u.key, 2)
+        self.history_of(u.key, 3, mem_high=4000)
+        self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB))  # but they aren't among the three it needs
+
+    def test_the_run_behind_the_estimate_may_have_been_throttled(self):
+        t = self.past_its_peak()
+        self.history_of(t.key, 3)
+        self.history_of(t.key, 1, peak=19 * GIB, mem_high=30000)  # the biggest, slowed at its MemoryHigh
+        self.assertEqual(self.settle_release(t, 900)[1], int(2 * GIB * 1.1) - 2 * GIB)
+        u = self.past_its_peak()
+        self.history_of(u.key, 3)
+        self.history_of(u.key, 1, peak=19 * GIB, mem_high=30000, peak_at=590.0)  # ... and peaked at its end
+        self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB))
+
+    def test_a_small_run_that_peaked_at_its_end_is_no_sign_against_it(self):
+        t = self.past_its_peak()
+        self.history_of(t.key, 3)
+        self.history_of(t.key, 1, peak_at=570.0, peak=2 * GIB)  # its end, but under what would be kept (2.2G)
+        self.assertEqual(self.settle_release(t, 900)[1], int(2 * GIB * 1.1) - 2 * GIB)
+        u = self.past_its_peak()
+        self.history_of(u.key, 3)
+        self.history_of(u.key, 1, peak_at=570.0, peak=3 * GIB)  # above it: a later phase can be bigger
+        self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB))
+
     def test_failed_runs_and_runs_unlike_this_one_teach_no_release(self):
         t = self.past_its_peak()
         self.history_of(t.key, 3, exit=1)  # failures may have skipped a later phase
