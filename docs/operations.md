@@ -49,38 +49,51 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
 
 ## `buildq top`
 
-`buildq top` is a live view of the queue, like `btop`:
-- **The machine, at the top:**
-  - CPU busy against the queue's target;
-  - memory used and free, the floor, what is held for running builds to grow into, and the room left;
-  - swap;
+`buildq top` is a live view of the queue, like `btop`, in boxed panels:
+- **CPU** (beside MEMORY on a terminal 110 columns or wider; otherwise a bar in the title line):
+  the last half hour as a graph, with busy cores against the queue's target and CPU pressure.
+  Its first minutes come from the analytics (`metrics.db`), so it isn't empty when top starts.
+- **MEMORY, as a ledger:** one bar where every part of the machine's memory has its place: each
+  running build's use (`▓`) and what is held for it to grow into (`▒`), everything else (`█`), the
+  floor (`░`) and the room a new build can start in (`■`). Below it:
+  - the next waiting build's need, and how far short of the room it is;
+  - swap and memory pressure;
+  - who uses the machine: buildq's builds, CI runners, containers and your apps, each with its
+    cores, memory and swap, and I/O pressure;
   - one DISK line per filesystem builds write to (`/` always): free space against `disk_floor`,
-    worked out for that filesystem, with read and write rates;
-  - CPU, memory and disk pressure ("-" where the kernel doesn't report it).
-- **Who uses it:** buildq's builds together, CI runners, containers and your apps, each with its cores, memory and swap.
-- **One row per running build:**
-  - its CPU used out of the cores given;
-  - its memory now, its peak and its plan;
-  - its swap;
-  - its own memory pressure (how much the kernel is slowing it);
-  - its disk read and write rates (I/O through dm-crypt or LVM counted once; a mirror's writes
-    count each copy, and a filesystem in a loop file counts twice);
-  - the space its folders take: its `CARGO_TARGET_DIR` (for cargo with none, the `target/`
-    beside its `Cargo.lock`) and its `TMPDIR`, only those inside your home. They're measured with
-    `ionice -c3 du -sx` in the background, each at most every five minutes. "≥" means only in
-    part, "…" not yet, "?" it couldn't be, and "*" a folder another running build shares.
-- **Below the builds:** the waiting builds and why each waits.
+    worked out for that filesystem, with read and write rates.
+- **Running, one row per build:**
+  - its cores used out of those given (`▮▯`);
+  - its memory now, its peak and its plan (`▓` now, `▒` up to the peak, `░` the rest of the plan);
+  - as width allows: the space its folders take, its own memory pressure (how much the kernel is
+    slowing it), its disk read and write rates (I/O through dm-crypt or LVM counted once; a
+    mirror's writes count each copy, and a filesystem in a loop file counts twice) and its swap;
+  - `CI` before the command of a CI job's build.
+
+  The folders are its `CARGO_TARGET_DIR` (for cargo with none, the `target/` beside its
+  `Cargo.lock`) and its `TMPDIR`, only those inside your home. They're measured with `ionice -c3
+  du -sx` in the background, each at most every five minutes. "≥" means only in part, "…" not
+  yet, "?" it couldn't be, and "*" a folder another running build shares.
+- **Waiting:** each waiting build with a bar of how long it has waited against the longest wait,
+  what it needs, `◀ next` on the one that starts next, `⚑ room held` where its room is already
+  held for it (a CI step), how far short of the room it is, and why it waits.
+- **LANES** (on a wide terminal): what each lane has running and waiting.
+- **The timeline** (`t`): the last half hour, a row per build, newest at the bottom: `·` while it
+  waited, a bar while it ran (darker for more memory), under a graph of the machine's memory.
 - **Keys:**
   - `s` sorts by age, CPU, memory, I/O or disk;
-  - ↑↓ select a build (the selection stays on that build when the order changes; the list
-    scrolls on a small screen; narrow terminals drop the last columns first, and LANE and AGE
-    under 80 columns);
+  - ↑↓ (or `j`/`k`) select a build: the selection stays on that build when the order changes,
+    the list scrolls on a small screen, and narrow terminals drop the last columns first, and LANE
+    and AGE under 80 columns;
   - Enter shows its plan, pressure, waits and folders;
-  - `l` shows the end of its output;
-  - `q` quits.
+  - `l` shows the end of its output (with Enter, the newest lines are kept);
+  - `t` the timeline and back, `?` what each key and glyph means, `q` quits.
+- **Small screens:** under 18 rows, the machine's panels give way to the builds, and the title
+  line says CPU and memory instead.
 - **Terminals:**
   - it draws with ASCII when the terminal isn't UTF-8 (`LC_ALL=C`), as curses itself writes;
-  - `NO_COLOR` turns colour off;
+  - `NO_COLOR` turns colour off; every part also has its own glyph, so nothing depends on colour;
+  - the "updated" time at the bottom turns yellow when the screen is more than three refreshes old;
   - a terminal this machine has no terminfo entry for (Ghostty or kitty over SSH, say) is drawn as
     `xterm-256color`, and on exit it says how to install the real entry;
   - with no usable terminal at all (`TERM` unset or `dumb`, or `--once`, or output to a pipe) it

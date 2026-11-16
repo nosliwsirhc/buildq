@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -4446,6 +4447,8 @@ class Top(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(buildq.GLYPHS.update, dict(buildq.GLYPHS))
+        self.addCleanup(buildq.BOX.update, dict(buildq.BOX))
+        self.addCleanup(buildq.TOP.update, dict(buildq.TOP))
 
     def cgroup(self, name, usec, anon, swap=0, rbytes=0, wbytes=0, some=0.0):
         path = os.path.join(self.tmp.name, name)
@@ -4536,13 +4539,19 @@ class Top(unittest.TestCase):
         with mock.patch.object(buildq, "safe_dir", side_effect=lambda p: p if isinstance(p, str) and p.startswith("/h/") else None):
             return buildq.render_top(snap, width, height, **kw)
 
+    @staticmethod
+    def marked(lines):
+        """The running build the screen marks as selected."""
+        return next(t for t, _ in lines if re.search(r"(▶|>) [0-9a-f]{8}", t))
+
     def test_the_screen(self):
         lines, order = self.draw(self.snap(), detail=True, selected="a" * 36)
         text = "\n".join(t for t, _ in lines)
-        for expected in ("20.0 of 32 busy · target 28.8", "60G free", "held for growth 30G", "6.0G of 8.0G",
+        for expected in ("20.0 of 32 busy · target 28.8", "60G free", "+30G held", "6.0G of 8.0G",
                          "/: 1000G free of 1860G · floor 372G · read 18M/s · write 45M/s", "CI 6.0c 8.0G",
-                         "other 3.0c", "pressure: io -", "2 running · 1 waiting", "aaaaaaaa", "1.5/8", "4.0G/18G/20G",
-                         "≥41G", "cargo test --locked·red", "memory 2m00s", "would keep 2.0G", "needs 20G of memory"):
+                         "other 3.0c", "pressure: io -", "2 running", "1 waiting", "aaaaaaaa", "1.5/8", "4.0G/18G/20G",
+                         "≥41G", "cargo test --locked·red", "memory 2m00s", "would keep 2.0G", "cccccccc",
+                         "MEMORY", "CPU", "LANES", "▓ used", "▒ held for growth", "◀ next"):
             self.assertIn(expected, text)
         self.assertNotIn("\x1b", text)
         self.assertEqual(order, ["a" * 36, "b" * 36])
@@ -4552,8 +4561,7 @@ class Top(unittest.TestCase):
     def test_the_selection_follows_the_build_not_the_row(self):
         for sort in ("age", "cpu"):
             lines, order = self.draw(self.snap(), selected="b" * 36, sort=sort)
-            marked = next(t for t, _ in lines if t.startswith("▶"))
-            self.assertIn("bbbbbbbb", marked, sort)
+            self.assertIn("bbbbbbbb", self.marked(lines), sort)
         self.assertEqual(self.draw(self.snap(), sort="cpu")[1][0], "b" * 36)  # 1.9 cores before 1.5
 
     def test_a_small_screen_scrolls_to_the_selected_build_and_keeps_its_detail(self):
@@ -4563,8 +4571,8 @@ class Top(unittest.TestCase):
             lines, order = self.draw(self.snap(rows), width=80, height=24, selected=f"{pick:036d}", detail=True)
             self.assertLessEqual(len(lines), 24)
             self.assertTrue(all(len(t) <= 80 for t, _ in lines))
-            self.assertTrue(any(t.startswith("▶") and f"{pick:08d}" in t for t, _ in lines), pick)
-            self.assertTrue(any(t.startswith("-- " + f"{pick:036d}") for t, _ in lines), pick)
+            self.assertIn(f"{pick:08d}", self.marked(lines), pick)
+            self.assertTrue(any(f"{pick:036d}" in t for t, _ in lines), pick)  # its detail's title
             self.assertTrue(any("above," in t and "below" in t for t, _ in lines), pick)
         log = [f"LOG{i:02d}" for i in range(12)]
         lines = self.draw(self.snap(rows), width=80, height=24, selected=f"{3:036d}", detail=True, log_lines=log)[0]
@@ -4575,7 +4583,7 @@ class Top(unittest.TestCase):
         self.assertIn("job 0", row)  # the command keeps its room
         self.assertNotIn("LANE", next(t for t, _ in narrow if "TICKET" in t))
         short = self.draw(self.snap(rows), width=100, height=12, selected=f"{9:036d}")[0]
-        self.assertTrue(any(t.startswith("▶") and "00000009" in t for t, _ in short))  # the header gave way
+        self.assertIn("00000009", self.marked(short))  # the machine's panel gave way
         header = next(t for t, _ in lines if "TICKET" in t)
         self.assertIn("COMMAND", header)
         self.assertNotIn("SWAP", header)  # 80 columns: the last optional columns go first
@@ -4600,6 +4608,75 @@ class Top(unittest.TestCase):
         text.encode("ascii")  # nothing a non-UTF-8 terminal can't show
         self.assertIn("> aaaaaaaa", text)
         self.assertIn("tab", text)
+
+    def test_the_memory_ledger_fills_what_its_parts_add_up_to(self):
+        cells = buildq.ledger_cells([(3, "u", "mem"), (3, "h", "held"), (0, "x", "other"), (4, "o", "other")], 10, 7)
+        self.assertEqual("".join(t for t, _ in cells), "uuhhooo")  # rounded as they add up, none lost or doubled
+        self.assertEqual(len("".join(t for t, _ in buildq.ledger_cells([(20, "u", "")], 10, 7))), 7)  # never past the bar
+        lines, _ = self.draw(self.snap(), width=150)
+        bar = next(t for t, _ in lines if "▓" in t and "▒" in t and "■" in t)
+        self.assertLess(bar.index("▓"), bar.index("█"))  # the builds, then other work, the floor, the room
+        self.assertLess(bar.index("█"), bar.index("░"))
+        self.assertLess(bar.index("░"), bar.index("■"))
+
+    def test_the_cpu_graph_starts_from_the_analytics(self):
+        path = os.path.join(self.enterContext(tempfile.TemporaryDirectory()), "metrics.db")
+        import sqlite3
+        db = sqlite3.connect(path)
+        db.execute("CREATE TABLE minute (t REAL, cpu_busy REAL, cores INTEGER, mem_total INTEGER, mem_available INTEGER,"
+                   " builds_mem INTEGER, growth INTEGER)")
+        now = 1794600000.0
+        db.executemany("INSERT INTO minute VALUES (?,?,?,?,?,?,?)",
+                       [(now - 3600, 31.0, 32, 128 * GIB, 64 * GIB, GIB, 0),  # older than the graph
+                        (now - 600, 16.0, 32, 128 * GIB, 64 * GIB, GIB, 0), (now - 300, 32.0, 32, 128 * GIB, 64 * GIB, GIB, 0)])
+        db.commit()
+        db.close()
+        hist = buildq.TopHistory()
+        hist.backfill(path, now)
+        self.assertEqual(len(hist.samples), 2)
+        cols = hist.columns(1, 30, now)
+        self.assertEqual(cols[:19], [None] * 19)  # nothing before the first minute
+        self.assertEqual((cols[20], cols[-1]), (16.0, 32.0))  # then the busiest in each column, carried on
+        hist.backfill(path, now)
+        self.assertEqual(len(hist.samples), 2)  # only once
+        buildq.TopHistory().backfill(os.path.join(os.path.dirname(path), "missing.db"), now)  # no analytics: empty
+        lines, _ = self.draw(self.snap(), width=150, hist=hist)
+        self.assertTrue(any("█" in t and "-30m" not in t and "│32" in t.replace(" ", "") for t, _ in lines))
+
+    def test_the_timeline_and_the_help(self):
+        snap = self.snap()
+        snap["overview"]["running"][0]["from_ci"] = True
+        finished = [{"short": "dddddddd", "lane": "check", "submitted": snap["time"] - 1500, "started": snap["time"] - 1400,
+                     "ended": snap["time"] - 900, "peak": 20 * GIB, "from_ci": False, "state": "done"}]
+        lines, _ = self.draw(snap, width=120, height=30, view="timeline", finished=finished)
+        text = "\n".join(t for t, _ in lines)
+        self.assertIn("TIMELINE", text)
+        rows = {m: next(t for t, _ in lines if m in t) for m in ("aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd")}
+        self.assertTrue(rows["aaaaaaaa"].lstrip("│ ").startswith("CI aaaaaaaa"))
+        self.assertIn("█", rows["dddddddd"])  # it ran, with a lot of memory
+        self.assertIn("·", rows["cccccccc"])  # it waits
+        self.assertNotIn("█", rows["cccccccc"].split("heavy", 1)[1])
+        self.assertLess(text.index("dddddddd"), text.index("cccccccc"))  # oldest first, newest at the bottom
+        lines, _ = self.draw(snap, width=120, height=30, show_help=True)
+        text = "\n".join(t for t, _ in lines)
+        for expected in ("HELP", "t", "the timeline, and back", "held for it to grow into"):
+            self.assertIn(expected, text)
+
+    def test_the_layout_follows_the_width(self):
+        wide = "\n".join(t for t, _ in self.draw(self.snap(), width=150, height=40)[0])
+        self.assertIn("LANES", wide)
+        self.assertIn("╭─ CPU", wide)
+        narrow = "\n".join(t for t, _ in self.draw(self.snap(), width=90, height=40)[0])
+        self.assertNotIn("LANES", narrow)
+        self.assertNotIn("╭─ CPU", narrow)
+        self.assertIn("CPU ", narrow.splitlines()[0])  # a bar in the title line instead
+        self.assertIn("MEMORY", narrow)
+        for width in (50, 79, 90, 110, 150, 300):
+            for height in (12, 17, 24, 40):
+                lines, _ = self.draw(self.snap(), width=width, height=height, selected="a" * 36, detail=True, log_lines=["x"] * 30)
+                self.assertEqual(len(lines), height, (width, height))
+                self.assertTrue(all(buildq.text_width(t) <= width for t, _ in lines), (width, height))
+                self.assertIn("aaaaaaaa", "\n".join(t for t, _ in lines), (width, height))
 
     def test_with_no_daemon_it_still_shows_the_machine(self):
         snap = self.snap()
@@ -4767,7 +4844,8 @@ class Top(unittest.TestCase):
         calls = []
 
         class Curses:
-            A_BOLD, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE = 1 << 21, 6, 2, 3, 1, 4
+            A_BOLD, A_REVERSE, COLOR_CYAN, COLOR_GREEN, COLOR_YELLOW, COLOR_RED, COLOR_BLUE, COLOR_MAGENTA = \
+                1 << 21, 1 << 18, 6, 2, 3, 1, 4, 5
             error = Exception
 
             def has_colors(self):
@@ -4786,7 +4864,7 @@ class Top(unittest.TestCase):
         self.assertEqual((plain[""], plain["head"]), (0, Curses.A_BOLD))  # headings keep their bold
         calls.clear()
         coloured = buildq.init_colours(Curses(), wanted=True)
-        self.assertEqual(calls.count("pair"), 5)
+        self.assertEqual(calls.count("pair"), 6)
         self.assertNotEqual(coloured["ok"], 0)
 
     def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
