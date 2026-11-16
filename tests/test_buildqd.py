@@ -2101,15 +2101,23 @@ class Analytics(DaemonCase):
         self.history_of(t.key, 1, peak_at=570.0, tail=0)  # one run peaked in its last half minute
         self.assertEqual(self.settle_release(t, 900), (18 * GIB, 18 * GIB))
 
-    def test_runs_slowed_at_their_memory_high_count_neither_way(self):
+    def test_runs_over_their_memory_high_count_but_not_toward_the_three(self):
         t = self.past_its_peak()
         self.history_of(t.key, 3)
-        self.history_of(t.key, 2, peak_at=570.0, mem_high=4000)  # throttled while memory was short (#56)
-        self.assertEqual(self.settle_release(t, 900)[1], int(2 * GIB * 1.1) - 2 * GIB)  # released all the same
+        self.history_of(t.key, 2, mem_high=4000)  # over MemoryHigh (page cache), peaked early: measured all the same
+        self.assertEqual(self.settle_release(t, 900)[1], int(2 * GIB * 1.1) - 2 * GIB)
         u = self.past_its_peak()
-        self.history_of(u.key, 2)
-        self.history_of(u.key, 3, mem_high=4000)
-        self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB))  # but they aren't among the three it needs
+        self.history_of(u.key, 3)
+        self.history_of(u.key, 1, peak_at=570.0, mem_high=4000)  # ... but one that peaked at its end, high
+        self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB))  # still rules it out (#61 review)
+        v = self.past_its_peak()
+        self.history_of(v.key, 2)
+        self.history_of(v.key, 3, mem_high=4000)
+        self.assertEqual(self.settle_release(v, 900), (18 * GIB, 18 * GIB))  # not among the three it needs
+        w = self.past_its_peak()
+        self.history_of(w.key, 3)
+        self.history_of(w.key, 1, mem_high=4000, tail=4 * GIB)  # used more after its peak: the hold says so
+        self.assertEqual(self.settle_release(w, 900)[1], int(4 * GIB * 1.1) - 2 * GIB)
 
     def test_the_run_behind_the_estimate_may_have_been_throttled(self):
         t = self.past_its_peak()
@@ -2124,12 +2132,18 @@ class Analytics(DaemonCase):
     def test_a_small_run_that_peaked_at_its_end_is_no_sign_against_it(self):
         t = self.past_its_peak()
         self.history_of(t.key, 3)
-        self.history_of(t.key, 1, peak_at=570.0, peak=2 * GIB)  # its end, but under what would be kept (2.2G)
+        self.history_of(t.key, 1, peak_at=570.0, peak=2 * GIB)  # its end, but no more than the runs' 2G after peaks
         self.assertEqual(self.settle_release(t, 900)[1], int(2 * GIB * 1.1) - 2 * GIB)
-        u = self.past_its_peak()
-        self.history_of(u.key, 3)
-        self.history_of(u.key, 1, peak_at=570.0, peak=3 * GIB)  # above it: a later phase can be bigger
-        self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB))
+        for peak in (int(2.1 * GIB), 3 * GIB):  # above it (2.1G: within the hold, but swap isn't in the history)
+            u = self.past_its_peak()
+            self.history_of(u.key, 3)
+            self.history_of(u.key, 1, peak_at=570.0, peak=peak)
+            self.assertEqual(self.settle_release(u, 900), (18 * GIB, 18 * GIB), peak)
+        w = self.past_its_peak()
+        self.history_of(w.key, 3)
+        self.history_of(w.key, 1, peak=19 * GIB, mem_high=30000, tail=5 * GIB)  # the biggest says 5G after its peak
+        self.history_of(w.key, 1, peak_at=570.0, peak=4 * GIB)  # so a 4G end-peak is within what was seen after
+        self.assertEqual(self.settle_release(w, 900)[1], int(5 * GIB * 1.1) - 2 * GIB)
 
     def test_failed_runs_and_runs_unlike_this_one_teach_no_release(self):
         t = self.past_its_peak()

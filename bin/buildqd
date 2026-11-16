@@ -2097,11 +2097,14 @@ class History:
         above what would be kept (such a command's runs say nothing about after a peak; one that
         never used more than that is no sign against it), and no run in the window was killed for
         memory (the clearest sign that a later phase can be bigger). Failed runs teach nothing here
-        either: a failure may have skipped a later, bigger phase. A run slowed at its MemoryHigh (the
-        machine was short, and buildq's slice guard throttled it) says nothing either way about its
-        shape: it is neither one of the runs read nor one that peaked at its end. The run behind the
-        estimate may be one, when it is otherwise shaped: its peak and what it used after were
-        still measured (#56: 8 of the release Rust step's 25 runs were, which turned this off for it)."""
+        either: a failure may have skipped a later, bigger phase. A run that went over its lane's
+        MemoryHigh (on this workstation mostly page cache, against the lane's cap) is measured all the
+        same: it isn't one of the `need` runs, but it counts toward the latest peak, the most used
+        after it and the CPU by it, and against the command if it peaked at its end; the run behind
+        the estimate may be one (#56: 8 of the release Rust step's 25 runs were, which turned this
+        off for it). A run that peaked at its end counts against the command only above what the
+        runs used after their peaks (the hold less its tenth, which covers swap: the history has
+        none)."""
         cutoff = now - cfg.history_days * 86400
         recent = [r for r in self.by_key.get(key, ()) if r["t"] >= cutoff][-cfg.history_runs:]
         window = [r for r in self._retained(key) if r["t"] >= cutoff] or recent
@@ -2111,12 +2114,12 @@ class History:
         known = [r for r in recent if self.shaped(r)]
         if len(known) < need or not self.shaped(top, throttled_ok=True) or any(r.get("oom") for r in window):
             return None
-        runs = known + ([top] if all(r is not top for r in known) else [])
+        measured = [r for r in recent if self.shaped(r, throttled_ok=True)]
+        runs = measured + ([top] if all(r is not top for r in measured) else [])
         tail = max(r["tail"] for r in runs)
-        hold = int(tail * 1.1)  # what past_peak_hold keeps
-        ended_at_peak = [r for r in recent if r.get("exit") == 0 and not r.get("oom") and not r.get("mem_high")
-                         and not self.shaped(r) and r.get("peak_at") is not None and (r.get("wall") or 0) >= 60
-                         and r["peak_mem"] > hold]
+        ended_at_peak = [r for r in recent if r.get("exit") == 0 and not r.get("oom")
+                         and not self.shaped(r, throttled_ok=True) and r.get("peak_at") is not None
+                         and (r.get("wall") or 0) >= 60 and r["peak_mem"] > tail]
         if ended_at_peak:
             return None
         cores = int(top.get("mem_cores") or top.get("granted") or 0)

@@ -144,11 +144,13 @@ records it. A build is past its peak once all of these have held for 30 seconds:
   three recent runs that succeeded without being killed for memory or slowed at their `MemoryHigh`,
   ran a minute or more, and say when they peaked (`peak_at`), after how much CPU (`peak_cpu`) and
   what they used after (`tail`); none of the recent successful runs peaked in its last minute or
-  last tenth above what would be kept (`tail` × 1.1), and no run in the window was killed for
-  memory. A run slowed at its `MemoryHigh` is set aside: it counts neither as one of those runs nor
-  as one that peaked at its end, though the run behind the estimate may be one if it is otherwise
-  shaped (#56). Failed runs don't count: a failure may have skipped a later, bigger phase. A command
-  whose peak comes at its end never qualifies;
+  last tenth above the most any of them used after its peak (`tail`; the hold's extra tenth covers
+  swap, which the history doesn't record), and no run in the window was killed for memory. A run
+  that went over its `MemoryHigh` (on the maintainer's workstation mostly page cache) isn't one of
+  those runs, but its `peak_at`, `tail` and `peak_cpu` count toward the latest peak, the hold and
+  the CPU gate, it counts against the command if it peaked at its end, and the run behind the
+  estimate may be one (#56). Failed runs don't count: a failure may have skipped a later, bigger
+  phase. A command whose biggest run peaked at its end never qualifies;
 - this attempt has run 1.25 × the latest of those `peak_at`s plus sixty seconds, has used 1.25 × the
   most CPU-seconds any of them had used by its peak (CPU work barely depends on the cores, so a run
   given fewer cores, slower to its peak, waits for it), and its own peak was sixty seconds ago or
