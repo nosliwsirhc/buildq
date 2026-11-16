@@ -77,6 +77,14 @@ make_room_for_ci = "0"
 # (overdue, or stopped once) are never stopped for one (#38).
 make_room_behind_agents = true
 
+# With ci_first: a CI job's build that has waited this long ("20m") goes before every other build,
+# including ones that have waited three times starve_seconds, its room binds every lane, and with
+# make_room_for_ci it stops the newest builds that can start over even when they free only part of
+# what it lacks. Its job's time limit counts the wait: GitHub cancels a step still queued, and with
+# it the release (a scan waited 30 of its 30 minutes, 2026-11-16). Set it below the shortest CI job
+# time limit, less the step's run time. "0" (the default) never.
+# ci_deadline = "20m"
+
 # With make_room_for_ci: never stop a build that has run this long ("20m"): it is likely far along,
 # and starting it over would throw the most work away. "0" (the default) spares none.
 make_room_spare_after = "0"

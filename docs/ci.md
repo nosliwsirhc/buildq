@@ -54,6 +54,15 @@ goes first. cargo keeps the crates it finished, so it repeats only the ones it w
 build is stopped this way at most twice, and never for a CI step in a lane with `may_pass_held`,
 which holds no room. Pausing a build wouldn't help: a paused build keeps its memory.
 
+A CI job's time limit counts the time its step waits in the queue: GitHub cancels a step still
+queued, and with it the run. With `ci_first`, a build that has waited three times `starve_seconds`
+goes before CI jobs' builds, so in a long queue a CI step could wait behind many of them until its
+job was cancelled. `ci_deadline = "20m"` stops that: a CI job's build that has waited that long goes
+before every other build, its room binds every lane, and with `make_room_for_ci` it stops the newest
+builds that can start over even when they free only part of what it lacks (what they free is held
+for it, so it starts as soon as the rest frees). Set it below the shortest CI job time limit, less the
+step's own run time.
+
 Two settings tune it (#38). `make_room_behind_agents = false` leaves a CI step that waits partly
 behind agents' builds that have waited longer than it (and so go first) to wait its turn: stopping
 builds for it would mostly let those go first. Those builds aren't stopped for a CI step once they
