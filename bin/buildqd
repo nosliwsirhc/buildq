@@ -3106,6 +3106,8 @@ class Ticket:
             if k in rec:
                 setattr(t, k, rec[k])
         t.take_waits(0, 0, 0)  # numbers only, whatever the file said
+        if "start_rigid" not in rec and t.started:  # (saved by an older daemon while running: #63)
+            t.start_rigid = bool(t.rigid)
         waited = t.waited_by if isinstance(t.waited_by, dict) else {}
         t.waited_by = {str(k): v for k, v in ((k, sane_count(v)) for k, v in waited.items()) if v is not None}
         t.peak_at = sane_count(t.peak_at) or 0.0

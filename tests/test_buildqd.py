@@ -1804,6 +1804,14 @@ class Analytics(DaemonCase):
         self.assertEqual((row["start_plan"], row["max_cores"], row["rigid"]), (plan, cores, 0))  # the attempt that ran
         self.assertEqual((row["start_rule"], row["end_rule"]), ("always", "never"))  # it straddled a change
 
+    def test_a_running_build_saved_by_an_older_daemon_keeps_its_rigidity(self):
+        t = self.submit()
+        rec = t.record()
+        rec.pop("start_rigid")
+        rec.update(rigid=True, state="running", started=self.now)
+        loaded = buildqd.Ticket.from_record(rec, t.dir)
+        self.assertTrue(loaded.start_rigid)
+
     def test_the_start_fields_are_one_attempt_on_one_clock(self):
         t = self.submit()
         plan, base, base_cores = t.est_mem, t.mem_base, t.mem_cores
