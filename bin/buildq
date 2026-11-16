@@ -2299,6 +2299,13 @@ class TopHistory:
         if points and self.samples:
             points.append((self.samples[0][0], self.samples[0][field]))
         start = self.samples[0][0] if self.samples else now + width
+        own: dict = {}  # an analytics minute in its own step, however far its neighbours are
+        for t, v in points[:len(self.minutes)]:
+            i = int(t // width) - first
+            if 0 <= i < n and out[i] is None and t < start:
+                own.setdefault(i, []).append(v)
+        for i, vals in own.items():
+            out[i] = sum(vals) / len(vals)
         for i in range(n):
             mid = (first + i + 0.5) * width
             if out[i] is not None or mid >= start or not points:
@@ -3008,6 +3015,7 @@ def init_colours(curses, wanted: bool) -> dict:
         if not wanted:
             return colours
         pairs: dict = {}
+        limit = getattr(curses, "COLOR_PAIRS", 64) - 1  # (pair 0 is the terminal's own)
 
         def pair(fg: int, bg: int = -1) -> int:
             if (fg, bg) not in pairs:
@@ -3015,7 +3023,10 @@ def init_colours(curses, wanted: bool) -> dict:
                 curses.init_pair(n, fg, bg)
                 pairs[(fg, bg)] = curses.color_pair(n)
             return pairs[(fg, bg)]
-        if getattr(curses, "COLORS", 8) >= 256:
+        rich = len({fg for fg, _ in TOP_COLOURS_256.values()}) + 3  # the pairs btop's theme takes
+        if limit < 9:  # not even the eight colours' pairs: plain text
+            return plain
+        if getattr(curses, "COLORS", 8) >= 256 and limit >= rich:
             for style, (fg, strong) in TOP_COLOURS_256.items():
                 colours[style] = pair(fg) | (bold if strong else 0)
             colours["sel"] = pair(255, SELECTED_BG_256) | bold
@@ -3033,7 +3044,7 @@ def init_colours(curses, wanted: bool) -> dict:
                            sel_bad=pair(red, curses.COLOR_BLUE) | bold, sel_warn=pair(yellow, curses.COLOR_BLUE) | bold)
             for i in range(8):
                 colours[f"cpu{i}"] = pair(green if i < 3 else yellow if i < 6 else red)
-    except curses.error:
+    except (curses.error, ValueError):  # (ValueError: a pair number past what the terminal has)
         return plain  # no default colours on this terminal: plain text
     return colours
 
@@ -3212,8 +3223,10 @@ def cmd_top(args) -> int:
                         x += text_width(text)
                 screen.noutrefresh()
                 sync(True)
-                curses.doupdate()
-                sync(False)
+                try:
+                    curses.doupdate()
+                finally:
+                    sync(False)  # (or the terminal waits out its timeout for the frame's end)
                 dirty, drawn_at = False, time.monotonic()
             key = screen.getch()
             if key == -1:

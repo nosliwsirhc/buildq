@@ -4814,7 +4814,10 @@ class Top(unittest.TestCase):
         self.assertEqual(steps[19:22], [16.0, 24.0, 32.0])  # each minute's average (not its busiest moment)
         self.assertEqual(steps[22:], [None] * 8)  # and no plateau carried on after the last
         half = hist.buckets(1, 60, now)  # half-minute steps: a line between the minutes, not flat steps
-        self.assertEqual((half[40], half[41]), (18.0, 22.0))
+        self.assertEqual((half[40], half[41]), (16.0, 22.0))  # a minute in its own step; a line between
+        lone = buildq.TopHistory()
+        lone.minutes = [(now - 870, 12.0, 32, 64 * GIB, GIB, 0, 128 * GIB)]  # one minute, no neighbours
+        self.assertIn(12.0, lone.buckets(1, 30, now))
         hist.backfill(path, now)
         self.assertEqual(len(hist.minutes), 3)  # only once
         buildq.TopHistory().backfill(os.path.join(os.path.dirname(path), "missing.db"), now)  # no analytics: empty
@@ -5232,6 +5235,18 @@ class Top(unittest.TestCase):
         self.assertEqual(calls.count("pair"), len({fg for fg, _ in buildq.TOP_COLOURS_256.values()}) + 3)
         self.assertTrue(coloured["sel"] & Curses.A_BOLD)
         self.assertNotEqual(coloured["dim"], coloured["faint"])
+        class Exhausted(Curses):  # real curses raises ValueError past the terminal's pairs
+            COLORS, COLOR_PAIRS = 256, 16
+
+            def init_pair(self, n, *a):
+                if n >= self.COLOR_PAIRS:
+                    raise ValueError("Color pair is greater than COLOR_PAIRS-1")
+                calls.append("pair")
+        few = buildq.init_colours(Exhausted(), wanted=True)  # too few pairs for btop's theme: its TTY theme
+        self.assertEqual(few["dim"], 0)
+        self.assertNotEqual(few["ok"], 0)
+        Exhausted.COLOR_PAIRS = 8
+        self.assertEqual(buildq.init_colours(Exhausted(), wanted=True).get("ok", 0), 0)  # too few for that too: plain
 
     def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
         import curses
