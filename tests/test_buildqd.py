@@ -2851,6 +2851,16 @@ class CIFirst(DaemonCase):
         with self.assertRaises(ValueError):
             buildqd.Config({"ci_first": True, "ci_deadline": "5m", "starve_seconds": 600}, 64 * GIB, 16)  # under starve
 
+    def test_due_ci_builds_go_oldest_first_whatever_their_lane(self):
+        self.daemon.cfg.ci_first = True
+        self.daemon.cfg.ci_deadline = 1200.0
+        self.higher_lane()
+        heavy = self.submit(("cargo", "test"), mem="20G", env=self.CI, caller="runner-1")
+        self.now += 60
+        higher = self.submit(("dotnet", "build"), lane="web", mem="20G", env=self.CI, caller="runner-2")
+        self.now += 1200  # both past the deadline; the heavy one nearer its job's limit
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [heavy.id, higher.id])
+
     def test_due_ci_builds_that_start_count_against_overdue_builds_waits(self):
         self.daemon.cfg.ci_first = True
         self.daemon.cfg.ci_deadline = 1200.0

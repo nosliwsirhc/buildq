@@ -3505,7 +3505,9 @@ class Daemon:
 
         With ci_first, any build that has waited three times starve_seconds, or was stopped to free
         memory, goes before all of those, so CI jobs (in a higher lane, for a CI job's build) can't
-        keep it waiting for ever."""
+        keep it waiting for ever. With ci_deadline, a CI job's build that has waited that long goes
+        before even those, the oldest first, until two such builds have started ahead of an overdue
+        build (CI_PASSES_MAX): then that build goes first again."""
         now = time.time() if now is None else now
 
         # Fair shares: at the same priority, a caller (a session, a CI runner) with fewer builds
@@ -3532,8 +3534,9 @@ class Daemon:
             # except an overdue build that two of them have already passed (CI_PASSES_MAX): so a stream of
             # CI jobs can't keep it waiting for ever, while a release's few steps still go first
             passed = overdue and not t.from_ci and t.ci_passed >= self.CI_PASSES_MAX
-            return (not (due or passed), not overdue, not starving, -self.weight(t), not first,
-                    not (first and self.waited_out(t, now)))
+            # (among those, the oldest first: the nearest to its job's time limit, whatever its lane)
+            return (not (due or passed), t.submitted if (due or passed) else 0.0, not overdue, not starving,
+                    -self.weight(t), not first, not (first and self.waited_out(t, now)))
 
         def own_order(t: Ticket):
             return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
@@ -4186,8 +4189,9 @@ class Daemon:
                     if total >= short:
                         break
                 else:
-                    if not (chosen and self.ci_due(ci, now)) or ci.id in self.partly_made:
-                        continue  # stopping every one of them wouldn't make it fit
+                    if not (chosen and self.ci_due(ci, now)) or ci.id in self.partly_made or total < short / 2:
+                        continue  # stopping every one of them wouldn't make it fit (or, past its deadline,
+                        # wouldn't free half of it: the rest is held by builds that can't be stopped)
                     # Past its deadline: stop them all the same. What they free is held for it (its
                     # room binds every lane, and they yield to it), so it starts as soon as the rest
                     # frees, rather than when its job is cancelled. Once only: if what they freed went
