@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 
 sys.dont_write_bytecode = True
@@ -1085,7 +1086,8 @@ class SameSource(DaemonCase):
                      ["cargo", "check", "--config", 'build.rustflags=["--sysroot", "/outside"]'],
                      ["cargo", "check", "--config", 'registries.x.index="file:///x/index"'],
                      ["dotnet", "test", "@../other/args.rsp"],
-                     ["env", "PATH=/usr/bin", "cargo", "test"],  # (a system folder too: that costs a run, no more)
+                     ["env", "-C", "..", "cargo", "test"], ["cargo", "-C", "..", "test"],
+                     ["env", "--", "make", "-C", "../x"],  # (env's `--`, not cargo's: make still moves)
                      ["env", "CFLAGS=-isystem/outside/include", "cargo", "check"], ["dotnet", "test", "/outside"],
                      ["vitest", "run", "-r", "sub"]):
             self.assertFalse(inside(argv, "/r", "/r"), argv)
@@ -1110,8 +1112,22 @@ class SameSource(DaemonCase):
                      ["dotnet", "test", "--logger", "console;verbosity=normal"],
                      ["dotnet", "test", "--filter", "FullyQualifiedName~X&Category!=Slow"], ["eslint", ".", "--max-warnings=0"],
                      ["cargo", "clippy", "--", "-W", "clippy::pedantic", "-Dclippy::all"], ["cargo", "test", "-F", "Cli"],
-                     ["cargo", "test", "--", "--test-threads=1"]):
+                     ["cargo", "test", "--", "--test-threads=1"],
+                     # variables that name tools, not source, and cargo's own value options and `--` (#48)
+                     ["env", "PATH=/usr/bin:/bin", "cargo", "test"], ["env", "RUSTC_WRAPPER=/usr/bin/sccache", "cargo", "check"],
+                     ["env", "PATH=/home/u/.cargo/bin:/usr/local/bin:/usr/bin", "cargo", "test"],
+                     ["sudo", "PATH=/usr/bin", "cargo", "test"], ["env", "-i", "PATH=/usr/bin", "cargo", "test"],
+                     ["cargo", "test", "-pCore"], ["cargo", "test", "-FCli"]):
             self.assertTrue(inside(argv, "/r", "/r"), argv)
+        # ... but only where a wrapper sets them, and only cargo's own options: a script's argument
+        # `PATH=…` is a path, and after cargo's `--` a custom test harness may take -C (#52 review)
+        for argv in (["python3", "check.py", "PATH=../outside/input"], ["cargo", "test", "--", "-C..", "../outside/input"],
+                     ["cargo", "test", "--", "-Cfoo"], ["env", "RUSTC_WRAPPER=/x/w.sh", "cargo", "check"],
+                     ["env", "RUSTC_WRAPPER=/home/u/other/target/release/sccache", "cargo", "check"],
+                     # a word with "=" that a wrapper runs, not sets: a program in a folder named `PATH=..`
+                     ["nice", "PATH=../../../outside/check.sh", "cargo", "test"], ["PATH=../x/check.sh", "cargo", "test"],
+                     ["env", "PATH=../tools/bin:/usr/bin", "cargo", "xyz"], ["env", "PATH=/home/u/Code/xyz/target/release", "cargo", "xyz"]):
+            self.assertFalse(inside(argv, "/r", "/r"), argv)
 
     def test_a_failure_or_an_old_pass_is_never_reused(self):
         failed = self.submit(("cargo", "test"), source=SOURCE)
@@ -1134,6 +1150,7 @@ class SameSource(DaemonCase):
 
     def test_which_commands_are_checks_and_which_start_over_safely(self):
         checks = [("cargo", "test", "-p", "api"), ("cargo", "+nightly", "check"), ("cargo", "nextest", "run"),
+                  ("vitest", "run", "-t", "adds"),
                   ("cargo", "clippy", "--", "-Dwarnings"), ("npx", "tsc", "--noEmit"), ("vitest", "run"),
                   ("eslint", "."), ("dotnet", "test")]
         not_checks = [("cargo", "build"), ("cargo", "doc"), ("cargo", "run"), ("cargo", "clippy", "--fix"),
@@ -1144,7 +1161,9 @@ class SameSource(DaemonCase):
                       ("dotnet", "test", "--logger", "trx"), ("dotnet", "test", "-l", "trx"),
                       ("vitest", "run", "--reporter", "html"), ("dotnet", "test", "--logger:trx"),
                       ("vitest", "run", "--coverage.enabled"),
-                      ("pnpm", "run", "build:deploy"), ("sh", "run-tests.sh"), ("git", "push"), ("make", "test")]
+                      ("pnpm", "run", "build:deploy"), ("sh", "run-tests.sh"), ("git", "push"), ("make", "test"),
+                      ("vitest", "run", "-ut", "adds"), ("vitest", "run", "-wt", "adds"),  # -u, -w grouped (#50)
+                      ("vitest", "run", "-u=true"), ("vitest", "run", "-tu=x")]
         for argv in checks:
             self.assertTrue(buildqd.reusable_check(list(argv)), argv)
         for argv in not_checks:
@@ -3635,6 +3654,139 @@ class Jobservers(DaemonCase):
         self.assertEqual(t.js.out, 13)
 
 
+    def test_a_ci_build_short_of_cores_takes_them_from_agents_builds(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()  # a cold build: it wants 16
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        self.assertEqual(agent.granted, 12)  # 12 cores were free
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0  # the machine is at its target
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        self.assertTrue(ci.from_ci)
+        self.assertEqual(ci.state, "running")
+        start = ci.granted
+        self.assertLess(start, 8)
+        ci.elastic, ci.cores_now = True, float(start)  # using all it has
+        target = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.machine.busy = self.machine.busy_now = target  # no idle cores: they come from the agent's build
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual(ci.granted, 8)  # up to its lane's usual cores, not the 16 a cold build may want
+        self.assertEqual(agent.granted, 12 - (8 - start))  # from the agent's build, the machine still at its target
+        self.assertEqual((ci.js.out, agent.js.out), (7, agent.granted - 1))
+        ci.cores_now = 8.0
+        self.daemon.rebalance(self.now + 125)
+        self.assertEqual(ci.granted, 8)  # no more from agents: beyond its usual cores, only idle ones
+        self.machine.busy = self.machine.busy_now = target + 2  # over its target: agents' builds are cut first
+        self.daemon.rebalance(self.now + 130)
+        self.assertEqual(ci.granted, 8)
+        self.assertLess(agent.granted, 12 - (8 - start))
+
+
+    def test_idle_cores_dont_wait_for_a_cut_build_s_jobs(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        ci.elastic, ci.cores_now = True, float(ci.granted)
+        start = ci.js.out
+        held = os.read(agent.js.fd, agent.js.out)  # the agent's jobs hold every token it has
+        agent.granted, agent.cores_now = agent.need, 1.0  # cut (for another reason), its tokens not back yet
+        self.machine.busy = self.machine.busy_now = 12.0  # cores went idle elsewhere
+        self.daemon.rebalance(self.now + 120)
+        self.assertGreater(ci.granted - 1, start)
+        self.assertEqual(ci.js.out, ci.granted - 1)  # idle cores paid for it: its tokens went out at once
+        os.write(agent.js.fd, held)
+
+    def test_idle_cores_pay_for_a_token_once(self):
+        # One idle core and a transfer in the same pass: the CI build gets one token for the idle
+        # core, not one more for the grant that core already raised (#52 review round 3).
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        ci.elastic, ci.cores_now = True, float(ci.granted)
+        start = ci.js.out
+        held = os.read(agent.js.fd, agent.js.out)  # the agent's jobs hold every token it has
+        target = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.machine.busy = self.machine.busy_now = target - 1.5  # one idle core
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual(ci.granted, 8)
+        self.assertEqual(ci.js.out, start + 1)  # one token: the idle core's
+        # The next pass: idle cores raise the agent's grant while the CI build is still owed tokens.
+        # The CI build gets no more than those idle cores paid for (Opus, #52 review round 3).
+        agent.cores_now = 12.0
+        self.machine.busy = self.machine.busy_now = target - 2.5  # two idle cores
+        was = ci.js.out
+        self.daemon.rebalance(self.now + 122)
+        self.assertLessEqual(ci.js.out - was, 2)
+        self.assertLessEqual(sum(t.js.out for t in (agent, ci)), 11 + was + 2)
+        # A token whose count couldn't be saved doesn't go out.
+        was = ci.js.out
+        with unittest.mock.patch.object(self.daemon, "save", return_value=False):
+            os.write(agent.js.fd, held)  # the agent's jobs end
+            self.daemon.rebalance(self.now + 125)
+        self.assertEqual(ci.js.out, was)
+        self.daemon.rebalance(self.now + 130)
+        self.assertEqual(ci.js.out, 7)
+
+    def test_tokens_moved_to_a_ci_build_are_issued_as_they_come_back(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        agent = self.submit(cwd=project)
+        agent.elastic, agent.cores_now = True, 12.0
+        self.machine.busy = self.machine.busy_now = 28.0
+        ci = self.submit(("cargo", "test"), cwd=self.workdir("ci"), env={"GITHUB_ACTIONS": "true", "RUNNER_NAME": "r1"})
+        start = ci.granted
+        ci.elastic, ci.cores_now = True, float(start)
+        held = os.read(agent.js.fd, agent.js.out)  # the agent's jobs hold every token it has
+        self.machine.busy = self.machine.busy_now = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual((ci.granted, agent.granted), (8, 12 - (8 - start)))  # the grants move at once
+        self.assertEqual((ci.js.out, agent.js.out), (start - 1, 11))  # but no token is issued before one comes back
+        os.write(agent.js.fd, held)  # its jobs end and give the tokens back
+        # A crash once the grower's tokens are out, before its save after them: what it saved is
+        # never below what is out, so a restart can't issue them twice.
+        def saved(t):
+            with open(os.path.join(t.dir, "ticket.json")) as f:
+                return json.load(f)["tokens_out"]
+        save = self.daemon.save
+        def crashing(t):
+            if t is ci and ci.js.out > start - 1:
+                raise SystemExit("crash")
+            return save(t)
+        with unittest.mock.patch.object(self.daemon, "save", side_effect=crashing):
+            try:
+                self.daemon.rebalance(self.now + 124)
+            except SystemExit:
+                pass  # (a save after its tokens went out: none is needed, as the count went first)
+        self.assertEqual(ci.js.out, 7)
+        self.assertGreaterEqual(saved(ci), ci.js.out)
+        self.daemon.rebalance(self.now + 125)
+        self.assertEqual((ci.js.out, agent.js.out), (7, agent.granted - 1))
+        self.assertEqual(saved(ci), 7)
+        # While a build waits for memory, none is taken for more cores.
+        ci.granted, agent.granted = ci.need, 12
+        big = self.submit(("cargo", "build"), cwd=self.workdir("big"), mem="90G")
+        self.assertEqual(big.reason_cat, "memory")  # it waits for memory
+        with unittest.mock.patch.object(self.daemon, "mem_for", lambda t, cores: t.est_mem + (cores - t.need) * GIB):
+            self.daemon.rebalance(self.now + 127)
+        self.assertEqual(ci.granted, ci.need)
+        # A CI build whose hold was let go past its peak grows no further this way, as growth doesn't.
+        ci.granted = ci.need
+        ci.release_at, ci.release_revoked, ci.release_hold = 60.0, False, 64 * GIB  # (kept: it stays under it)
+        with unittest.mock.patch.object(self.daemon, "past_peak_hold", return_value=64 * GIB):  # (still released)
+            self.daemon.rebalance(self.now + 130)
+        self.assertEqual(ci.granted, ci.need)
+
+
 class Recovery(DaemonCase):
     def test_a_resent_submission_gets_its_ticket_back(self):
         cwd = self.workdir()
@@ -3953,7 +4105,9 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("npx", "vitest", "run"), "npx vitest")
         self.assertEqual(self.words("git", "-C", "/x", "push", "--force-with-lease", "origin", "b"), "git push")
         self.assertEqual(self.words("bash", "./scripts/ci.sh", "--fast"), "bash ci.sh")
-        self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 pytest")
+        self.assertEqual(self.words("python3", "-m", "pytest", "-x"), "python3 -m pytest")  # (#49)
+        self.assertEqual(self.words("python3", "script.py", "-m", "slow"), "python3 script.py")  # the script's own -m
+        self.assertEqual(self.words("python3", "-X", "dev", "-W", "error", "-m", "pytest"), "python3 -m pytest")
 
     def test_a_labelled_scripts_label_tells_its_builds_apart(self):
         labels = frozenset({"persistent-cargo-target.sh", "gen.py"})
@@ -3975,7 +4129,8 @@ class Keys(unittest.TestCase):
         # an unlisted script, -c, -lc and modules are keyed as before
         self.assertEqual(words("bash", "run.sh", "build"), "bash run.sh")
         self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh build"), self.words("bash", "-lc", "persistent-cargo-target.sh build"))
-        self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 discover unittest")
+        self.assertEqual(words("python3", "-m", "unittest", "discover", "tests"), "python3 -m unittest discover")
+        self.assertEqual(words("python3", "-m", "unittest", "discover"), "python3 -m unittest discover")  # keys back to itself (#49)
         # only a script that comes straight after the interpreter: not a command string or an option's value
         self.assertEqual(words("bash", "-lc", "persistent-cargo-target.sh", "hunter"),
                          self.words("bash", "-lc", "persistent-cargo-target.sh", "hunter"))
