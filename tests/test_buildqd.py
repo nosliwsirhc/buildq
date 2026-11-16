@@ -4736,7 +4736,7 @@ class Top(unittest.TestCase):
         lines, _ = self.draw(snap, width=260)
         rows = {m: next(t for t, _ in lines if m in t and "needs" in t) for m in ("cccccccc", "dddddddd", "eeeeeeee", "ffffffff", "gggggggg")}
         self.assertIn("⚑ in line", rows["cccccccc"])
-        self.assertIn("26G short", rows["cccccccc"])  # what the free room lacks: 20G, and it is 6G over
+        self.assertIn("20G short", rows["cccccccc"])  # what the free room lacks, never more than it needs
         self.assertIn("0M is free after the 16G floor", rows["cccccccc"])
         self.assertNotIn("needs 20G of memory;", rows["cccccccc"])  # (said in its column)
         self.assertIn("behind 1 in line", rows["dddddddd"])  # its room is free, kept for the one ahead
@@ -4746,7 +4746,7 @@ class Top(unittest.TestCase):
         self.assertIn("cancel it or give its lane a smaller MemoryMax", rows["ffffffff"])
         text = "\n".join(t for t, _ in lines)
         self.assertIn("over by 6.0G", text)  # more held than free: not "room 0M"
-        self.assertIn("1 for memory, the closest 26G short", text)
+        self.assertIn("1 for memory, the closest 20G short", text)
         self.assertIn("2 in line, with room kept for them", text)
         self.assertNotIn("223G", text)  # room kept, summed over everyone in line, would read as more than the machine
         self.assertNotIn("next", text)

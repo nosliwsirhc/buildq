@@ -2430,7 +2430,7 @@ def memory_panel(snap: dict, running: list, queued: list, w: int, holds: dict):
         line = [(f"{len(queued)} waiting", "warn")]
         for_mem = [r for r in queued if r.get("waiting_for") == "memory"]
         if for_mem:
-            closest = min((r.get("est_mem") or 0) - room for r in for_mem)
+            closest = min((r.get("est_mem") or 0) - max(room, 0) for r in for_mem)  # (over by: said beside the bar)
             line.append((f" {sep} {len(for_mem)} for memory"
                          + (f", the closest {fmt_size(closest)} short" if closest > 0 else ""), "dim"))
         in_line = sum(1 for r in queued if r.get("held"))
@@ -2613,8 +2613,8 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
                  (" " + fit(row["lane"], lane_w).ljust(lane_w), "dim"), (f" needs {fmt_size(need):>6}", "")]
         if row.get("held"):  # room is kept for it: builds behind it wait
             parts.append((f" {TOP['flag']} in line", "warn"))
-        if row.get("waiting_for") == "memory" and need > room:
-            parts.append((f" {fmt_size(need - room)} short", "dim"))  # (what the free room lacks)
+        if row.get("waiting_for") == "memory" and need > max(room, 0):
+            parts.append((f" {fmt_size(need - max(room, 0))} short", "dim"))  # (what the free room lacks)
         elif row.get("waiting_for") == "held" and ahead:
             parts.append((f" behind {ahead} in line", "dim"))
         reason = clean(row.get("reason") or "")
