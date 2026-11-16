@@ -608,7 +608,10 @@ one take turns; `repo` is its source repository when it sent one),
 and `plan_cores` (the peak behind the plan and the cores it was measured at), `outgrown_at` (when the
 last attempt first used more than `start_plan`), `breached_at` (when it first used more than its
 running plan, which more cores may have raised under `"always"`: a real breach), `breaches` (attempts
-that did), `max_cores` (the most cores it was given), `rigid` and `cold`.
+that did), `max_cores` (the most cores the last started attempt was given), `rigid` (at its start)
+and `cold`; `end_rule` (the setting when it ended: a row whose `start_rule` differs straddled a
+change), and `peak_swap` and `tail_used` (its swap at its peak, and its memory and swap together
+from thirty seconds after it: what "past the peak" would have had to keep, #56).
 
 The profile comes from a trace kept while the build runs: the most memory in each ten seconds,
 with neighbours merged (and the step doubled) whenever it passes 720 points, so a long run's trace
@@ -682,7 +685,9 @@ sampled is recorded as needing little. The line holds its key, peak memory and t
 that peak, peak and average cores, the time-weighted cores it was given, wall time, exit status,
 whether it was cold or killed for memory, and, for a sampled run, when it peaked (`peak_at`, seconds
 into its last attempt, time paused not counted) and the most it used from thirty seconds after that
-peak to its end (`tail`), which "Past the peak" reads. Each key keeps its last 100 runs and, for 400 days,
+peak to its end (`tail`), which "Past the peak" reads, with its swap at the peak (`peak_swap`) and
+its memory and swap together after it (`tail_used`): `tail` leaves out what `MemoryHigh` reclaim
+pushed to swap, so these tell whether a throttled run's shape can be trusted (#56). Each key keeps its last 100 runs and, for 400 days,
 each day's biggest run, so a full rebuild isn't forgotten behind a stream of small ones.
 
 The key is `repository|lane|words`. The repository is the name of the git repository holding the

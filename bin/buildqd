@@ -2282,6 +2282,9 @@ BUILD_COLUMNS = [
     # its core count (rigid: its plan isn't scaled).
     ("breached_at", "REAL"), ("breaches", "INTEGER"), ("start_rule", "TEXT"), ("max_cores", "INTEGER"),
     ("rigid", "INTEGER"),
+    # The setting when it ended (a row whose start_rule differs straddled a change: leave it out of a
+    # comparison, #63), and its swap at its peak and its memory and swap together after it (#56).
+    ("end_rule", "TEXT"), ("peak_swap", "INTEGER"), ("tail_used", "INTEGER"),
 ]
 CI_UNITS = ("actions.runner.*", "gha-*", "*-runner-*", "gitlab-runner*")  # CI runner services, by unit name
 
@@ -2897,7 +2900,7 @@ class Ticket:
     PERSIST = ("id", "name", "argv", "cwd", "lane", "key", "label", "notify", "submitted", "priority", "timeout",
                "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
                "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
-               "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
+               "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
                "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
                "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
@@ -2941,6 +2944,11 @@ class Ticket:
         self.start_rule = None  # scale_mem_with_cores when this attempt started
         self.start_base = 0  # and the peak and cores its plan was made of then (a waiting build is estimated again)
         self.start_base_cores = 0
+        self.start_rigid = False  # ... and whether it ignored its core count then
+        self.started_max_cores = 0  # the most cores the last started attempt was given (requeue zeroes max_granted)
+        self.peak_swap = 0  # swap at its memory peak (not kept across attempts)
+        self.tail_used = 0  # the most memory and swap together from half a minute after its peak
+        self.behind = 0  # (not kept) builds in line whose room binds this one, while it is held behind them
         self.seq = next(_seq)
         self.dir = directory
         self.cores_given = None
@@ -3157,10 +3165,12 @@ class Ticket:
         if need > self.mem_peak:
             self.mem_peak = need
             self.peak_mem_cores = self.granted
-            self.peak_at, self.tail = elapsed, 0
+            self.peak_at, self.tail, self.tail_used = elapsed, 0, 0
+            self.peak_swap = self.swap_now
             self.peak_cpu = max(0, usage - (self.cpu_usec_base or 0)) / 1e6
         elif elapsed - self.peak_at >= 30 and not self.frozen:
             self.tail = max(self.tail, need)
+            self.tail_used = max(self.tail_used, need + self.swap_now)  # (what it held, swap included: #56)
         if not self.frozen:
             self.note_trace(elapsed, need)
         if self.release_at is not None and (not self.release_revoked or self.release_breach):
@@ -3240,6 +3250,7 @@ class Ticket:
             "released": bool(self.released and not self.release_revoked),
             "growth": int(self.growth_now) if self.state in ("starting", "running") else 0,
             "held_for": self.held_for if self.state == "queued" else None,
+            "behind": self.behind if self.state == "queued" else 0,
         }
 
 
@@ -4209,6 +4220,7 @@ class Daemon:
         t.force_sent = t.freeze_failed = t.thaw_failed = False
         t.state, t.started, t.running_since, t.result_seen, t.stop_sent = "queued", None, None, None, None
         t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = None
+        t.started_max_cores = t.max_granted  # (the row describes the last attempt that started)
         t.granted = t.max_granted = t.tokens_out = 0
         t.measured = t.elastic = t.frozen = t.requeue_pending = False
         t.frozen_at = None
@@ -4218,6 +4230,7 @@ class Daemon:
         t.peak_at, t.tail, t.trace, t.trace_merges, t.released = 0.0, 0, [], 1, False
         t.release_at, t.release_hold, t.after_release_peak, t.release_revoked = None, 0, 0, False
         t.settled_since, t.swap_now, t.observed_gap, t.release_end, t.peak_cpu = None, 0, False, None, 0.0
+        t.peak_swap = t.tail_used = 0
         t.release_est = t.release_oom_base = t.kills_seen = 0
         t.release_breach = t.kills_own_cap = t.release_open_at_gap = False
         t.mem_wait_some = t.mem_wait_full = 0.0
@@ -4661,6 +4674,7 @@ class Daemon:
         count = len(running)
         per_lane = collections.Counter(t.lane for t in running)
         held_mem = held_cpu = 0.0
+        held_n_mem = held_n_cpu = 0  # how many builds in line those are (#62)
         held_agents = 0.0  # of held_mem, the room held for builds that aren't CI jobs' (#38)
         # Room held for CI jobs' builds by ci_first, as (priority, memory, cores): it binds only
         # builds of the same priority or lower, so a higher lane can still start in room that is free.
@@ -4679,7 +4693,7 @@ class Daemon:
         if self.paused is not None:
             why = self.paused.get("reason") or "no reason given"
             for t in self.queue(now):
-                t.held, t.short_by, t.held_for = False, 0.0, None
+                t.held, t.short_by, t.held_for, t.behind = False, 0.0, None, 0
                 t.reason_cat, t.reason = "paused", f"the queue is paused ({why}); `buildq resume` starts it again"
             self.budget.update(held_mem=0, held_cores=0)
             return
@@ -4693,6 +4707,7 @@ class Daemon:
             t.held = False
             t.short_by = 0.0
             t.held_for = None
+            t.behind = 0
             reason, holds = None, True
             if not os.path.isdir(t.cwd):
                 self.finalize(t, now, None, error=f"its working directory {t.cwd} is gone")
@@ -4790,12 +4805,18 @@ class Daemon:
                     busy_workspaces[(lane.workspace_group, t.workspace)] = t
                 continue
             t.reason_cat, t.reason = reason
+            if t.held_for == "memory":  # (the builds in line whose room binds it, for buildq top)
+                t.behind = held_n_mem + sum(1 for w, _, _ in ci_holds if w >= weight)
+            elif t.held_for == "cores":
+                t.behind = held_n_cpu + sum(1 for w, _, c in ci_holds if w >= weight and c > 0)
             if holds and not passes and self.starving(t, now):
                 t.held = True
                 cores = t.need if lane.waits_for_cpu else 0  # it would start without that room
                 if self.waited_out(t, now):
                     held_mem += t.est_mem
                     held_cpu += cores
+                    held_n_mem += 1
+                    held_n_cpu += 1 if cores else 0
                     if not t.from_ci:
                         held_agents += t.est_mem
                 else:  # a CI job's build, first by ci_first: a higher lane may still use the room
@@ -4853,7 +4874,7 @@ class Daemon:
         t.growth_now = t.est_mem  # (all of its plan, until the queue next works out what it uses)
         t.start_plan, t.start_cores, t.outgrown_at, t.breached_at = t.est_mem, granted, None, None
         t.start_rule = self.cfg.scale_mem_with_cores
-        t.start_base, t.start_base_cores = t.mem_base, t.mem_cores
+        t.start_base, t.start_base_cores, t.start_rigid = t.mem_base, t.mem_cores, t.rigid
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
         t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
         env_path = os.path.join(t.dir, "env.json")
@@ -5164,6 +5185,7 @@ class Daemon:
         if t.breached_at is None and t.started:  # (past the plan it holds now: a breach under any setting)
             t.breached_at = self.attempt_seconds(t, now)
             t.breaches += 1
+            self.save(t)  # (a restart before the next save would lose when; #63)
         lane = self.lane(t.lane)
         cap = lane.mem_cap if self.runner_of(t).name == "systemd" else None
         raised = cap if cap and cap > t.mem_now else int(t.mem_now * 1.5)
@@ -5322,6 +5344,8 @@ class Daemon:
                     "requeues": t.requeues,
                     "peak_at": round(t.peak_at, 1) if t.measured and not t.observed_gap else None,
                     "tail": t.tail if t.measured and not t.observed_gap else None,
+                    "peak_swap": t.peak_swap if t.measured and not t.observed_gap else None,
+                    "tail_used": t.tail_used if t.measured and not t.observed_gap else None,
                     "peak_cpu": round(t.peak_cpu, 1) if t.measured and not t.observed_gap else None,
                 })
             except OSError as e:
@@ -5397,7 +5421,9 @@ class Daemon:
             "start_plan": t.start_plan or None, "start_cores": t.start_cores or None, "outgrown_at": t.outgrown_at,
             "plan_base": t.start_base or None, "plan_cores": t.start_base_cores or None, "cold": int(bool(t.cold)),
             "breached_at": t.breached_at, "breaches": t.breaches, "start_rule": t.start_rule,
-            "max_cores": t.max_granted or None, "rigid": int(bool(t.rigid)),
+            "end_rule": self.cfg.scale_mem_with_cores if t.start_rule else None,
+            "max_cores": t.max_granted or t.started_max_cores or None, "rigid": int(bool(t.start_rigid)),
+            "peak_swap": t.peak_swap if whole else None, "tail_used": t.tail_used if whole else None,
             "waited_by": json.dumps(t.waited_by, separators=(",", ":"), sort_keys=True),
             "est_mem": t.est_mem, "est_src": t.est_src, "mem_peak": max(t.mem_peak, t.attempts_peak),
             "peak_at": round(t.peak_at, 1) if whole else None, "tail": t.tail if whole else None,

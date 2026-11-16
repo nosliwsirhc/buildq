@@ -2616,8 +2616,9 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
             parts.append((f" {TOP['flag']} in line", "warn"))
         if row.get("waiting_for") == "memory" and need > max(room, 0):
             parts.append((f" {fmt_size(need - max(room, 0))} short", "dim"))  # (what the free room lacks)
-        elif row.get("waiting_for") == "held" and ahead:
-            parts.append((f" behind {ahead} in line", "dim"))
+        elif row.get("waiting_for") == "held" and (row["behind"] if "behind" in row else ahead):
+            # (the daemon says how many in line bind it, #62; an older one doesn't: every one ahead)
+            parts.append((f" behind {row['behind'] if 'behind' in row else ahead} in line", "dim"))
         reason = clean(row.get("reason") or "")
         said = f"needs {fmt_size(need)} of memory; "  # (the column says that much already)
         reason = reason[len(said):] if reason.startswith(said) else reason
