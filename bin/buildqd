@@ -2986,6 +2986,7 @@ class Ticket:
         self.short_agents = 0.0  # (not kept) of that, the room held for agents' builds (not CI jobs')
         self.short_by = 0.0  # (not kept) the memory it lacked when the queue was last looked at
         self.growth_now = 0  # (not kept) what is held for it to grow into, as the queue last worked it out
+        self.held_for = None  # (not kept) "memory" or "cores": what a build in line waits to be free of others' holds
         self.requeue_pending = False  # being stopped, to be queued again
         self.shed_error = None  # why it can't be queued again once stopped
         self.restartable = False  # its caller says it can start over from the beginning safely
@@ -3195,7 +3196,7 @@ class Ticket:
             "peak_at": round(self.peak_at, 1), "release_at": self.release_at, "release_hold": self.release_hold,
             "released": bool(self.released and not self.release_revoked),
             "growth": int(self.growth_now) if self.state in ("starting", "running") else 0,
-            "short_by": int(max(0.0, self.short_by)) if self.state == "queued" else 0,
+            "held_for": self.held_for if self.state == "queued" else None,
         }
 
 
@@ -4629,7 +4630,7 @@ class Daemon:
         if self.paused is not None:
             why = self.paused.get("reason") or "no reason given"
             for t in self.queue(now):
-                t.held = False
+                t.held, t.short_by, t.held_for = False, 0.0, None
                 t.reason_cat, t.reason = "paused", f"the queue is paused ({why}); `buildq resume` starts it again"
             self.budget.update(held_mem=0, held_cores=0)
             return
@@ -4642,6 +4643,7 @@ class Daemon:
             hc = 0.0 if passes else held_cpu + sum(cores for w, _, cores in ci_holds if w >= weight)
             t.held = False
             t.short_by = 0.0
+            t.held_for = None
             reason, holds = None, True
             if not os.path.isdir(t.cwd):
                 self.finalize(t, now, None, error=f"its working directory {t.cwd} is gone")
@@ -4691,6 +4693,7 @@ class Daemon:
                 t.short_hm = hm
                 t.short_agents = 0.0 if passes else held_agents
                 if t.est_mem <= free_mem:
+                    t.held_for = "memory"
                     reason = ("held", "the room it needs is held for a build that has waited longer"
                               if passes or t.est_mem > free_mem - held_mem else
                               "the room it needs is held for a CI job's build, which goes first")
@@ -4711,9 +4714,10 @@ class Daemon:
                                           f"{cfg.cpu_psi_block:g}% while one runs)")
             elif count > 0 and lane.waits_for_cpu and t.need > free_cpu + shrinkable - hc:
                 if t.need <= free_cpu + shrinkable:
-                    reason = ("held", "the room it needs is held for a build that has waited longer"
+                    t.held_for = "cores"
+                    reason = ("held", "the cores it needs are held for a build that has waited longer"
                               if passes or t.need > free_cpu + shrinkable - held_cpu else
-                              "the room it needs is held for a CI job's build, which goes first")
+                              "the cores it needs are held for a CI job's build, which goes first")
                 else:
                     reason = ("cpu", f"needs {t.need} core{'s' if t.need != 1 else ''}; "
                                      f"{max(free_cpu + shrinkable, 0):.1f} of {cpu_cap:.1f} are free "
@@ -4797,6 +4801,7 @@ class Daemon:
         t.reason = t.reason_cat = ""
         t.yields_to = t.yield_until = None  # running again: a later stop for memory isn't one for that CI job's build
         t.granted = t.max_granted = granted
+        t.growth_now = t.est_mem  # (all of its plan, until the queue next works out what it uses)
         t.workspace_group = lane.workspace_group if lane.exclusive else ""
         t.group_lane = lane.name  # (the lane it really starts under: a reload may have removed t.lane)
         env_path = os.path.join(t.dir, "env.json")

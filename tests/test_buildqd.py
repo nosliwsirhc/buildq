@@ -197,8 +197,21 @@ class Admission(DaemonCase):
         rows = {r["id"]: r for r in ov["running"] + ov["queued"]}
         self.assertEqual((rows[a.id]["growth"], rows[b.id]["growth"]), (15 * GIB, 20 * GIB))
         self.assertFalse(rows[a.id]["released"])
-        self.assertEqual(rows[c.id]["short_by"], c.est_mem - (50 * GIB - 35 * GIB - 10 * GIB))
-        self.assertEqual(rows[a.id]["short_by"], 0)
+        self.assertIsNone(rows[c.id]["held_for"])  # it waits for memory itself, not behind a build in line
+        d = self.submit()
+        self.assertEqual(d.row(self.now)["growth"], 0)  # (queued)
+        self.machine.mem_available = 200 * GIB
+        self.daemon.schedule(self.now + 2)
+        self.assertEqual(d.state, "running")
+        self.assertEqual(d.row(self.now)["growth"], d.est_mem)  # all of its plan from the start, not a tick later
+        self.machine.mem_available = 60 * GIB  # less than running builds may grow into, more than "never fits"
+        e = self.submit()
+        self.daemon.schedule(self.now + 3)
+        self.assertEqual((e.state, e.reason_cat), ("queued", "memory"))
+        self.assertGreater(e.short_by, 0)
+        self.daemon.pause("maintenance", self.now + 4)
+        self.daemon.schedule(self.now + 4)
+        self.assertEqual((e.reason_cat, e.short_by, e.held_for), ("paused", 0.0, None))  # nothing stale while paused
 
     def test_memory_decides_how_many_start(self):
         self.machine.mem_available = 50 * GIB  # 40G above the 10G floor: two 20G builds
@@ -2682,6 +2695,7 @@ class CIFirst(DaemonCase):
         self.assertTrue(ci.held)
         self.assertEqual((higher.state, higher.reason),
                          ("queued", "the room it needs is held for a build that has waited longer"))
+        self.assertEqual(higher.row(self.now)["held_for"], "memory")
 
     def test_a_higher_lane_still_goes_first_when_both_have_waited(self):
         self.daemon.cfg.ci_first = True
@@ -4672,7 +4686,7 @@ class Top(unittest.TestCase):
         self.assertLess(text.index("dddddddd"), text.index("cccccccc"))  # oldest first, newest at the bottom
         lines, _ = self.draw(snap, width=120, height=30, show_help=True)
         text = "\n".join(t for t, _ in lines)
-        for expected in ("HELP", "t", "the timeline, and back", "held for it to grow into"):
+        for expected in ("HELP", "the timeline", "held for it to grow into", "behind N", "a long wait, or a CI job's build"):
             self.assertIn(expected, text)
 
     def test_the_layout_follows_the_width(self):
@@ -4702,32 +4716,51 @@ class Top(unittest.TestCase):
                         tops = [i for i, (t, _) in enumerate(lines) if t.startswith("╭")]
                         self.assertEqual(len(borders), len(tops), where)  # no box drawn over another
 
-    def test_every_wait_says_why_and_what_it_lacks(self):
-        snap = self.snap()
-        snap["overview"]["budget"].update(free_mem=-6 * GIB, held_mem=40 * GIB)
+    def queue_in_a_jam(self, snap, free=-6 * GIB):
+        snap["overview"]["budget"].update(free_mem=free, held_mem=223 * GIB)  # (summed over all in line: not shown)
         snap["overview"]["queued"] = [
-            {"short": "cccccccc", "lane": "heavy", "waited": 400, "est_mem": 20 * GIB, "held": True, "waiting_for": "held",
-             "short_by": 26 * GIB, "reason": "the room it needs is held for a build that has waited longer"},
-            {"short": "dddddddd", "lane": "heavy", "waited": 300, "est_mem": 2 * GIB, "held": False, "waiting_for": "cpu",
-             "short_by": 0, "reason": "needs 8 cores; 2.0 of 28.8 are free (20.0 busy, 0.0 expected from builds just started)"},
-            {"short": "eeeeeeee", "lane": "heavy", "waited": 200, "est_mem": 300 * GIB, "held": False, "waiting_for": "too-big",
-             "short_by": 0, "reason": "needs 300G of memory, more than this machine has; cancel it or give its lane a smaller MemoryMax"},
-            {"short": "ffffffff", "lane": "web", "waited": 100, "est_mem": 4 * GIB, "held": False, "waiting_for": "memory",
-             "short_by": 10 * GIB, "reason": "needs 4.0G of memory; 0M is free after the 16G floor"}]
+            {"short": "cccccccc", "lane": "heavy", "waited": 400, "est_mem": 20 * GIB, "held": True, "waiting_for": "memory",
+             "reason": "needs 20G of memory; 0M is free after the 16G floor and what running builds may still grow into"},
+            {"short": "dddddddd", "lane": "heavy", "waited": 390, "est_mem": 2 * GIB, "held": True, "waiting_for": "held",
+             "held_for": "memory", "reason": "the room it needs is held for a build that has waited longer"},
+            {"short": "eeeeeeee", "lane": "heavy", "waited": 300, "est_mem": 2 * GIB, "held": False, "waiting_for": "cpu",
+             "reason": "needs 8 cores; 2.0 of 28.8 are free (20.0 busy, 0.0 expected from builds just started)"},
+            {"short": "ffffffff", "lane": "heavy", "waited": 200, "est_mem": 300 * GIB, "held": False, "waiting_for": "too-big",
+             "reason": "needs 300G of memory, more than this machine has; cancel it or give its lane a smaller MemoryMax"},
+            {"short": "gggggggg", "lane": "web", "waited": 100, "est_mem": GIB, "held": False, "waiting_for": "held",
+             "held_for": "memory", "reason": "the room it needs is held for a build that has waited longer"}]
+        return snap
+
+    def test_every_wait_says_why_and_what_it_lacks(self):
+        snap = self.queue_in_a_jam(self.snap())
         lines, _ = self.draw(snap, width=260)
-        rows = {m: next(t for t, _ in lines if m in t and "needs" in t) for m in ("cccccccc", "dddddddd", "eeeeeeee", "ffffffff")}
+        rows = {m: next(t for t, _ in lines if m in t and "needs" in t) for m in ("cccccccc", "dddddddd", "eeeeeeee", "ffffffff", "gggggggg")}
         self.assertIn("⚑ in line", rows["cccccccc"])
-        self.assertIn("26G short", rows["cccccccc"])  # the daemon's figure, the room kept for others counted
-        self.assertIn("needs 8 cores; 2.0 of 28.8 are free", rows["dddddddd"])  # not hidden for starting "needs"
-        self.assertNotIn("short", rows["dddddddd"])
-        self.assertIn("cancel it or give its lane a smaller MemoryMax", rows["eeeeeeee"])
-        self.assertIn("0M is free after the 16G floor", rows["ffffffff"])
-        self.assertNotIn("needs 4.0G of memory;", rows["ffffffff"])  # (said in its column)
+        self.assertIn("26G short", rows["cccccccc"])  # what the free room lacks: 20G, and it is 6G over
+        self.assertIn("0M is free after the 16G floor", rows["cccccccc"])
+        self.assertNotIn("needs 20G of memory;", rows["cccccccc"])  # (said in its column)
+        self.assertIn("behind 1 in line", rows["dddddddd"])  # its room is free, kept for the one ahead
+        self.assertIn("behind 2 in line", rows["gggggggg"])
+        self.assertIn("needs 8 cores; 2.0 of 28.8 are free", rows["eeeeeeee"])  # not hidden for starting "needs"
+        self.assertNotIn("short", rows["eeeeeeee"])
+        self.assertIn("cancel it or give its lane a smaller MemoryMax", rows["ffffffff"])
         text = "\n".join(t for t, _ in lines)
         self.assertIn("over by 6.0G", text)  # more held than free: not "room 0M"
-        self.assertIn("2 for memory, the closest 10G short", text)
-        self.assertIn("40G kept for the longest waits", text)
-        self.assertNotIn("next", text.split("1 waiting")[-1] if "1 waiting" in text else text.split("4 waiting")[1])
+        self.assertIn("1 for memory, the closest 26G short", text)
+        self.assertIn("2 in line, with room kept for them", text)
+        self.assertNotIn("223G", text)  # room kept, summed over everyone in line, would read as more than the machine
+        self.assertNotIn("next", text)
+
+    def test_a_jam_on_a_normal_terminal_still_lists_waiting_builds(self):
+        snap = self.queue_in_a_jam(self.snap())
+        snap["overview"]["queued"] *= 5  # 25 waiting
+        snap["overview"]["running"] = [dict(snap["overview"]["running"][1], id=f"{i:036d}", short=f"{i:08d}")
+                                       for i in range(8)]
+        for width, height in ((80, 24), (100, 30), (150, 24), (80, 18), (80, 12)):
+            lines, _ = self.draw(snap, width=width, height=height)
+            text = "\n".join(t for t, _ in lines)
+            self.assertIn("cccccccc", text, (width, height))  # a waiting build, not just a count
+            self.assertIn("more waiting", text, (width, height))  # (the count, in the box's border)
 
     def test_each_build_is_drawn_holding_what_the_daemon_holds_for_it(self):
         snap = self.snap()

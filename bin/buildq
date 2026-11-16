@@ -2428,13 +2428,14 @@ def memory_panel(snap: dict, running: list, queued: list, w: int, holds: dict):
               (f"{TOP['other']} other work  ", "other"), (f"{TOP['floor']} floor  ", "dim"), (f"{TOP['room']} room", "room")]]
     if queued:
         line = [(f"{len(queued)} waiting", "warn")]
-        for_mem = [r for r in queued if r.get("waiting_for") in ("memory", "held")]
+        for_mem = [r for r in queued if r.get("waiting_for") == "memory"]
         if for_mem:
-            shorts = [r["short_by"] for r in for_mem if r.get("short_by")]
+            closest = min((r.get("est_mem") or 0) - room for r in for_mem)
             line.append((f" {sep} {len(for_mem)} for memory"
-                         + (f", the closest {fmt_size(min(shorts))} short" if shorts else ""), "dim"))
-        if budget.get("held_mem"):
-            line.append((f" {sep} {fmt_size(budget['held_mem'])} kept for the longest waits", "dim"))
+                         + (f", the closest {fmt_size(closest)} short" if closest > 0 else ""), "dim"))
+        in_line = sum(1 for r in queued if r.get("held"))
+        if in_line:
+            line.append((f" {sep} {in_line} in line, with room kept for them", "dim"))
         lines.append(line)
     pm = m.get("psi_memory", {})
     swap = (f"swap {fmt_size(m['swap_used'])} of {fmt_size(m['swap_total'])} {sep} " if m.get("swap_total") else "")
@@ -2545,6 +2546,8 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
         used = s.get("cores")
         filled = 0 if used is None else round(min(1.0, used / max(given, 1)) * 6)
         mem_now, growth = holds.get(row["id"], (s.get("mem", row.get("mem_now") or 0) or 0, 0))
+        if not row.get("released"):  # (nothing let go: the rest of its plan is held, whatever the samples' timing)
+            growth = max(growth, (row.get("est_mem") or 0) - mem_now)
         peak, plan = max(row.get("mem_peak") or 0, mem_now), row.get("est_mem") or 0
         cells_now = round(min(1.0, mem_now / plan) * 8) if plan else 0  # its plan: ▓ used, ▒ held, · let go
         cells_held = max(0, round(min(1.0, (mem_now + growth) / plan) * 8) - cells_now) if plan else 0
@@ -2577,15 +2580,18 @@ def draw_running(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running:
 
 
 def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: list) -> None:
+    """The waiting builds, in the order they get a turn. Each says what it needs and why it waits:
+    what the free room lacks, or how many builds in line are ahead of it."""
     sep = GLYPHS["sep"]
     budget = ((snap.get("overview") or {}).get("budget") or {})
     room = budget.get("free_mem") or 0
     reasons = {row.get("waiting_for") or "" for row in queued}
+    in_line = sum(1 for row in queued if row.get("held"))
     title = [(f"{len(queued)} waiting", "warn" if queued else "title")]
     if len(reasons) == 1 and queued and next(iter(reasons)):
         title.append((f" {sep} all for {next(iter(reasons))}", "dim"))
-    if budget.get("held_mem"):
-        title.append((f" {sep} {fmt_size(budget['held_mem'])} kept for the longest waits", "dim"))
+    if in_line:
+        title.append((f" {sep} {in_line} in line", "dim"))
     c.box(y, x, h, w, title)
     iy, ix, ih, iw = y + 1, x + 1, h - 2, w - 2
     if ih < 1:
@@ -2594,30 +2600,32 @@ def draw_waiting(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, queued: 
         c.put(iy, ix, "nothing waiting", "dim", iw)
         return
     longest = max((row.get("waited") or 0) for row in queued) or 1
-    shown = queued if len(queued) <= ih else queued[:max(0, ih - 1)]
-    lane_w = min(12, max(text_width(clean(row["lane"])) for row in shown)) if shown else 7
-    for n, row in enumerate(shown):
+    shown = queued[:ih]
+    lane_w = min(12, max(text_width(clean(row["lane"])) for row in shown))
+    ahead = 0  # builds in line before this one
+    for n, row in enumerate(queued):
+        if n >= len(shown):
+            break
         waited, need = row.get("waited") or 0, row.get("est_mem") or 0
         cells = max(1, round(waited / longest * 10))
         parts = [(TOP["wait"] * cells + " " * (10 - cells), "warn" if row.get("held") else "dim"),
                  (" " + fmt_age(waited).rjust(6), ""), (" " + row["short"], "title"),
                  (" " + fit(row["lane"], lane_w).ljust(lane_w), "dim"), (f" needs {fmt_size(need):>6}", "")]
-        if row.get("held"):  # it has waited long: room is kept for it, and builds behind it wait
+        if row.get("held"):  # room is kept for it: builds behind it wait
             parts.append((f" {TOP['flag']} in line", "warn"))
-        # What it lacks: the daemon's figure, counting the room kept for longer waits (an older
-        # daemon doesn't say: then what the room lacks)
-        short = row["short_by"] if "short_by" in row else (
-            need - room if row.get("waiting_for") in ("memory", "held") else 0)
-        if short > 0:
-            parts.append((f" {fmt_size(short)} short", "dim"))
+        if row.get("waiting_for") == "memory" and need > room:
+            parts.append((f" {fmt_size(need - room)} short", "dim"))  # (what the free room lacks)
+        elif row.get("waiting_for") == "held" and ahead:
+            parts.append((f" behind {ahead} in line", "dim"))
         reason = clean(row.get("reason") or "")
         said = f"needs {fmt_size(need)} of memory; "  # (the column says that much already)
         reason = reason[len(said):] if reason.startswith(said) else reason
         if reason:
             parts.append(("  " + reason, "dim"))
         c.spans(iy + n, ix, parts, iw)
-    if len(shown) < len(queued):
-        c.put(iy + len(shown), ix, f"{GLYPHS['more']} {len(queued) - len(shown)} more waiting", "dim", iw)
+        ahead += 1 if row.get("held") else 0
+    if len(shown) < len(queued):  # (in the border: every line inside shows a build)
+        c.put(y + h - 1, x + 2, f" {GLYPHS['more']} {len(queued) - len(shown)} more waiting ", "dim", max(0, w - 4))
 
 
 def draw_lanes(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, running: list, queued: list) -> None:
@@ -2689,24 +2697,24 @@ def draw_timeline(c: Canvas, y: int, x: int, h: int, w: int, snap: dict, hist: T
             if ch != " ":
                 c.put(ry, ix + label + 1 + i, ch, st)
     legend = [(f"{TOP['dot']} waiting  ", "dim"), (f"{TOP['big']} running  ", "mem"), (f"{TOP['big']} done  ", "ok"),
-              (f"{TOP['big']} failed  ", "bad"), (f"(darker {TOP['big']} {TOP['mid']} {TOP['small']}: more memory)", "dim")]
+              (f"{TOP['big']} failed or lost  ", "bad"), (f"(darker {TOP['big']} {TOP['mid']} {TOP['small']}: more memory)", "dim")]
     if more:
         legend.insert(0, (f"{GLYPHS['more']} {more} not shown  ", "dim"))
     c.spans(iy + ih - 1, ix, legend, iw)
 
 
 def draw_help(c: Canvas) -> None:
-    lines = [("q", "quit"), ("up/down, j/k", "select a running build"), ("enter, d", "its detail"),
-             ("l", "the end of its output"), ("s", "sort: age, cpu, mem, io, disk"), ("t", "the timeline, and back"),
-             ("?", "this help (any key closes it)"), ("", ""),
-             (TOP["used"], "memory a build uses"), (TOP["held"], "held for it to grow into (its plan, from past runs)"),
+    lines = [("q  ?  t", "quit · this help (any key closes it) · the timeline"),
+             ("up/down j/k", "select a running build; enter or d: its detail"),
+             ("l  s", "the end of its output · sort: age, cpu, mem, io, disk"), ("", ""),
+             (TOP["used"] + " " + TOP["held"], "memory a build uses · held for it to grow into"),
              (TOP["dot"], "in a build's row: its plan, let go after its peak"),
-             (TOP["other"], "memory other work uses"), (TOP["floor"], "the floor: kept free for everything else"),
-             (TOP["room"], "room: what a new build can start in"),
+             (TOP["other"] + " " + TOP["floor"] + " " + TOP["room"], "other work · the floor · room for a new build"),
              (TOP["core"] + TOP["nocore"], "cores in use / given"),
-             (TOP["flag"], "waited long: in line, with room kept for it"),
-             ("short", "what it lacks, counting room kept for longer waits")]
-    w = min(c.width - 4, 70)
+             (TOP["flag"] + " in line", "room is kept for it (a long wait, or a CI job's build)"),
+             ("short", "what the free room lacks for it"),
+             ("behind N", "its room is free but kept for N in line ahead")]
+    w = min(c.width - 4, 78)
     h = min(c.height - 2, len(lines) + 2)
     y, x = max(0, (c.height - h) // 2), max(0, (c.width - w) // 2)
     for row in range(y, y + h):

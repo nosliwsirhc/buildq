@@ -58,8 +58,8 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   running build's use (`▓`) and what is held for it to grow into (`▒`), everything else (`█`), the
   floor (`░`) and the room a new build can start in (`■`). When more is held than is free, it says
   "over by" instead of the room. Below it:
-  - how many builds wait, how many of them for memory and how far short the closest is, and the
-    room kept for the builds that have waited longest (see Waiting);
+  - how many builds wait, how many of them for memory and how far short of the free room the closest
+    is, and how many are in line (see Waiting);
   - swap and memory pressure;
   - who uses the machine: buildq's builds, CI runners, containers and your apps, each with its
     cores, memory and swap, and I/O pressure;
@@ -79,13 +79,16 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   `Cargo.lock`) and its `TMPDIR`, only those inside your home. They're measured with `ionice -c3
   du -sx` in the background, each at most every five minutes. "≥" means only in part, "…" not
   yet, "?" it couldn't be, and "*" a folder another running build shares.
-- **Waiting:** each waiting build with a bar of how long it has waited against the longest wait,
-  what it needs, how much memory it lacks, and why it waits, in the daemon's words. `⚑ in line`
-  marks a build that has waited long: room is kept for it, so builds behind it wait, and what it
-  lacks counts the room kept for builds ahead of it. The panel's title says how much is kept in all.
+- **Waiting:** the waiting builds in the order they get a turn, each with a bar of how long it has
+  waited against the longest wait, what it needs, and why it waits, in the daemon's words. A build
+  waiting for memory says how much the free room lacks ("short"). `⚑ in line` marks a build that
+  room is kept for, because it has waited long or is a CI job's build: builds behind it don't take
+  that room, and one whose own room is free says how many in line are ahead of it ("behind N in
+  line"). When more builds wait than fit, the box's bottom border says how many more.
 - **LANES** (on a wide terminal): what each lane has running and waiting.
 - **The timeline** (`t`): the last half hour, a row per build, newest at the bottom: `·` while it
-  waited, a bar while it ran (darker for more memory; green if it succeeded, red if it failed),
+  waited, a bar while it ran (darker for more memory; green if it succeeded, red if it failed or was
+  lost, dim if it was cancelled),
   under a graph of the machine's memory. The running and waiting builds always have a row; when
   there are more than fit, the oldest finished ones go first.
 - **Keys:**
