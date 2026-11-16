@@ -2311,13 +2311,6 @@ class TopHistory:
         if points and self.samples:
             points.append((self.samples[0][0], self.samples[0][field]))
         start = self.samples[0][0] if self.samples else now + width
-        own: dict = {}  # an analytics minute in its own step, however far its neighbours are
-        for t, v in points[:len(self.minutes)]:
-            i = int(t // width) - first
-            if 0 <= i < n and out[i] is None and t < start:
-                own.setdefault(i, []).append(v)
-        for i, vals in own.items():
-            out[i] = sum(vals) / len(vals)
         for i in range(n):
             mid = (first + i + 0.5) * width
             if out[i] is not None or mid >= start or not points:
@@ -2326,6 +2319,13 @@ class TopHistory:
                 if t0 <= mid <= t1 and t1 - t0 <= 180:  # (no line across a gap in the analytics)
                     out[i] = v0 + (v1 - v0) * (mid - t0) / (t1 - t0) if t1 > t0 else v0
                     break
+        own: dict = {}  # a lone analytics minute (no neighbour to draw a line to) in its own step
+        for t, v in points[:len(self.minutes)]:
+            i = int(t // width) - first
+            if 0 <= i < n and out[i] is None and t < start:
+                own.setdefault(i, []).append(v)
+        for i, vals in own.items():
+            out[i] = sum(vals) / len(vals)
         return out
 
 
@@ -3041,7 +3041,11 @@ def init_colours(curses, wanted: bool) -> dict:
         if limit < 9:  # not even the eight colours' pairs: plain text
             return plain
         palette = getattr(curses, "COLORS", 8)
-        if 256 <= palette < 0x1000000 and limit >= rich:  # (a direct-colour terminal's numbers are RGB)
+        try:
+            direct = getattr(curses, "tigetflag", lambda name: -1)("RGB") > 0
+        except curses.error:
+            direct = False
+        if 256 <= palette < 0x1000000 and not direct and limit >= rich:  # (direct colour: numbers are RGB)
             for style, (fg, strong) in TOP_COLOURS_256.items():
                 colours[style] = pair(fg) | (bold if strong else 0)
             colours["sel"] = pair(255, SELECTED_BG_256) | bold
@@ -3272,10 +3276,15 @@ def cmd_top(args) -> int:
 
     why = None
     try:
-        code, why = curses_with_fallback(run, curses.wrapper)
-        if sys.stdout.isatty():
-            sys.stdout.write("\x1b[?2026l")  # (synchronized output off, whatever ended the session)
-            sys.stdout.flush()
+        try:
+            code, why = curses_with_fallback(run, curses.wrapper)
+        finally:  # (synchronized output off, whatever ended the session: Ctrl-C and signals too)
+            try:
+                if sys.stdout.isatty():
+                    sys.stdout.write("\x1b[?2026l")
+                    sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
         if code is not None:
             return code
         sizes.stop()

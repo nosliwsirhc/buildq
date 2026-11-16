@@ -4814,7 +4814,7 @@ class Top(unittest.TestCase):
         self.assertEqual(steps[19:22], [16.0, 24.0, 32.0])  # each minute's average (not its busiest moment)
         self.assertEqual(steps[22:], [None] * 8)  # and no plateau carried on after the last
         half = hist.buckets(1, 60, now)  # half-minute steps: a line between the minutes, not flat steps
-        self.assertEqual((half[40], half[41]), (16.0, 22.0))  # a minute in its own step; a line between
+        self.assertEqual((half[40], half[41]), (18.0, 22.0))  # a straight line between the minutes
         lone = buildq.TopHistory()
         lone.minutes = [(now - 870, 12.0, 32, 64 * GIB, GIB, 0, 128 * GIB)]  # one minute, no neighbours
         self.assertIn(12.0, lone.buckets(1, 30, now))
@@ -5261,6 +5261,10 @@ class Top(unittest.TestCase):
         calls.clear()
         self.assertEqual(buildq.init_colours(direct, wanted=True)["dim"], 0)  # the eight colours' theme
         self.assertEqual(calls.count("pair"), 9)
+        capped = Curses()
+        capped.COLORS, capped.COLOR_PAIRS = 32767, 0x10000  # direct colour capped by an older ncurses
+        capped.tigetflag = lambda name: 1 if name == "RGB" else -1
+        self.assertEqual(buildq.init_colours(capped, wanted=True)["dim"], 0)
 
     def test_a_closed_terminal_ends_with_its_signal_s_code_not_a_traceback(self):
         import curses
