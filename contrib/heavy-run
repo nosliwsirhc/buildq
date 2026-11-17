@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# heavy-run: run a heavy job through buildq, this workstation's build queue.
+#
+#   ~/.agents/bin/heavy-run <command> [args...]           queue it, stream its output, exit with its code
+#   ~/.agents/bin/heavy-run --web <command> [args...]     the same, in the web lane (a FileDrop push that
+#                                                         changes nothing outside src/, public/ and docs)
+#   ~/.agents/bin/heavy-run --submit <command> [args...]  drop it off: prints a ticket and returns at once
+#   ~/.agents/bin/heavy-run --wait <ticket> [--timeout 9m]   block until it ends; exit with its code
+#   ~/.agents/bin/heavy-run --logs <ticket> [--tail 100] [--follow]
+#   ~/.agents/bin/heavy-run --status [<ticket>]           a ticket, or the whole queue and the machine
+#   ~/.agents/bin/heavy-run --list | --cancel <ticket>
+#   ~/.agents/bin/heavy-run --wsl <command> [args...]     run it on living-room-wsl instead (heavy-run-wsl)
+#
+# Before the command (or before --submit), these pass through to buildq:
+#   --again        run it even if the same command on the same source already ran (no joining)
+#   --reuse        take a pass of the same check on the same source from the last two hours
+#   --restartable  safe to stop and start over if memory runs short (cargo/dotnet/vitest checks
+#                  and builds are already known to be)
+#   --script "why" let a throwaway script through, saying why it can't be split (see below)
+#
+# Throwaway scripts are turned away (owner, 2026-11-16: "How do we stop things from being submitted
+# as a script?"; rule + refusal with a way out, switched on after buildq#67's verdict). A script
+# that isn't committed to its project (`bash ~/.cache/build-tmp/<task>/run.sh`, `bash -c "…"`)
+# hides its builds from buildq: about half of agents' heavy builds came that way, under 171 names
+# in three days, so one memory record covered unrelated jobs (50 different `run.sh` builds planned
+# at 23 GB), a compile-then-test script held its biggest step's memory throughout, and buildq
+# couldn't stop it to make room for CI. Agents send each step as its own command instead. A script
+# committed to its project goes through, as does anything inside a job already. Not a security
+# boundary: it keeps well-meaning agents in line, like heavy-run-guard.
+#
+# buildq (~/Code/buildq, https://github.com/nosliwsirhc/buildq; the daemon is buildq.service, config
+# ~/.config/buildq/config.toml, log `journalctl --user -u buildq`) starts a job when the machine has
+# room for it, measured machine-wide with CI runners and containers included, and runs it as a
+# systemd service capped at MemoryHigh 24G / MemoryMax 26G (cargo; 10G/12G web, 14G/16G .NET). It
+# sizes each job's cores to the job and the load, and resizes cargo and make builds while they run.
+# Front-end jobs go first (and start even when the CPU is full), .NET next, cargo last. The command
+# picks the lane unless --web names it. Agents get the details from the buildq skill.
+#
+# This replaced the fixed four Rust and three web slots on 2026-11-12, at the owner's request: CPUs
+# sat idle while jobs waited for slots held by low-CPU jobs, and the machine maxed out while jobs
+# kept starting. That script is heavy-run-slots beside this one; heavy-run falls back to it whenever
+# the buildq daemon can't be reached.
+set -uo pipefail
+
+here=$(dirname "$(readlink -f "$0")")
+# buildq's hints then name heavy-run's commands (heavy-run --submit, --wait, --status ...).
+export BUILDQ_AS='~/.agents/bin/heavy-run'
+buildq=${BUILDQ_BIN:-$HOME/.local/bin/buildq}
+lane=()
+opts=()  # buildq run options given before the command
+script_reason=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --web) lane=(--lane web) ;;
+    --again | --reuse | --restartable) opts+=("$1") ;;
+    --script)
+      if [[ $# -lt 2 || -z "${2//[[:space:]]/}" || $2 == -* ]]; then
+        echo "heavy-run: --script needs a reason, such as --script \"the emulator needs one shell\"" >&2
+        exit 2
+      fi
+      script_reason=$2
+      shift
+      ;;
+    *) break ;;
+  esac
+  shift
+done
+
+# The command a run or --submit hands buildq: past --submit and buildq's own options, `env` and its
+# settings, and wrappers such as nice or timeout. Prints, NUL-separated, the folder `env -C` moves it
+# to (empty if none), then its words.
+command_of() {
+  local -a a=("$@")
+  local run_dir=""
+  if [[ ${a[0]:-} == --submit ]]; then
+    a=("${a[@]:1}")
+    while [[ ${#a[@]} -gt 0 ]]; do
+      case "${a[0]}" in
+        --) a=("${a[@]:1}"); break ;;
+        --lane | --cores | --mem | --priority | --timeout | --name | --notify) a=("${a[@]:2}") ;;
+        -*) a=("${a[@]:1}") ;;
+        *) break ;;
+      esac
+    done
+  fi
+  while [[ ${#a[@]} -gt 0 ]]; do
+    case "${a[0]##*/}" in
+      env)
+        a=("${a[@]:1}")
+        while [[ ${#a[@]} -gt 0 ]]; do
+          case "${a[0]}" in
+            -C | --chdir | --chdir=* | -C?*)
+              local to
+              case "${a[0]}" in
+                -C | --chdir) to=${a[1]:-}; a=("${a[@]:2}") ;;
+                --chdir=*) to=${a[0]#--chdir=}; a=("${a[@]:1}") ;;
+                *) to=${a[0]#-C}; a=("${a[@]:1}") ;;
+              esac
+              # a nested `env -C` moves on from where the outer one went
+              if [[ $to == /* || -z $run_dir ]]; then run_dir=$to; else run_dir=$run_dir/$to; fi
+              ;;
+            -u | --unset) a=("${a[@]:2}") ;;
+            -* | *=*) a=("${a[@]:1}") ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      nice | ionice | nohup | time | timeout | stdbuf | chrt | taskset)
+        # Their options, the separated values some take (timeout -s TERM, stdbuf -o L, time -o log,
+        # nice -n 5, ionice -c 3, taskset -c 0-3), and a leading number or duration (timeout 9m).
+        a=("${a[@]:1}")
+        while [[ ${#a[@]} -gt 0 ]]; do
+          case "${a[0]}" in
+            -s | --signal | -k | --kill-after | -i | -o | -e | --input | --output | --error | -f | --format | \
+              -n | --adjustment | -c | --class | --classdata | --cpu-list)
+              a=("${a[@]:2}") ;;
+            -*) a=("${a[@]:1}") ;;
+            *)
+              [[ ${a[0]} =~ ^[0-9][0-9.,xa-fA-F-]*[smhd]?$ ]] || break
+              a=("${a[@]:1}")
+              ;;
+          esac
+        done
+        ;;
+      *) break ;;
+    esac
+  done
+  printf '%s\0' "$run_dir" "${a[@]}"
+}
+
+# Prints what makes the command a throwaway script (and returns 0), or nothing (returns 1).
+throwaway_script() {
+  local -a a=()
+  local w i script="" inline=0 run_dir
+  while IFS= read -r -d '' w; do a+=("$w"); done < <(command_of "$@")
+  run_dir=${a[0]:-}
+  a=("${a[@]:1}")
+  [[ ${#a[@]} -gt 0 ]] || return 1
+  case "${a[0]##*/}" in
+    bash | sh | zsh | dash | ksh)
+      i=1
+      while (( i < ${#a[@]} )); do
+        case "${a[i]}" in
+          -o | +o | -O | +O | --rcfile | --init-file) i=$((i + 2)); continue ;;
+          --) i=$((i + 1)); break ;;
+          --*) ;;
+          -*c* | +*c*) inline=1 ;;
+          -* | +*) ;;
+          *) break ;;
+        esac
+        i=$((i + 1))
+      done
+      if (( inline || i >= ${#a[@]} )); then
+        printf '`%s -c "…"`, a command written inline' "${a[0]##*/}"
+        return 0
+      fi
+      script=${a[i]}
+      ;;
+    *.sh) script=${a[0]} ;;
+    *) return 1 ;;
+  esac
+  # Where the shell will find it: from the folder `env -C` names, else on PATH for a bare name.
+  local file=$script dir
+  if [[ $file != /* && -n $run_dir ]]; then
+    file=$run_dir/$file
+  fi
+  if [[ ! -f $file && $script != */* ]]; then
+    local IFS=:
+    for dir in $PATH; do
+      if [[ -f ${dir:-.}/$script ]]; then
+        file=${dir:-.}/$script
+        break
+      fi
+    done
+  fi
+  # A script that doesn't exist fails on its own; one committed to its project (in HEAD, not just
+  # staged) is reviewed and keeps one name, so buildq learns its size.
+  [[ -f $file ]] || return 1
+  if [[ -n $(git -C "$(dirname -- "$file")" ls-tree --name-only HEAD -- "$(basename -- "$file")" 2>/dev/null) ]]; then
+    return 1
+  fi
+  script=$file
+  printf '`%s`, a script that isn'"'"'t committed to its project' "${script##*/}"
+  return 0
+}
+
+name=()  # with --script, the reason shows in buildq's lists and `buildq top`
+case "${1:-}" in
+  --status | --list | --wait | --logs | --cancel | --wsl | "") ;;
+  *)
+    if [[ -z "${HEAVY_RUN_SLOT:-}" ]]; then
+      if [[ -n "$script_reason" ]]; then
+        words=$(command_of "$@" | tr '\0' ' ')
+        words=${words#* }  # past the folder field
+        words=${words% }
+        name=(--name "script: ${script_reason:0:80} · ${words:0:100}")
+      elif what=$(throwaway_script "$@"); then
+        cat >&2 <<EOF
+heavy-run: refused: $what.
+buildq can't see the builds inside it, so it can't size them or pause them to make room for CI
+(owner, 2026-11-16). Send each build step as its own command instead, one after another, from the
+folder it runs in and with its settings in front:
+  cd <folder> && GRADLE_OPTS=… CARGO_TARGET_DIR=… ~/.agents/bin/heavy-run <build command>
+Don't run the script without heavy-run either: its Gradle and Docker steps would skip the queue.
+A script committed to the project goes through. If this one truly can't be split, say why:
+  ~/.agents/bin/heavy-run --script "<why>" <the same command>
+EOF
+        exit 2
+      fi
+    fi
+    ;;
+esac
+
+case "${1:-}" in
+  --wsl)
+    shift
+    exec "$here/heavy-run-wsl" "$@"
+    ;;
+  --status | --list | --wait | --logs | --cancel)
+    command=${1#--}
+    shift
+    if [[ -x "$buildq" ]]; then
+      exec "$buildq" "$command" "$@"
+    fi
+    [[ $command == status ]] && exec "$here/heavy-run-slots" --status
+    echo "heavy-run: buildq isn't installed at $buildq" >&2
+    exit 75
+    ;;
+  --submit)
+    shift
+    exec "$buildq" submit "${lane[@]}" "${opts[@]}" "${name[@]}" "$@"  # buildq's own options (--name, --timeout, ...) may come first
+    ;;
+  "")
+    echo "usage: heavy-run [--web] [--again|--reuse] [--restartable] [--script \"why\"] <command> [args...] | --submit <command> | --wait|--logs|--status|--cancel <ticket> | --list | --wsl <command>" >&2
+    exit 2
+    ;;
+esac
+
+# Inside a job already (a heavy job that calls heavy-run): its turn covers this, so run directly.
+if [[ -n "${HEAVY_RUN_SLOT:-}" ]]; then
+  exec "$@"
+fi
+
+fallback=("$here/heavy-run-slots")
+[[ ${#lane[@]} -gt 0 ]] && fallback+=(--web)
+if [[ ! -x "$buildq" ]]; then
+  echo "heavy-run: buildq isn't installed at $buildq; using the fixed slots." >&2
+  exec "${fallback[@]}" "$@"
+fi
+BUILDQ_FALLBACK="${fallback[*]}" exec "$buildq" run "${lane[@]}" "${opts[@]}" "${name[@]}" -- "$@"

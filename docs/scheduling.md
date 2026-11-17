@@ -116,6 +116,13 @@ scaling. buildq doesn't try to tell a warm build from a full one for this: Cargo
 a folder set by a flag, two environment variables or a config file, and its layout inside is
 Cargo's own.
 
+On the maintainer's workstation, `"never"` is on trial (#67): a baseline day under `"always"`, then
+three days under `"never"` from 2026-11-17, switching back at once on an OOM kill, a memory stop of a
+build past its plan, available memory under the 16G floor, or more than 5% of heavy builds past
+their start plan. The baseline day: 1,289 builds (396 heavy), 1.0% of heavy builds past their start
+plan and 0.8% past the plan they held, no OOM kill or memory stop, at least 29.6G available, and
+38.7G held for growth on average. [`contrib/trial54.py`](../contrib/trial54.py) prints the numbers.
+
 A running build that passes its estimate is planned at its lane's `MemoryMax` from then on, so the
 room it may still grow into stays held. The analytics record each build's plan, cores and setting
 at the start of its last attempt (`start_plan`, `start_cores`, `start_rule`, with `plan_base`,

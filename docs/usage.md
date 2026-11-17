@@ -112,7 +112,8 @@ or SIGHUP (Ctrl-C is a cancel meant as one), leaves its place: the same command 
 caller, in the same directory and lane, submitted within ten minutes of the cancel, goes in as if it
 had waited as long, rather than at the back. A build that was already running leaves none, and a
 daemon restart forgets the places. A build dropped off with `buildq
-submit` belongs to its ticket and runs to the end whoever is watching.
+submit` belongs to its ticket and runs to the end whoever is watching, even after the agent that
+dropped it off has gone: cancel such a build with `buildq cancel <ticket>` (#71 would do it for you).
 
 ## Being told when a build finishes
 
