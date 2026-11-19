@@ -127,18 +127,25 @@ has been running and nobody has waited on the ticket.
   and one dropped off from anywhere else (a terminal, a script, CI). Cancel those with
   `buildq cancel <ticket>`.
 - **Its limits:** an agent program that serves several sessions in one process (Codex under T3)
-  counts as running until that process ends. A daemon restart starts the 10 minutes again.
+  counts as running until that process ends. A daemon restart starts the 10 minutes again, and so
+  does a build's being stopped and queued again.
 
 ## Commands that never compile
 
 `buildq run` (and so a wrapper around it) runs a cargo command that never compiles at once instead
-of queueing it behind builds, with a one-line note (#72): the subcommands the shim already runs
-directly (`cargo fmt`, `cargo metadata`, `cargo tree`, `cargo update`, ...) and `cargo --version`
-or `--help`. The rule is the shim's own list. It is narrow on purpose:
+of queueing it behind builds, with a one-line note (#72): `cargo fmt`, cargo's own light commands
+(`cargo metadata`, `cargo tree`, `cargo update`, ...) and `cargo --version` or `--help`. The rule
+reads the shim's own lists. It is narrow on purpose:
 - only cargo, and only when `buildq run` is given no option of its own (`--lane`, `--timeout`,
-  `--name`, `--notify`, ...): with one, the command queues as asked;
+  `--name`, `--notify`, `--restartable`, ...): with one, the command queues as asked;
 - `cargo clean` still queues, because it deletes a target folder that a build may be using;
+- other programs' subcommands queue too (`cargo audit`, `cargo deny`, ...), since an alias may
+  take such a name and make it a build; cargo doesn't let an alias redefine its own commands;
 - anything else queues as before, `cargo build --help` and `make help` included.
+
+For `cargo fmt`, an alias set through `CARGO_ALIAS_FMT` is seen and queues. One written in a cargo
+config file isn't (the shim doesn't read those either); where the rustc guard is installed, it
+refuses that compile.
 
 ## Being told when a build finishes
 

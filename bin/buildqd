@@ -954,6 +954,33 @@ def proc_identity(pid):
     return stat[:2] if stat else None
 
 
+def proc_gone(pid, start) -> bool:
+    """Whether a process has certainly ended: nothing has that pid now, another process has it, or
+    it is a zombie. A stat line that can't be read for another reason (out of descriptors, say)
+    says nothing, so the process isn't called gone on that."""
+    stat = proc_stat(pid)
+    if stat is not None:
+        return stat[0] != start or stat[1] in ("Z", "X")
+    try:
+        os.stat(f"/proc/{int(pid)}")
+    except (FileNotFoundError, ProcessLookupError, ValueError, TypeError, OverflowError):
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def own_pids():
+    """The pids of this user's processes, from /proc."""
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                if os.stat(f"/proc/{entry}").st_uid == UID:
+                    yield int(entry)
+            except OSError:
+                continue
+
+
 # Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run) and Codex.
 AGENT_COMM = ("claude", "codex")
 AGENT_EXE = re.compile(r"/\.?claude/(versions|remote/ccd-cli)/[^/]+$")
@@ -985,24 +1012,25 @@ def agents_above(pid) -> list[list[int]]:
     return found
 
 
-def live_threads() -> dict[str, list[int]]:
-    """Each T3 thread that has an agent process of this user's now -> that process's [pid, start ticks]."""
-    out = {}
+def live_threads() -> dict[str, list[list[int]]]:
+    """Each T3 thread with agent processes of this user's now -> their [pid, start ticks]. An agent
+    whose environment may not be read isn't listed (it can't be told which thread it serves); any
+    other failure to read is raised, so that it isn't taken for there being no such process."""
+    out: dict[str, list[list[int]]] = {}
     prefix = T3_THREAD_VAR.encode() + b"="
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
+    for pid in own_pids():
+        if not is_agent(pid):
             continue
-        pid = int(entry)
         try:
-            if os.stat(f"/proc/{pid}").st_uid != UID or not is_agent(pid):
-                continue
             with open(f"/proc/{pid}/environ", "rb") as f:
-                thread = next((v[len(prefix):] for v in f.read().split(b"\0") if v.startswith(prefix)), b"")
-        except OSError:
+                entries = f.read().split(b"\0")
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
             continue
+        thread = next((v[len(prefix):] for v in entries if v.startswith(prefix)), b"")
+        thread = thread.decode(errors="replace").strip()[:200]
         stat = proc_stat(pid)
         if thread and stat and stat[1] not in ("Z", "X"):
-            out[thread.decode(errors="replace")[:200]] = [pid, stat[0]]
+            out.setdefault(thread, []).append([pid, stat[0]])
     return out
 
 
@@ -1061,17 +1089,15 @@ def tagged_processes(job: str, exclude: int | None = None) -> list[int]:
     including any that left the build's process group."""
     tag = f"BUILDQ_JOB={job}".encode()
     found = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or int(entry) == exclude or int(entry) == os.getpid():
+    for pid in own_pids():
+        if pid == exclude or pid == os.getpid():
             continue
         try:
-            if os.stat(f"/proc/{entry}").st_uid != UID:
-                continue
-            with open(f"/proc/{entry}/environ", "rb") as f:
+            with open(f"/proc/{pid}/environ", "rb") as f:
                 if tag in f.read().split(b"\0"):
-                    ident = proc_identity(int(entry))
+                    ident = proc_identity(pid)
                     if ident and ident[1] not in ("Z", "X"):
-                        found.append(int(entry))
+                        found.append(pid)
         except OSError:
             continue
     return found
@@ -6054,31 +6080,31 @@ class Daemon:
         scan = self.thread_scan[1]
         if scan is None:
             return True
-        found = scan.get(thread)
-        return found if found and proc_alive(found[0], found[1]) else None
+        return next((list(p) for p in scan.get(thread, ()) if not proc_gone(p[0], p[1])), None)
 
-    def agent_state(self, t: Ticket, now: float, alive: dict, fresh: bool = False) -> str | None:
+    def agent_state(self, t: Ticket, now: float, running: dict, fresh: bool = False) -> str | None:
         """Whether the agent sessions that dropped a build off still run: "alive" while one of them
         does, "gone" once every one has ended, None when it isn't theirs alone to want: a `buildq
         run` waits for it too, or a submission from no known agent (CI, a terminal).
 
         A session runs while its agent process does, or an agent that process ran under, or a later
         agent process of the same T3 thread (a restart, a handoff to another account), which then
-        stands for it. `alive` remembers each process looked at, for one pass over the tickets."""
+        stands for it. A process that can't be read isn't called gone. `running` remembers each
+        process looked at, for one pass over the tickets."""
         waiting = self.waiting(t, now)
         if not waiting or any(t.interests.get(who) != "submit" or who not in t.agents for who in waiting):
             return None
         for who in waiting:
             record = t.agents[who]
             for pid, start in record["pids"]:
-                if (pid, start) not in alive:
-                    alive[pid, start] = proc_alive(pid, start)
-                if alive[pid, start]:
+                if (pid, start) not in running:
+                    running[pid, start] = not proc_gone(pid, start)
+                if running[pid, start]:
                     return "alive"
             later = self.live_thread(record["thread"], now, fresh) if record["thread"] else None
             if later:
                 if later is not True:
-                    record["pids"] = [list(later)]
+                    record["pids"] = [later]
                     self.save(t)
                 return "alive"
         return "gone"
@@ -6088,21 +6114,27 @@ class Daemon:
         so going unwatched for a while means nothing. But once the agent session that dropped it off
         has ended, and for abandoned_seconds on end that session stayed gone and nobody waited on the
         ticket, it would only run for nobody: cancel it while it's queued (#71). The time counts from
-        the daemon's start at the earliest, and a build that is running carries on."""
+        the daemon's start at the earliest, and from when it was queued again for a build that ran
+        and was stopped. A build that is running carries on."""
         limit = self.cfg.abandoned_seconds
-        alive: dict = {}
+        running: dict = {}
         for t in list(self.tickets.values()):
             if not limit or t.state != "queued" or t.cancel_requested or t.flock or t.attached or not t.agents:
                 t.agent_now = None
+                if t.state not in FINISHED:
+                    t.wanted_at = now  # (the time starts when the rule first applies to it)
                 continue
-            t.agent_now = self.agent_state(t, now, alive)
+            t.agent_now = self.agent_state(t, now, running)
+            if t.agent_now == "gone" and not self.watchers.get(t.id) and now - t.wanted_at > limit:
+                t.agent_now = self.agent_state(t, now, running, fresh=True)  # a look of its own, not the kept one
+                if t.agent_now == "gone":
+                    log(f"cancelling {t.id}: the agent session that dropped it off ended, and nobody has "
+                        f"waited on it for {fmt_duration(now - t.wanted_at)}")
+                    self.cancel(t, now, why=f"the agent session that dropped it off had ended, and nobody waited "
+                                            f"on it for {fmt_duration(limit)}; submit it again if it's still wanted")
+                    continue
             if t.agent_now != "gone" or self.watchers.get(t.id):
                 t.wanted_at = now
-            elif now - t.wanted_at > limit and self.agent_state(t, now, alive, fresh=True) == "gone":
-                log(f"cancelling {t.id}: the agent session that dropped it off ended, and nobody has waited "
-                    f"on it for {fmt_duration(now - t.wanted_at)}")
-                self.cancel(t, now, why=f"the agent session that dropped it off had ended, and nobody waited on "
-                                        f"it for {fmt_duration(limit)}; submit it again if it's still wanted")
 
     def send_waits(self, now: float) -> None:
         for position, t in enumerate(self.queue()):

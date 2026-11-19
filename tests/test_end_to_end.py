@@ -5,8 +5,6 @@ no systemd user session. With BUILDQ_TEST_SCOPES=1 on a machine that has one, ev
 with builds as systemd services (ScopeTests), plus checks that only systemd can do.
 """
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import re
@@ -60,7 +58,10 @@ lane = "fast"
 def clean_env():
     return {k: v for k, v in os.environ.items()
             if not k.startswith("BUILDQ_") and k not in ("MAKEFLAGS", "MFLAGS", "CARGO_MAKEFLAGS", "MAKELEVEL",
-                                                         "CI", "GITHUB_ACTIONS", "INVOCATION_ID")}
+                                                         "CI", "GITHUB_ACTIONS", "INVOCATION_ID",
+                                                         # (or the suite's own agent session would stand
+                                                         # for a test's: the daemon looks its thread up)
+                                                         "T3CODE_THREAD_ID")}
 
 
 class Daemon:
@@ -517,8 +518,11 @@ class Enforcement(Harness):
         self.assertNotIn("fmt", fmt.stderr)  # the note never repeats the command (it may hold a secret)
         built = self.q("run", "--", cargo, "test", "version", env=env)  # names a test: a build like any other
         self.assertRegex(built.stdout, r"^cargo test version job=[0-9a-f-]{36}$")
-        asked = self.q("run", "--timeout", "5m", "--", cargo, "fmt", env=env)  # an option for the daemon
-        self.assertRegex(asked.stdout, r"^cargo fmt job=[0-9a-f-]{36}$")
+        for option in (("--timeout", "5m"), ("--restartable",), ("--lane", "fast")):  # asked of the daemon
+            asked = self.q("run", *option, "--", cargo, "fmt", env=env)
+            self.assertRegex(asked.stdout, r"^cargo fmt job=[0-9a-f-]{36}$", option)
+        refused = self.q("run", "--cores", "0", "--", cargo, "fmt", env=env)  # and checked by it
+        self.assertEqual((refused.returncode, refused.stdout), (2, ""), refused.stderr)
         # A client beside an older shim, as halfway through an install: everything queues, as before.
         old = os.path.join(self.tmp.name, "old-install")
         os.makedirs(old)
@@ -568,11 +572,6 @@ class AbandonedBuilds(Harness):
         return CONFIG.replace("unwatched_seconds = 3", "unwatched_seconds = 3\nabandoned_seconds = 2")
 
     def test_a_build_whose_agent_session_ended_is_cancelled_and_says_why(self):
-        loader = importlib.machinery.SourceFileLoader("buildqd", BUILDQD)
-        buildqd = importlib.util.module_from_spec(importlib.util.spec_from_loader("buildqd", loader))
-        loader.exec_module(buildqd)
-        if buildqd.agents_above(os.getpid()):
-            self.skipTest("the suite runs under an agent session, which would keep the build wanted")
         self.assertEqual(self.q("pause", "nothing starts").returncode, 0)  # so builds stay queued
         fake = os.path.join(self.tmp.name, "claude")  # a process named as an agent session is
         os.symlink(sys.executable, fake)
@@ -582,8 +581,14 @@ class AbandonedBuilds(Harness):
         self.assertEqual(dropped.returncode, 0, dropped.stderr)
         ticket = dropped.stdout.strip()
         self.assertRegex(ticket, UUID)
-        kept = self.submit("--", "echo", "kept")  # from no agent: it waits for its turn, as before
-        row = self.wait_for(ticket, ("cancelled",), timeout=30)
+        kept = self.submit("--", "echo", "kept")  # from no agent session of its own: it waits, as before
+        deadline = time.time() + 30
+        while (row := self.daemon.ticket(ticket))["state"] != "cancelled":
+            if row["agent"] == "alive" and time.time() > deadline - 25:
+                # (run through the queue, as a build, the suite has no agent above it)
+                self.skipTest("the suite runs under an agent session, which keeps the build wanted")
+            self.assertLess(time.time(), deadline, f"never cancelled; daemon log:\n{self.daemon.log()}")
+            time.sleep(0.1)
         self.assertIn("agent session that dropped it off had ended", row["error"])
         self.assertIn("submit it again", self.q("status", ticket).stdout)
         self.assertIn("agent session", self.daemon.log())

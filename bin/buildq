@@ -998,6 +998,15 @@ def the_command(args) -> list[str] | None:
     return command
 
 
+def run_now(command: list[str]) -> int:
+    """Become the command. Returns only if it can't be run."""
+    try:
+        os.execvp(command[0], command)
+    except OSError as e:
+        note(f"can't run {command[0]}: {e}")
+        return 127
+
+
 def fallback(command: list[str], lane: str | None, why: str) -> int | None:
     """What to do when the daemon can't be reached. None means: wait for it and try again."""
     choice = os.environ.get("BUILDQ_FALLBACK", "").strip()
@@ -1010,11 +1019,7 @@ def fallback(command: list[str], lane: str | None, why: str) -> int | None:
     os.environ["BUILDQ_FALLBACK_ACTIVE"] = "1"  # a nested buildq run inside it runs directly
     argv = command if choice == "run" else shlex.split(choice) + command
     note(f"{why}; running the command " + ("now, unqueued." if choice == "run" else f"through `{choice}` instead."))
-    try:
-        os.execvp(argv[0], argv)
-    except OSError as e:
-        note(f"can't run {argv[0]}: {e}")
-        return 127
+    return run_now(argv)
 
 
 def inside_a_build() -> bool:
@@ -1098,23 +1103,17 @@ def shim_classifier():
 
 def runs_directly(args, command: list[str]) -> bool:
     """A cargo command that never compiles (`cargo fmt`, `cargo metadata`, `cargo --version`), by the
-    shim's own rule, runs at once rather than wait behind builds (#72). Not when an option asks the
-    daemon for something (a lane, a time limit, a name, a finish hook): then it queues as asked. If
-    the shim can't be read, or is an older one without the rule, everything queues as before."""
-    if args.lane or args.cores or args.mem or args.priority or args.timeout or args.name or args.notify:
+    shim's own rule, runs at once rather than wait behind builds (#72). Not when `buildq run` was
+    given any option of its own (a lane, a time limit, a name, a finish hook, --again, ...): then
+    it queues as asked, and the daemon checks the option. If the shim can't be read, or is an older
+    one without the rule, everything queues as before."""
+    given = (args.lane, args.cores, args.mem, args.timeout, args.name, args.notify)
+    if any(x is not None for x in given) or args.priority or args.again or args.reuse or args.restartable:
         return False
     try:
         return shim_classifier().never_builds(command[0], command[1:]) is True
     except Exception:
         return False
-
-
-def run_now(command: list[str]) -> int:
-    try:
-        os.execvp(command[0], command)
-    except OSError as e:
-        note(f"can't run {command[0]}: {e}")
-        return 127
 
 
 def cmd_run(args) -> int:

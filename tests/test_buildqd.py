@@ -1220,7 +1220,7 @@ class AbandonedSubmits(DaemonCase):
         self.alive = [me, buildqd.proc_identity(me)[0]]
         self.gone = [me, self.alive[1] + 1]  # (another start time: the pid was reused)
         self.above = {}  # a client's pid -> the agent processes the daemon finds above it
-        self.threads = {}  # a T3 thread -> its agent process now
+        self.threads = {}  # a T3 thread -> its agent processes now
         for name, fake in (("agents_above", lambda pid: [list(a) for a in self.above.get(pid, ())]),
                            ("live_threads", lambda: dict(self.threads))):
             patch = mock.patch.object(buildqd, name, fake)
@@ -1286,7 +1286,7 @@ class AbandonedSubmits(DaemonCase):
         self.assertEqual(t.agents["s"]["thread"], "thread-1")  # from the client's environment
         self.daemon.drop_abandoned(self.now + 300)
         self.assertEqual(t.agent_now, "gone")
-        self.threads["thread-1"] = self.alive  # T3 starts the thread's agent again
+        self.threads["thread-1"] = [self.gone, self.alive]  # T3 starts the thread's agent again
         self.daemon.drop_abandoned(self.now + 601)
         self.assertFalse(t.cancel_requested)
         self.assertEqual(t.agents["s"]["pids"], [self.alive])  # followed by its process from now on
@@ -1294,13 +1294,14 @@ class AbandonedSubmits(DaemonCase):
     def test_a_process_started_since_the_last_look_is_seen_before_a_cancel(self):
         t = self.drop_off(self.gone, submission="s", thread="thread-1")
         self.daemon.drop_abandoned(self.now + 590)  # a look at the processes, kept for 30 s
-        self.threads["thread-1"] = self.alive  # started just after it
+        self.threads["thread-1"] = [self.alive]  # started just after it
         self.daemon.drop_abandoned(self.now + 601)
         self.assertFalse(t.cancel_requested)  # a cancel takes a look of its own
+        self.assertEqual((t.agent_now, t.wanted_at), ("alive", self.now + 601))  # and what it finds counts at once
 
     def test_a_thread_whose_only_process_has_gone_too_is_cancelled(self):
         t = self.drop_off(self.gone, submission="s", thread="thread-1")
-        self.threads["thread-1"] = self.gone  # (gone between the look and its use)
+        self.threads["thread-1"] = [self.gone]  # (gone between the look and its use)
         self.daemon.drop_abandoned(self.now + 601)
         self.assertTrue(t.cancel_requested)
 
@@ -1353,13 +1354,33 @@ class AbandonedSubmits(DaemonCase):
         self.daemon.drop_abandoned(self.now + 611)  # the run was killed and never followed again
         self.assertTrue(t.cancel_requested)
 
-    def test_a_running_build_carries_on(self):
+    def test_a_running_build_carries_on_and_has_the_whole_time_if_queued_again(self):
         self.machine.mem_available = 200 * GIB
         running = self.drop_off(self.gone, submission="s")
         self.assertEqual(running.state, "running")
         self.daemon.drop_abandoned(self.now + 1000)
         self.assertFalse(running.cancel_requested)
         self.assertIsNone(running.row(self.now)["agent"])
+        self.machine.mem_available = 15 * GIB
+        running.requeue_pending = True  # stopped to free memory ...
+        self.runner.running.discard(running.id)
+        self.daemon.check(self.now + 1000)
+        self.assertEqual((running.state, running.requeues), ("queued", 1))  # ... and queued again
+        self.daemon.drop_abandoned(self.now + 1001)
+        self.daemon.drop_abandoned(self.now + 1600)
+        self.assertFalse(running.cancel_requested)  # 600 s since it last ran
+        self.daemon.drop_abandoned(self.now + 1601)
+        self.assertTrue(running.cancel_requested)
+
+    def test_a_process_that_cant_be_read_isnt_called_gone(self):
+        t = self.drop_off(self.alive, submission="s")
+        with mock.patch.object(buildqd, "proc_stat", return_value=None):  # (out of descriptors, say)
+            self.assertFalse(buildqd.proc_gone(*self.alive))  # it is there: can't tell
+            self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, "alive"))
+        self.assertTrue(buildqd.proc_gone(*self.gone))  # another process has that pid now
+        self.assertTrue(buildqd.proc_gone(2 ** 40, 1))  # nothing has
+        self.assertTrue(buildqd.proc_gone(float("inf"), 1))
 
     def test_zero_turns_it_off(self):
         self.daemon.cfg.abandoned_seconds = 0
@@ -1369,6 +1390,8 @@ class AbandonedSubmits(DaemonCase):
 
     def test_the_agent_is_kept_across_a_restart_and_the_time_starts_again(self):
         t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        t.wanted_at = self.now - 5000
+        self.daemon.save(t)
         again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
                                queries=buildqd.InlineExecutor())
         again.load_tickets(self.now + 1)
@@ -1401,29 +1424,27 @@ class AgentProcesses(unittest.TestCase):
         self.thread = f"test-thread-{os.getpid()}-{time.time()}"
 
     def session(self):
-        """A stand-in agent session that runs one child, as an agent runs a build client."""
-        code = "import subprocess; p = subprocess.Popen(['sleep', '60']); print(p.pid, flush=True); p.wait()"
+        """A stand-in agent session that runs one child, as an agent runs a build client. The child
+        reads from the session, so it ends when the session does."""
+        code = ("import subprocess; p = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL); "
+                "print(p.pid, flush=True); p.wait()")
         proc = subprocess.Popen([self.fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
                                 env={**os.environ, "T3CODE_THREAD_ID": self.thread})
-        child = int(proc.stdout.readline())
 
         def stop():
-            for pid in (child, proc.pid):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+            if proc.poll() is None:
+                proc.kill()
             proc.wait()
             proc.stdout.close()
         self.addCleanup(stop)
-        return proc, child
+        return proc, int(proc.stdout.readline())
 
     def test_an_agent_above_a_client_is_found_and_seen_to_go(self):
         proc, child = self.session()
         above = buildqd.agents_above(child)
         self.assertEqual(above[0][0], proc.pid)  # (the suite's own agent session, if any, follows it)
         self.assertTrue(buildqd.proc_alive(*above[0]))
-        self.assertEqual(buildqd.live_threads().get(self.thread), above[0])
+        self.assertEqual(buildqd.live_threads().get(self.thread), [above[0]])
         proc.kill()
         proc.wait()
         self.assertFalse(buildqd.proc_alive(*above[0]))
@@ -4553,12 +4574,18 @@ class ShimRules(unittest.TestCase):
             words = command.split()  # and the shim never queues what runs at once
             self.assertFalse(self.shim.heavy("cargo", words[1:]), command)
 
+    def test_an_alias_named_fmt_queues(self):
+        with mock.patch.dict(os.environ, {"CARGO_ALIAS_FMT": "build --release"}):
+            self.assertFalse(self.never_builds("cargo fmt"))
+        self.assertEqual(self.shim.CARGO_LIGHT, self.shim.CARGO_OWN_LIGHT | self.shim.CARGO_TOOLS_LIGHT)
+
     def test_everything_else_queues_as_asked(self):
         for command in ("cargo build", "cargo test", "cargo clippy", "cargo",
                         "cargo test version", "cargo run help",  # a test's name, a program's argument
                         "cargo build --help", "cargo xtask --help", "cargo sqlx --version",  # an alias may compile
                         "cargo clean",  # deletes a target folder a build may be using: it waits its turn
                         "cargo watch -x test", "cargo fmt --watch",
+                        "cargo audit", "cargo deny check", "cargo outdated",  # other programs': an alias may take the name
                         "make help", "make --version", "pnpm --version", "npm version", "dotnet --info",
                         "env X=1 cargo fmt", "sh -c cargo-fmt", "./cargo-fmt.sh"):
             self.assertFalse(self.never_builds(command), command)

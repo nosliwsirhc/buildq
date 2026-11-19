@@ -31,10 +31,16 @@ import sys
 # Cargo subcommands that never compile; anything else, external subcommands included (insta,
 # sqlx, xtask, hack, ...), is treated as a build. `watch` runs here and sends what it starts back
 # through the shim, so each of its runs is queued instead of the watcher holding a turn.
-CARGO_LIGHT = {"fmt", "metadata", "tree", "version", "help", "search", "login", "logout", "owner", "yank",
-               "locate-project", "pkgid", "read-manifest", "verify-project", "clean", "new", "init", "add",
-               "remove", "rm", "update", "fetch", "generate-lockfile", "vendor", "config", "report", "info",
-               "uninstall", "watch", "deny", "audit", "outdated", "udeps-list", "machete", "sort"}
+# They are kept in two sets, for never_builds() below. Cargo's own commands: an alias can't
+# redefine these ("Aliases are not allowed to redefine existing built-in commands", cargo's
+# configuration reference).
+CARGO_OWN_LIGHT = {"metadata", "tree", "version", "help", "search", "login", "logout", "owner", "yank",
+                   "locate-project", "pkgid", "read-manifest", "verify-project", "clean", "new", "init", "add",
+                   "remove", "rm", "update", "fetch", "generate-lockfile", "vendor", "config", "report", "info",
+                   "uninstall"}
+# Other programs' (cargo-fmt, cargo-watch, cargo-deny, ...), whose names an alias may take.
+CARGO_TOOLS_LIGHT = {"fmt", "watch", "deny", "audit", "outdated", "udeps-list", "machete", "sort"}
+CARGO_LIGHT = CARGO_OWN_LIGHT | CARGO_TOOLS_LIGHT
 JS_SCRIPT_PREFIXES = ("build", "test", "typecheck", "type-check", "check", "lint", "e2e", "verify", "storybook:build",
                       "build-storybook", "test-storybook", "ci")
 import re
@@ -98,28 +104,35 @@ def cargo_subcommand(args: list[str]) -> list[str]:
 
 
 CARGO_ASKS = {"--help", "-h", "--version", "-V", "--list"}  # to cargo itself: they build nothing
-# Light, but not to be run at once when sent to the queue on purpose: `watch` runs until stopped,
-# and `clean` deletes a target folder without locking it, so it waits for a build using that folder.
-CARGO_QUEUED_ON_REQUEST = {"watch", "clean"}
 
 
 def never_builds(tool: str, args: list[str]) -> bool:
     """Whether a command sent to the queue on purpose (`buildq run`, a wrapper around it) is a
-    cargo command that never compiles: `cargo fmt`, `cargo metadata` and the rest of CARGO_LIGHT,
-    or cargo asked for its version or help. `buildq run` runs such a command at once instead of
-    queueing it behind builds (#72).
+    cargo command that never compiles, which `buildq run` then runs at once instead of queueing it
+    behind builds (#72): cargo asked for its version or help, one of cargo's own light commands
+    (`cargo metadata`, `cargo tree`, `cargo update`, ...), or `cargo fmt`.
 
-    Deliberately narrow. It answers for cargo only, by the same list heavy() reads, and whatever it
-    calls light heavy() calls light too, so nothing the shim queues is ever let through here. Other
-    tools' commands (`make help` is a target like any other) and words after a subcommand
-    (`cargo test version` names a test) stay queued."""
+    Deliberately narrower than "not heavy()", though it reads the same lists, and whatever it
+    calls light heavy() calls light too, so nothing the shim queues is ever let through here:
+    - cargo only: other tools' commands stay queued (`make help` is a target like any other), and
+      so do words after a subcommand (`cargo test version` names a test);
+    - `clean` stays queued: it deletes a target folder without locking it, so it waits for a build
+      that uses the folder;
+    - of other programs' subcommands only `fmt`, which is what agents send: an alias may take such
+      a name and make it a build. For `fmt`, CARGO_ALIAS_FMT in the environment is seen; an alias
+      in a config file isn't (heavy() doesn't see it either), and the rustc guard is what refuses
+      that compile outside the queue."""
     if os.path.basename(tool) != "cargo":
         return False
     rest = args[1:] if args and args[0].startswith("+") else args
     if rest and all(a in CARGO_ASKS for a in rest):
         return True
     sub = cargo_subcommand(args)
-    return bool(sub) and sub[0] in CARGO_LIGHT and sub[0] not in CARGO_QUEUED_ON_REQUEST and not watching(args)
+    if not sub or watching(args):
+        return False
+    if sub[0] == "fmt":
+        return "CARGO_ALIAS_FMT" not in os.environ
+    return sub[0] in CARGO_OWN_LIGHT and sub[0] != "clean"
 
 
 def heavy(tool: str, args: list[str]) -> bool:

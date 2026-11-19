@@ -63,7 +63,8 @@ Instead, the daemon notes the agent session each submit came from (#71):
   comes from the submission's environment.
 - **Still running:** a session runs while any of those processes does, or while a later agent
   process carries the same T3 thread in its own environment (a restart, a handoff), found by a
-  look through `/proc` at most every 30 s. That process then stands for the session.
+  look through `/proc` at most every 30 s. That process then stands for the session. A process
+  that can't be read is not taken for one that has ended.
 - **The rule:** a submit build that is queued is cancelled once, for `abandoned_seconds` on end,
   every submission waiting for it came from a session that is gone and nobody waited on the
   ticket. The time is kept in memory, so a daemon restart starts it again. Before a cancel the
