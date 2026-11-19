@@ -61,7 +61,8 @@ def clean_env():
                                                          "CI", "GITHUB_ACTIONS", "INVOCATION_ID",
                                                          # (or the suite's own agent session would stand
                                                          # for a test's: the daemon looks its thread up)
-                                                         "T3CODE_THREAD_ID")}
+                                                         "T3CODE_THREAD_ID",
+                                                         "CARGO_ALIAS_FMT")}  # (an alias of the caller's)
 
 
 class Daemon:

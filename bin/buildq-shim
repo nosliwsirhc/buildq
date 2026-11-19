@@ -33,13 +33,14 @@ import sys
 # through the shim, so each of its runs is queued instead of the watcher holding a turn.
 # They are kept in two sets, for never_builds() below. Cargo's own commands: an alias can't
 # redefine these ("Aliases are not allowed to redefine existing built-in commands", cargo's
-# configuration reference).
+# configuration reference; seen with cargo 1.99: CARGO_ALIAS_TREE is ignored).
 CARGO_OWN_LIGHT = {"metadata", "tree", "version", "help", "search", "login", "logout", "owner", "yank",
                    "locate-project", "pkgid", "read-manifest", "verify-project", "clean", "new", "init", "add",
-                   "remove", "rm", "update", "fetch", "generate-lockfile", "vendor", "config", "report", "info",
-                   "uninstall"}
-# Other programs' (cargo-fmt, cargo-watch, cargo-deny, ...), whose names an alias may take.
-CARGO_TOOLS_LIGHT = {"fmt", "watch", "deny", "audit", "outdated", "udeps-list", "machete", "sort"}
+                   "remove", "update", "fetch", "generate-lockfile", "vendor", "config", "report", "uninstall"}
+# Names an alias may take: other programs' (cargo-fmt, cargo-watch, cargo-deny, ...); `rm`, itself
+# cargo's alias for `remove`, which a user's alias replaces (CARGO_ALIAS_RM=version cargo rm prints
+# the version); and `info`, a command of cargo's own only since 1.82.
+CARGO_TOOLS_LIGHT = {"fmt", "watch", "deny", "audit", "outdated", "udeps-list", "machete", "sort", "rm", "info"}
 CARGO_LIGHT = CARGO_OWN_LIGHT | CARGO_TOOLS_LIGHT
 JS_SCRIPT_PREFIXES = ("build", "test", "typecheck", "type-check", "check", "lint", "e2e", "verify", "storybook:build",
                       "build-storybook", "test-storybook", "ci")
@@ -118,18 +119,19 @@ def never_builds(tool: str, args: list[str]) -> bool:
       so do words after a subcommand (`cargo test version` names a test);
     - `clean` stays queued: it deletes a target folder without locking it, so it waits for a build
       that uses the folder;
-    - of other programs' subcommands only `fmt`, which is what agents send: an alias may take such
-      a name and make it a build. For `fmt`, CARGO_ALIAS_FMT in the environment is seen; an alias
-      in a config file isn't (heavy() doesn't see it either), and the rustc guard is what refuses
-      that compile outside the queue."""
+    - of the names an alias may take (CARGO_TOOLS_LIGHT) only `fmt`, which is what agents send.
+      For `fmt`, an alias given in the environment (CARGO_ALIAS_FMT) or on the command line
+      (--config) is seen; one in a config file isn't (heavy() doesn't see it either), and the
+      rustc guard is what refuses that compile outside the queue."""
     if os.path.basename(tool) != "cargo":
         return False
     rest = args[1:] if args and args[0].startswith("+") else args
     if rest and all(a in CARGO_ASKS for a in rest):
         return True
     sub = cargo_subcommand(args)
-    if not sub or watching(args):
-        return False
+    own = args[:args.index("--")] if "--" in args else args  # (after `--` they are the tool's, not cargo's)
+    if not sub or watching(args) or any(a == "--config" or a.startswith("--config=") for a in own):
+        return False  # (cargo's --config can define an alias, or anything else)
     if sub[0] == "fmt":
         return "CARGO_ALIAS_FMT" not in os.environ
     return sub[0] in CARGO_OWN_LIGHT and sub[0] != "clean"

@@ -1219,6 +1219,7 @@ class AbandonedSubmits(DaemonCase):
         me = os.getpid()
         self.alive = [me, buildqd.proc_identity(me)[0]]
         self.gone = [me, self.alive[1] + 1]  # (another start time: the pid was reused)
+        self.real_live_threads = buildqd.live_threads
         self.above = {}  # a client's pid -> the agent processes the daemon finds above it
         self.threads = {}  # a T3 thread -> its agent processes now
         for name, fake in (("agents_above", lambda pid: [list(a) for a in self.above.get(pid, ())]),
@@ -1371,6 +1372,14 @@ class AbandonedSubmits(DaemonCase):
         self.assertFalse(running.cancel_requested)  # 600 s since it last ran
         self.daemon.drop_abandoned(self.now + 1601)
         self.assertTrue(running.cancel_requested)
+
+    def test_a_look_that_fails_partway_cancels_nothing(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        with mock.patch.object(buildqd, "live_threads", self.real_live_threads), \
+                mock.patch.object(buildqd, "own_pids", return_value=[os.getpid()]), \
+                mock.patch.object(buildqd, "is_agent", side_effect=OSError(24, "Too many open files")):
+            self.daemon.drop_abandoned(self.now + 601)  # the look can't tell who runs: nothing is called gone
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, "alive"))
 
     def test_a_process_that_cant_be_read_isnt_called_gone(self):
         t = self.drop_off(self.alive, submission="s")
@@ -4562,6 +4571,12 @@ class ShimRules(unittest.TestCase):
 
     shim = load("buildq-shim")
 
+    def setUp(self):
+        patch = mock.patch.dict(os.environ)  # (whatever aliases the suite's own environment sets)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("CARGO_ALIAS_FMT", None)
+
     def never_builds(self, command):
         words = command.split()
         return self.shim.never_builds(words[0], words[1:])
@@ -4569,6 +4584,7 @@ class ShimRules(unittest.TestCase):
     def test_cargo_commands_that_never_compile_run_at_once(self):
         for command in ("cargo fmt", "cargo fmt --check -p api", "cargo +nightly fmt", "cargo -C sub tree",
                         "/home/u/.cargo/bin/cargo metadata --format-version 1", "cargo update -p x",
+                        "cargo remove serde", "cargo add serde", "cargo fmt -- --config max_width=100",
                         "cargo --version", "cargo +stable -V", "cargo --list", "cargo help build"):
             self.assertTrue(self.never_builds(command), command)
             words = command.split()  # and the shim never queues what runs at once
@@ -4586,6 +4602,8 @@ class ShimRules(unittest.TestCase):
                         "cargo clean",  # deletes a target folder a build may be using: it waits its turn
                         "cargo watch -x test", "cargo fmt --watch",
                         "cargo audit", "cargo deny check", "cargo outdated",  # other programs': an alias may take the name
+                        "cargo rm serde", "cargo info serde",  # cargo's alias for remove; its own only since 1.82
+                        "cargo --config alias.fmt=\"build\" fmt", "cargo --config=x.toml fmt",
                         "make help", "make --version", "pnpm --version", "npm version", "dotnet --info",
                         "env X=1 cargo fmt", "sh -c cargo-fmt", "./cargo-fmt.sh"):
             self.assertFalse(self.never_builds(command), command)

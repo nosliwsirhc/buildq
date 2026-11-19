@@ -139,13 +139,15 @@ reads the shim's own lists. It is narrow on purpose:
 - only cargo, and only when `buildq run` is given no option of its own (`--lane`, `--timeout`,
   `--name`, `--notify`, `--restartable`, ...): with one, the command queues as asked;
 - `cargo clean` still queues, because it deletes a target folder that a build may be using;
-- other programs' subcommands queue too (`cargo audit`, `cargo deny`, ...), since an alias may
-  take such a name and make it a build; cargo doesn't let an alias redefine its own commands;
+- names an alias may take queue too: other programs' subcommands (`cargo audit`, `cargo deny`,
+  ...) and `cargo rm`, which is itself an alias. Cargo doesn't let an alias redefine its own
+  commands, so those can't be turned into a build;
+- a command with `--config` queues, since that can define anything;
 - anything else queues as before, `cargo build --help` and `make help` included.
 
-For `cargo fmt`, an alias set through `CARGO_ALIAS_FMT` is seen and queues. One written in a cargo
-config file isn't (the shim doesn't read those either); where the rustc guard is installed, it
-refuses that compile.
+For `cargo fmt`, an alias set through `CARGO_ALIAS_FMT` or `--config` is seen and queues. One
+written in a cargo config file isn't (the shim doesn't read those either); where the rustc guard is
+installed, it refuses that compile.
 
 ## Being told when a build finishes
 

@@ -936,15 +936,20 @@ def cgroup_populated(path: str) -> bool:
         return True  # can't tell (out of descriptors, say): don't call a build gone on that
 
 
-def proc_stat(pid):
+def proc_stat(pid, strict: bool = False):
     """(start time in clock ticks since boot, state letter, parent pid) of a process, from one read
-    of its stat line, or None if it's gone."""
+    of its stat line, or None if it's gone. With `strict`, a read that fails for another reason
+    than the process being gone (out of descriptors, say) is raised, not taken for that."""
     try:
         with open(f"/proc/{int(pid)}/stat") as f:
             data = f.read()
         fields = data.rsplit(")", 1)[1].split()
         return int(fields[19]), fields[0], int(fields[1])
-    except (OSError, ValueError, IndexError, TypeError, OverflowError):
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError, TypeError, OverflowError):
+        return None
+    except OSError:
+        if strict:
+            raise
         return None
 
 
@@ -987,13 +992,19 @@ AGENT_EXE = re.compile(r"/\.?claude/(versions|remote/ccd-cli)/[^/]+$")
 T3_THREAD_VAR = "T3CODE_THREAD_ID"  # T3 sets it for a thread's agent process, and so for all that runs
 
 
-def is_agent(pid: int) -> bool:
+def is_agent(pid: int, strict: bool = False) -> bool:
+    """Whether a process is an agent session's. With `strict`, a read that fails for another reason
+    than the process being gone or closed to us is raised, not taken for "no"."""
     try:
         with open(f"/proc/{pid}/comm") as f:
             if f.read().strip() in AGENT_COMM:
                 return True
         return bool(AGENT_EXE.search(os.readlink(f"/proc/{pid}/exe")))
-    except (OSError, ValueError):
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        return False
+    except OSError:
+        if strict:
+            raise
         return False
 
 
@@ -1019,7 +1030,7 @@ def live_threads() -> dict[str, list[list[int]]]:
     out: dict[str, list[list[int]]] = {}
     prefix = T3_THREAD_VAR.encode() + b"="
     for pid in own_pids():
-        if not is_agent(pid):
+        if not is_agent(pid, strict=True):
             continue
         try:
             with open(f"/proc/{pid}/environ", "rb") as f:
@@ -1028,7 +1039,7 @@ def live_threads() -> dict[str, list[list[int]]]:
             continue
         thread = next((v[len(prefix):] for v in entries if v.startswith(prefix)), b"")
         thread = thread.decode(errors="replace").strip()[:200]
-        stat = proc_stat(pid)
+        stat = proc_stat(pid, strict=True)
         if thread and stat and stat[1] not in ("Z", "X"):
             out.setdefault(thread, []).append([pid, stat[0]])
     return out
@@ -4339,6 +4350,7 @@ class Daemon:
     def requeue(self, t: Ticket, now: float) -> None:
         """A build stopped to free memory is gone: queue it again, at the front, or fail it."""
         self.drop_queries(t)  # its attempt's answers are no use to the next one, or to no one
+        t.wanted_at = now  # (#71: queued again, it has the whole of abandoned_seconds)
         result = read_json(os.path.join(t.dir, "result.json"))  # its kills, before the file goes
         if isinstance(result, dict):
             t.kills_seen = max(t.kills_seen, int(sane_count(result.get("oom_kills")) or 0))
