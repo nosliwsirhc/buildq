@@ -55,7 +55,13 @@ queued ──► starting ──► running ──► succeeded | failed
    others.
 
 A build started by `buildq run` is *attached*: once no client has followed it for
-`unwatched_seconds`, it is cancelled. Builds from `buildq submit` are not.
+`unwatched_seconds`, it is cancelled. Builds from `buildq submit` are not. Instead, the daemon notes the
+agent session each submit came from: the nearest ancestor of the client (its pid from the socket's
+peer credentials) that is a Claude Code or Codex process, as pid and start time, so a reused pid
+doesn't count, plus the T3 thread in that process's environment. A submit build that is still
+queued is cancelled once every submission waiting for it came from an agent that has exited, and
+nobody has waited on the ticket for `abandoned_seconds` (#71). When T3 starts a new process for the
+same thread (a restart, a handoff to another account), the submission moves to that process.
 
 ### Protocol
 

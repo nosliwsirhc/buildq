@@ -1209,6 +1209,113 @@ class SameSource(DaemonCase):
             self.assertNotEqual(digest({name: "a"}), digest({name: "b"}), name)
 
 
+class AbandonedSubmits(DaemonCase):
+    """#71: a dropped-off build whose agent session has exited, and that nobody waits on, is cancelled
+    while it's still queued."""
+
+    def setUp(self):
+        super().setUp()
+        self.machine.mem_available = 15 * GIB  # nothing fits: everything waits
+        start = buildqd.proc_identity(os.getpid())[0]
+        self.alive = [os.getpid(), start, None]
+        self.gone = [os.getpid(), start + 1, None]  # (another start time: the pid was reused)
+        self.agents = {}  # client pid -> the agent the daemon finds above it
+        self.daemon.find_agent = lambda pid: self.agents.get(pid)
+        self.daemon.agent_scan = (self.now + 1e9, {})  # no T3 thread has a live agent (no /proc scan)
+
+    def drop_off(self, argv=("cargo", "test"), agent=None, **extra):
+        pid = 1000 + len(self.agents)
+        self.agents[pid] = agent
+        msg = {"argv": list(argv), "cwd": extra.pop("cwd", None) or self.workdir(), "env": {}, **extra}
+        t, error = self.daemon.submit(msg, self.now, peer=pid)
+        self.assertIsNone(error)
+        return t
+
+    def test_a_dropped_off_build_whose_agent_went_is_cancelled_after_a_while(self):
+        t = self.drop_off(submission="s", agent=self.gone)
+        self.assertEqual(t.state, "queued")
+        self.daemon.drop_abandoned(self.now + 599)
+        self.assertFalse(t.cancel_requested)  # within abandoned_seconds: it may still be waited on
+        self.assertEqual(t.row(self.now)["agent"], "gone")
+        self.daemon.drop_abandoned(self.now + 601)
+        self.assertTrue(t.cancel_requested)
+        self.assertEqual(t.state, "cancelled")
+
+    def test_it_stays_while_its_agent_runs_or_with_no_known_agent(self):
+        live = self.drop_off(submission="a", agent=self.alive)
+        unknown = self.drop_off(("cargo", "build"), submission="b")  # CI, a terminal
+        self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertFalse(live.cancel_requested or unknown.cancel_requested)
+        self.assertEqual((live.row(self.now)["agent"], unknown.row(self.now)["agent"]), ("alive", None))
+
+    def test_a_new_process_of_the_same_t3_thread_takes_it_over(self):
+        t = self.drop_off(submission="s", agent=[*self.gone[:2], "thread-1"])
+        self.daemon.agent_scan = (self.now + 1e9, {"thread-1": self.alive[:2] + ["thread-1"]})
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(t.cancel_requested)
+        self.assertEqual(t.agents["s"], self.alive[:2] + ["thread-1"])  # followed from now on by pid
+
+    def test_a_wait_on_the_ticket_holds_it_off(self):
+        t = self.drop_off(submission="s", agent=self.gone)
+
+        class Waiting:
+            submission = None
+
+            def send(self, message):
+                return True
+        self.daemon.watchers[t.id].add(Waiting())  # a `buildq wait` on the ticket
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(t.cancel_requested)
+        self.daemon.watchers[t.id].clear()  # its --timeout ran out
+        self.daemon.drop_abandoned(self.now + 1500)
+        self.assertFalse(t.cancel_requested)  # 500 s since the last wait
+        self.daemon.drop_abandoned(self.now + 1601)
+        self.assertTrue(t.cancel_requested)
+
+    def test_another_live_or_unknown_submission_keeps_it(self):
+        first = self.drop_off(source=SOURCE, submission="a", agent=self.gone)
+        self.drop_off(cwd=first.cwd, source=SOURCE, submission="b", agent=self.alive)
+        self.assertEqual(set(first.agents), {"a", "b"})
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(first.cancel_requested)
+        self.drop_off(cwd=first.cwd, source=SOURCE, submission="c")  # joined by no known agent
+        first.agents["b"] = self.gone
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(first.cancel_requested)
+
+    def test_a_build_that_started_or_a_followed_run_carries_on(self):
+        self.machine.mem_available = 200 * GIB
+        running = self.drop_off(submission="s", agent=self.gone)
+        self.assertEqual(running.state, "running")
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(running.cancel_requested)
+        run = self.drop_off(("cargo", "build"), attach=True, submission="r", agent=self.gone)
+        self.assertEqual(run.agents, {})  # a `buildq run` has the unwatched rule instead
+
+    def test_zero_turns_it_off(self):
+        self.daemon.cfg.abandoned_seconds = 0
+        t = self.drop_off(submission="s", agent=self.gone)
+        self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertFalse(t.cancel_requested)
+
+    def test_the_agent_is_kept_across_a_restart(self):
+        t = self.drop_off(submission="s", agent=self.gone)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                               queries=buildqd.InlineExecutor())
+        again.load_tickets(self.now + 1)
+        self.assertEqual(again.tickets[t.id].agents, {"s": self.gone})
+        again.stop_memory_watch()
+        for x in again.tickets.values():
+            again.close_jobserver(x)
+
+    def test_this_process_is_found_under_its_agent_or_not_at_all(self):
+        found = buildqd.agent_of(os.getpid())  # the suite may run under an agent, or not
+        if found is not None:
+            self.assertTrue(buildqd.is_agent(found[0]))
+            self.assertTrue(buildqd.proc_alive(found[0], found[1]))
+        self.assertIsNone(buildqd.agent_of(1))
+
+
 class SheddingMemory(DaemonCase):
     """When other work takes the machine's memory, buildq pauses its newest build, then stops it
     and queues it again (GNU parallel's --memsuspend and --memfree)."""

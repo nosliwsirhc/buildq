@@ -112,8 +112,17 @@ or SIGHUP (Ctrl-C is a cancel meant as one), leaves its place: the same command 
 caller, in the same directory and lane, submitted within ten minutes of the cancel, goes in as if it
 had waited as long, rather than at the back. A build that was already running leaves none, and a
 daemon restart forgets the places. A build dropped off with `buildq
-submit` belongs to its ticket and runs to the end whoever is watching, even after the agent that
-dropped it off has gone: cancel such a build with `buildq cancel <ticket>` (#71 would do it for you).
+submit` belongs to its ticket: agents wait on it in rounds (`buildq wait --timeout 9m`), so going
+unwatched between them means nothing. When it was dropped off from a Claude Code or Codex session,
+the daemon notes that session's process. Once that process has exited (with no new process for the
+same T3 thread) and nobody has waited on the ticket for `abandoned_seconds` (10 min), a build still
+queued is cancelled, since it would only run for nobody (#71); `buildq status <ticket>` says whether the session still runs.
+A build that already started runs to the end, and one dropped off from anywhere else (a terminal,
+a script, CI) waits for its turn whoever is watching: cancel it with `buildq cancel <ticket>`.
+
+`buildq run` (and so `heavy-run`) runs a command that never compiles at once instead of queueing
+it: a tool's `--version` or `--help`, and the cargo subcommands the shim already runs directly
+(`cargo fmt`, `cargo metadata`, `cargo clean`, ...), with a one-line note (#72).
 
 ## Being told when a build finishes
 

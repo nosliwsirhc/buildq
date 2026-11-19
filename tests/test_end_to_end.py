@@ -504,6 +504,14 @@ class Enforcement(Harness):
         build_line, run_line = run.stdout.splitlines()
         self.assertRegex(build_line, r"^cargo build --bin x job=[0-9a-f-]{36}$")
         self.assertEqual(run_line, "cargo run --bin x job=none")
+        cargo = os.path.join(self.tmp.name, "real", "cargo")
+        fmt = self.q("run", "--", cargo, "fmt", "--check", env=env)  # sent to the queue on purpose (#72)
+        self.assertEqual((fmt.returncode, fmt.stdout), (0, "cargo fmt --check job=none\n"), fmt.stderr)
+        self.assertIn("compiles nothing", fmt.stderr)
+        version = self.q("run", "--", cargo, "sqlx", "--version", env=env)
+        self.assertEqual(version.stdout, "cargo sqlx --version job=none\n")
+        queued = self.q("run", "--", cargo, "build", env=env)
+        self.assertRegex(queued.stdout, r"^cargo build job=[0-9a-f-]{36}$")
 
     def test_the_rustc_guard(self):
         rustc = os.path.join(self.tmp.name, "fake-rustc")

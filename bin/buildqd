@@ -147,11 +147,12 @@ def read_json(path: str):
         return None
 
 
-def peer_uid(sock: socket.socket) -> int | None:
+def peer_cred(sock: socket.socket) -> tuple[int, int] | None:
+    """(pid, uid) of the process at the other end of a Unix socket, or None."""
     try:
-        _pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
-                                                              struct.calcsize("3i")))
-        return uid
+        pid, uid, _gid = struct.unpack("3i", sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                                             struct.calcsize("3i")))
+        return pid, uid
     except (OSError, AttributeError):
         return None
 
@@ -258,6 +259,7 @@ DEFAULTS = {
     "script_labels": [],
     "restartable_scripts": [],
     "unwatched_seconds": 30,
+    "abandoned_seconds": 600,
     "history_runs": 30,
     "history_days": 30,
     "history_keys": 2000,
@@ -430,6 +432,7 @@ class Config:
                              "would make anything run with them restartable")
         self.restartable_scripts = frozenset(scripts)
         self.unwatched_seconds = number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)
+        self.abandoned_seconds = number(d["abandoned_seconds"], "abandoned_seconds", 0, 30 * 86400)
         self.history_runs = number(d["history_runs"], "history_runs", 1, 1000, integer=True)
         self.history_days = number(d["history_days"], "history_days", 1, 3650)
         self.history_keys = number(d["history_keys"], "history_keys", 10, 1_000_000, integer=True)
@@ -942,6 +945,66 @@ def proc_identity(pid):
         return int(fields[19]), fields[0]
     except (OSError, ValueError, IndexError, TypeError):
         return None
+
+
+# Agent sessions (#71): Claude Code (also as T3's or the desktop app's build of it) and Codex.
+AGENT_EXE = re.compile(r"/claude/(versions|remote/ccd-cli)/[^/]+$|/(claude|codex)$")
+AGENT_THREAD_VARS = ("T3CODE_THREAD_ID", "CODEX_THREAD_ID")  # set in the agent's own environment by T3
+
+
+def is_agent(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            if f.read().strip() in ("claude", "codex"):
+                return True
+        return bool(AGENT_EXE.search(os.readlink(f"/proc/{pid}/exe")))
+    except (OSError, ValueError):
+        return False
+
+
+def agent_thread(pid: int) -> str | None:
+    """The T3 thread an agent process works for, from its environment, or None."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            env = dict(v.split(b"=", 1) for v in f.read().split(b"\0") if b"=" in v)
+    except (OSError, ValueError):
+        return None
+    for name in AGENT_THREAD_VARS:
+        value = env.get(name.encode(), b"").decode(errors="replace").strip()
+        if value:
+            return value[:200]
+    return None
+
+
+def agent_of(pid: int) -> list | None:
+    """The agent session a client runs under: [pid, start ticks, T3 thread or None] of its nearest
+    ancestor (or itself) that is a Claude Code or Codex process. None for CI, a terminal, a script."""
+    for _ in range(64):
+        if not pid or pid <= 1:
+            return None
+        ident = proc_identity(pid)
+        if ident is None:
+            return None
+        if is_agent(pid):
+            return [pid, ident[0], agent_thread(pid)]
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return None
+    return None
+
+
+def live_agents() -> dict[str, list]:
+    """Each T3 thread an agent process now works for -> that process's [pid, start ticks, thread]."""
+    out = {}
+    for name in os.listdir("/proc"):
+        if name.isdigit() and is_agent(int(name)):
+            thread = agent_thread(int(name))
+            ident = proc_identity(int(name))
+            if thread and ident:
+                out[thread] = [int(name), ident[0], thread]
+    return out
 
 
 def proc_alive(pid, start) -> bool:
@@ -2898,6 +2961,7 @@ class Conn:
         self.writer = writer
         self.closed = False
         self.submission = None  # the submission a `buildq run` on this connection made or joined
+        self.peer_pid = None  # the client's process, from the socket
 
     def send(self, message: dict) -> bool:
         if self.closed or self.writer is None or self.writer.is_closing():
@@ -2919,7 +2983,7 @@ class Ticket:
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
                "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
                "requeue_pending", "shed_error", "restartable", "joiners", "answered", "interests", "followed",
-               "extra_notify",
+               "extra_notify", "agents",
                "frozen_total", "frozen_attempt", "attempts_wall", "attempts_mem_wait", "attempts_peak", "attempts_cpu",
                "attempts_mem_high", "git_env", "freeze_failed", "freeze_asked", "thaw_failed",
                "source_verified", "source_changed", "attempt_offsets", "queued_at", "wait_total", "source_checks", "from_ci", "workspace_group", "group_lane",
@@ -3061,6 +3125,7 @@ class Ticket:
         self.answered: dict[str, str] = {}  # other submissions it answered: id -> "joined" or "reused"
         self.interests: dict[str, str] = {}  # submissions waiting for it: id -> "run" (followed) or "submit"
         self.followed: dict[str, float] = {}  # a run submission -> when a client of it last followed
+        self.agents: dict[str, list] = {}  # a submit submission -> [pid, start, T3 thread] of its agent (#71)
         self.frozen_total = 0.0  # seconds spent paused, over all its attempts
         self.frozen_attempt = 0.0  # seconds this attempt spent paused, the current pause not included
         self.attempts_cpu = 0.0  # CPU seconds of attempts stopped for memory
@@ -3241,6 +3306,15 @@ class Ticket:
             best = max(sane_count(getattr(self, name)) or 0.0, value or 0.0)
             setattr(self, name, int(best) if name == "mem_high" else best)
 
+    def agent_state(self) -> str | None:
+        """"alive" while an agent session that dropped it off still runs, "gone" once all have exited,
+        None when no known agent did (#71)."""
+        agents = [a for who, a in self.agents.items() if self.interests.get(who) == "submit"
+                  and isinstance(a, list) and len(a) == 3]
+        if not agents:
+            return None
+        return "alive" if any(proc_alive(a[0], a[1]) for a in agents) else "gone"
+
     def row(self, now: float, ahead: int | None = None) -> dict:
         elapsed = round((self.ended or now) - self.started, 1) if self.started else None
         return {
@@ -3256,6 +3330,7 @@ class Ticket:
             "measured": self.measured, "exit": self.exit, "oom": self.oom, "timed_out": self.timed_out,
             "mem_wait_some": round(self.mem_wait_some, 1), "mem_wait_full": round(self.mem_wait_full, 1),
             "mem_high": self.mem_high, "source": self.source, "caller": self.caller, "from_ci": bool(self.from_ci),
+            "agent": self.agent_state(),
             "frozen": self.frozen,
             "requeues": self.requeues, "ci_stops": self.ci_stops, "yields_to": self.yields_to,
             "source_changed": self.source_changed, "attempt_offsets": self.attempt_offsets,
@@ -3320,6 +3395,7 @@ class Daemon:
         # timeout), by (directory, command, lane, caller): (seconds it waited, kept until). The retry
         # takes it (#7). Kept in memory only: a daemon restart forgets them (the retry goes to the back).
         self.vacated: dict[tuple, tuple[float, float]] = {}
+        self.agent_scan: tuple[float, dict] | None = None  # (when, live_agents()) for drop_abandoned
         self.guard_available: int | None = None  # MemAvailable when the slice was last guarded
         self.submissions: dict[str, str] = {}  # the client's submission id -> its ticket
         self.slice_limit = None  # the slice's configured MemoryMax, read once systemd has the slice
@@ -3677,7 +3753,7 @@ class Daemon:
 
     # ---- submitting, cancelling
 
-    def submit(self, msg: dict, now: float) -> tuple[Ticket | None, str | None]:
+    def submit(self, msg: dict, now: float, peer: int | None = None) -> tuple[Ticket | None, str | None]:
         if self.stopping:
             return None, "the daemon is stopping; try again in a moment"
         argv = msg.get("argv")
@@ -3718,6 +3794,7 @@ class Daemon:
             return None, f"bad option: {e}"
         t.attached = bool(msg.get("attach"))
         t.restartable = msg.get("restartable") is True
+        agent = self.find_agent(peer) if peer and not t.attached else None  # who dropped it off (#71)
         umask = msg.get("umask")
         if isinstance(umask, int) and not isinstance(umask, bool) and 0 <= umask <= 0o777:
             t.umask = umask
@@ -3749,6 +3826,8 @@ class Daemon:
                     earlier.interests[who] = "run" if t.attached else "submit"
                     if t.attached:
                         earlier.followed[who] = now
+                    elif agent:
+                        earlier.agents[who] = agent
                 self.save(earlier)
                 return earlier, None
         t.workspace = workspace_of(cwd, env)
@@ -3758,6 +3837,8 @@ class Daemon:
         t.interests = {t.submission or f"anon-{tid}": "run" if t.attached else "submit"}
         if t.attached:
             t.followed = {t.submission or f"anon-{tid}": now}
+        elif agent:
+            t.agents = {t.submission or f"anon-{tid}": agent}
         t.git_env = {k: v for k, v in env.items() if GIT_ENV.fullmatch(k)}
         t.cold = cargo_cold(argv, cwd, env)
         t.max_log = self.cfg.max_log
@@ -5623,6 +5704,8 @@ class Daemon:
                 t.interests = {}
             if not isinstance(t.followed, dict):
                 t.followed = {}
+            if not isinstance(t.agents, dict):
+                t.agents = {}
             if not t.interests and t.state not in FINISHED:  # saved before buildq kept interests
                 t.interests = {t.submission or f"anon-{t.id}": "run" if t.attached else "submit"}
             for other in t.answered:
@@ -5731,6 +5814,7 @@ class Daemon:
         self.check(now)
         self.shed_memory(now)
         self.drop_unwatched(now)
+        self.drop_abandoned(now)
         self.scan_flock_slots(now)
         self.schedule(now)
         self.make_room_for_ci(now)
@@ -5940,6 +6024,51 @@ class Daemon:
             if until < now:
                 del self.vacated[place]
 
+    def find_agent(self, pid: int) -> list | None:
+        return agent_of(pid)
+
+    def agents_gone(self, t: Ticket, now: float) -> bool:
+        """Whether every submission still waiting for a dropped-off build came from an agent session
+        (Claude Code, Codex) that has since exited. A `buildq run` following it, or a submission from
+        no known agent (CI, a terminal), means no. An agent of a T3 thread lives on in a new process
+        when T3 starts one for the same thread (a restart, a handoff): the submission moves to it."""
+        if not t.interests:
+            return False
+        for who, kind in t.interests.items():
+            agent = t.agents.get(who) if kind == "submit" else None
+            if not (isinstance(agent, list) and len(agent) == 3):
+                return False
+            if proc_alive(agent[0], agent[1]):
+                return False
+            if agent[2]:
+                if self.agent_scan is None or now - self.agent_scan[0] >= 30:
+                    self.agent_scan = (now, live_agents())  # (a /proc scan: at most every 30 s)
+                successor = self.agent_scan[1].get(agent[2])
+                if successor:
+                    t.agents[who] = successor
+                    self.save(t)
+                    return False
+        return True
+
+    def drop_abandoned(self, now: float) -> None:
+        """A build dropped off with `buildq submit` is waited on in rounds (`buildq wait --timeout 9m`),
+        so going unwatched for a while means nothing. But once the agent session that dropped it off
+        has exited, and nobody has waited on it for abandoned_seconds, it would only run for nobody:
+        cancel it while it's still queued (#71). A build that started carries on."""
+        if not self.cfg.abandoned_seconds:
+            return
+        for t in list(self.tickets.values()):
+            if t.state != "queued" or t.cancel_requested or t.flock or t.attached:
+                continue
+            if self.watchers.get(t.id):
+                t.last_watched = now
+                continue
+            idle = now - max(t.last_watched, t.submitted)
+            if idle > self.cfg.abandoned_seconds and self.agents_gone(t, now):
+                log(f"cancelling {t.id}: the agent session that dropped it off has exited and nobody has "
+                    f"waited on it for {fmt_duration(idle)}")
+                self.cancel(t, now)
+
     def send_waits(self, now: float) -> None:
         for position, t in enumerate(self.queue()):
             if t.reason_cat != t.sent_cat or now - t.sent_at >= 60:
@@ -5959,7 +6088,7 @@ class Daemon:
     def handle_message(self, msg: dict, conn: Conn, now: float) -> None:
         op = msg.get("op")
         if op == "submit":
-            t, error = self.submit(msg, now)
+            t, error = self.submit(msg, now, peer=getattr(conn, "peer_pid", None))
             if t is None:
                 conn.send({"type": "error", "error": error})
                 return
@@ -6045,9 +6174,11 @@ class Daemon:
     async def handle(self, reader, writer) -> None:
         conn = Conn(writer)
         sock = writer.get_extra_info("socket")
-        if sock is not None and peer_uid(sock) not in (UID, None):
+        cred = peer_cred(sock) if sock is not None else None
+        if cred is not None and cred[1] != UID:
             writer.close()  # only this user's processes may use the queue
             return
+        conn.peer_pid = cred[0] if cred else None
         try:
             while not self.stopping:
                 line = await reader.readline()
