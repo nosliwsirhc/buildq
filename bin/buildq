@@ -45,9 +45,10 @@ submitted it, and no stdin. `buildq run` streams its output to stdout and exits 
 code (128 + N if signal N ended it). Interrupting `buildq run` (Ctrl-C, SIGTERM, SIGHUP) cancels
 the build, and so does killing it outright, once no client has followed the build for the
 daemon's unwatched_seconds. A build dropped off with `buildq submit` runs on alone, unless the agent
-session (Claude Code, Codex) that dropped it off has exited and nobody has waited on it for the
-daemon's abandoned_seconds: then it's cancelled while still queued. `buildq run` runs a command that
-never compiles (cargo fmt, cargo metadata, a --version) at once, as the shim does.
+session (Claude Code, Codex) that dropped it off has ended and, for the daemon's abandoned_seconds,
+nobody has waited on it: then it's cancelled while still queued. `buildq run` with no options runs
+a cargo command that never compiles (cargo fmt, cargo metadata, cargo --version) at once, as the
+shim does.
 
 Exit codes of the client itself: 2 for a refused request, 75 when the daemon can't be reached
 (BUILDQ_FALLBACK=fail, or submit), 124 when `wait --timeout` runs out, 125 when a build ended
@@ -329,10 +330,10 @@ def print_ticket(row: dict) -> None:
               f" (fingerprint {src['fingerprint'][:12]}){checked}")
     if row.get("caller"):
         print(f"  from      {row['caller']}")
-    if row.get("agent") and row["state"] not in FINISHED:  # who dropped it off (#71)
+    if row.get("agent") and row["state"] == "queued":  # the agent session that dropped it off (#71)
         print("  agent     " + ("the session that dropped it off is running" if row["agent"] == "alive" else
-                              "the session that dropped it off has exited: unless someone waits on it, or "
-                              "its T3 thread starts again, it's cancelled while still queued"))
+                              "the session that dropped it off has ended: unless that session comes back or "
+                              "someone waits on the ticket, it's cancelled while still queued"))
     if row.get("frozen"):
         print("  paused    to give the machine its memory back; it goes on once there is room")
     if row.get("requeues"):
@@ -1082,47 +1083,49 @@ def cmd_submit(args) -> int:
 
 
 def shim_classifier():
-    """buildq-shim's own rules for what's heavy, loaded from beside this program, or None."""
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "buildq-shim")
+    """buildq-shim's own rules for what is heavy, loaded from beside this program."""
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    loader = SourceFileLoader("buildq_shim", os.path.join(os.path.dirname(os.path.realpath(__file__)), "buildq-shim"))
+    module = module_from_spec(spec_from_loader("buildq_shim", loader))
+    sys.dont_write_bytecode, before = True, sys.dont_write_bytecode  # no __pycache__ in the bin folder
     try:
-        from importlib.machinery import SourceFileLoader
-        from importlib.util import module_from_spec, spec_from_loader
-        loader = SourceFileLoader("buildq_shim", path)
-        module = module_from_spec(spec_from_loader("buildq_shim", loader))
-        sys.dont_write_bytecode, before = True, sys.dont_write_bytecode  # no __pycache__ in the bin folder
-        try:
-            loader.exec_module(module)
-        finally:
-            sys.dont_write_bytecode = before
-        return module
-    except (OSError, ImportError, SyntaxError):
-        return None
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = before
+    return module
 
 
-def runs_directly(command: list[str]) -> bool:
-    """A command that never compiles (`cargo fmt`, `cargo metadata`, a tool's --version), by the
-    shim's rules: it runs at once rather than wait behind builds (#72)."""
-    shim = shim_classifier()
-    return bool(shim) and shim.never_builds(command[0], command[1:])
+def runs_directly(args, command: list[str]) -> bool:
+    """A cargo command that never compiles (`cargo fmt`, `cargo metadata`, `cargo --version`), by the
+    shim's own rule, runs at once rather than wait behind builds (#72). Not when an option asks the
+    daemon for something (a lane, a time limit, a name, a finish hook): then it queues as asked. If
+    the shim can't be read, or is an older one without the rule, everything queues as before."""
+    if args.lane or args.cores or args.mem or args.priority or args.timeout or args.name or args.notify:
+        return False
+    try:
+        return shim_classifier().never_builds(command[0], command[1:]) is True
+    except Exception:
+        return False
+
+
+def run_now(command: list[str]) -> int:
+    try:
+        os.execvp(command[0], command)
+    except OSError as e:
+        note(f"can't run {command[0]}: {e}")
+        return 127
 
 
 def cmd_run(args) -> int:
     command = the_command(args)
     if command is None:
         return 2
-    if runs_directly(command):
-        note(f"`{shlex.join(command)[:80]}` compiles nothing, so it runs now instead of queueing.")
-        try:
-            os.execvp(command[0], command)
-        except OSError as e:
-            note(f"can't run {command[0]}: {e}")
-            return 127
     if inside_a_build():
-        try:
-            os.execvp(command[0], command)  # already inside a build's turn
-        except OSError as e:
-            note(f"can't run {command[0]}: {e}")
-            return 127
+        return run_now(command)  # already inside a build's turn
+    if runs_directly(args, command):
+        note("this command compiles nothing, so it runs now instead of queueing.")
+        return run_now(command)
     # Interrupts are caught from here on, so one that comes while the build is being submitted
     # still cancels it once its ticket is known.
     pending: list[int] = []

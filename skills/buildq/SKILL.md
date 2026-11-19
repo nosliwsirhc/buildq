@@ -33,8 +33,13 @@ your tool call's time limit.
 
 - Claude Code: run `buildq wait "$T"` as a background command, and you are told when it ends.
 - A `buildq run` belongs to whoever called it. If that call is interrupted, killed or timed out,
-  the build is cancelled within half a minute. A dropped-off build keeps running whatever happens
-  to the caller. After a timeout, wait on the ticket. Never start the same build again.
+  the build is cancelled within half a minute. A dropped-off build keeps its place whatever happens
+  to that call. After a timeout, wait on the ticket. Never start the same build again.
+- A dropped-off build that is still queued is cancelled once your session has been gone for ten
+  minutes with nobody waiting on the ticket. If you come back to a ticket that says so, submit the
+  build again.
+- `buildq run -- cargo fmt` (and `cargo metadata`, `cargo tree`, `cargo --version`: cargo commands
+  that never compile) runs at once and says so. There is no need to queue them.
 - Commands run inside a build (a script the build runs) go straight through: they share the
   build's turn. `buildq submit` refuses there.
 - Submit a script that only builds and runs tests with `--restartable` (`buildq run --restartable --
@@ -112,6 +117,7 @@ outside it, your toolchain, or ignored files other than `.env*`. After changing 
 | `stopped to free memory, and queued again at the front` | The machine ran very short. Your build was stopped, and starts over from the beginning once there is room. | Keep waiting on the same ticket. Don't submit it again. |
 | `stopped to make room for a CI job's build …` | A CI step had waited for memory your build held. Your build was stopped and queued again; it starts over once that step has started, and then goes first. | Keep waiting on the same ticket. Don't submit it again. |
 | `stopped to free memory … It isn't started again by itself` | The machine ran very short. It was a script or a push, and starting it over might repeat what it did. | Check what it had done, then run it again. If it only builds and tests, submit it with `--restartable` next time. |
+| `cancelled; the agent session that dropped it off had ended …` | The build was dropped off, its session then ended, and nobody waited on the ticket for ten minutes, so it was removed from the queue. | Submit it again if you still need it. |
 | `the same command on the same source is already running as ticket …` | Someone (maybe you, before a timeout) started this exact build. | Wait on that ticket. |
 | `this exact source passed this command … ago` | It already passed on this source. | Nothing to do. `--again` only if you have a reason. |
 

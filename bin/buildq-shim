@@ -45,8 +45,6 @@ MAKE_LIGHT_TARGET = re.compile(r"(^|[-_:.])(dev|watch|up|down|serve|server|start
 JS_TOOLS = {"vitest", "vite", "tsc", "vue-tsc", "playwright", "storybook", "build-storybook", "jest", "eslint",
             "next", "nuxt", "astro"}
 INFO = {"--help", "-h", "--version", "-V", "version", "help", "--list"}  # asks, builds nothing
-# The tools heavy() knows (install.sh --shims links most of these names).
-SHIMMED = {"cargo", "npm", "pnpm", "npx", "pnpx", "yarn", "bun", "bunx", "make", "gmake", "ninja", "dotnet"}
 
 
 def positionals(args, value_options=()):
@@ -99,27 +97,29 @@ def cargo_subcommand(args: list[str]) -> list[str]:
     return positionals(rest, {"-Z", "--config", "--color", "-C", "--manifest-path"})[:2]
 
 
+CARGO_ASKS = {"--help", "-h", "--version", "-V", "--list"}  # to cargo itself: they build nothing
+# Light, but not to be run at once when sent to the queue on purpose: `watch` runs until stopped,
+# and `clean` deletes a target folder without locking it, so it waits for a build using that folder.
+CARGO_QUEUED_ON_REQUEST = {"watch", "clean"}
+
+
 def never_builds(tool: str, args: list[str]) -> bool:
-    """Whether a command sent to the queue on purpose (`buildq run`, heavy-run) is one that never
-    compiles: it asks a tool's version or help, or it's a cargo subcommand that never compiles
-    (fmt, metadata, clean, ...). Such a command runs at once instead of waiting behind builds
-    (#72). Narrower than `not heavy()`, which also lets long-running and watch commands through:
-    sent to the queue by hand, those were meant to queue."""
-    tool = os.path.basename(tool)
-    if tool not in SHIMMED:
+    """Whether a command sent to the queue on purpose (`buildq run`, a wrapper around it) is a
+    cargo command that never compiles: `cargo fmt`, `cargo metadata` and the rest of CARGO_LIGHT,
+    or cargo asked for its version or help. `buildq run` runs such a command at once instead of
+    queueing it behind builds (#72).
+
+    Deliberately narrow. It answers for cargo only, by the same list heavy() reads, and whatever it
+    calls light heavy() calls light too, so nothing the shim queues is ever let through here. Other
+    tools' commands (`make help` is a target like any other) and words after a subcommand
+    (`cargo test version` names a test) stay queued."""
+    if os.path.basename(tool) != "cargo":
         return False
-    rest = args[1:] if tool == "cargo" and args and args[0].startswith("+") else args
-    if rest and all(a in INFO for a in rest):
+    rest = args[1:] if args and args[0].startswith("+") else args
+    if rest and all(a in CARGO_ASKS for a in rest):
         return True
-    if tool == "cargo":
-        sub = cargo_subcommand(args)
-        if not sub:
-            return False
-        after = rest[rest.index(sub[0]) + 1:]
-        if after and all(a in INFO for a in after):
-            return True  # cargo build --help, cargo sqlx --version
-        return sub[0] in CARGO_LIGHT and sub[0] != "watch" and not watching(args)
-    return False
+    sub = cargo_subcommand(args)
+    return bool(sub) and sub[0] in CARGO_LIGHT and sub[0] not in CARGO_QUEUED_ON_REQUEST and not watching(args)
 
 
 def heavy(tool: str, args: list[str]) -> bool:

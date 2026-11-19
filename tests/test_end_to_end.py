@@ -5,6 +5,8 @@ no systemd user session. With BUILDQ_TEST_SCOPES=1 on a machine that has one, ev
 with builds as systemd services (ScopeTests), plus checks that only systemd can do.
 """
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -504,14 +506,28 @@ class Enforcement(Harness):
         build_line, run_line = run.stdout.splitlines()
         self.assertRegex(build_line, r"^cargo build --bin x job=[0-9a-f-]{36}$")
         self.assertEqual(run_line, "cargo run --bin x job=none")
+
+    def test_run_runs_cargo_commands_that_never_compile_at_once(self):
+        """#72: `buildq run -- cargo fmt` (heavy-run cargo fmt) doesn't wait behind builds."""
+        env = self.make_tools()
         cargo = os.path.join(self.tmp.name, "real", "cargo")
-        fmt = self.q("run", "--", cargo, "fmt", "--check", env=env)  # sent to the queue on purpose (#72)
+        fmt = self.q("run", "--", cargo, "fmt", "--check", env=env)
         self.assertEqual((fmt.returncode, fmt.stdout), (0, "cargo fmt --check job=none\n"), fmt.stderr)
         self.assertIn("compiles nothing", fmt.stderr)
-        version = self.q("run", "--", cargo, "sqlx", "--version", env=env)
-        self.assertEqual(version.stdout, "cargo sqlx --version job=none\n")
-        queued = self.q("run", "--", cargo, "build", env=env)
-        self.assertRegex(queued.stdout, r"^cargo build job=[0-9a-f-]{36}$")
+        self.assertNotIn("fmt", fmt.stderr)  # the note never repeats the command (it may hold a secret)
+        built = self.q("run", "--", cargo, "test", "version", env=env)  # names a test: a build like any other
+        self.assertRegex(built.stdout, r"^cargo test version job=[0-9a-f-]{36}$")
+        asked = self.q("run", "--timeout", "5m", "--", cargo, "fmt", env=env)  # an option for the daemon
+        self.assertRegex(asked.stdout, r"^cargo fmt job=[0-9a-f-]{36}$")
+        # A client beside an older shim, as halfway through an install: everything queues, as before.
+        old = os.path.join(self.tmp.name, "old-install")
+        os.makedirs(old)
+        shutil.copy(BUILDQ, os.path.join(old, "buildq"))
+        with open(os.path.join(old, "buildq-shim"), "w") as f:
+            f.write("def heavy(tool, args):\n    return True\n")
+        mixed = subprocess.run([sys.executable, os.path.join(old, "buildq"), "run", "--", cargo, "fmt"], env=env,
+                               cwd=self.work, capture_output=True, text=True, timeout=60)
+        self.assertRegex(mixed.stdout, r"^cargo fmt job=[0-9a-f-]{36}$", mixed.stderr)
 
     def test_the_rustc_guard(self):
         rustc = os.path.join(self.tmp.name, "fake-rustc")
@@ -543,6 +559,36 @@ class Enforcement(Harness):
         with open(os.path.join(self.tmp.name, "buildq", "guard.env"), "w") as f:
             f.write('RUN_WITH="~/bin/heavy"\n')
         self.assertIn("    ~/bin/heavy cargo ...", compile_().stderr)  # the machine's wrapper
+
+
+class AbandonedBuilds(Harness):
+    """#71: a build dropped off by an agent session that then ends is cancelled while it's queued."""
+
+    def config(self):
+        return CONFIG.replace("unwatched_seconds = 3", "unwatched_seconds = 3\nabandoned_seconds = 2")
+
+    def test_a_build_whose_agent_session_ended_is_cancelled_and_says_why(self):
+        loader = importlib.machinery.SourceFileLoader("buildqd", BUILDQD)
+        buildqd = importlib.util.module_from_spec(importlib.util.spec_from_loader("buildqd", loader))
+        loader.exec_module(buildqd)
+        if buildqd.agents_above(os.getpid()):
+            self.skipTest("the suite runs under an agent session, which would keep the build wanted")
+        self.assertEqual(self.q("pause", "nothing starts").returncode, 0)  # so builds stay queued
+        fake = os.path.join(self.tmp.name, "claude")  # a process named as an agent session is
+        os.symlink(sys.executable, fake)
+        code = "import subprocess, sys; sys.exit(subprocess.call([sys.argv[1], sys.argv[2], 'submit', '--', 'true']))"
+        dropped = subprocess.run([fake, "-I", "-c", code, sys.executable, BUILDQ], env=self.env, cwd=self.work,
+                                 capture_output=True, text=True, timeout=60)  # the session ends with it
+        self.assertEqual(dropped.returncode, 0, dropped.stderr)
+        ticket = dropped.stdout.strip()
+        self.assertRegex(ticket, UUID)
+        kept = self.submit("--", "echo", "kept")  # from no agent: it waits for its turn, as before
+        row = self.wait_for(ticket, ("cancelled",), timeout=30)
+        self.assertIn("agent session that dropped it off had ended", row["error"])
+        self.assertIn("submit it again", self.q("status", ticket).stdout)
+        self.assertIn("agent session", self.daemon.log())
+        time.sleep(3)  # past abandoned_seconds
+        self.assertEqual(self.daemon.ticket(kept)["state"], "queued")
 
 
 class SocketActivation(unittest.TestCase):

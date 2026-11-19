@@ -116,7 +116,8 @@ make_room_spare_after = "0"
 # client was killed); builds dropped off with `buildq submit` aren't.
 unwatched_seconds = 30
 # A build dropped off with `buildq submit` from a Claude Code or Codex session is cancelled while
-# still queued once that session has exited and nobody has waited on it for this long. 0 turns it off.
+# it is queued once, for this long on end, that session has been gone and nobody has waited on the
+# ticket. 0 turns it off. A daemon restart starts the time again.
 abandoned_seconds = 600
 
 # ---- What builds are expected to need -----------------------------------------------------------
