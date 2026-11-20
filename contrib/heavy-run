@@ -54,7 +54,9 @@ while [[ $# -gt 0 ]]; do
     --web) lane=(--lane web) ;;
     --again | --reuse | --restartable) opts+=("$1") ;;
     --script)
-      if [[ $# -lt 2 || -z "${2//[[:space:]]/}" || $2 == -* ]]; then
+      # (a single word that is itself a command, as in `--script bash run.sh`, is a forgotten reason)
+      if [[ $# -lt 2 || -z "${2//[[:space:]]/}" || $2 == -* ]] ||
+         { [[ $2 != *[[:space:]]* ]] && command -v -- "$2" >/dev/null 2>&1; }; then
         echo "heavy-run: --script needs a reason, such as --script \"the emulator needs one shell\"" >&2
         exit 2
       fi
@@ -65,6 +67,38 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+# Code light, ship heavy (owner, 2026-11-17; plan: ~/.agents/plans/release-batches.md). In a
+# project listed in ~/.config/release-batches/projects a heavy command runs only inside a queue
+# job, for the quick check, in a pipeline job, for a person at a terminal, or from inside the
+# project's ship workspace, or its urgent workspace, while it holds the ship turn
+# (`~/.agents/bin/batch begin`; this script then sets that workspace's CARGO_TARGET_DIR). Any other caller is refused: the
+# owner expected a softer rule to slide "back into the old patterns". The rule and its messages are
+# rb_guard in release-batches-lib.sh beside this script. The switch is
+# ~/.config/release-batches/enforce: without that file the library is not even read, and this
+# script does what it did before.
+# The guard runs as a process of its own, so nothing in the library can stop a build: only its
+# explicit refusal does (exit 86). A library that is missing, broken, crashes or hangs is skipped,
+# with one line saying so. Without the switch file it is not run at all.
+rb_lib=$here/release-batches-lib.sh
+rb_guard() {
+  [[ -e "${XDG_CONFIG_HOME:-$HOME/.config}/release-batches/enforce" ]] || return 0
+  local out rc=0 at_terminal=
+  if [[ -t 0 && -t 2 ]]; then at_terminal=1; fi
+  # 30 seconds at most, and 8 KB of answer at most: a guard that hangs or floods is a fault too.
+  out=$(RB_AT_TERMINAL=$at_terminal timeout -k 5 30 bash "$rb_lib" guard "$@" 2>&1 < /dev/null | head -c 8192) || rc=$?
+  if [[ $rc -eq 86 ]]; then
+    printf '%s\n' "$out" >&2
+    return 2
+  elif [[ $rc -eq 0 ]]; then
+    out=${out##*$'\n'}
+    if [[ $out == CARGO_TARGET_DIR=/* ]]; then export CARGO_TARGET_DIR="${out#CARGO_TARGET_DIR=}"; fi
+  else
+    out=${out%%$'\n'*}
+    echo "heavy-run: the release-batches guard failed and was skipped (exit $rc${out:+: ${out:0:160}})." >&2
+  fi
+  return 0
+}
 
 # The command a run or --submit hands buildq: past --submit and buildq's own options, `env` and its
 # settings, and wrappers such as nice or timeout. Prints, NUL-separated, the folder `env -C` moves it
@@ -214,6 +248,9 @@ esac
 case "${1:-}" in
   --wsl)
     shift
+    if [[ "${1:-}" != --status && "${1:-}" != --clean ]]; then
+      rb_guard "$@" || exit 2
+    fi
     exec "$here/heavy-run-wsl" "$@"
     ;;
   --status | --list | --wait | --logs | --cancel)
@@ -228,6 +265,7 @@ case "${1:-}" in
     ;;
   --submit)
     shift
+    rb_guard "$@" || exit 2
     exec "$buildq" submit "${lane[@]}" "${opts[@]}" "${name[@]}" "$@"  # buildq's own options (--name, --timeout, ...) may come first
     ;;
   "")
@@ -240,6 +278,9 @@ esac
 if [[ -n "${HEAVY_RUN_SLOT:-}" ]]; then
   exec "$@"
 fi
+
+# Before the queue and before the fixed-slot fallback, so neither path skips the rule.
+rb_guard "$@" || exit 2
 
 fallback=("$here/heavy-run-slots")
 [[ ${#lane[@]} -gt 0 ]] && fallback+=(--web)
