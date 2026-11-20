@@ -112,7 +112,42 @@ or SIGHUP (Ctrl-C is a cancel meant as one), leaves its place: the same command 
 caller, in the same directory and lane, submitted within ten minutes of the cancel, goes in as if it
 had waited as long, rather than at the back. A build that was already running leaves none, and a
 daemon restart forgets the places. A build dropped off with `buildq
-submit` belongs to its ticket and runs to the end whoever is watching.
+submit` belongs to its ticket: agents wait on it in rounds (`buildq wait --timeout 9m`), so going
+unwatched between them means nothing, and it waits for its turn whoever is watching.
+
+One kind is cleaned up: a build dropped off from a Claude Code or Codex session that has since
+ended (#71). The daemon notes which agent processes the `buildq submit` ran under. While the build
+is queued, it is cancelled once, for `abandoned_seconds` (10 min) on end, none of those processes
+has been running and nobody has waited on the ticket.
+- **A session that comes back keeps its build.** A later agent process of the same T3 thread (a
+  restart, a handoff to another account) counts as the session, and so does any `buildq wait`.
+- **The ticket says why.** `buildq status <ticket>` shows whether the session still runs, and a
+  cancelled ticket says that its session had ended and to submit it again if it's still wanted.
+- **What it leaves alone:** a build that is running, one that another submission still waits for,
+  and one dropped off from anywhere else (a terminal, a script, CI). Cancel those with
+  `buildq cancel <ticket>`.
+- **Its limits:** an agent program that serves several sessions in one process (Codex under T3)
+  counts as running until that process ends. A daemon restart starts the 10 minutes again, and so
+  does a build's being stopped and queued again.
+
+## Commands that never compile
+
+`buildq run` (and so a wrapper around it) runs a cargo command that never compiles at once instead
+of queueing it behind builds, with a one-line note (#72): `cargo fmt`, cargo's own light commands
+(`cargo metadata`, `cargo tree`, `cargo update`, ...) and `cargo --version` or `--help`. The rule
+reads the shim's own lists. It is narrow on purpose:
+- only cargo, and only when `buildq run` is given no option of its own (`--lane`, `--timeout`,
+  `--name`, `--notify`, `--restartable`, ...): with one, the command queues as asked;
+- `cargo clean` still queues, because it deletes a target folder that a build may be using;
+- names an alias may take queue too: other programs' subcommands (`cargo audit`, `cargo deny`,
+  ...) and `cargo rm`, which is itself an alias. Cargo doesn't let an alias redefine its own
+  commands, so those can't be turned into a build;
+- a command with `--config` queues, since that can define anything;
+- anything else queues as before, `cargo build --help` and `make help` included.
+
+For `cargo fmt`, an alias set through `CARGO_ALIAS_FMT` or `--config` is seen and queues. One
+written in a cargo config file isn't (the shim doesn't read those either); where the rustc guard is
+installed, it refuses that compile.
 
 ## Being told when a build finishes
 

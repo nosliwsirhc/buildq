@@ -55,7 +55,22 @@ queued ──► starting ──► running ──► succeeded | failed
    others.
 
 A build started by `buildq run` is *attached*: once no client has followed it for
-`unwatched_seconds`, it is cancelled. Builds from `buildq submit` are not.
+`unwatched_seconds`, it is cancelled. Builds from `buildq submit` are not: they are waited on in rounds.
+Instead, the daemon notes the agent session each submit came from (#71):
+- **Who:** the client's pid comes from the socket's peer credentials, so no client has to say. The
+  client and each of its ancestors that is a Claude Code or Codex process is recorded as pid and
+  start time (a reused pid doesn't count), nearest first: an agent may run another. The T3 thread
+  comes from the submission's environment.
+- **Still running:** a session runs while any of those processes does, or while a later agent
+  process carries the same T3 thread in its own environment (a restart, a handoff), found by a
+  look through `/proc` at most every 30 s. That process then stands for the session. A process
+  that can't be read is not taken for one that has ended.
+- **The rule:** a submit build that is queued is cancelled once, for `abandoned_seconds` on end,
+  every submission waiting for it came from a session that is gone and nobody waited on the
+  ticket. The time is kept in memory, so a daemon restart starts it again. Before a cancel the
+  processes are looked through afresh.
+- **Left alone:** a build a `buildq run` follows, one with a submission from no known agent, and
+  any build when the processes can't be listed.
 
 ### Protocol
 

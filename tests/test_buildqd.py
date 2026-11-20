@@ -171,9 +171,9 @@ class DaemonCase(unittest.TestCase):
         os.makedirs(os.path.join(path, ".git"), exist_ok=True)  # its own worktree
         return path
 
-    def submit(self, argv=("cargo", "build"), lane=None, cwd=None, env=None, **extra):
+    def submit(self, argv=("cargo", "build"), lane=None, cwd=None, env=None, peer=None, **extra):
         msg = {"argv": list(argv), "cwd": cwd or self.workdir(), "lane": lane, "env": env or {}, **extra}
-        t, error = self.daemon.submit(msg, self.now)
+        t, error = self.daemon.submit(msg, self.now, peer=peer)  # (peer: the client's pid, from its socket)
         self.assertIsNone(error)
         return t
 
@@ -1207,6 +1207,271 @@ class SameSource(DaemonCase):
                          digest({"PATH": "/bin", "PWD": "/b", "SHLVL": "2", "CLAUDE_CODE_SESSION_ID": "y"}))
         for name in ("DATABASE_URL", "API_TOKEN", "SESSION_BACKEND", "DB_PASSWORD"):
             self.assertNotEqual(digest({name: "a"}), digest({name: "b"}), name)
+
+
+class AbandonedSubmits(DaemonCase):
+    """#71: a dropped-off build whose agent session has ended, and that nobody waits on, is cancelled
+    while it's still queued."""
+
+    def setUp(self):
+        super().setUp()
+        self.machine.mem_available = 15 * GIB  # nothing fits: everything waits
+        me = os.getpid()
+        self.alive = [me, buildqd.proc_identity(me)[0]]
+        self.gone = [me, self.alive[1] + 1]  # (another start time: the pid was reused)
+        self.real_live_threads = buildqd.live_threads
+        self.above = {}  # a client's pid -> the agent processes the daemon finds above it
+        self.threads = {}  # a T3 thread -> its agent processes now
+        for name, fake in (("agents_above", lambda pid: [list(a) for a in self.above.get(pid, ())]),
+                           ("live_threads", lambda: dict(self.threads))):
+            patch = mock.patch.object(buildqd, name, fake)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def drop_off(self, *agents, argv=("cargo", "test"), thread=None, **extra):
+        """A `buildq submit` from a client that runs under these agent processes, nearest first."""
+        pid = 1000 + len(self.above)
+        self.above[pid] = agents
+        t = self.submit(argv, peer=pid, env={"T3CODE_THREAD_ID": thread} if thread else None, **extra)
+        t.wanted_at = self.now
+        return t
+
+    class Conn:
+        submission = None
+
+        def send(self, message):
+            return True
+
+    def test_a_dropped_off_build_whose_agent_went_is_cancelled_after_a_while(self):
+        t = self.drop_off(self.gone, submission="s")
+        self.assertEqual((t.state, t.agents), ("queued", {"s": {"pids": [self.gone], "thread": None}}))
+        self.daemon.drop_abandoned(self.now + 599)
+        self.assertFalse(t.cancel_requested)  # within abandoned_seconds: its session may be starting again
+        self.assertEqual(t.row(self.now)["agent"], "gone")
+        self.daemon.drop_abandoned(self.now + 601)
+        self.assertEqual(t.state, "cancelled")
+        self.assertIn("agent session that dropped it off had ended", t.error)  # what a later wait is told
+
+    def test_the_time_counts_from_when_the_agent_went_not_from_the_last_wait(self):
+        t = self.drop_off(self.alive, submission="s")
+        self.daemon.drop_abandoned(self.now + 5000)  # nobody has waited for over an hour: its agent runs
+        self.assertEqual((t.cancel_requested, t.row(self.now)["agent"]), (False, "alive"))
+        t.agents["s"]["pids"] = [self.gone]  # the agent's process ends (a restart, say)
+        self.daemon.drop_abandoned(self.now + 5001)
+        self.daemon.drop_abandoned(self.now + 5600)
+        self.assertFalse(t.cancel_requested)  # it has abandoned_seconds to come back
+        self.daemon.drop_abandoned(self.now + 5601)
+        self.assertTrue(t.cancel_requested)
+
+    def test_the_tick_does_it(self):
+        t = self.drop_off(self.gone, submission="s")
+        self.daemon.tick(self.now + 601)
+        self.assertEqual(t.state, "cancelled")
+
+    def test_a_build_from_no_known_agent_or_followed_by_a_run_stays(self):
+        unknown = self.drop_off(submission="b")  # CI, a terminal: no agent above the client
+        self.assertEqual(unknown.agents, {})
+        run = self.drop_off(self.gone, argv=("cargo", "check"), attach=True, submission="r")
+        self.assertEqual(run.agents, {})  # a `buildq run` has the unwatched rule instead
+        self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertFalse(unknown.cancel_requested or run.cancel_requested)
+        self.assertIsNone(unknown.row(self.now)["agent"])
+
+    def test_an_agent_run_by_a_session_that_still_runs_keeps_it(self):
+        t = self.drop_off(self.gone, self.alive, submission="s")  # a `claude -p` the session ran, and the session
+        self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, "alive"))
+
+    def test_a_new_process_of_the_same_t3_thread_stands_for_the_session(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        self.assertEqual(t.agents["s"]["thread"], "thread-1")  # from the client's environment
+        self.daemon.drop_abandoned(self.now + 300)
+        self.assertEqual(t.agent_now, "gone")
+        self.threads["thread-1"] = [self.gone, self.alive]  # T3 starts the thread's agent again
+        self.daemon.drop_abandoned(self.now + 601)
+        self.assertFalse(t.cancel_requested)
+        self.assertEqual(t.agents["s"]["pids"], [self.alive])  # followed by its process from now on
+
+    def test_a_process_started_since_the_last_look_is_seen_before_a_cancel(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        self.daemon.drop_abandoned(self.now + 590)  # a look at the processes, kept for 30 s
+        self.threads["thread-1"] = [self.alive]  # started just after it
+        self.daemon.drop_abandoned(self.now + 601)
+        self.assertFalse(t.cancel_requested)  # a cancel takes a look of its own
+        self.assertEqual((t.agent_now, t.wanted_at), ("alive", self.now + 601))  # and what it finds counts at once
+
+    def test_a_thread_whose_only_process_has_gone_too_is_cancelled(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        self.threads["thread-1"] = [self.gone]  # (gone between the look and its use)
+        self.daemon.drop_abandoned(self.now + 601)
+        self.assertTrue(t.cancel_requested)
+
+    def test_nothing_is_cancelled_when_the_processes_cant_be_listed(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        with mock.patch.object(buildqd, "live_threads", side_effect=OSError("no /proc")):
+            self.daemon.drop_abandoned(self.now + 601)
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, "alive"))
+
+    def test_a_wait_on_the_ticket_holds_it_off(self):
+        t = self.drop_off(self.gone, submission="s")
+        self.daemon.watchers[t.id].add(self.Conn())  # a `buildq wait` on the ticket
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(t.cancel_requested)
+        self.daemon.watchers[t.id].clear()  # its --timeout ran out
+        self.daemon.drop_abandoned(self.now + 1500)
+        self.assertFalse(t.cancel_requested)  # 500 s since the last wait
+        self.daemon.drop_abandoned(self.now + 1601)
+        self.assertTrue(t.cancel_requested)
+
+    def test_a_wait_shorter_than_a_tick_counts(self):
+        t = self.drop_off(self.gone, submission="s")
+        self.daemon.handle_message({"op": "watch", "ticket": t.id}, self.Conn(), self.now + 500)
+        self.daemon.watchers[t.id].clear()  # it went before the next tick
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(t.cancel_requested)
+        self.daemon.drop_abandoned(self.now + 1101)
+        self.assertTrue(t.cancel_requested)
+
+    def test_another_submission_that_still_wants_it_keeps_it(self):
+        first = self.drop_off(self.gone, source=SOURCE, submission="a")
+        self.drop_off(self.alive, cwd=first.cwd, source=SOURCE, submission="b")  # joins it
+        self.assertEqual(set(first.agents), {"a", "b"})
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertEqual((first.cancel_requested, first.agent_now), (False, "alive"))
+        first.agents["b"]["pids"] = [self.gone]
+        self.drop_off(cwd=first.cwd, source=SOURCE, submission="c")  # joined from a terminal
+        self.daemon.drop_abandoned(self.now + 5000)
+        self.assertFalse(first.cancel_requested)
+        self.assertIsNone(first.row(self.now)["agent"])  # not up to the agents' sessions any more
+
+    def test_a_run_that_joined_keeps_it_until_it_goes(self):
+        t = self.drop_off(self.gone, source=SOURCE, submission="s")
+        self.submit(("cargo", "test"), cwd=t.cwd, source=SOURCE, attach=True, submission="r")  # a `buildq run` joins
+        self.daemon.started_at = self.now - 1000
+        self.daemon.drop_abandoned(self.now + 10)
+        self.assertIsNone(t.agent_now)  # the run waits for it too
+        self.daemon.drop_abandoned(self.now + 610)
+        self.assertFalse(t.cancel_requested)  # 600 s since the run was last seen
+        self.daemon.drop_abandoned(self.now + 611)  # the run was killed and never followed again
+        self.assertTrue(t.cancel_requested)
+
+    def test_a_running_build_carries_on_and_has_the_whole_time_if_queued_again(self):
+        self.machine.mem_available = 200 * GIB
+        running = self.drop_off(self.gone, submission="s")
+        self.assertEqual(running.state, "running")
+        self.daemon.drop_abandoned(self.now + 1000)
+        self.assertFalse(running.cancel_requested)
+        self.assertIsNone(running.row(self.now)["agent"])
+        self.machine.mem_available = 15 * GIB
+        running.requeue_pending = True  # stopped to free memory ...
+        self.runner.running.discard(running.id)
+        self.daemon.check(self.now + 1000)
+        self.assertEqual((running.state, running.requeues), ("queued", 1))  # ... and queued again
+        self.daemon.drop_abandoned(self.now + 1001)
+        self.daemon.drop_abandoned(self.now + 1600)
+        self.assertFalse(running.cancel_requested)  # 600 s since it last ran
+        self.daemon.drop_abandoned(self.now + 1601)
+        self.assertTrue(running.cancel_requested)
+
+    def test_a_look_that_fails_partway_cancels_nothing(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        with mock.patch.object(buildqd, "live_threads", self.real_live_threads), \
+                mock.patch.object(buildqd, "own_pids", return_value=[os.getpid()]), \
+                mock.patch.object(buildqd, "is_agent", side_effect=OSError(24, "Too many open files")):
+            self.daemon.drop_abandoned(self.now + 601)  # the look can't tell who runs: nothing is called gone
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, "alive"))
+
+    def test_a_process_that_cant_be_read_isnt_called_gone(self):
+        t = self.drop_off(self.alive, submission="s")
+        with mock.patch.object(buildqd, "proc_stat", return_value=None):  # (out of descriptors, say)
+            self.assertFalse(buildqd.proc_gone(*self.alive))  # it is there: can't tell
+            self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, "alive"))
+        self.assertTrue(buildqd.proc_gone(*self.gone))  # another process has that pid now
+        self.assertTrue(buildqd.proc_gone(2 ** 40, 1))  # nothing has
+        self.assertTrue(buildqd.proc_gone(float("inf"), 1))
+
+    def test_zero_turns_it_off(self):
+        self.daemon.cfg.abandoned_seconds = 0
+        t = self.drop_off(self.gone, submission="s")
+        self.daemon.drop_abandoned(self.now + 10_000)
+        self.assertEqual((t.cancel_requested, t.agent_now), (False, None))
+
+    def test_the_agent_is_kept_across_a_restart_and_the_time_starts_again(self):
+        t = self.drop_off(self.gone, submission="s", thread="thread-1")
+        t.wanted_at = self.now - 5000
+        self.daemon.save(t)
+        again = buildqd.Daemon(self.config_path, self.state, machine=self.machine, runner=self.runner,
+                               queries=buildqd.InlineExecutor())
+        again.load_tickets(self.now + 1)
+        loaded = again.tickets[t.id]
+        self.assertEqual(loaded.agents, {"s": {"pids": [self.gone], "thread": "thread-1"}})
+        self.assertGreaterEqual(loaded.wanted_at, self.now)  # not kept: a restart gives it the time again
+        again.stop_memory_watch()
+        for x in again.tickets.values():
+            again.close_jobserver(x)
+
+    def test_bad_saved_agents_are_left_out(self):
+        good = {"pids": [[5, 6], [7, 8]], "thread": "thread-1"}
+        saved = {"ok": good, "old": [5, 6, None], "inf": {"pids": [[5, float("inf")]]}, "none": {"pids": []},
+                 "num": {"pids": 5}, "bool": {"pids": [[True, 1]]}, "huge": {"pids": [[2 ** 70, 1]]},
+                 "list": {"pids": [[5, 6]], "thread": ["thread"]}, 7: good}
+        self.assertEqual(buildqd.sane_agents(saved),
+                         {"ok": good, "list": {"pids": [[5, 6]], "thread": None}})
+        self.assertEqual(buildqd.sane_agents(["x"]), {})
+        self.assertIsNone(buildqd.proc_identity(float("inf")))  # (no error from a number that isn't a pid)
+
+
+class AgentProcesses(unittest.TestCase):
+    """#71: which processes count as agent sessions, read from the real /proc."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake = os.path.join(self.tmp.name, "claude")  # a process named as Claude Code's is
+        os.symlink(sys.executable, self.fake)
+        self.thread = f"test-thread-{os.getpid()}-{time.time()}"
+
+    def session(self):
+        """A stand-in agent session that runs one child, as an agent runs a build client. The child
+        reads from the session, so it ends when the session does."""
+        code = ("import subprocess; p = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL); "
+                "print(p.pid, flush=True); p.wait()")
+        proc = subprocess.Popen([self.fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
+                                env={**os.environ, "T3CODE_THREAD_ID": self.thread})
+
+        def stop():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            proc.stdout.close()
+        self.addCleanup(stop)
+        return proc, int(proc.stdout.readline())
+
+    def test_an_agent_above_a_client_is_found_and_seen_to_go(self):
+        proc, child = self.session()
+        above = buildqd.agents_above(child)
+        self.assertEqual(above[0][0], proc.pid)  # (the suite's own agent session, if any, follows it)
+        self.assertTrue(buildqd.proc_alive(*above[0]))
+        self.assertEqual(buildqd.live_threads().get(self.thread), [above[0]])
+        proc.kill()
+        proc.wait()
+        self.assertFalse(buildqd.proc_alive(*above[0]))
+        self.assertNotIn(self.thread, buildqd.live_threads())
+
+    def test_no_agent_above_init_or_a_pid_that_isnt_one(self):
+        self.assertEqual(buildqd.agents_above(1), [])
+        self.assertEqual(buildqd.agents_above(None), [])
+        self.assertEqual(buildqd.agents_above(2 ** 40), [])
+
+    def test_the_programs_that_count(self):
+        for exe in ("/home/u/.local/share/claude/versions/2.1.328",
+                    "/home/u/.claude/remote/ccd-cli/2.1.321-3fb3e6595884",  # the desktop app's
+                    "/home/u/.local/share/claude/versions/2.1.300 (deleted)"):  # replaced by an update
+            self.assertTrue(buildqd.AGENT_EXE.search(exe), exe)
+        for exe in ("/usr/bin/python3.13", "/usr/bin/node", "/home/u/.claude/skills/x/run.sh",
+                    "/home/u/Code/claude/versions/notes/readme"):
+            self.assertFalse(buildqd.AGENT_EXE.search(exe), exe)
 
 
 class SheddingMemory(DaemonCase):
@@ -4299,6 +4564,49 @@ class Estimates(DaemonCase):
             history.add({"key": f"k{i}", "t": self.now, "peak_mem": 1, "peak_cores": 1.0})
         self.assertEqual(len(history.by_key), 10)
         self.assertIn("k49", history.by_key)
+
+
+class ShimRules(unittest.TestCase):
+    """#72: what `buildq run` runs at once instead of queueing, by the shim's own rule."""
+
+    shim = load("buildq-shim")
+
+    def setUp(self):
+        patch = mock.patch.dict(os.environ)  # (whatever aliases the suite's own environment sets)
+        patch.start()
+        self.addCleanup(patch.stop)
+        os.environ.pop("CARGO_ALIAS_FMT", None)
+
+    def never_builds(self, command):
+        words = command.split()
+        return self.shim.never_builds(words[0], words[1:])
+
+    def test_cargo_commands_that_never_compile_run_at_once(self):
+        for command in ("cargo fmt", "cargo fmt --check -p api", "cargo +nightly fmt", "cargo -C sub tree",
+                        "/home/u/.cargo/bin/cargo metadata --format-version 1", "cargo update -p x",
+                        "cargo remove serde", "cargo add serde", "cargo fmt -- --config max_width=100",
+                        "cargo --version", "cargo +stable -V", "cargo --list", "cargo help build"):
+            self.assertTrue(self.never_builds(command), command)
+            words = command.split()  # and the shim never queues what runs at once
+            self.assertFalse(self.shim.heavy("cargo", words[1:]), command)
+
+    def test_an_alias_named_fmt_queues(self):
+        with mock.patch.dict(os.environ, {"CARGO_ALIAS_FMT": "build --release"}):
+            self.assertFalse(self.never_builds("cargo fmt"))
+        self.assertEqual(self.shim.CARGO_LIGHT, self.shim.CARGO_OWN_LIGHT | self.shim.CARGO_TOOLS_LIGHT)
+
+    def test_everything_else_queues_as_asked(self):
+        for command in ("cargo build", "cargo test", "cargo clippy", "cargo",
+                        "cargo test version", "cargo run help",  # a test's name, a program's argument
+                        "cargo build --help", "cargo xtask --help", "cargo sqlx --version",  # an alias may compile
+                        "cargo clean",  # deletes a target folder a build may be using: it waits its turn
+                        "cargo watch -x test", "cargo fmt --watch",
+                        "cargo audit", "cargo deny check", "cargo outdated",  # other programs': an alias may take the name
+                        "cargo rm serde", "cargo info serde",  # cargo's alias for remove; its own only since 1.82
+                        "cargo --config alias.fmt=\"build\" fmt", "cargo --config=x.toml fmt",
+                        "make help", "make --version", "pnpm --version", "npm version", "dotnet --info",
+                        "env X=1 cargo fmt", "sh -c cargo-fmt", "./cargo-fmt.sh"):
+            self.assertFalse(self.never_builds(command), command)
 
 
 class Keys(unittest.TestCase):

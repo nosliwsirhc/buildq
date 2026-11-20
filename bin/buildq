@@ -44,7 +44,11 @@ The build runs in the background with the environment and working directory of t
 submitted it, and no stdin. `buildq run` streams its output to stdout and exits with its exit
 code (128 + N if signal N ended it). Interrupting `buildq run` (Ctrl-C, SIGTERM, SIGHUP) cancels
 the build, and so does killing it outright, once no client has followed the build for the
-daemon's unwatched_seconds. A build dropped off with `buildq submit` runs on alone.
+daemon's unwatched_seconds. A build dropped off with `buildq submit` runs on alone, unless the agent
+session (Claude Code, Codex) that dropped it off has ended and, for the daemon's abandoned_seconds,
+nobody has waited on it: then it's cancelled while still queued. `buildq run` with no options runs
+a cargo command that never compiles (cargo fmt, cargo metadata, cargo --version) at once, as the
+shim does.
 
 Exit codes of the client itself: 2 for a refused request, 75 when the daemon can't be reached
 (BUILDQ_FALLBACK=fail, or submit), 124 when `wait --timeout` runs out, 125 when a build ended
@@ -326,6 +330,10 @@ def print_ticket(row: dict) -> None:
               f" (fingerprint {src['fingerprint'][:12]}){checked}")
     if row.get("caller"):
         print(f"  from      {row['caller']}")
+    if row.get("agent") and row["state"] == "queued":  # the agent session that dropped it off (#71)
+        print("  agent     " + ("the session that dropped it off is running" if row["agent"] == "alive" else
+                              "the session that dropped it off has ended: unless that session comes back or "
+                              "someone waits on the ticket, it's cancelled while still queued"))
     if row.get("frozen"):
         print("  paused    to give the machine its memory back; it goes on once there is room")
     if row.get("requeues"):
@@ -990,6 +998,15 @@ def the_command(args) -> list[str] | None:
     return command
 
 
+def run_now(command: list[str]) -> int:
+    """Become the command. Returns only if it can't be run."""
+    try:
+        os.execvp(command[0], command)
+    except OSError as e:
+        note(f"can't run {command[0]}: {e}")
+        return 127
+
+
 def fallback(command: list[str], lane: str | None, why: str) -> int | None:
     """What to do when the daemon can't be reached. None means: wait for it and try again."""
     choice = os.environ.get("BUILDQ_FALLBACK", "").strip()
@@ -1002,11 +1019,7 @@ def fallback(command: list[str], lane: str | None, why: str) -> int | None:
     os.environ["BUILDQ_FALLBACK_ACTIVE"] = "1"  # a nested buildq run inside it runs directly
     argv = command if choice == "run" else shlex.split(choice) + command
     note(f"{why}; running the command " + ("now, unqueued." if choice == "run" else f"through `{choice}` instead."))
-    try:
-        os.execvp(argv[0], argv)
-    except OSError as e:
-        note(f"can't run {argv[0]}: {e}")
-        return 127
+    return run_now(argv)
 
 
 def inside_a_build() -> bool:
@@ -1074,16 +1087,44 @@ def cmd_submit(args) -> int:
     return 0
 
 
+def shim_classifier():
+    """buildq-shim's own rules for what is heavy, loaded from beside this program."""
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    loader = SourceFileLoader("buildq_shim", os.path.join(os.path.dirname(os.path.realpath(__file__)), "buildq-shim"))
+    module = module_from_spec(spec_from_loader("buildq_shim", loader))
+    sys.dont_write_bytecode, before = True, sys.dont_write_bytecode  # no __pycache__ in the bin folder
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = before
+    return module
+
+
+def runs_directly(args, command: list[str]) -> bool:
+    """A cargo command that never compiles (`cargo fmt`, `cargo metadata`, `cargo --version`), by the
+    shim's own rule, runs at once rather than wait behind builds (#72). Not when `buildq run` was
+    given any option of its own (a lane, a time limit, a name, a finish hook, --again, ...): then
+    it queues as asked, and the daemon checks the option. If the shim can't be read, or is an older
+    one without the rule, everything queues as before."""
+    given = (args.lane, args.cores, args.mem, args.timeout, args.name, args.notify)
+    if any(x is not None for x in given) or args.priority or args.again or args.reuse or args.restartable:
+        return False
+    try:
+        return shim_classifier().never_builds(command[0], command[1:]) is True
+    except Exception:
+        return False
+
+
 def cmd_run(args) -> int:
     command = the_command(args)
     if command is None:
         return 2
     if inside_a_build():
-        try:
-            os.execvp(command[0], command)  # already inside a build's turn
-        except OSError as e:
-            note(f"can't run {command[0]}: {e}")
-            return 127
+        return run_now(command)  # already inside a build's turn
+    if runs_directly(args, command):
+        note("this command compiles nothing, so it runs now instead of queueing.")
+        return run_now(command)
     # Interrupts are caught from here on, so one that comes while the build is being submitted
     # still cancels it once its ticket is known.
     pending: list[int] = []

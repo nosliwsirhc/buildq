@@ -116,6 +116,26 @@ scaling. buildq doesn't try to tell a warm build from a full one for this: Cargo
 a folder set by a flag, two environment variables or a config file, and its layout inside is
 Cargo's own.
 
+On the maintainer's workstation, `"never"` was tried for three days from 2026-11-17, after a
+baseline day under `"always"` (#67). It was to be switched back at once on an OOM kill, a memory
+stop of a build past its plan, available memory under the 16G floor, or more than 5% of heavy
+builds past their start plan. None of those happened, and `"never"` was kept (2026-11-20):
+
+| | Baseline day (`always`) | Three days (`never`) |
+| --- | --- | --- |
+| Builds (heavy) | 1,289 (396) | 1,976 (548) |
+| Heavy builds past their start plan | 1.0% | 1.1% (1.6%, 1.1%, 0.0% by day) |
+| OOM kills, memory stops | 0, 0 | 0, 0 |
+| Lowest available memory | 29.6G | 61.6G |
+| Held for growth, average | 38.7G | 12.6G, 9.9G, 6.7G by day |
+| Agents' heavy-lane wait for memory, 90th percentile | 27.5 min | 0.9 min, then none |
+
+The trial shows the setting is safe there. It does not show how much it helps: the build load fell
+to about a fifth over the same days for another reason (builds' cores 7.9 on the baseline day, 1.7
+on the third), so the shorter waits can't be credited to the setting alone. The six builds that
+went past their plan were scripts planned at the lane's floor, not cargo builds, and none was
+stopped or killed. [`contrib/trial54.py`](../contrib/trial54.py) prints the numbers.
+
 A running build that passes its estimate is planned at its lane's `MemoryMax` from then on, so the
 room it may still grow into stays held. The analytics record each build's plan, cores and setting
 at the start of its last attempt (`start_plan`, `start_cores`, `start_rule`, with `plan_base`,
