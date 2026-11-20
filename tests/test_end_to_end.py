@@ -483,7 +483,7 @@ class Enforcement(Harness):
         shims = os.path.join(self.tmp.name, "shims")
         os.makedirs(real)
         os.makedirs(shims)
-        for tool in ("make", "cargo"):
+        for tool in ("make", "cargo", "dotnet"):
             with open(os.path.join(real, tool), "w") as f:
                 f.write(f"#!/bin/sh\necho \"{tool} $* job=${{BUILDQ_JOB:-none}}\"\n")
             os.chmod(os.path.join(real, tool), 0o755)
@@ -508,6 +508,18 @@ class Enforcement(Harness):
         build_line, run_line = run.stdout.splitlines()
         self.assertRegex(build_line, r"^cargo build --bin x job=[0-9a-f-]{36}$")
         self.assertEqual(run_line, "cargo run --bin x job=none")
+        dotnet_run = subprocess.run(["dotnet", "run", "--", "--port", "8080"], env=env, cwd=self.work,
+                                    capture_output=True, text=True, timeout=60)
+        self.assertEqual(dotnet_run.returncode, 0, dotnet_run.stderr)
+        dbuild, drun = dotnet_run.stdout.splitlines()
+        self.assertRegex(dbuild, r"^dotnet build job=[0-9a-f-]{36}$")
+        self.assertEqual(drun, "dotnet run --no-build -- --port 8080 job=none")
+        dotnet_app_flag = subprocess.run(["dotnet", "run", "--project", "app", "--", "--no-build"], env=env,
+                                         cwd=self.work, capture_output=True, text=True, timeout=60)
+        self.assertEqual(dotnet_app_flag.returncode, 0, dotnet_app_flag.stderr)
+        dbuild2, drun2 = dotnet_app_flag.stdout.splitlines()
+        self.assertRegex(dbuild2, r"^dotnet build --project app job=[0-9a-f-]{36}$")
+        self.assertEqual(drun2, "dotnet run --project app --no-build -- --no-build job=none")
 
     def test_run_runs_cargo_commands_that_never_compile_at_once(self):
         """#72: `buildq run -- cargo fmt` (heavy-run cargo fmt) doesn't wait behind builds."""
@@ -564,6 +576,16 @@ class Enforcement(Harness):
         with open(os.path.join(self.tmp.name, "buildq", "guard.env"), "w") as f:
             f.write('RUN_WITH="~/bin/heavy"\n')
         self.assertIn("    ~/bin/heavy cargo ...", compile_().stderr)  # the machine's wrapper
+        # Ancestor walk passes through intermediate process names containing spaces and parentheses.
+        ra = os.path.join(self.tmp.name, "rust-analyzer")
+        mid = os.path.join(self.tmp.name, "my (helper) proc")
+        os.symlink(sys.executable, ra)
+        os.symlink(sys.executable, mid)
+        inner = "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))"
+        nested = subprocess.run([ra, "-I", "-c", inner, mid, "-I", "-c", inner,
+                                 guard, rustc, "--crate-name", "demo", "src/lib.rs"],
+                                env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual((nested.returncode, nested.stdout), (0, "compiled\n"), nested.stderr)
 
 
 class AbandonedBuilds(Harness):

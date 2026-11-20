@@ -154,7 +154,9 @@ same check on the same commit (its own verdict, an exit of 1 to 127; not a kill,
 stop to free memory) posts `failure`; other failures aren't posted. Results are ordered by when
 their builds ended, so an older one never replaces a newer one. A commit GitHub
 doesn't have yet is tried again after the next `git push` run through buildq from that
-repository, and every ten minutes, for a day; the first refusal is logged with `gh`'s message.
+repository, and with exponential backoff (10 minutes up to 2 hours), for up to 6 hours (or a day
+for transient errors; permanent 4xx refusals are dropped at once); the first refusal is logged with
+`gh`'s message.
 Statuses go to the `origin` remote's repository (in a fork, the fork). A build from a GitHub
 Actions job never posts `success`, since the job reports its own result. Its failure can still
 turn red a `success` posted on the same commit. The daemon runs the `gh` the `gh` setting names

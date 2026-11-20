@@ -58,7 +58,7 @@ A build started by `buildq run` is *attached*: once no client has followed it fo
 `unwatched_seconds`, it is cancelled. Builds from `buildq submit` are not: they are waited on in rounds.
 Instead, the daemon notes the agent session each submit came from (#71):
 - **Who:** the client's pid comes from the socket's peer credentials, so no client has to say. The
-  client and each of its ancestors that is a Claude Code or Codex process is recorded as pid and
+  client and each of its ancestors that is a Claude Code, Codex or Antigravity process is recorded as pid and
   start time (a reused pid doesn't count), nearest first: an agent may run another. The T3 thread
   comes from the submission's environment.
 - **Still running:** a session runs while any of those processes does, or while a later agent
@@ -121,7 +121,9 @@ and walks the queue in order, starting each ticket for which, in this order:
    is refused. A build that has waited `starve_seconds` and is held holds its workspace too, so
    a quicker lane in its group can't keep taking it. The wait reason names the build holding the
    workspace;
-5. memory pressure is at most `mem_psi_block`;
+5. memory pressure is at most `mem_psi_block` whenever available memory is low (under twice
+   `mem_floor` or a quarter of RAM: with plenty of RAM free, a single build slowed at its own
+   `MemoryHigh` or routine zram swap-in can raise system PSI without the machine being short);
 6. it has a turn: its lane has a free `extra_jobs` turn, or fewer than `max_jobs` builds hold
    ordinary turns;
 7. its expected memory ≤ `free_mem`, less any room held for starving builds;
@@ -475,10 +477,12 @@ verdict seen (queued, posted, or not posted because there was nothing to correct
 time per commit and context, and after a restart only the newest queued result per commit and
 context is kept. The daemon sends at most two at once with `gh api`, in processes it doesn't wait on, and
 keeps the queue and what it has posted in
-`github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails (the
-commit isn't pushed yet, say) is logged with `gh`'s message the first time, tried again ten
-minutes later, at once after a `git push` run through buildq from the same repository succeeds, and
-dropped after a day. With `github_status` off, nothing queued is sent.
+`github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails
+permanently (HTTP 400, 403 other than rate limiting, 404, or a 422 other than a missing commit) is
+logged and dropped at once. Otherwise it is logged with `gh`'s message the first time and retried
+with exponential backoff (10 minutes up to 2 hours), at once after a `git push` run through buildq
+from the same repository succeeds, and dropped after 6 hours for a missing commit (HTTP 422 "No
+commit found") or a day for transient errors. With `github_status` off, nothing queued is sent.
 
 ## Fair shares and pausing
 

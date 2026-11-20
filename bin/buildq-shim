@@ -54,16 +54,20 @@ JS_TOOLS = {"vitest", "vite", "tsc", "vue-tsc", "playwright", "storybook", "buil
 INFO = {"--help", "-h", "--version", "-V", "version", "help", "--list"}  # asks, builds nothing
 
 
-def positionals(args, value_options=()):
+def positional_items(args, value_options=()):
     out, skip = [], False
-    for arg in args:
+    for i, arg in enumerate(args):
         if skip:
             skip = False
         elif arg.startswith("-"):
             skip = arg in value_options
         else:
-            out.append(arg)
+            out.append((i, arg))
     return out
+
+
+def positionals(args, value_options=()):
+    return [arg for _, arg in positional_items(args, value_options)]
 
 
 def watching(args: list[str]) -> bool:
@@ -151,17 +155,22 @@ def heavy(tool: str, args: list[str]) -> bool:
     if watching(args):
         return False
     if tool in ("npm", "pnpm", "yarn", "bun"):
-        pos = positionals(args, {"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"})
-        if pos[:1] in (["run"], ["run-script"]):
-            pos = pos[1:]
-        if pos[:1] in (["exec"], ["dlx"], ["x"]) and len(pos) > 1:
-            return js_tool_heavy(os.path.basename(pos[1]), args[args.index(pos[1]) + 1:])
-        if pos and pos[0] in JS_TOOLS:  # pnpm vitest, yarn tsc: the tool itself
-            return js_tool_heavy(pos[0], args[args.index(pos[0]) + 1:])
-        return bool(pos) and js_script_heavy(pos[0])
+        items = positional_items(args, {"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"})
+        if items and items[0][1] in ("run", "run-script"):
+            items = items[1:]
+        if items and items[0][1] in ("exec", "dlx", "x") and len(items) > 1:
+            idx, cmd = items[1]
+            return js_tool_heavy(os.path.basename(cmd), args[idx + 1:])
+        if items and items[0][1] in JS_TOOLS:  # pnpm vitest, yarn tsc: the tool itself
+            idx, cmd = items[0]
+            return js_tool_heavy(cmd, args[idx + 1:])
+        return bool(items) and js_script_heavy(items[0][1])
     if tool in ("npx", "pnpx", "bunx"):
-        pos = positionals(args, {"-p", "--package"})
-        return bool(pos) and js_tool_heavy(os.path.basename(pos[0]), args[args.index(pos[0]) + 1:])
+        items = positional_items(args, {"-p", "--package"})
+        if not items:
+            return False
+        idx, cmd = items[0]
+        return js_tool_heavy(os.path.basename(cmd), args[idx + 1:])
     if tool in ("make", "gmake", "ninja"):
         if {"-n", "--dry-run", "--just-print", "--recon", "-q", "--question", "-t", "--touch"} & set(args):
             return False
@@ -205,17 +214,17 @@ def build_then_run(tool: str, args: list[str]) -> list[str] | None:
         lead = [args[0]] if args and args[0].startswith("+") else []
         rest = args[len(lead):]
         before = rest[: rest.index("--")] if "--" in rest else rest
-        pos = positionals(before, {"-Z", "--config", "--color", "-C", "--manifest-path"})
-        if not pos or pos[0] not in ("run", "r"):
+        items = positional_items(before, {"-Z", "--config", "--color", "-C", "--manifest-path"})
+        if not items or items[0][1] not in ("run", "r"):
             return None
-        i = before.index(pos[0])
+        i = items[0][0]
         return lead + before[:i] + ["build"] + before[i + 1:]
     if tool == "dotnet":
         before = args[: args.index("--")] if "--" in args else args
-        pos = positionals(before)
-        if pos[:1] != ["run"]:
+        items = positional_items(before)
+        if not items or items[0][1] != "run":
             return None
-        i = before.index("run")
+        i = items[0][0]
         build = before[:i] + ["build"] + before[i + 1:]
         return [a for a in build if a not in ("--no-build", "--no-restore")]
     return None
@@ -254,7 +263,12 @@ def main() -> int:
             code = subprocess.call(queued + [tool, *build_first])
             if code != 0:
                 return code
-            os.execv(tool, [tool, *args] + (["--no-build"] if name == "dotnet" and "--no-build" not in args else []))
+            run_args = list(args)
+            if name == "dotnet":
+                sep = run_args.index("--") if "--" in run_args else len(run_args)
+                if "--no-build" not in run_args[:sep]:
+                    run_args.insert(sep, "--no-build")
+            os.execv(tool, [tool, *run_args])
         # `buildq run` runs it directly when this is already inside a build.
         os.execv(sys.executable, queued + [tool, *args])
     os.execv(tool, [tool, *args])

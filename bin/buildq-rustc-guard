@@ -106,7 +106,7 @@ while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$depth" -lt 40 ]; do
   for name in $allow_parents; do
     [ "$comm" = "$name" ] && pass "$@"
   done
-  pid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+  pid=$(awk '{s = s (NR > 1 ? " " : "") $0} END {if (sub(/.*\) /, "", s)) {split(s, f); print f[2]}}' "/proc/$pid/stat" 2>/dev/null)
   depth=$((depth + 1))
 done
 

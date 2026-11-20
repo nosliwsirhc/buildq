@@ -986,8 +986,8 @@ def own_pids():
                 continue
 
 
-# Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run) and Codex.
-AGENT_COMM = ("claude", "codex")
+# Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run), Codex, and Antigravity.
+AGENT_COMM = ("claude", "codex", "antigravity")
 AGENT_EXE = re.compile(r"/\.?claude/(versions|remote/ccd-cli)/[^/]+$")
 T3_THREAD_VAR = "T3CODE_THREAD_ID"  # T3 sets it for a thread's agent process, and so for all that runs
 
@@ -1922,8 +1922,8 @@ VOLATILE_ENV = re.compile(
     r"SSH_CLIENT|SSH_CONNECTION|SSH_TTY|GPG_TTY|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_ID|XDG_ACTIVATION_TOKEN|"
     r"INVOCATION_ID|JOURNAL_STREAM|MANAGERPID|MANAGERPIDFDID|SYSTEMD_EXEC_PID|NOTIFY_SOCKET|LISTEN_(PID|FDS|FDNAMES)|"
     r"CLAUDE_PID|CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|SESSION_ATTENDED|MESSAGING_SOCKET|MESSAGING_TOKEN)|"
-    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|KITTY_WINDOW_ID|WEZTERM_PANE|VSCODE_GIT_IPC_HANDLE|"
-    r"VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
+    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|ANTIGRAVITY_[A-Z0-9_]+|KITTY_WINDOW_ID|WEZTERM_PANE|"
+    r"VSCODE_GIT_IPC_HANDLE|VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
 
 
 def env_digest(env: dict[str, str]) -> str:
@@ -2871,13 +2871,24 @@ class SystemdRunner:
 
     def result(self, ticket) -> str:
         """systemd's Result for the build's service: "success", "exit-code", "signal", "oom-kill" (the
-        kernel or systemd-oomd stopped it for memory), ... or "" if systemd can't say."""
+        kernel or systemd-oomd stopped it for memory), ... or "" if systemd can't say. With
+        OOMPolicy=continue, systemd-oomd or kernel kills leave Result=signal while still incrementing
+        OOMKills / ManagedOOMKills, so those count as "oom-kill" too."""
+        if not ticket.unit:
+            return ""
         try:
-            out = subprocess.run(["systemctl", "--user", "show", "-p", "Result", "--value", ticket.unit],
+            out = subprocess.run(["systemctl", "--user", "show", "-p", "Result,OOMKills,ManagedOOMKills", ticket.unit],
                                  stdin=DEVNULL, capture_output=True, text=True, timeout=5).stdout
-            return out.strip()
         except (OSError, subprocess.SubprocessError):
             return ""
+        props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        for key in ("OOMKills", "ManagedOOMKills"):
+            try:
+                if int(props.get(key) or 0) > 0:
+                    return "oom-kill"
+            except ValueError:
+                pass
+        return props.get("Result", "").strip()
 
     def cleanup(self, ticket):
         """Unload the build's service once its outcome is read (a failed one stays loaded until then)."""
@@ -3469,9 +3480,7 @@ class Daemon:
         self.paused = read_json(os.path.join(state_dir, "paused.json"))  # {"reason", "since"} or None
         if not isinstance(self.paused, dict):
             self.paused = None
-        self.status_posts: list = read_json(os.path.join(state_dir, "github-statuses.json")) or []
-        if not isinstance(self.status_posts, list):
-            self.status_posts = []
+        self.status_posts: list = []
         self.status_procs: list[tuple[subprocess.Popen, dict, float]] = []
         self.gh: list | None = None  # None: found as each status is sent (tests put a stand-in here)
         self.gh_unrunnable = False  # said so in the log already, until gh runs again
@@ -3481,7 +3490,9 @@ class Daemon:
         self.status_posted: dict[str, dict] = {}  # "repo@sha@context" -> {state, order} last posted
         self.status_seen: dict[str, list] = {}  # "repo@sha@context" -> order of the newest verdict seen
         statuses = read_json(os.path.join(state_dir, "github-statuses.json"))
-        if isinstance(statuses, dict):
+        if isinstance(statuses, list):
+            self.status_posts = statuses
+        elif isinstance(statuses, dict):
             self.status_posts = statuses.get("queue") or []
             seen = statuses.get("seen")
             self.status_seen = {str(k): list(v) for k, v in seen.items() if isinstance(v, list)} \
@@ -3669,17 +3680,20 @@ class Daemon:
             return (not long, not due, t.submitted if due else 0.0, not overdue, not starving, -self.weight(t),
                     not first, not (first and self.waited_out(t, now)))
 
-        def own_order(t: Ticket):
-            return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
+        queued = [t for t in self.tickets.values() if t.state == "queued"]
+        tiers = {t.id: tier(t) for t in queued}
 
-        queued = sorted((t for t in self.tickets.values() if t.state == "queued"), key=own_order)
+        def tail(t: Ticket):
+            return (t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
+
+        queued.sort(key=lambda t: (*tiers[t.id], *tail(t)))
         # Within a tier, a caller's k-th waiting build counts as if k more of its builds ran, so
         # callers take turns: one session's burst of builds is interleaved with everyone else's.
         share, seen = {}, collections.Counter()
         for t in queued:
-            share[t.id] = running[t.caller] + seen[(tier(t), t.caller)]
-            seen[(tier(t), t.caller)] += 1
-        return sorted(queued, key=lambda t: (*tier(t), share[t.id], *own_order(t)[2:]))
+            share[t.id] = running[t.caller] + seen[(tiers[t.id], t.caller)]
+            seen[(tiers[t.id], t.caller)] += 1
+        return sorted(queued, key=lambda t: (*tiers[t.id], share[t.id], *tail(t)))
 
     def weight(self, t: Ticket) -> int:
         """Its priority: its lane's plus its own."""
@@ -4409,7 +4423,7 @@ class Daemon:
         t.attempts_peak = max(t.attempts_peak, t.mem_peak)
         t.force_sent = t.freeze_failed = t.thaw_failed = False
         t.state, t.started, t.running_since, t.result_seen, t.stop_sent = "queued", None, None, None, None
-        t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = None
+        t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = t.exec_argv = None
         t.started_max_cores = t.max_granted  # (the row describes the last attempt that started)
         t.ended_rule = self.cfg.scale_mem_with_cores
         t.granted = t.max_granted = t.tokens_out = 0
@@ -4576,6 +4590,24 @@ class Daemon:
         except OSError as e:
             log(f"can't save the GitHub statuses to send: {e}")
 
+    STATUS_RETRY_BASE = 600.0        # first retry wait (10m); doubles each failure up to STATUS_RETRY_MAX
+    STATUS_RETRY_MAX = 7200.0        # longest backoff between retries (2h)
+    STATUS_MISSING_MAX_AGE = 21600.0  # missing commit (HTTP 422): stop trying after 6h (likely amended/unpushed)
+    STATUS_MAX_AGE = 86400.0         # transient/network failures: stop trying after a day
+
+    @staticmethod
+    def _status_failure(error: str) -> str:
+        """Classify a failed `gh api` status post: 'missing' (commit not on GitHub yet),
+        'permanent' (4xx client error that retrying won't fix), or 'transient'."""
+        lower = error.lower()
+        if "no commit found" in lower or ("http 422" in lower and "commit" in lower):
+            return "missing"
+        if "rate limit" in lower or "abuse" in lower:
+            return "transient"
+        if re.search(r"\bHTTP 4(00|03|04|22)\b", error):
+            return "permanent"
+        return "transient"
+
     def send_status_posts(self, now: float) -> None:
         changed = False
         for entry in list(self.status_procs):
@@ -4600,20 +4632,37 @@ class Daemon:
                 if (post.get("order") or [0, ""]) >= (self.status_posted.get(where, {}).get("order") or [0, ""]):
                     self.status_posted.pop(where, None)
                     self.status_posted[where] = {"state": post["state"], "order": post.get("order") or [0, ""]}
-            else:
-                post["next"] = now + 600
-                if not post.get("logged"):
-                    post["logged"] = True
-                    log(f"GitHub didn't take the status for {post['repo']}@{post['sha'][:8]} (trying again in ten "
-                        f"minutes, for a day): {error[:300] or f'gh exited {proc.returncode}'}", level=4)
+            elif not newer:
+                kind = self._status_failure(error)
+                if kind == "permanent":
+                    if post in self.status_posts:
+                        self.status_posts.remove(post)
+                    log(f"GitHub refused the status for {post['repo']}@{post['sha'][:8]} (not retrying): "
+                        f"{error[:300] or f'gh exited {proc.returncode}'}", level=4)
+                else:
+                    tries = max(0, int(sane_count(post.get("tries")) or 0)) + 1
+                    post["tries"] = tries
+                    if kind == "missing":
+                        post["missing"] = True
+                    else:
+                        post.pop("missing", None)
+                    delay = min(self.STATUS_RETRY_MAX, self.STATUS_RETRY_BASE * (2 ** min(tries - 1, 10)))
+                    post["next"] = now + delay
+                    if not post.get("logged"):
+                        post["logged"] = True
+                        span = "6 hours" if post.get("missing") else "a day"
+                        log(f"GitHub didn't take the status for {post['repo']}@{post['sha'][:8]} (trying again with "
+                            f"backoff, for {span}): {error[:300] or f'gh exited {proc.returncode}'}", level=4)
             changed = True
+        busy = {id(p) for _, p, _ in self.status_procs}
         for post in list(self.status_posts):
-            if now - post["first"] > 86400:
+            limit = self.STATUS_MISSING_MAX_AGE if post.get("missing") else self.STATUS_MAX_AGE
+            if id(post) not in busy and now - post["first"] > limit:
                 why = "it didn't take it" if post.get("logged") else "gh couldn't be run"  # (logged: GitHub said no)
-                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: {why} for a day")
+                span = "6 hours" if post.get("missing") else "a day"
+                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: {why} for {span}")
                 self.status_posts.remove(post)
                 changed = True
-        busy = {id(p) for _, p, _ in self.status_procs}
         sending = {p.get("where") for _, p, _ in self.status_procs}
         for post in self.status_posts if self.cfg.github_status else ():
             if len(self.status_procs) >= 2:
@@ -4934,7 +4983,7 @@ class Daemon:
                 # everything else for nothing.)
                 holds = (holder.state == "queued" and not self.waited_out(holder, now) and self.waited_out(t, now)
                          and t.est_mem <= m.mem_available + ours_now - cfg.mem_floor)
-            elif m.psi_mem > cfg.mem_psi_block:
+            elif m.psi_mem > cfg.mem_psi_block and self.memory_scarce():
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
                                              f"{cfg.mem_psi_block:g}%)")
             elif per_lane[t.lane] >= lane.extra_jobs and count - sum(
@@ -5148,7 +5197,7 @@ class Daemon:
         ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in self.active()
                       if t.started and now - t.started < cfg.ramp_seconds and t not in elastic)
         cpu_cap = cfg.cpu_target * m.ncpu
-        waiting = next((t for t in self.queue() if t.reason_cat in ("cpu", "held")), None)
+        waiting = next((t for t in self.queue(now) if t.reason_cat == "cpu" or t.held_for == "cores"), None)
         spare = cpu_cap - max(m.busy, m.busy_now) - ramping - (waiting.need if waiting else 0)
         free_mem = m.mem_available - sum(self.still_to_grow(t, now) for t in self.active()) - cfg.mem_floor
         changed = []
@@ -5246,13 +5295,21 @@ class Daemon:
 
     # ---- keeping all builds together inside what the machine has free
 
-    def memory_moving(self) -> bool:
-        """Memory is short, under pressure ("full": a build held at its own MemoryHigh stalls only
-        "some"), or has fallen a gigabyte since the slice was last
-        guarded: other work can outgrow a guard every REBALANCE_SECONDS, so it is guarded every
-        tick (a second) until things settle."""
+    def memory_scarce(self) -> bool:
+        """Whether the machine's available memory is low enough that system-wide memory pressure
+        (PSI full) reflects a real shortage rather than one cgroup slowed at its own MemoryHigh or
+        routine zram swap-in while tens of gigabytes are free."""
         m = self.machine
-        return (m.mem_available < 2 * self.cfg.mem_floor or m.psi_mem > 1.0
+        if not m.mem_total:
+            return True
+        return m.mem_available < max(2 * self.cfg.mem_floor, m.mem_total // 4)
+
+    def memory_moving(self) -> bool:
+        """Memory is short, under real machine-wide pressure, or has fallen a gigabyte since the
+        slice was last guarded: other work can outgrow a guard every REBALANCE_SECONDS, so it is
+        guarded every tick (a second) until things settle."""
+        m = self.machine
+        return (m.mem_available < 2 * self.cfg.mem_floor or (m.psi_mem > 1.0 and self.memory_scarce())
                 or (self.guard_available is not None and self.guard_available - m.mem_available >= GIB))
 
     def guard_slice(self, stopping: bool = False) -> None:
@@ -5565,6 +5622,7 @@ class Daemon:
             for post in self.status_posts:  # a push may have brought commits that were waiting
                 if post.get("repo") == t.source.get("remote"):
                     post["next"] = now
+                    post["tries"] = 0
         waits = ""
         if t.mem_wait_some >= 1 or t.mem_high:
             waits = (f"; waited on memory {t.mem_wait_some:.0f}s ({t.mem_wait_full:.0f}s with all of it waiting)"
@@ -5910,8 +5968,9 @@ class Daemon:
         Nothing slow happens here, on the daemon's loop: memory.log is written and synced by a
         thread of its own, and the cgroups are walked by another."""
         m, floor = self.machine, self.cfg.mem_floor
-        tight = m.mem_available < 2 * floor or m.psi_mem >= 5
-        calm = m.mem_available > 2.5 * floor and m.psi_mem < 1
+        scarce = self.memory_scarce()
+        tight = m.mem_available < 2 * floor or (m.psi_mem >= 5 and scarce)
+        calm = m.mem_available > 2.5 * floor and (m.psi_mem < 1 or not scarce)
         if not tight and not self.memory_tight:
             return
         if calm:

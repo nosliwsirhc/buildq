@@ -933,7 +933,8 @@ def caller() -> str | None:
     Code's session, a Codex or T3 thread), else the unit this client runs in (a CI runner's
     service, a terminal's scope). Agents that share a terminal or tmux server and set none of these
     can set BUILDQ_CALLER apart."""
-    for name in ("BUILDQ_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "T3CODE_THREAD_ID"):
+    for name in ("BUILDQ_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "T3CODE_THREAD_ID",
+                 "ANTIGRAVITY_CONVERSATION_ID"):
         named = os.environ.get(name, "").strip()
         if named:
             return named[:200]
@@ -1282,18 +1283,25 @@ def tail_offset(path: str, lines: int) -> int:
     """The offset where the last `lines` lines of the file begin."""
     try:
         size = os.path.getsize(path)
+        if lines <= 0:
+            return size
         with open(path, "rb") as f:
-            block, data, offset = 1 << 16, b"", size
-            while offset > 0 and data.count(b"\n") <= lines:
+            block, offset, seen = 1 << 16, size, 0
+            while offset > 0:
+                prev = offset
                 offset = max(0, offset - block)
                 f.seek(offset)
-                data = f.read(size - offset)
-            if data.count(b"\n") <= lines:
-                return offset
-            cut = len(data)
-            for _ in range(lines + 1):
-                cut = data.rfind(b"\n", 0, cut)
-            return offset + cut + 1
+                chunk = f.read(prev - offset)
+                n = chunk.count(b"\n")
+                if seen + n > lines:
+                    need = lines + 1 - seen
+                    cut = len(chunk)
+                    for _ in range(need):
+                        cut = chunk.rfind(b"\n", 0, cut)
+                    return offset + cut + 1
+                seen += n
+                block = min(block * 2, 1 << 20)
+            return 0
     except OSError:
         return 0
 
