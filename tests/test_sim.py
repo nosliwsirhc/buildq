@@ -428,11 +428,12 @@ class Export(SimCase):
                     ["gradle", "assembleRelease"],
                     ["gradle", "--max-workers=8", "test"]):
             key_words = bq_commands.command_words(raw)
-            self.assertEqual(bq_commands.command_words(key_words), key_words, raw)
-            anon = sim.anonymous_argv(key_words)
-            self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(raw), (raw, key_words, anon))
+            exported = " ".join(key_words).split()  # as metrics.db stores and sim.export_builds splits it
+            self.assertEqual(bq_commands.command_words(exported), key_words, raw)
+            anon = sim.anonymous_argv(exported)
+            self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(raw), (raw, exported, anon))
             self.assertEqual(bq_tools.honors_grant_for(anon[0], anon[1:]),
-                             bq_tools.honors_grant_for(raw[0], raw[1:]), (raw, key_words, anon))
+                             bq_tools.honors_grant_for(raw[0], raw[1:]), (raw, exported, anon))
         key = lambda argv: bq_commands.command_words(sim.anonymous_argv(argv))  # noqa: E731
         self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
 
