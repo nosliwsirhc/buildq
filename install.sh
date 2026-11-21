@@ -842,9 +842,10 @@ if [ "$do_uninstall" = yes ]; then
     # Unconditionally monitor buildqd.lock for a monotonic ~2.2 s window (strictly within 2–3 s,
     # using fast non-blocking flock probes and never 2 s-retrying socket calls inside the loop) to
     # catch a starting/unresponsive daemon or an init supervisor respawning buildqd between crashes.
-    _now_cs=$(mono_cs || printf '')
-    if [ -n "$_now_cs" ]; then
-      _end_cs=$(( _now_cs + 220 ))
+    _start_cs=$(mono_cs || printf '')
+    if [ -n "$_start_cs" ]; then
+      _end_cs=$(( _start_cs + 220 ))
+      _cap_cs=$(( _start_cs + 280 ))
       while :; do
         if daemon_lock_held; then
           say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
@@ -853,18 +854,26 @@ if [ "$do_uninstall" = yes ]; then
         fi
         _now_cs=$(mono_cs || printf '%s' "$_end_cs")
         [ "$_now_cs" -ge "$_end_cs" ] && break
-        sleep 0.2 2>/dev/null || sleep 1
+        if ! sleep 0.2 2>/dev/null; then
+          [ $(( _now_cs + 100 )) -gt "$_cap_cs" ] && break
+          sleep 1
+        fi
       done
     else
       _w=0
-      while [ "$_w" -lt 11 ]; do
+      while [ "$_w" -lt 10 ]; do
         if daemon_lock_held; then
           say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
           say "Disable and stop that service first, then re-run ./install.sh --uninstall."
           exit 1
         fi
-        sleep 0.2 2>/dev/null || { sleep 1; _w=$((_w + 4)); }
-        _w=$((_w + 1))
+        if ! sleep 0.2 2>/dev/null; then
+          [ "$_w" -ge 6 ] && break
+          sleep 1
+          _w=$((_w + 5))
+        else
+          _w=$((_w + 1))
+        fi
       done
     fi
     # One final bounded socket probe (only when a socket path exists) followed by a final lock check.
