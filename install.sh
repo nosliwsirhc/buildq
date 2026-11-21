@@ -171,7 +171,8 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$bindir/buildq" "$bindir/buildqd" "$bindir/buildq-shim" \
         "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice"
   [[ $keep_guard == no ]] && rm -f "$bindir/buildq-rustc-guard"
-  rm -f "$unitdir/buildq.slice.d/50-buildq-memory.conf"
+  rm -f "$unitdir/buildq.slice.d/40-buildq-oomd.conf" "$unitdir/buildq.slice.d/60-buildq-oomd.conf" \
+        "$unitdir/buildq.slice.d/50-buildq-memory.conf"
   have_systemd && systemctl --user daemon-reload
   say "removed. Kept $confdir and ${XDG_STATE_HOME:-$HOME/.local/state}/buildq; delete them by hand if you like."
   exit 0
@@ -260,6 +261,15 @@ if [[ ! -e "$unitdir/buildq.slice.d/50-buildq-memory.conf" ]]; then
   mkdir -p "$unitdir/buildq.slice.d"
   printf '[Slice]\nMemoryHigh=75%%\nMemoryMax=85%%\n' >"$unitdir/buildq.slice.d/50-buildq-memory.conf"
   say "capped all builds together at 75%/85% of memory ($unitdir/buildq.slice.d/50-buildq-memory.conf)"
+fi
+# Distros such as Fedora set ManagedOOMMemoryPressure=kill on every user slice, so a single build
+# slowed at its own MemoryHigh can make systemd-oomd kill it even while plenty of RAM is free.
+# buildq enforces per-build MemoryMax, slice_guard and shed_memory itself; this user-range drop-in
+# disables pressure monitoring rooted at buildq.slice while leaving ancestor/system oomd intact.
+if [[ ! -e "$unitdir/buildq.slice.d/60-buildq-oomd.conf" ]]; then
+  mkdir -p "$unitdir/buildq.slice.d"
+  printf '[Slice]\nManagedOOMMemoryPressure=auto\nManagedOOMMemoryPressureLimit=\n' >"$unitdir/buildq.slice.d/60-buildq-oomd.conf"
+  say "disabled per-slice systemd-oomd pressure kills on buildq.slice ($unitdir/buildq.slice.d/60-buildq-oomd.conf)"
 fi
 systemctl --user daemon-reload
 systemctl --user enable --now buildq.socket >/dev/null

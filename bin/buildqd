@@ -14,7 +14,8 @@ machine is doing right now rather than from a fixed number of slots:
 
   Memory  The build's expected peak must fit in MemAvailable, less what every running build may
           still grow into (its expected peak minus what it holds now), less mem_floor. Never
-          skipped. No build starts while memory pressure (PSI "full") is above mem_psi_block.
+          skipped. No build starts while memory pressure (PSI "full") is above mem_psi_block and
+          available memory is scarce.
   CPU     The build's minimum cores must fit in what is free: cpu_target x cores, less the busy
           cores measured machine-wide (CI runners, containers and other users included), less the
           cores that builds started in the last ramp_seconds haven't reached yet, plus the cores
@@ -986,8 +987,8 @@ def own_pids():
                 continue
 
 
-# Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run) and Codex.
-AGENT_COMM = ("claude", "codex")
+# Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run), Codex, and Antigravity (including its `agy` CLI).
+AGENT_COMM = ("claude", "codex", "antigravity", "agy")
 AGENT_EXE = re.compile(r"/\.?claude/(versions|remote/ccd-cli)/[^/]+$")
 T3_THREAD_VAR = "T3CODE_THREAD_ID"  # T3 sets it for a thread's agent process, and so for all that runs
 
@@ -1010,8 +1011,8 @@ def is_agent(pid: int, strict: bool = False) -> bool:
 
 def agents_above(pid) -> list[list[int]]:
     """The agent sessions a client runs under: [pid, start ticks] of the client and each of its
-    ancestors that is a Claude Code or Codex process, nearest first (an agent may run another).
-    Empty for CI, a terminal, a script."""
+    ancestors that is a Claude Code, Codex or Antigravity process, nearest first (an agent may run
+    another). Empty for CI, a terminal, a script."""
     found = []
     for _ in range(64):
         stat = proc_stat(pid) if isinstance(pid, int) and pid > 1 else None
@@ -1922,8 +1923,9 @@ VOLATILE_ENV = re.compile(
     r"SSH_CLIENT|SSH_CONNECTION|SSH_TTY|GPG_TTY|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_ID|XDG_ACTIVATION_TOKEN|"
     r"INVOCATION_ID|JOURNAL_STREAM|MANAGERPID|MANAGERPIDFDID|SYSTEMD_EXEC_PID|NOTIFY_SOCKET|LISTEN_(PID|FDS|FDNAMES)|"
     r"CLAUDE_PID|CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|SESSION_ATTENDED|MESSAGING_SOCKET|MESSAGING_TOKEN)|"
-    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|KITTY_WINDOW_ID|WEZTERM_PANE|VSCODE_GIT_IPC_HANDLE|"
-    r"VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
+    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|"
+    r"ANTIGRAVITY_(AGENT|AGENTAPI_EXE|APP_DATA_DIR|CONVERSATION_ID|CSRF_TOKEN|LS_ADDRESS|LS_VERSION|PROJECT_ID|SOURCE_METADATA|TRAJECTORY_ID)|"
+    r"KITTY_WINDOW_ID|WEZTERM_PANE|VSCODE_GIT_IPC_HANDLE|VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
 
 
 def env_digest(env: dict[str, str]) -> str:
@@ -2871,13 +2873,28 @@ class SystemdRunner:
 
     def result(self, ticket) -> str:
         """systemd's Result for the build's service: "success", "exit-code", "signal", "oom-kill" (the
-        kernel or systemd-oomd stopped it for memory), ... or "" if systemd can't say."""
+        kernel stopped it for memory), "managed-oom-kill" (systemd-oomd stopped it for slice/ancestor
+        pressure), ... or "" if systemd can't say. With OOMPolicy=continue, OOM kills leave
+        Result=signal while still incrementing OOMKills / ManagedOOMKills, so those are checked
+        explicitly (kernel OOMKills first so own-cap kills stay distinguishable from slice-pressure
+        managed kills)."""
+        if not ticket.unit:
+            return ""
         try:
-            out = subprocess.run(["systemctl", "--user", "show", "-p", "Result", "--value", ticket.unit],
+            out = subprocess.run(["systemctl", "--user", "show", "-p", "LoadState,Result,OOMKills,ManagedOOMKills", ticket.unit],
                                  stdin=DEVNULL, capture_output=True, text=True, timeout=5).stdout
-            return out.strip()
         except (OSError, subprocess.SubprocessError):
             return ""
+        props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if props.get("LoadState") == "not-found":
+            return ""
+        # systemd prints UINT64_MAX (18446744073709551615) when an OOM counter is unavailable;
+        # sane_count() rejects that sentinel alongside non-numeric or negative values.
+        if int(sane_count(props.get("OOMKills")) or 0) > 0:
+            return "oom-kill"
+        if int(sane_count(props.get("ManagedOOMKills")) or 0) > 0:
+            return "managed-oom-kill"
+        return props.get("Result", "").strip()
 
     def cleanup(self, ticket):
         """Unload the build's service once its outcome is read (a failed one stays loaded until then)."""
@@ -3469,9 +3486,7 @@ class Daemon:
         self.paused = read_json(os.path.join(state_dir, "paused.json"))  # {"reason", "since"} or None
         if not isinstance(self.paused, dict):
             self.paused = None
-        self.status_posts: list = read_json(os.path.join(state_dir, "github-statuses.json")) or []
-        if not isinstance(self.status_posts, list):
-            self.status_posts = []
+        self.status_posts: list = []
         self.status_procs: list[tuple[subprocess.Popen, dict, float]] = []
         self.gh: list | None = None  # None: found as each status is sent (tests put a stand-in here)
         self.gh_unrunnable = False  # said so in the log already, until gh runs again
@@ -3481,8 +3496,11 @@ class Daemon:
         self.status_posted: dict[str, dict] = {}  # "repo@sha@context" -> {state, order} last posted
         self.status_seen: dict[str, list] = {}  # "repo@sha@context" -> order of the newest verdict seen
         statuses = read_json(os.path.join(state_dir, "github-statuses.json"))
-        if isinstance(statuses, dict):
-            self.status_posts = statuses.get("queue") or []
+        if isinstance(statuses, list):
+            self.status_posts = statuses
+        elif isinstance(statuses, dict):
+            queued = statuses.get("queue")
+            self.status_posts = queued if isinstance(queued, list) else []
             seen = statuses.get("seen")
             self.status_seen = {str(k): list(v) for k, v in seen.items() if isinstance(v, list)} \
                 if isinstance(seen, dict) else {}
@@ -3669,17 +3687,20 @@ class Daemon:
             return (not long, not due, t.submitted if due else 0.0, not overdue, not starving, -self.weight(t),
                     not first, not (first and self.waited_out(t, now)))
 
-        def own_order(t: Ticket):
-            return (*tier(t), t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
+        queued = [t for t in self.tickets.values() if t.state == "queued"]
+        tiers = {t.id: tier(t) for t in queued}
 
-        queued = sorted((t for t in self.tickets.values() if t.state == "queued"), key=own_order)
+        def tail(t: Ticket):
+            return (t.expected if t.expected is not None else math.inf, t.submitted, t.seq)
+
+        queued.sort(key=lambda t: (*tiers[t.id], *tail(t)))
         # Within a tier, a caller's k-th waiting build counts as if k more of its builds ran, so
         # callers take turns: one session's burst of builds is interleaved with everyone else's.
         share, seen = {}, collections.Counter()
         for t in queued:
-            share[t.id] = running[t.caller] + seen[(tier(t), t.caller)]
-            seen[(tier(t), t.caller)] += 1
-        return sorted(queued, key=lambda t: (*tier(t), share[t.id], *own_order(t)[2:]))
+            share[t.id] = running[t.caller] + seen[(tiers[t.id], t.caller)]
+            seen[(tiers[t.id], t.caller)] += 1
+        return sorted(queued, key=lambda t: (*tiers[t.id], share[t.id], *tail(t)))
 
     def weight(self, t: Ticket) -> int:
         """Its priority: its lane's plus its own."""
@@ -4409,7 +4430,7 @@ class Daemon:
         t.attempts_peak = max(t.attempts_peak, t.mem_peak)
         t.force_sent = t.freeze_failed = t.thaw_failed = False
         t.state, t.started, t.running_since, t.result_seen, t.stop_sent = "queued", None, None, None, None
-        t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = None
+        t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = t.exec_argv = None
         t.started_max_cores = t.max_granted  # (the row describes the last attempt that started)
         t.ended_rule = self.cfg.scale_mem_with_cores
         t.granted = t.max_granted = t.tokens_out = 0
@@ -4522,7 +4543,8 @@ class Daemon:
         local failure on the way to a fix is noise on a pull request). Results are ordered by when
         their builds ended, not when their checks did: an older result never replaces a newer one.
         A commit that isn't on GitHub yet is tried again after the next `git push` run through buildq
-        from that repository, and every ten minutes, for a day. A build from a GitHub Actions job never
+        from that repository, and with exponential backoff (10 minutes up to 2 hours) for up to 6
+        hours (24 hours for transient/network errors). A build from a GitHub Actions job never
         posts success: the job reports its own result, and on a pull request its commit is usually a
         merge commit the pull request doesn't show. Its failure can still turn a green buildq posted
         on the same commit red."""
@@ -4557,12 +4579,23 @@ class Daemon:
             if id(p) not in in_flight:
                 self.status_posts.remove(p)
         took = fmt_duration((t.ended or now) - (t.started or now))
-        self.status_posts.append({
+        firsts = [p["first"] for p in pending if isinstance(p.get("first"), (int, float))]
+        nexts = [p["next"] for p in pending if isinstance(p.get("next"), (int, float))]
+        post = {
             "repo": src["remote"], "sha": src["commit"], "state": "success" if t.state == "succeeded" else "failure",
             "context": context, "where": where, "order": order,
             "description": (f"passed on the shared build machine in {took}" if t.state == "succeeded" else
                             f"failed (exit {t.exit}) on the shared build machine")[:140],
-            "first": now, "next": now, "ticket": t.id})
+            "first": min([now, *firsts]), "next": max([now, *nexts]), "ticket": t.id}
+        if pending:
+            tries = max(int(sane_count(p.get("tries")) or 0) for p in pending)
+            if tries:
+                post["tries"] = tries
+            if any(p.get("missing") for p in pending):
+                post["missing"] = True
+            if any(p.get("logged") for p in pending):
+                post["logged"] = True
+        self.status_posts.append(post)
         self.save_status_posts()
 
     def save_status_posts(self) -> None:
@@ -4575,6 +4608,24 @@ class Daemon:
                        {"queue": self.status_posts, "posted": self.status_posted, "seen": self.status_seen})
         except OSError as e:
             log(f"can't save the GitHub statuses to send: {e}")
+
+    STATUS_RETRY_BASE = 600.0        # first retry wait (10m); doubles each failure up to STATUS_RETRY_MAX
+    STATUS_RETRY_MAX = 7200.0        # longest backoff between retries (2h)
+    STATUS_MISSING_MAX_AGE = 21600.0  # missing commit (HTTP 422): stop trying after 6h (likely amended/unpushed)
+    STATUS_MAX_AGE = 86400.0         # transient/network failures: stop trying after a day
+
+    @staticmethod
+    def _status_failure(error: str) -> str:
+        """Classify a failed `gh api` status post: 'missing' (commit not on GitHub yet),
+        'permanent' (4xx client error that retrying won't fix), or 'transient'."""
+        lower = error.lower()
+        if "no commit found" in lower:
+            return "missing"
+        if "rate limit" in lower or "abuse" in lower:
+            return "transient"
+        if re.search(r"\bHTTP 4(00|01|03|04|22)\b", error):
+            return "permanent"
+        return "transient"
 
     def send_status_posts(self, now: float) -> None:
         changed = False
@@ -4600,20 +4651,54 @@ class Daemon:
                 if (post.get("order") or [0, ""]) >= (self.status_posted.get(where, {}).get("order") or [0, ""]):
                     self.status_posted.pop(where, None)
                     self.status_posted[where] = {"state": post["state"], "order": post.get("order") or [0, ""]}
+                if newer:
+                    # The commit is now on GitHub: give any queued replacement a fresh delivery
+                    # window instead of expiring or backing off under the old missing-commit state.
+                    for p in self.status_posts:
+                        if p.get("where") == post.get("where"):
+                            p.pop("missing", None)
+                            p.pop("tries", None)
+                            p["first"] = now
+                            p["next"] = min(p.get("next", now), now)
             else:
-                post["next"] = now + 600
-                if not post.get("logged"):
-                    post["logged"] = True
-                    log(f"GitHub didn't take the status for {post['repo']}@{post['sha'][:8]} (trying again in ten "
-                        f"minutes, for a day): {error[:300] or f'gh exited {proc.returncode}'}", level=4)
+                kind = self._status_failure(error)
+                if not newer and kind == "permanent":
+                    if post in self.status_posts:
+                        self.status_posts.remove(post)
+                    log(f"GitHub refused the status for {post['repo']}@{post['sha'][:8]} (not retrying): "
+                        f"{error[:300] or f'gh exited {proc.returncode}'}", level=4)
+                elif kind != "permanent":
+                    # If a newer verdict arrived while this request was in flight, carry a missing-commit
+                    # or transient/rate-limit failure onto the surviving replacement so the send loop
+                    # below doesn't immediately retry the same commit or rate-limited API in this tick.
+                    target = (max((p for p in self.status_posts if p.get("where") == post.get("where")),
+                                  key=lambda p: p.get("order") or [0, ""], default=None)
+                              if newer else post)
+                    if target is not None:
+                        tries = max(0, int(sane_count(target.get("tries")) or 0)) + 1
+                        target["tries"] = tries
+                        if kind == "missing":
+                            target["missing"] = True
+                        else:
+                            target.pop("missing", None)
+                        delay = min(self.STATUS_RETRY_MAX, self.STATUS_RETRY_BASE * (2 ** min(tries - 1, 10)))
+                        target["next"] = max(target.get("next", 0), now + delay)
+                        if not target.get("logged"):
+                            target["logged"] = True
+                            span = "6 hours" if target.get("missing") else "a day"
+                            log(f"GitHub didn't take the status for {target['repo']}@{target['sha'][:8]} "
+                                f"(trying again with backoff, for {span}): "
+                                f"{error[:300] or f'gh exited {proc.returncode}'}", level=4)
             changed = True
+        busy = {id(p) for _, p, _ in self.status_procs}
         for post in list(self.status_posts):
-            if now - post["first"] > 86400:
+            limit = self.STATUS_MISSING_MAX_AGE if post.get("missing") else self.STATUS_MAX_AGE
+            if id(post) not in busy and now - post["first"] > limit:
                 why = "it didn't take it" if post.get("logged") else "gh couldn't be run"  # (logged: GitHub said no)
-                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: {why} for a day")
+                span = "6 hours" if post.get("missing") else "a day"
+                log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: {why} for {span}")
                 self.status_posts.remove(post)
                 changed = True
-        busy = {id(p) for _, p, _ in self.status_procs}
         sending = {p.get("where") for _, p, _ in self.status_procs}
         for post in self.status_posts if self.cfg.github_status else ():
             if len(self.status_procs) >= 2:
@@ -4934,7 +5019,7 @@ class Daemon:
                 # everything else for nothing.)
                 holds = (holder.state == "queued" and not self.waited_out(holder, now) and self.waited_out(t, now)
                          and t.est_mem <= m.mem_available + ours_now - cfg.mem_floor)
-            elif m.psi_mem > cfg.mem_psi_block:
+            elif m.psi_mem > cfg.mem_psi_block and self.memory_scarce():
                 reason = ("memory-pressure", f"memory pressure is {m.psi_mem:.0f}% (no new build above "
                                              f"{cfg.mem_psi_block:g}%)")
             elif per_lane[t.lane] >= lane.extra_jobs and count - sum(
@@ -5089,12 +5174,14 @@ class Daemon:
             callers_own = any(k in env and str(env[k]).strip()
                               and (k not in cleaned or callers_jobs(split_make_flags(cleaned[k])[0]))
                               for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
+            t.elastic = False
             if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
                 t.jobserver = os.path.join(t.dir, "jobserver")
                 t.js = Jobserver(t.jobserver, create=True)
                 t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
                 t.tokens_out = t.js.out
+            t.exec_argv = None
             if t.jobserver and tool in ("make", "gmake", "ninja") and asks_for_jobs(t.argv[1:]):
                 tool_at = len(t.argv) - len(strip_wrappers(t.argv))  # (a wrapper's own words stay: env -u -j make)
                 t.exec_argv = t.argv[:tool_at] + without_jobs(t.argv[tool_at:])  # its -j would make it ignore the jobserver
@@ -5148,12 +5235,13 @@ class Daemon:
         ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in self.active()
                       if t.started and now - t.started < cfg.ramp_seconds and t not in elastic)
         cpu_cap = cfg.cpu_target * m.ncpu
-        waiting = next((t for t in self.queue() if t.reason_cat in ("cpu", "held")), None)
+        queued = self.queue(now)
+        waiting = next((t for t in queued if t.reason_cat == "cpu" or t.held_for == "cores"), None)
         spare = cpu_cap - max(m.busy, m.busy_now) - ramping - (waiting.need if waiting else 0)
         free_mem = m.mem_available - sum(self.still_to_grow(t, now) for t in self.active()) - cfg.mem_floor
         changed = []
         idle_grown = 0  # cores handed out from measured idle ones this pass
-        waiting_for_memory = any(t.reason_cat == "memory" for t in self.queue(now))
+        waiting_for_memory = any(t.reason_cat == "memory" for t in queued)
         if spare >= 1 and free_mem > 0 and not waiting_for_memory:
             growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted
                               and (t.release_at is None or t.release_revoked)),
@@ -5246,13 +5334,21 @@ class Daemon:
 
     # ---- keeping all builds together inside what the machine has free
 
-    def memory_moving(self) -> bool:
-        """Memory is short, under pressure ("full": a build held at its own MemoryHigh stalls only
-        "some"), or has fallen a gigabyte since the slice was last
-        guarded: other work can outgrow a guard every REBALANCE_SECONDS, so it is guarded every
-        tick (a second) until things settle."""
+    def memory_scarce(self) -> bool:
+        """Whether the machine's available memory is low enough that system-wide memory pressure
+        (PSI full) reflects a real shortage rather than one cgroup slowed at its own MemoryHigh or
+        routine zram swap-in while tens of gigabytes are free."""
         m = self.machine
-        return (m.mem_available < 2 * self.cfg.mem_floor or m.psi_mem > 1.0
+        if not m.mem_total:
+            return True
+        return m.mem_available < max(2 * self.cfg.mem_floor, m.mem_total // 4)
+
+    def memory_moving(self) -> bool:
+        """Memory is short, under real machine-wide pressure, or has fallen a gigabyte since the
+        slice was last guarded: other work can outgrow a guard every REBALANCE_SECONDS, so it is
+        guarded every tick (a second) until things settle."""
+        m = self.machine
+        return (m.mem_available < 2 * self.cfg.mem_floor or (m.psi_mem > 1.0 and self.memory_scarce())
                 or (self.guard_available is not None and self.guard_available - m.mem_available >= GIB))
 
     def guard_slice(self, stopping: bool = False) -> None:
@@ -5354,10 +5450,12 @@ class Daemon:
                     if verdict is PENDING:
                         continue  # finalized on a later tick, with systemd's verdict
                     oom = verdict == "oom-kill"
+                    managed_oom = verdict == "managed-oom-kill"
                     error = None if t.cancel_requested else (
+                        "it was stopped for memory (systemd-oomd)" if managed_oom else
                         "it was stopped for memory (systemd-oomd or the kernel)" if oom else
                         f"the build ended without reporting an exit status ({verdict or 'killed?'})")
-                    self.finalize(t, now, None, lost=True, oom=oom, error=error)
+                    self.finalize(t, now, None, lost=True, oom=oom or managed_oom, learn_oom=oom, error=error)
 
     def attempt_seconds(self, t: Ticket, now: float | None) -> float:
         """Seconds into this attempt, pauses left out: the clock attempt_wall and the profile use."""
@@ -5418,7 +5516,7 @@ class Daemon:
                     return False  # the build stays starting until the name is free
                 self.close_jobserver(t, remove=True)
                 self.drop_queries(t)  # (this attempt is over)
-                t.state, t.started, t.unit, t.cg, t.granted = "queued", None, None, None, 0
+                t.state, t.started, t.unit, t.cg, t.exec_argv, t.granted, t.elastic = "queued", None, None, None, None, 0, False
                 self.save(t)
                 log(f"requeued {t.id}: it hadn't started when the daemon stopped")
             else:
@@ -5471,7 +5569,8 @@ class Daemon:
             t.jobserver, t.tokens_out = None, 0
 
     def finalize(self, t: Ticket, now: float, exit_code, oom: bool = False, timed_out: bool = False,
-                 error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
+                 error: str | None = None, lost: bool = False, result: dict | None = None,
+                 learn_oom: bool | None = None) -> None:
         if t.state in FINISHED:
             return
         self.drop_queries(t)  # its attempt's answers are no use to anyone now
@@ -5483,7 +5582,9 @@ class Daemon:
         exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
         lane = self.lane(t.lane)
         t.exit = exit_code
-        t.oom = bool(oom or t.oom_kills) or (exit_code == 137 and bool(lane.mem_cap) and t.mem_peak >= 0.9 * lane.mem_cap)
+        own_oom = bool((oom if learn_oom is None else learn_oom) or t.oom_kills) or (
+            exit_code == 137 and bool(lane.mem_cap) and t.mem_peak >= 0.9 * lane.mem_cap)
+        t.oom = bool(oom) or own_oom
         t.timed_out = timed_out
         t.error = error or (f"timed out after {t.timeout or 0:.0f}s" if timed_out else None)
         t.ended = now
@@ -5519,13 +5620,14 @@ class Daemon:
         except OSError:
             pass
         # A run that a signal ended (a cancel, a timeout) shows how far it got, not what it needs,
-        # so it teaches nothing; a run the kernel killed for memory teaches that it needs more.
-        if t.oom and not t.measured:  # killed before it could be sampled: it needed at least its cap
+        # so it teaches nothing; a run the kernel killed for its own memory cap teaches that it
+        # needs more (a slice/ancestor managed-oom kill doesn't inflate this command's own estimate).
+        if own_oom and not t.measured:  # killed before it could be sampled: it needed at least its cap
             t.mem_peak = max(t.mem_peak, lane.mem_cap or t.est_mem)
             t.peak_cores = max(t.peak_cores, float(t.max_granted or 1))
         if exit_code is not None and exit_code < 128 and not t.measured and not t.oom:
             t.mem_peak = t.mem_peak or 0  # too quick to sample: it needed little, and that is worth knowing
-        learn = t.oom or (exit_code is not None and exit_code < 128 and (t.measured or wall < 2))
+        learn = own_oom or (exit_code is not None and exit_code < 128 and (t.measured or wall < 2))
         if learn and not t.cancel_requested and not timed_out:
             given = round(t.grant_area / wall, 1) if wall > 0 and t.grant_area else t.max_granted
             try:
@@ -5533,7 +5635,7 @@ class Daemon:
                     "key": t.key, "lane": t.lane, "t": round(time.time()), "wall": round(wall, 1), "exit": exit_code,
                     "peak_mem": t.mem_peak, "peak_cores": round(t.peak_cores, 2), "avg_cores": round(t.avg_cores, 2),
                     "granted": given, "mem_cores": t.peak_mem_cores or t.max_granted, "elastic": t.elastic,
-                    "cold": t.cold, "oom": t.oom, "mem_wait_some": round(t.mem_wait_some, 1),
+                    "cold": t.cold, "oom": own_oom, "mem_wait_some": round(t.mem_wait_some, 1),
                     "mem_wait_full": round(t.mem_wait_full, 1), "mem_high": t.mem_high,
                     "waited": round(t.wait_total, 1), "caller": t.caller,
                     "requeues": t.requeues,
@@ -5562,9 +5664,14 @@ class Daemon:
         except Exception as e:  # the analytics must never cost a build its ending
             self.metrics.trouble(f"can't record {t.id} for the analytics: {e!r}")
         if t.state == "succeeded" and command_words(t.argv)[:2] == ["git", "push"] and t.source:
+            nudged = False
             for post in self.status_posts:  # a push may have brought commits that were waiting
-                if post.get("repo") == t.source.get("remote"):
+                if post.get("repo") == t.source.get("remote") and post.get("missing"):
                     post["next"] = now
+                    post["tries"] = 0
+                    nudged = True
+            if nudged:
+                self.save_status_posts()
         waits = ""
         if t.mem_wait_some >= 1 or t.mem_high:
             waits = (f"; waited on memory {t.mem_wait_some:.0f}s ({t.mem_wait_full:.0f}s with all of it waiting)"
@@ -5903,15 +6010,17 @@ class Daemon:
         """While memory is tight, say every half minute how much is free and which cgroups hold the
         most, builds or not, so that if the machine stalls and has to be reset, there is a record of
         what filled it. Tight is less than twice mem_floor available, or every task on the machine
-        stalled on memory at once 5% of the time (memory "full"; "some" also counts one build slowed
-        at its own MemoryHigh, which is normal). It is no longer tight once more than 2.5 times
-        mem_floor is available and "full" is under 1% for half a minute.
+        stalled on memory at once 5% of the time (memory "full") while memory is scarce (under the
+        greater of twice mem_floor or a quarter of RAM; "some" also counts one build slowed at its
+        own MemoryHigh, which is normal). It is no longer tight once more than 2.5 times mem_floor
+        is available and either "full" is under 1% or memory is no longer scarce, for half a minute.
 
         Nothing slow happens here, on the daemon's loop: memory.log is written and synced by a
         thread of its own, and the cgroups are walked by another."""
         m, floor = self.machine, self.cfg.mem_floor
-        tight = m.mem_available < 2 * floor or m.psi_mem >= 5
-        calm = m.mem_available > 2.5 * floor and m.psi_mem < 1
+        scarce = self.memory_scarce()
+        tight = m.mem_available < 2 * floor or (m.psi_mem >= 5 and scarce)
+        calm = m.mem_available > 2.5 * floor and (m.psi_mem < 1 or not scarce)
         if not tight and not self.memory_tight:
             return
         if calm:

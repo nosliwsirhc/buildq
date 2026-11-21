@@ -38,7 +38,8 @@ disk_floor = "2G"
 #                      "/var/lib/containers/storage", "~/.local/share/containers/storage"]
 
 # No new build while CPU pressure ("some", avg10, %) is above this and a build is running, or
-# while memory pressure ("full", avg10, %) is above mem_psi_block.
+# while memory pressure ("full", avg10, %) is above mem_psi_block and available memory is low
+# (under twice mem_floor or a quarter of RAM).
 cpu_psi_block = 50
 mem_psi_block = 10
 
@@ -115,9 +116,9 @@ make_room_spare_after = "0"
 # A build started by `buildq run` is cancelled once no client has followed it for this long (its
 # client was killed); builds dropped off with `buildq submit` aren't.
 unwatched_seconds = 30
-# A build dropped off with `buildq submit` from a Claude Code or Codex session is cancelled while
-# it is queued once, for this long on end, that session has been gone and nobody has waited on the
-# ticket. 0 turns it off. A daemon restart starts the time again.
+# A build dropped off with `buildq submit` from a Claude Code, Codex or Antigravity session is
+# cancelled while it is queued once, for this long on end, that session has been gone and nobody
+# has waited on the ticket. 0 turns it off. A daemon restart starts the time again.
 abandoned_seconds = 600
 
 # ---- What builds are expected to need -----------------------------------------------------------

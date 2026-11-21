@@ -58,7 +58,7 @@ A build started by `buildq run` is *attached*: once no client has followed it fo
 `unwatched_seconds`, it is cancelled. Builds from `buildq submit` are not: they are waited on in rounds.
 Instead, the daemon notes the agent session each submit came from (#71):
 - **Who:** the client's pid comes from the socket's peer credentials, so no client has to say. The
-  client and each of its ancestors that is a Claude Code or Codex process is recorded as pid and
+  client and each of its ancestors that is a Claude Code, Codex or Antigravity process is recorded as pid and
   start time (a reused pid doesn't count), nearest first: an agent may run another. The T3 thread
   comes from the submission's environment.
 - **Still running:** a session runs while any of those processes does, or while a later agent
@@ -121,7 +121,9 @@ and walks the queue in order, starting each ticket for which, in this order:
    is refused. A build that has waited `starve_seconds` and is held holds its workspace too, so
    a quicker lane in its group can't keep taking it. The wait reason names the build holding the
    workspace;
-5. memory pressure is at most `mem_psi_block`;
+5. memory pressure is at most `mem_psi_block` whenever available memory is low (under twice
+   `mem_floor` or a quarter of RAM: with plenty of RAM free, a single build slowed at its own
+   `MemoryHigh` or routine zram swap-in can raise system PSI without the machine being short);
 6. it has a turn: its lane has a free `extra_jobs` turn, or fewer than `max_jobs` builds hold
    ordinary turns;
 7. its expected memory ≤ `free_mem`, less any room held for starving builds;
@@ -280,9 +282,9 @@ starts with are cut until their memory fits, and the rebalancer grows a build on
 for its extra cores is free, sharing what is free among the builds it grows.
 
 **The slice guard.** Every five seconds, and every second while memory is short (less than twice
-`mem_floor` free), under pressure (memory "full" above 1%: a build held at its own `MemoryHigh`
-stalls only "some") or has fallen a gigabyte since the last
-time, the daemon sets `buildq.slice`'s `memory.max` to what its
+`mem_floor` free), under machine-wide pressure (memory "full" above 1% while available memory is
+scarce — under the greater of twice `mem_floor` or a quarter of RAM) or has fallen a gigabyte since
+the last time, the daemon sets `buildq.slice`'s `memory.max` to what its
 builds hold (`memory.current`) plus what the machine has free above half of `mem_floor`, at least
 2 GB above what they hold, and never above the `MemoryMax` the slice is configured with. When other
 work on the machine grows, the room for builds shrinks with it, and past it builds are stopped
@@ -475,10 +477,12 @@ verdict seen (queued, posted, or not posted because there was nothing to correct
 time per commit and context, and after a restart only the newest queued result per commit and
 context is kept. The daemon sends at most two at once with `gh api`, in processes it doesn't wait on, and
 keeps the queue and what it has posted in
-`github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails (the
-commit isn't pushed yet, say) is logged with `gh`'s message the first time, tried again ten
-minutes later, at once after a `git push` run through buildq from the same repository succeeds, and
-dropped after a day. With `github_status` off, nothing queued is sent.
+`github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails
+permanently (HTTP 400, 401, 403 other than rate limiting, 404, or a 422 other than a missing commit) is
+logged and dropped at once. Otherwise it is logged with `gh`'s message the first time and retried
+with exponential backoff (10 minutes up to 2 hours), at once for missing-commit posts after a
+`git push` run through buildq from the same repository succeeds, and dropped after 6 hours for a
+missing commit (HTTP 422 "No commit found") or a day for transient errors. With `github_status` off, nothing queued is sent.
 
 ## Fair shares and pausing
 
@@ -671,10 +675,11 @@ back by that cap. Numbers read back from `result.json` or `ticket.json` count on
 finite, non-negative and not absurdly large; anything else is ignored.
 
 **Memory watch.** While `MemAvailable` is under twice `mem_floor`, or memory `full avg10` is 5% or
-more, the daemon records every 30 seconds the machine's memory, swap and pressure. Memory `some`
+more while memory is scarce (under the greater of twice `mem_floor` or a quarter of RAM), the daemon
+records every 30 seconds the machine's memory, swap and pressure. Memory `some`
 doesn't count: one build slowed at its own `MemoryHigh` keeps it high on a machine with plenty
-free. Once more than 2.5 times `mem_floor` is available and `full` is under 1% for 30 seconds, it
-says memory is no longer tight. Going in and out of tight in between doesn't log more often.
+free. Once more than 2.5 times `mem_floor` is available and either `full` is under 1% or memory is
+no longer scarce for 30 seconds, it says memory is no longer tight. Going in and out of tight in between doesn't log more often.
 
 Nothing slow runs on the daemon's loop. The loop writes the machine's numbers to the journal at
 once (at warning priority) and puts them on a queue for `memory.log` in the state directory. A

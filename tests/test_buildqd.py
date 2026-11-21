@@ -276,14 +276,20 @@ class Admission(DaemonCase):
 
     def test_pressure(self):
         self.machine.psi_mem = 25.0
+        self.assertFalse(self.daemon.memory_moving())  # 100G available: PSI alone doesn't mean memory is scarce
         first = self.submit()
-        self.assertEqual(first.reason_cat, "memory-pressure")
+        self.assertEqual(first.state, "running")
+        self.finish(first)
+        self.machine.mem_available = 25 * GIB  # under a quarter of 128G: memory is scarce
+        self.assertTrue(self.daemon.memory_moving())
+        second = self.submit(lane="web")  # 4G lane: fits in the 15G above the 10G floor once PSI clears
+        self.assertEqual(second.reason_cat, "memory-pressure")
         self.machine.psi_mem = 0.0
         self.daemon.schedule(self.now)
-        self.assertEqual(first.state, "running")
+        self.assertEqual(second.state, "running")
         self.machine.psi_cpu = 80.0
-        second = self.submit()
-        self.assertEqual(second.reason_cat, "cpu-pressure")
+        third = self.submit(lane="web")
+        self.assertEqual(third.reason_cat, "cpu-pressure")
 
     def test_too_big_for_the_machine(self):
         t = self.submit(mem="125G")
@@ -1205,7 +1211,13 @@ class SameSource(DaemonCase):
         digest = buildqd.env_digest
         self.assertEqual(digest({"PATH": "/bin", "PWD": "/a", "SHLVL": "1", "CLAUDE_CODE_SESSION_ID": "x"}),
                          digest({"PATH": "/bin", "PWD": "/b", "SHLVL": "2", "CLAUDE_CODE_SESSION_ID": "y"}))
-        for name in ("DATABASE_URL", "API_TOKEN", "SESSION_BACKEND", "DB_PASSWORD"):
+        for name in ("ANTIGRAVITY_AGENT", "ANTIGRAVITY_AGENTAPI_EXE", "ANTIGRAVITY_APP_DATA_DIR",
+                     "ANTIGRAVITY_CONVERSATION_ID", "ANTIGRAVITY_CSRF_TOKEN", "ANTIGRAVITY_LS_ADDRESS",
+                     "ANTIGRAVITY_LS_VERSION", "ANTIGRAVITY_PROJECT_ID", "ANTIGRAVITY_SOURCE_METADATA",
+                     "ANTIGRAVITY_TRAJECTORY_ID"):
+            self.assertEqual(digest({name: "a"}), digest({name: "b"}), name)
+            self.assertEqual(digest({name: "a"}), digest({}), name)
+        for name in ("DATABASE_URL", "API_TOKEN", "SESSION_BACKEND", "DB_PASSWORD", "ANTIGRAVITY_CUSTOM_FLAG"):
             self.assertNotEqual(digest({name: "a"}), digest({name: "b"}), name)
 
 
@@ -1432,13 +1444,13 @@ class AgentProcesses(unittest.TestCase):
         os.symlink(sys.executable, self.fake)
         self.thread = f"test-thread-{os.getpid()}-{time.time()}"
 
-    def session(self):
+    def session(self, exe=None, env=None):
         """A stand-in agent session that runs one child, as an agent runs a build client. The child
         reads from the session, so it ends when the session does."""
         code = ("import subprocess; p = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL); "
                 "print(p.pid, flush=True); p.wait()")
-        proc = subprocess.Popen([self.fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
-                                env={**os.environ, "T3CODE_THREAD_ID": self.thread})
+        proc = subprocess.Popen([exe or self.fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
+                                env=env if env is not None else {**os.environ, "T3CODE_THREAD_ID": self.thread})
 
         def stop():
             if proc.poll() is None:
@@ -1472,6 +1484,18 @@ class AgentProcesses(unittest.TestCase):
         for exe in ("/usr/bin/python3.13", "/usr/bin/node", "/home/u/.claude/skills/x/run.sh",
                     "/home/u/Code/claude/versions/notes/readme"):
             self.assertFalse(buildqd.AGENT_EXE.search(exe), exe)
+
+    def test_antigravity_process_counts_as_an_agent(self):
+        for name in ("antigravity", "agy"):
+            fake = os.path.join(self.tmp.name, name)
+            os.symlink(sys.executable, fake)
+            proc, child = self.session(exe=fake, env=os.environ)
+            above = buildqd.agents_above(child)
+            self.assertEqual(above[0][0], proc.pid, name)
+            self.assertTrue(buildqd.proc_alive(*above[0]), name)
+            proc.kill()
+            proc.wait()
+            self.assertFalse(buildqd.proc_alive(*above[0]), name)
 
 
 class SheddingMemory(DaemonCase):
@@ -1924,6 +1948,58 @@ class SheddingMemory(DaemonCase):
         self.assertEqual(t.requeues, 1)
         buildqd.SystemdRunner(self.tmp.name).prepare(t, "buildq.slice")
         self.assertTrue(t.unit.endswith(f"{t.id}-r1.service"))
+
+    def test_systemd_result_detects_oom_kills_with_oom_policy_continue(self):
+        runner = buildqd.SystemdRunner(self.tmp.name)
+        t = self.submit()
+        t.unit = None
+        with mock.patch.object(buildqd.subprocess, "run", side_effect=AssertionError("must not call systemctl")):
+            self.assertEqual(runner.result(t), "")
+        t.unit = "buildq-test.service"
+        cases = [
+            ("LoadState=not-found\nResult=success\nOOMKills=18446744073709551615\nManagedOOMKills=18446744073709551615\n", ""),
+            ("LoadState=loaded\nResult=signal\nOOMKills=18446744073709551615\nManagedOOMKills=18446744073709551615\n", "signal"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=18446744073709551615\nManagedOOMKills=2\n", "managed-oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=1\nManagedOOMKills=18446744073709551615\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=1\nManagedOOMKills=5\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=0\nManagedOOMKills=38\n", "managed-oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=1\nManagedOOMKills=0\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=0\nManagedOOMKills=0\n", "signal"),
+            ("LoadState=loaded\nResult=oom-kill\n", "oom-kill"),
+            ("LoadState=loaded\nResult=exit-code\nOOMKills=[not set]\nManagedOOMKills=\n", "exit-code"),
+        ]
+        for stdout, expected in cases:
+            with mock.patch.object(buildqd.subprocess, "run",
+                                   return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")):
+                self.assertEqual(runner.result(t), expected, stdout)
+
+    def test_managed_oom_kill_records_oom_without_inflating_future_estimates(self):
+        cwd = self.workdir("oomd")
+        base = self.submit(("cargo", "test"), cwd=cwd)
+        base.measured, base.mem_peak = True, 2 * GIB
+        self.finish(base, 0)
+        self.now += 40
+        victim = self.submit(("cargo", "test"), cwd=cwd, again=True)
+        self.assertLess(victim.est_mem, 5 * GIB)
+        victim.measured, victim.mem_peak = True, 2 * GIB
+        self.runner.running.discard(victim.id)
+        self.runner.result = lambda ticket: "managed-oom-kill"
+        self.daemon.check(self.now + 40)
+        self.assertEqual((victim.state, victim.oom), ("lost", True))
+        self.assertIn("systemd-oomd", victim.error)
+        # Slice/ancestor managed-oom kill must not inflate this command's next reservation to MemoryMax.
+        self.now += 50
+        after = self.submit(("cargo", "test"), cwd=cwd, again=True)
+        self.assertLess(after.est_mem, 5 * GIB)
+        # A kernel OOM kill on the unit's own cgroup still teaches history to reserve more.
+        after.measured, after.mem_peak = True, 2 * GIB
+        self.runner.running.discard(after.id)
+        self.runner.result = lambda ticket: "oom-kill"
+        self.daemon.check(self.now + 40)
+        self.assertEqual((after.state, after.oom), ("lost", True))
+        self.now += 50
+        inflated = self.submit(("cargo", "test"), cwd=cwd, again=True)
+        self.assertGreaterEqual(inflated.est_mem, 20 * GIB)
 
     def test_turning_it_off_lets_paused_builds_go_on(self):
         (t,) = self.running(1)
@@ -2749,7 +2825,8 @@ class GitHubStatuses(DaemonCase):
         again.stop_memory_watch()
 
     def test_a_commit_github_doesnt_have_yet_is_tried_again_after_a_push(self):
-        self.daemon.gh = [sys.executable, "-c", "import sys; sys.exit(1)"]  # not on GitHub yet
+        self.daemon.gh = [sys.executable, "-c",
+                          "import sys; sys.stderr.write('No commit found for SHA: aaaa\\n'); sys.exit(1)"]  # not on GitHub yet
         t = self.submit(("cargo", "test"), source=SOURCE)
         self.finish(t, 0)
         self.settle()
@@ -2902,6 +2979,170 @@ class GitHubStatuses(DaemonCase):
         self.daemon.cfg.github_status = False  # turned off with a post still queued
         self.drain(self.now + 60)
         self.assertEqual(self.calls(), [])
+
+    def test_missing_commit_backs_off_and_gives_up_after_six_hours(self):
+        self.daemon.gh = [sys.executable, "-c",
+                          "import sys; sys.stderr.write('gh: Validation Failed (HTTP 422)\\n"
+                          "No commit found for SHA: aaaa\\n'); sys.exit(1)"]
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        (post,) = self.daemon.status_posts
+        first = post["first"]
+        t1 = first + 60
+        self.drain(t1)
+        self.assertEqual((post["tries"], post.get("missing"), post["next"]), (1, True, t1 + 600))
+        t2 = t1 + 600
+        self.drain(t2)
+        self.assertEqual((post["tries"], post["next"]), (2, t2 + 1200))
+        t3 = t2 + 1200
+        self.drain(t3)
+        self.assertEqual((post["tries"], post["next"]), (3, t3 + 2400))
+        # A newer verdict for the same commit/check during backoff preserves backoff and first timestamp.
+        self.now = t3 + 100
+        newer = self.submit(("cargo", "test"), cwd=t.cwd, source=SOURCE, again=True)
+        self.finish(newer, 1, after=10)
+        self.settle()
+        (replaced,) = self.daemon.status_posts
+        self.assertEqual((replaced["state"], replaced["first"], replaced["next"],
+                          replaced["tries"], replaced.get("missing")),
+                         ("failure", first, t3 + 2400, 3, True))
+        # Pushing resets backoff and persists the reset across a daemon restart.
+        self.now = t3 + 200
+        push = self.submit(("git", "push"), source=SOURCE)
+        self.finish(push, 0)
+        self.assertEqual(replaced["tries"], 0)
+        self.assertLessEqual(replaced["next"], push.ended)
+        saved = buildqd.read_json(os.path.join(self.state, "github-statuses.json"))
+        self.assertEqual(saved["queue"][0]["tries"], 0)
+        self.assertLessEqual(saved["queue"][0]["next"], push.ended)
+        with mock.patch.object(buildqd, "log") as log:
+            self.daemon.send_status_posts(first + buildqd.Daemon.STATUS_MISSING_MAX_AGE + 1)
+        self.assertEqual(self.daemon.status_posts, [])
+        self.assertTrue(any("6 hours" in str(c) for c in log.call_args_list), log.call_args_list)
+
+    def test_permanent_http_errors_drop_immediately_while_rate_limits_retry(self):
+        for msg in ("gh: Bad credentials (HTTP 401)",
+                    "gh: Not Found (HTTP 404)",
+                    "gh: Resource not accessible by integration (HTTP 403)",
+                    "gh: Validation Failed (HTTP 422)\nState is invalid",
+                    "gh: Validation Failed (HTTP 422)\nThis commit has reached the maximum number of statuses"):
+            self.now += 60  # strictly increasing order so note_status() never suppresses a later case
+            self.daemon.gh = [sys.executable, "-c", f"import sys; sys.stderr.write({msg!r}); sys.exit(1)"]
+            t = self.submit(("cargo", "test"), source=SOURCE, again=True)
+            self.finish(t, 0)
+            self.settle()
+            with mock.patch.object(buildqd, "log") as log:
+                self.drain(self.now + 60)
+            self.assertEqual(self.daemon.status_posts, [], msg)
+            self.assertTrue(any("not retrying" in str(c) for c in log.call_args_list), (msg, log.call_args_list))
+        self.now += 60
+        self.daemon.gh = [sys.executable, "-c",
+                          "import sys; sys.stderr.write('gh: API rate limit exceeded (HTTP 403)'); sys.exit(1)"]
+        t = self.submit(("cargo", "test"), source=SOURCE, again=True)
+        self.finish(t, 0)
+        self.settle()
+        (post,) = self.daemon.status_posts
+        first = post["first"]
+        self.drain(first + 60)
+        self.assertEqual((len(self.daemon.status_posts), post.get("missing")), (1, None))
+        # An unrelated git push does not reset rate-limit backoff.
+        rate_next = post["next"]
+        push = self.submit(("git", "push"), source=SOURCE)
+        self.finish(push, 0)
+        self.assertEqual((post["next"], post["tries"]), (rate_next, 1))
+        # Rate limits keep the full 24h retry window, not the 6h missing-commit window.
+        post["next"] = first + buildqd.Daemon.STATUS_MAX_AGE + 100
+        self.daemon.send_status_posts(first + buildqd.Daemon.STATUS_MISSING_MAX_AGE + 60)
+        self.assertEqual(len(self.daemon.status_posts), 1)
+        self.daemon.send_status_posts(first + buildqd.Daemon.STATUS_MAX_AGE + 1)
+        self.assertEqual(self.daemon.status_posts, [])
+
+    def test_in_flight_failure_applies_backoff_to_queued_replacement(self):
+        import io
+        t1 = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t1, 0)
+        self.settle()
+        (p1,) = self.daemon.status_posts
+
+        class FakeProc:
+            def __init__(self):
+                self.returncode = None
+                self.stderr = io.BytesIO(b"gh: Validation Failed (HTTP 422)\nNo commit found for SHA: aaaa\n")
+
+            def poll(self):
+                return self.returncode
+
+        proc = FakeProc()
+        launched = []
+
+        def fake_popen(*a, **kw):
+            launched.append(a[0])
+            return proc
+
+        t_start = t1.ended + 10
+        with mock.patch.object(buildqd.subprocess, "Popen", side_effect=fake_popen):
+            self.daemon.send_status_posts(t_start)
+        self.assertEqual(len(launched), 1)
+        # Newer verdict arrives while p1 is still in flight (outside Popen mock so source check runs).
+        self.now = t_start + 5
+        t2 = self.submit(("cargo", "test"), cwd=t1.cwd, source=SOURCE, again=True)
+        self.finish(t2, 1, after=5)
+        self.settle()
+        self.assertEqual(len(self.daemon.status_posts), 2)
+        # p1 finishes with missing-commit 422; replacement p2 inherits backoff and is NOT launched this tick.
+        proc.returncode = 1
+        t_done = t_start + 15
+        with mock.patch.object(buildqd.subprocess, "Popen", side_effect=fake_popen):
+            self.daemon.send_status_posts(t_done)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(self.daemon.status_procs, [])
+        (p2,) = self.daemon.status_posts
+        self.assertEqual((p2["state"], p2["tries"], p2.get("missing"), p2["next"]),
+                         ("failure", 1, True, t_done + 600))
+        # When an in-flight retry succeeds past the 6h missing-commit window, a queued replacement gets
+        # a fresh delivery window instead of expiring before its first send.
+        t_retry = t_done + 600
+        proc2 = FakeProc()
+        proc2.stderr = io.BytesIO(b"")
+        with mock.patch.object(buildqd.subprocess, "Popen", return_value=proc2):
+            self.daemon.send_status_posts(t_retry)
+        self.now = t_retry + 5
+        t3 = self.submit(("cargo", "test"), cwd=t1.cwd, source=SOURCE, again=True)
+        self.finish(t3, 0, after=5)
+        self.settle()
+        proc2.returncode = 0
+        t_ok = p2["first"] + buildqd.Daemon.STATUS_MISSING_MAX_AGE + 10
+        proc3 = FakeProc()
+        with mock.patch.object(buildqd.subprocess, "Popen", return_value=proc3):
+            self.daemon.send_status_posts(t_ok)
+        self.assertEqual(len(self.daemon.status_posts), 1)
+        (p3,) = self.daemon.status_posts
+        self.assertEqual((p3["state"], p3.get("missing"), p3.get("tries"), p3["first"]),
+                         ("success", None, None, t_ok))
+        self.assertEqual(len(self.daemon.status_procs), 1)
+        self.daemon.status_procs.clear()
+
+    def test_in_flight_status_post_is_not_dropped_before_it_finishes(self):
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        (post,) = self.daemon.status_posts
+
+        class Running:
+            stderr = None
+            returncode = None
+
+            def poll(self):
+                return None
+
+        with mock.patch.object(buildqd.subprocess, "Popen", return_value=Running()):
+            self.daemon.send_status_posts(post["first"] + 10)
+        self.assertEqual(len(self.daemon.status_procs), 1)
+        post["first"] -= buildqd.Daemon.STATUS_MAX_AGE + 100  # past max age while still in flight
+        self.daemon.send_status_posts(post["first"] + buildqd.Daemon.STATUS_MAX_AGE + 120)
+        self.assertIn(post, self.daemon.status_posts)
+        self.daemon.status_procs.clear()
 
 
 class Order(DaemonCase):
@@ -3716,6 +3957,25 @@ class Cores(DaemonCase):
             self.assertIn("--jobserver-auth", json.load(f)["MAKEFLAGS"])
         self.assertEqual(parallel.exec_argv, ["make", "all"])  # its own -j would override the jobserver
 
+    def test_requeue_clears_exec_argv(self):
+        t = self.submit(("make", "-j8", "all"))
+        self.assertEqual(t.exec_argv, ["make", "all"])
+        self.daemon.requeue(t, self.now + 10)
+        self.assertIsNone(t.exec_argv)
+        self.daemon.cfg.lanes[t.lane].jobserver = "off"
+        self.daemon.schedule(self.now + 11)
+        self.assertEqual((t.state, t.exec_argv), ("running", None))
+        # Also cleared on the check_starting() recovery path and defensively in start(), along with elastic.
+        t2 = self.submit(("make", "-j8", "all"), cwd=self.workdir("two"))
+        t2.state, t2.launcher, t2.exec_argv, t2.elastic = "starting", None, ["make", "all"], True
+        self.runner.running.discard(t2.id)
+        self.runner.unit_state = lambda ticket: "gone"
+        self.daemon.check_starting(t2, self.now + 20)
+        self.assertEqual((t2.state, t2.exec_argv, t2.elastic), ("queued", None, False))
+        t2.exec_argv, t2.elastic = ["make", "all"], True  # stale on disk from an older daemon version
+        self.daemon.schedule(self.now + 21)
+        self.assertEqual((t2.state, t2.exec_argv, t2.elastic), ("running", None, False))
+
     def test_test_threads_are_set_only_where_the_lane_asks(self):
         self.daemon.cfg.lanes["heavy"].test_threads = True
         t = self.submit(("cargo", "test"))
@@ -4074,6 +4334,10 @@ class MemoryWatch(DaemonCase):
         self.machine.psi_mem_some = 40.0  # one build slowed at its MemoryHigh: not a reason
         self.watch(1000.5)
         self.assertEqual(lines, [])
+        self.machine.psi_mem = 25.0  # PSI full while 100G is free: still not tight
+        self.watch(1000.6)
+        self.assertEqual(lines, [])
+        self.machine.psi_mem = 0.0
         self.machine.mem_available = 15 * GIB  # under twice the 10G floor
         self.watch(1001.0)
         self.watch(1020.0)
@@ -4092,6 +4356,7 @@ class MemoryWatch(DaemonCase):
         self.watch(1064.0)
         self.assertEqual(len(lines), 6)
         self.machine.mem_available = 100 * GIB
+        self.machine.psi_mem = 25.0  # plentiful RAM clears tight state even if PSI full is still elevated
         self.watch(1065.0)
         self.watch(1094.0)
         self.assertEqual(len(lines), 6)
@@ -4266,6 +4531,26 @@ class Jobservers(DaemonCase):
         with unittest.mock.patch.object(self.daemon, "past_peak_hold", return_value=64 * GIB):  # (still released)
             self.daemon.rebalance(self.now + 130)
         self.assertEqual(ci.granted, ci.need)
+
+    def test_rebalance_ignores_builds_held_for_memory_but_makes_room_for_cores(self):
+        project = self.workdir("project")
+        open(os.path.join(project, "Cargo.lock"), "w").close()
+        self.machine.busy = self.machine.busy_now = 20.0
+        running = self.submit(cwd=project)
+        self.assertEqual(running.granted, 12)
+        running.elastic, running.cores_now = True, 12.0
+        self.machine.mem_available = 12 * GIB
+        queued = self.submit(cwd=self.workdir("other"), cores=8)
+        self.assertEqual(queued.state, "queued")
+        queued.reason_cat, queued.held_for = "held", "memory"
+        self.machine.mem_available = 100 * GIB
+        target = self.daemon.cfg.cpu_target * self.machine.ncpu
+        self.machine.busy = self.machine.busy_now = target
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual(running.granted, 12)  # waiting on memory must not throttle running builds' cores
+        queued.reason_cat, queued.held_for = "held", "cores"
+        self.daemon.rebalance(self.now + 140)
+        self.assertLess(running.granted, 12)  # waiting on cores does shrink it
 
 
 class Recovery(DaemonCase):
@@ -4607,6 +4892,33 @@ class ShimRules(unittest.TestCase):
                         "make help", "make --version", "pnpm --version", "npm version", "dotnet --info",
                         "env X=1 cargo fmt", "sh -c cargo-fmt", "./cargo-fmt.sh"):
             self.assertFalse(self.never_builds(command), command)
+
+    def test_duplicate_option_values_do_not_confuse_tool_or_subcommand_position(self):
+        self.assertTrue(self.shim.heavy("pnpm", ["--filter", "vite", "vite", "build"]))
+        self.assertTrue(self.shim.heavy("pnpm", ["-F", "next", "next", "build"]))
+        self.assertTrue(self.shim.heavy("pnpm", ["--filter", "vite", "exec", "vite", "build"]))
+        self.assertFalse(self.shim.heavy("npx", ["-p", "vite", "vite", "dev"]))
+        self.assertTrue(self.shim.heavy("npx", ["-p", "vite", "vite", "build"]))
+        self.assertEqual(self.shim.build_then_run("cargo", ["-C", "run", "run", "--bin", "x"]),
+                         ["-C", "run", "build", "--bin", "x"])
+        self.assertEqual(self.shim.build_then_run("cargo", ["-C", "r", "r", "--", "--flag"]),
+                         ["-C", "r", "build"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project", "app", "--", "--no-build"]),
+                         ["build", "app"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "-p", "app", "-p:Configuration=Release"]),
+                         ["build", "app", "-p:Configuration=Release"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project", "App.csproj", "-p", "Configuration=Release"]),
+                         ["build", "App.csproj", "-p:Configuration=Release"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project=app.csproj", "--no-restore"]),
+                         ["build", "app.csproj", "--no-restore"])
+        self.assertFalse(self.shim.heavy("dotnet", ["run", "--no-build", "--", "--port", "8080"]))
+        self.assertIsNone(self.shim.build_then_run("dotnet", ["run", "--no-build", "--", "--port", "8080"]))
+        self.assertFalse(self.shim.heavy("dotnet", ["watch", "run"]))
+        self.assertTrue(self.shim.heavy("dotnet", ["run", "--project", "App.csproj", "--", "--watch"]))
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project", "App.csproj", "--", "--watch"]),
+                         ["build", "App.csproj"])
+        self.assertTrue(self.shim.heavy("dotnet", ["run", "--", "--no-build"]))
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--", "--no-build"]), ["build"])
 
 
 class Keys(unittest.TestCase):
@@ -5687,6 +5999,62 @@ class Top(unittest.TestCase):
             time.sleep(0.01)
         self.assertGreaterEqual(fetcher.latest()[0], 3)  # it went on asking
         self.assertTrue(fetcher.thread.is_alive())
+
+
+class ClientAndGuardHelpers(unittest.TestCase):
+    def test_caller_recognises_antigravity_conversation_id(self):
+        cleared = {k: "" for k in ("BUILDQ_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+                                   "T3CODE_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        with mock.patch.dict(os.environ, {**cleared, "ANTIGRAVITY_CONVERSATION_ID": "conv-42"}):
+            self.assertEqual(buildq.caller(), "conv-42")
+        with mock.patch.dict(os.environ, {**cleared, "T3CODE_THREAD_ID": "thread-9",
+                                          "ANTIGRAVITY_CONVERSATION_ID": "conv-42"}):
+            self.assertEqual(buildq.caller(), "thread-9")
+
+    def test_tail_offset_handles_edges_and_multi_chunk_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def check(data: bytes, lines: int, expected: bytes):
+                path = os.path.join(tmp, "log")
+                with open(path, "wb") as f:
+                    f.write(data)
+                off = buildq.tail_offset(path, lines)
+                self.assertEqual(data[off:], expected, (len(data), lines, off))
+
+            check(b"", 5, b"")
+            check(b"a\nb\nc\n", 0, b"")
+            check(b"a\nb\nc\n", -3, b"")
+            check(b"a\nb\nc\nd\n", 2, b"c\nd\n")
+            check(b"a\nb\nc\nd\n", 10, b"a\nb\nc\nd\n")
+            check(b"a\nb\nc\nd", 2, b"c\nd")
+            check(b"a\nb\nc\nd", 1, b"d")
+            check(b"a\nb", 2, b"a\nb")
+            check(b"only", 1, b"only")
+            # Multi-chunk (> 200 KiB): both many short lines and lines wider than one 64 KiB chunk.
+            many = b"".join(f"line-{i:06d}-{'x' * 40}\n".encode() for i in range(4500))
+            self.assertGreater(len(many), 200_000)
+            tail_1500 = b"".join(f"line-{i:06d}-{'x' * 40}\n".encode() for i in range(3000, 4500))
+            check(many, 1500, tail_1500)
+            wide = (b"A" * 80_000 + b"\n") + (b"B" * 80_000 + b"\n") + (b"C" * 80_000 + b"\n")
+            check(wide, 2, (b"B" * 80_000 + b"\n") + (b"C" * 80_000 + b"\n"))
+
+    def test_rustc_guard_stat_parser_handles_spaces_parens_and_newlines(self):
+        with open(os.path.join(ROOT, "bin", "buildq-rustc-guard")) as f:
+            script = f.read()
+        match = re.search(r"pid=\$\(awk '([^']+)' \"/proc/\$pid/stat\"", script)
+        self.assertIsNotNone(match)
+        awk_prog = match.group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, content in (
+                ("plain", "1234 (bash) S 5678 1234 1234 0 -1\n"),
+                ("spaces", "1234 (Web Content) S 5678 1234 1234 0 -1\n"),
+                ("parens", "1234 (a (b) c) S 5678 1234 1234 0 -1\n"),
+                ("newline", "1234 (line1\nline2) S 5678 1234 1234 0 -1\n"),
+            ):
+                path = os.path.join(tmp, f"{name}.stat")
+                with open(path, "w") as f:
+                    f.write(content)
+                res = subprocess.run(["awk", awk_prog, path], capture_output=True, text=True, timeout=10)
+                self.assertEqual((res.returncode, res.stdout.strip()), (0, "5678"), (name, res.stderr))
 
 
 if __name__ == "__main__":
