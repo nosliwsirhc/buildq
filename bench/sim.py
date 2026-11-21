@@ -1071,7 +1071,7 @@ PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest in
 PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
     eslint playwright storybook python python3 pytest py.test uv dotnet msbuild make gmake ninja cmake docker
     podman buildah bash sh zsh dash ksh fish ruby perl git go gradle mvn java""".split())
-PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?")  # versioned Pythons
+PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?|(?:gcc|g\+\+|clang|clang\+\+)-\d+")  # versioned tools
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 

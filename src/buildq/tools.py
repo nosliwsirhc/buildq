@@ -27,6 +27,7 @@ def redact_args(args: list[str]) -> list[str]:
 
 
 def positional_items(args: list[str], value_options: Collection[str] = frozenset()) -> list[tuple[int, str]]:
+    """(index, arg) of non-option args; bin/buildq-shim keeps a standalone zero-import copy checked by unit tests."""
     out, skip = [], False
     for i, arg in enumerate(args):
         if skip:
@@ -110,9 +111,8 @@ class ToolSpec:
     container_storage: bool = False
     # True when these names must be rejected in `restartable_scripts` config validation.
     not_script: bool = True
-    # Env var names whose values this tool explicitly merges with `caller_env` (exempted from
-    # scheduler.start()'s `given` filter so returned merged values take effect; returning without
-    # the key lets the caller's existing value stand unchanged).
+    # Env var names whose values this tool explicitly merges with `caller_env`; exempted from
+    # scheduler.start()'s `given` filter only when this spec's callback actually emits the key.
     merge_env_vars: tuple[str, ...] = ()
     command_words: Callable[[str, list[str], Collection[str]], list[str]] | None = None
     restart_safe: Callable[[str, list[str]], bool] | None = None
@@ -394,9 +394,7 @@ JOBSERVER_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.jobserver for 
 MAKEFLAGS_JOBSERVER_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.makeflags_jobserver for n in s.names)
 HONORS_GRANT_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.honors_grant for n in s.names)
 CONTAINER_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.container_storage for n in s.names)
-MERGE_ENV_VARS: frozenset[str] = frozenset(v for s in SPECS for v in s.merge_env_vars)
 NOT_SCRIPT_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.not_script for n in s.names)
-REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(REGISTRY)
 
 
 def lookup(tool: str) -> ToolSpec | None:
@@ -415,6 +413,11 @@ def lookup(tool: str) -> ToolSpec | None:
 def honors_grant_tool(tool: str) -> bool:
     spec = lookup(tool)
     return bool(spec and spec.honors_grant)
+
+
+def is_not_script(tool: str) -> bool:
+    spec = lookup(tool)
+    return bool(spec and spec.not_script)
 
 
 def uses_jobserver(tool: str) -> bool:
@@ -449,30 +452,49 @@ def is_reusable_check(tool: str, args: list[str]) -> bool:
     return bool(spec and spec.reusable_check and spec.reusable_check(tool, args))
 
 
-def env_for(tool: str, args: list[str], granted: int, want: int, jobserver: str | None,
-            test_threads: bool, caller_env: dict | None = None) -> dict[str, str]:
-    """Parallelism and cgroup-containment env vars for a build (caller's own settings win later,
-    except keys declared in `MERGE_ENV_VARS`, which a tool merges with `caller_env` itself)."""
+def env_with_merged(tool: str, args: list[str], granted: int, want: int, jobserver: str | None,
+                    test_threads: bool, caller_env: dict | None = None) -> tuple[dict[str, str], frozenset[str]]:
+    """Parallelism and cgroup-containment env vars plus the exact subset of keys explicitly merged
+    with `caller_env` by the callback that emitted them."""
     values: dict[str, str] = {"BUILDQ_CORES": str(granted)}
+    merged: set[str] = set()
     for spec in SPECS:
         if spec.global_env:
-            values.update(spec.global_env(granted, want, jobserver, test_threads, caller_env))
+            emitted = spec.global_env(granted, want, jobserver, test_threads, caller_env)
+            for k, v in emitted.items():
+                values[k] = v
+                if k in spec.merge_env_vars:
+                    merged.add(k)
+                else:
+                    merged.discard(k)
     direct = lookup(tool)
     if direct and direct.direct_env:
-        values.update(direct.direct_env(tool, args, granted, want, jobserver, test_threads, caller_env))
-    return values
+        emitted = direct.direct_env(tool, args, granted, want, jobserver, test_threads, caller_env)
+        for k, v in emitted.items():
+            values[k] = v
+            if k in direct.merge_env_vars:
+                merged.add(k)
+            else:
+                merged.discard(k)
+    return values, frozenset(merged)
+
+
+def env_for(tool: str, args: list[str], granted: int, want: int, jobserver: str | None,
+            test_threads: bool, caller_env: dict | None = None) -> dict[str, str]:
+    """Parallelism and cgroup-containment env vars for a build."""
+    return env_with_merged(tool, args, granted, want, jobserver, test_threads, caller_env)[0]
 
 
 def rewrite_argv_for(tool: str, argv: list[str], tool_at: int, granted: int, jobserver: str | None,
                      test_threads: bool = False, caller_env: dict | None = None) -> list[str] | None:
-    if tool_at >= len(argv):
+    if tool_at < 0 or tool_at >= len(argv):
         return None
     spec = lookup(tool)
     if not (spec and spec.rewrite_argv):
         return None
-    args = argv[tool_at + 1:]
-    rewritten = spec.rewrite_argv(tool, args, granted, jobserver, test_threads, caller_env)
-    if rewritten is None or rewritten == args:
+    original = argv[tool_at + 1:]
+    rewritten = spec.rewrite_argv(tool, list(original), granted, jobserver, test_threads, caller_env)
+    if rewritten is None or rewritten == original:
         return None
     return argv[:tool_at + 1] + rewritten
 

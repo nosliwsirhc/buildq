@@ -1318,11 +1318,26 @@ class ToolsRegistry(unittest.TestCase):
         cfg = config.Config(config.tomllib.loads('restartable_scripts = ["eslint", "tsc", "vitest"]\n' + BASE_CONFIG),
                             128 * GIB, 32)
         self.assertEqual(cfg.restartable_scripts, frozenset({"eslint", "tsc", "vitest"}))
-        # Pattern lookup fallback supports versioned tool names (e.g. gcc-16 in PR 2).
+        # Pattern lookup fallback supports versioned tool names (e.g. gcc-16 in PR 2) and not_script validation.
         pat_spec = tools.ToolSpec(names=("gcc",), name_pattern=re.compile(r"gcc-\d+"), honors_grant=True)
         with mock.patch.object(tools, "_PATTERN_SPECS", (pat_spec,)):
             self.assertIs(tools.lookup("gcc-16"), pat_spec)
             self.assertTrue(tools.honors_grant_tool("gcc-16"))
+            self.assertTrue(tools.is_not_script("gcc-16"))
+            with self.assertRaisesRegex(ValueError, "not tools: gcc-16"):
+                config.Config(config.tomllib.loads('restartable_scripts = ["gcc-16"]\n' + BASE_CONFIG),
+                              128 * GIB, 32)
+
+    def test_shim_positional_items_parity(self):
+        shim = client.shim_classifier()
+        for args, opts in (
+            ([], set()),
+            (["build", "-p", "api", "--release", "extra"], {"-p"}),
+            (["-C", "dir", "--filter", "web", "run", "test"], {"-C", "--filter"}),
+            (["-j", "4", "-k", "target1", "target2"], {"-j", "-k"}),
+        ):
+            self.assertEqual(tools.positional_items(args, opts), shim.positional_items(args, opts), (args, opts))
+            self.assertEqual(tools.positionals(args, opts), shim.positionals(args, opts), (args, opts))
 
     def test_env_rewrite_argv_and_cargo_redaction_parity(self):
         env_cargo = tools.env_for("cargo", ["build"], 4, 8, "/tmp/js", False)
@@ -1343,6 +1358,14 @@ class ToolsRegistry(unittest.TestCase):
                          ["env", "-u", "-j", "make", "all"])
         self.assertIsNone(tools.rewrite_argv_for("make", ["env", "-u", "-j", "make", "all"], 3, 4, "/tmp/js"))
         self.assertIsNone(tools.rewrite_argv_for("make", [], 0, 4, "/tmp/js"))
+        self.assertIsNone(tools.rewrite_argv_for("make", ["make", "-j8", "all"], -1, 4, "/tmp/js"))
+        # In-place mutation by a rewrite callback is preserved rather than discarded as a no-op.
+        def append_flag(_t, args, g, _js, _tt, _env):
+            args.append(f"-j{g}")
+            return args
+        mut_spec = tools.ToolSpec(names=("zig",), rewrite_argv=append_flag)
+        with mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "zig": mut_spec}):
+            self.assertEqual(tools.rewrite_argv_for("zig", ["zig", "build"], 0, 4, None), ["zig", "build", "-j4"])
         # Cargo subcommand classification uses the same credential/URL redaction and `--` truncation as command_words.
         self.assertFalse(commands.restart_safe(["cargo", "--", "test"]))
         self.assertFalse(commands.reusable_check(["cargo", "--", "test"]))
@@ -1357,9 +1380,9 @@ class ToolsRegistry(unittest.TestCase):
 
 
 class MergeEnvVars(DaemonCase):
-    """ToolSpec.merge_env_vars passes merged caller env values through SchedulerMixin.start()."""
+    """Per-callback merge_env_vars exemption and parallel.json secret cleanup."""
 
-    def test_merge_env_vars_bypasses_given_filter_while_plain_keys_keep_caller_precedence(self):
+    def test_merge_env_vars_scopes_to_emitting_callback_and_cleans_parallel_json(self):
         merged_spec = tools.ToolSpec(
             names=("gradle",),
             merge_env_vars=("GRADLE_OPTS",),
@@ -1367,13 +1390,26 @@ class MergeEnvVars(DaemonCase):
                 "GRADLE_OPTS": f"{(cenv or {}).get('GRADLE_OPTS', '')} -Dorg.gradle.workers.max={g}".strip()
             },
         )
-        with mock.patch.object(tools, "SPECS", (*tools.SPECS, merged_spec)), \
-             mock.patch.object(tools, "MERGE_ENV_VARS", tools.MERGE_ENV_VARS | {"GRADLE_OPTS"}):
+        direct_merger = tools.ToolSpec(
+            names=("othertool",),
+            merge_env_vars=("MAKEFLAGS",),
+            direct_env=lambda _t, _a, g, _w, _js, _tt, cenv: {"MAKEFLAGS": f"{(cenv or {}).get('MAKEFLAGS', '')} -j{g}"},
+        )
+        with mock.patch.object(tools, "SPECS", (*tools.SPECS, merged_spec, direct_merger)), \
+             mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "gradle": merged_spec, "othertool": direct_merger}):
             t = self.submit(("cargo", "build"), env={"GRADLE_OPTS": "-Xmx4g", "GOMAXPROCS": "2"})
-        with open(os.path.join(t.dir, "parallel.json")) as f:
-            parallel = json.load(f)
-        self.assertEqual(parallel["GRADLE_OPTS"], f"-Xmx4g -Dorg.gradle.workers.max={t.granted}")
-        self.assertNotIn("GOMAXPROCS", parallel)  # plain key still defers to caller's value
+            with open(os.path.join(t.dir, "parallel.json")) as f:
+                parallel = json.load(f)
+            self.assertEqual(parallel["GRADLE_OPTS"], f"-Xmx4g -Dorg.gradle.workers.max={t.granted}")
+            self.assertNotIn("GOMAXPROCS", parallel)  # plain key still defers to caller's value
+            # Unrelated direct_env merge declaration for MAKEFLAGS must NOT disable caller precedence for ninja.
+            n = self.submit(("ninja", "all"), env={"MAKEFLAGS": "-k"})
+            with open(os.path.join(n.dir, "parallel.json")) as f:
+                n_parallel = json.load(f)
+            self.assertNotIn("MAKEFLAGS", n_parallel)
+        # Finalize removes parallel.json alongside env.json so merged caller secrets don't persist.
+        self.finish(t)
+        self.assertFalse(os.path.exists(os.path.join(t.dir, "parallel.json")))
 
 
 if __name__ == "__main__":

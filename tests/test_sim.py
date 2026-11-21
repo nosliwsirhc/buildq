@@ -396,7 +396,7 @@ class Export(SimCase):
         for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
                      "--filter", "-p", "-F"):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
-        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS | {"python3.13", "python2", "py.test", "gcc-16", "clang++-22"}
         self.assertTrue(sim.Simulation.GRANT_TOOLS <= bq_tools.HONORS_GRANT_TOOLS)
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)

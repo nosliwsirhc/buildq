@@ -934,12 +934,12 @@ class SchedulerMixin:
                                                  lane.test_threads, env)
             # buildq's settings go in a file of their own, so a build that is queued again after a
             # restart gets fresh ones.
-            ours = self.build_env(t, caller_env=env)
-            # The caller's own settings win, except keys declared in MERGE_ENV_VARS (which a tool
-            # merges with `caller_env` itself) and empty make variables (a make recipe exports
-            # MAKEFLAGS= and MFLAGS=), so buildq's flags go in their place.
+            ours, merged = tools.env_with_merged(tool, stripped[1:], t.granted, t.want, t.jobserver,
+                                                 lane.test_threads, env)
+            # The caller's own settings win, except keys explicitly merged by the emitting tool
+            # callback and empty make variables (a make recipe exports MAKEFLAGS= and MFLAGS=).
             given = {k for k in env
-                     if k not in tools.MERGE_ENV_VARS and (k not in MAKE_FLAG_VARS or str(env[k]).strip())}
+                     if k not in merged and (k not in MAKE_FLAG_VARS or str(env[k]).strip())}
             parallel = {k: v for k, v in ours.items() if k not in given}
             for k, rest in cleaned.items():
                 # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
