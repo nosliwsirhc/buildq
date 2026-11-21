@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: MIT
 """buildq-shim: send heavy commands through buildq without anyone having to remember to.
 
-Install it as links named after the tools (cargo, pnpm, npm, npx, yarn, make, ninja, dotnet)
-in a directory that comes first on PATH (`./install.sh --shims`). Each link runs this program,
-which finds the real tool further down PATH and then:
+Install it as links named after the tools (cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet,
+cmake, ctest, zig, gradle) in a directory that comes first on PATH (`./install.sh --shims`). Each
+link runs this program, which finds the real tool further down PATH and then:
 
   - runs a heavy invocation as `buildq run -- <the real tool> ARGS...`: it waits its turn, its
     output streams as usual, and it exits with the tool's exit code;
@@ -15,8 +15,11 @@ Heavy means it compiles or runs a whole suite: any cargo subcommand but the few 
 compile (fmt, metadata, tree, clean, ...), npm/pnpm/yarn scripts named build*, test*, lint*,
 check*, e2e* and the like, `vitest run`, `jest`, `vite build`, `tsc`, `playwright test`, make and
 ninja (except dry runs and long-running targets such as dev, serve or up), `dotnet build/test/
-publish/pack`. A watch mode is never heavy: it would hold a turn for as long as it runs.
-`cargo run` and `dotnet run` queue the build, then run the program directly, with stdin.
+publish/pack`, `cmake --build/--workflow`, `ctest` (except `--show-only`/`--list-presets`),
+`zig build/test/build-exe/build-lib/build-obj`, and `gradle` tasks (except `--stop`, `--status`,
+dry runs, continuous mode, and query/run tasks). A watch mode is never heavy: it would hold a turn
+for as long as it runs. `cargo run` and `dotnet run` queue the build, then run the program
+directly, with stdin.
 
 BUILDQ_SHIM=off in the environment turns the shim off for one command. In CI jobs (CI or
 GITHUB_ACTIONS set) and under rust-analyzer, tools always run directly.
@@ -49,6 +52,25 @@ import re
 # make targets that start something long-running (a dev server, containers) or just tidy up.
 MAKE_LIGHT_TARGET = re.compile(r"(^|[-_:.])(dev|watch|up|down|serve|server|start|run|stop|help|clean|shell|logs|"
                                r"format|fmt|open)($|[-_:.])")
+GRADLE_LIGHT_TASK = re.compile(
+    r"(^|:)(help|tasks|projects|properties|dependencies|dependencyInsight|components|model|"
+    r"outgoingVariants|resolvableConfigurations|clean|wrapper|init|bootRun|run)$", re.I
+)
+GRADLE_SHORT_LIGHT = re.compile(r"-[qidswamtuUSvh?]*[tmvh?][qidswamtuUSvh?]*")
+GRADLE_VALUE_OPTIONS = {
+    "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-g", "--gradle-user-home",
+    "-I", "--init-script", "-x", "--exclude-task", "--max-workers", "--console", "--console-unicode",
+    "--warning-mode", "--priority", "--include-build", "--project-cache-dir",
+    "--configuration-cache-problems", "-F", "--dependency-verification", "-M",
+    "--write-verification-metadata", "--update-locks", "--develocity-url",
+    "--develocity-plugin-version", "--tests", "-D", "--system-prop", "-P", "--project-prop",
+}
+ZIG_BUILD_VALUE_OPTIONS = {
+    "-j", "-p", "--prefix", "--prefix-lib-dir", "--prefix-exe-dir", "--prefix-include-dir",
+    "--sysroot", "--search-prefix", "--libc", "--cache-dir", "--global-cache-dir", "--zig-lib-dir",
+    "--build-file", "--build-runner", "--seed", "--maxrss", "--color",
+    "--summary", "--debounce", "--system", "--port",
+}
 JS_TOOLS = {"vitest", "vite", "tsc", "vue-tsc", "playwright", "storybook", "build-storybook", "jest", "eslint",
             "next", "nuxt", "astro"}
 INFO = {"--help", "-h", "--version", "-V", "version", "help", "--list"}  # asks, builds nothing
@@ -142,6 +164,15 @@ def never_builds(tool: str, args: list[str]) -> bool:
 
 
 def heavy(tool: str, args: list[str]) -> bool:
+    if tool == "ctest":
+        # Checked before INFO and watching(): `-V` is verbose (heavy), and `-R watch` is a test regex.
+        if any(a in ("-N", "--show-only", "--list-presets", "--print-labels", "--help", "-h", "-H",
+                     "-help", "-usage", "/?", "--version", "-version", "/V", "/version")
+               or a.startswith(("--show-only=", "--list-presets=", "--help-", "--version=",
+                                "-version=", "/V=", "/version="))
+               for a in args):
+            return False
+        return True
     if args and all(a in INFO for a in args):
         return False
     if tool == "cargo":
@@ -160,6 +191,37 @@ def heavy(tool: str, args: list[str]) -> bool:
         if pos[:1] == ["run"] and "--no-build" in before:
             return False  # caller explicitly asked to run without building
         return pos[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
+    if tool == "cmake":
+        before = args[: args.index("--")] if "--" in args else args
+        if any(a in ("--help", "-h", "--version", "--list-presets")
+               or a.startswith(("--help-", "--list-presets=")) for a in before):
+            return False
+        return before[:1] in (["--build"], ["--workflow"])
+    if tool == "zig":
+        sub = args[0] if args and not args[0].startswith("-") else ""
+        rest = args[1:]
+        before = rest[: rest.index("--")] if "--" in rest else rest
+        if any(a in ("-h", "--help", "--watch", "--fuzz", "--webui", "--listen", "--time-report")
+               or a.startswith(("--watch=", "--webui=", "--listen=", "--time-report=")) for a in before):
+            return False
+        if sub == "build":
+            if {"-l", "--list-steps"} & set(before):
+                return False
+            steps = positionals(before, ZIG_BUILD_VALUE_OPTIONS)
+            return not steps or not all(MAKE_LIGHT_TARGET.search(s) for s in steps)
+        if sub == "test" and any(a == "--test-cmd" or a.startswith("--test-cmd=") for a in before):
+            return False
+        return sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj")
+    if tool in ("gradle", "gradlew"):
+        sep = args.index("--") if "--" in args else len(args)
+        before, after = args[:sep], args[sep + 1:]
+        if any(a in ("--stop", "--status", "--foreground", "-t", "--continuous", "-m", "--dry-run",
+                     "--task-graph", "-v", "--version", "-h", "--help", "-?")
+               or GRADLE_SHORT_LIGHT.fullmatch(a) for a in before):
+            return False
+        # After `--`, Gradle stops parsing built-in options; remaining tokens are tasks and task options.
+        tasks = positionals(before, GRADLE_VALUE_OPTIONS) + positionals(after, {"--tests"})
+        return not tasks or not all(GRADLE_LIGHT_TASK.search(t) for t in tasks)
     if watching(args):
         return False
     if tool in ("npm", "pnpm", "yarn", "bun"):

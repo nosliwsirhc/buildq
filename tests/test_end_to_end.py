@@ -474,6 +474,49 @@ class EndToEnd(Harness):
         self.assertEqual(most, 2)  # two at a time: the token in its pipe and the one every make has
         self.assertGreaterEqual(time.time() - started, 3.0)
 
+    def test_compiler_env_merge_argv_rewrite_and_python_reuse_end_to_end(self):
+        stub_dir = os.path.join(self.tmp.name, "stubs")
+        os.makedirs(stub_dir)
+        for name, body in (
+            ("gradlew", '#!/bin/sh\necho "GRADLE_OPTS=$GRADLE_OPTS"\n'),
+            ("zig", '#!/bin/sh\necho "ARGS=$*"\n'),
+        ):
+            path = os.path.join(stub_dir, name)
+            with open(path, "w") as f:
+                f.write(body)
+            os.chmod(path, 0o755)
+        cores = str(min(2, os.cpu_count() or 1))
+        env = dict(self.env, PATH=stub_dir + os.pathsep + self.env["PATH"], GRADLE_OPTS="-Xmx2g")
+        g = self.q("run", "--cores", cores, "--", "gradlew", "test", env=env)
+        self.assertEqual(g.returncode, 0, g.stderr)
+        self.assertEqual(g.stdout.strip(), f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={cores} -Xmx2g")
+        g_env = self.q("run", "--cores", cores, "--", "env", "GRADLE_OPTS=-Xmx3g", "gradlew", "test", env=env)
+        self.assertEqual(g_env.returncode, 0, g_env.stderr)
+        self.assertEqual(g_env.stdout.strip(), f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={cores} -Xmx3g")
+        z = self.q("run", "--cores", cores, "--", "zig", "build", "test", env=env)
+        self.assertEqual(z.returncode, 0, z.stderr)
+        self.assertEqual(z.stdout.strip(), f"ARGS=build -j{cores} test")
+        z_explicit = self.q("run", "--cores", cores, "--", "zig", "build", "-j5", "test", env=env)
+        self.assertEqual(z_explicit.returncode, 0, z_explicit.stderr)
+        self.assertEqual(z_explicit.stdout.strip(), "ARGS=build -j5 test")
+        # Real python3 -m unittest runs and automatically reuses its pass on unchanged git source.
+        self.git_repo()
+        with open(os.path.join(self.work, "test_ok.py"), "w") as f:
+            f.write("import unittest\nclass T(unittest.TestCase):\n    def test_add(self): self.assertEqual(1+1, 2)\n")
+        git = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t"]
+        subprocess.run([*git, "add", "test_ok.py"], cwd=self.work, check=True)
+        subprocess.run([*git, "commit", "-qm", "add test"], cwd=self.work, check=True)
+        first = self.q("run", "--", sys.executable, "-m", "unittest", "test_ok")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        tid = re.search(r"ticket ([0-9a-f-]{36})", first.stderr).group(1)
+        deadline = time.time() + 20
+        while time.time() < deadline and not self.daemon.ticket(tid).get("source_verified"):
+            time.sleep(0.1)
+        self.assertTrue(self.daemon.ticket(tid).get("source_verified"), self.daemon.log())
+        second = self.q("run", "--", sys.executable, "-m", "unittest", "test_ok")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("passed this command", second.stderr)
+
 
 class Enforcement(Harness):
     """The shim sends heavy commands through the queue; the rustc guard refuses compiles outside it."""
@@ -483,7 +526,7 @@ class Enforcement(Harness):
         shims = os.path.join(self.tmp.name, "shims")
         os.makedirs(real)
         os.makedirs(shims)
-        for tool in ("make", "cargo", "dotnet"):
+        for tool in ("make", "cargo", "dotnet", "cmake", "ctest", "zig", "gradle"):
             with open(os.path.join(real, tool), "w") as f:
                 f.write(f"#!/bin/sh\necho \"{tool} $* job=${{BUILDQ_JOB:-none}}\"\n")
             os.chmod(os.path.join(real, tool), 0o755)
@@ -526,6 +569,23 @@ class Enforcement(Harness):
         dbuild3, drun3 = dotnet_watch_arg.stdout.splitlines()
         self.assertRegex(dbuild3, r"^dotnet build App\.csproj job=[0-9a-f-]{36}$")
         self.assertEqual(drun3, "dotnet run --project App.csproj --no-build -- --watch job=none")
+        # New shims: cmake, ctest, zig, gradle queue heavy builds and pass light invocations straight through.
+        for cmd, queued in (
+            (["cmake", "--build", "out"], True),
+            (["cmake", "-B", "out", "-S", "."], False),
+            (["ctest", "--test-dir", "out"], True),
+            (["ctest", "-N"], False),
+            (["zig", "build", "test"], True),
+            (["zig", "fmt", "."], False),
+            (["gradle", "test"], True),
+            (["gradle", "--stop"], False),
+        ):
+            res = subprocess.run(cmd, env=env, cwd=self.work, capture_output=True, text=True, timeout=60)
+            self.assertEqual(res.returncode, 0, (cmd, res.stderr))
+            if queued:
+                self.assertRegex(res.stdout, r"job=[0-9a-f-]{36}$", (cmd, res.stdout))
+            else:
+                self.assertTrue(res.stdout.endswith("job=none\n"), (cmd, res.stdout))
 
     def test_run_runs_cargo_commands_that_never_compile_at_once(self):
         """#72: `buildq run -- cargo fmt` (heavy-run cargo fmt) doesn't wait behind builds."""

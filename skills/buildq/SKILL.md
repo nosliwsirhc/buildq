@@ -1,6 +1,6 @@
 ---
 name: buildq
-description: How to run compiles, test suites, image builds and other heavy commands on a machine whose builds share one queue (buildq). Covers running a command through the queue, dropping a long job off and checking back by ticket, what each wait message means, and what to do when a build is killed for memory or a Rust compile is refused. Use before running cargo, make, ninja, dotnet, a JS build or test suite, docker build, or a push whose hook runs tests, and whenever buildq or its wrapper prints a ticket, a wait reason or a refusal.
+description: How to run compiles, test suites, image builds and other heavy commands on a machine whose builds share one queue (buildq). Covers running a command through the queue, dropping a long job off and checking back by ticket, what each wait message means, and what to do when a build is killed for memory or a Rust compile is refused. Use before running cargo, make, ninja, dotnet, gradle/gradlew, cmake/ctest, zig, gcc/clang, pytest/uv, a JS build or test suite, docker build, or a push whose hook runs tests, and whenever buildq or its wrapper prints a ticket, a wait reason or a refusal.
 ---
 
 # Building on a machine that queues its builds
@@ -47,7 +47,9 @@ your tool call's time limit.
   without it a script stopped for memory fails instead of being started over, and it can never be
   stopped to let a waiting CI job's build in (unless this machine lists it in `restartable_scripts`;
   this machine's notes below say which scripts, if any).
-  Plain `cargo build`/`test`, `dotnet build`/`test`, `tsc`, `eslint` and `vitest` need nothing;
+  Plain `cargo build`/`test`, `dotnet build`/`test`, `gradle`/`gradlew` build/test tasks,
+  `cmake --build`, `ctest`, `zig`, `gcc`/`clang`, `pytest`/`mypy`/`pyright`, `python -m unittest`/
+  `pytest`/`mypy`/`pyright`, `uv build`/`uv run <safe>`, `tsc`, `eslint` and `vitest` need nothing;
   package scripts (`pnpm test`, `npm run …`) are scripts. Mark one only after reading it and what it
   calls, and never one that pushes, commits, tags, uploads, deploys, sends, or changes anything outside
   its own build output (a shared database, migrations, a fixed-name container, `cargo install`). A
@@ -66,7 +68,9 @@ the same source again, from the same directory, with the same environment and op
   waits for it. `buildq cancel` won't stop a shared build unless you add `--all`: only do that if
   you know nobody else needs it.
 - **A check passed on it in the last two hours** (cargo check, clippy or test, dotnet test,
-  `tsc --noEmit`, eslint, `vitest run`): you get that result and its output at once, and nothing
+  `zig test`/`ast-check`, `gcc`/`clang -fsyntax-only`, `pytest`, `python -m unittest`/`pytest`/
+  `mypy`/`pyright`, `mypy`, `pyright`, `uv run --no-sync <check>`, `tsc --noEmit`, eslint,
+  `vitest run`): you get that result and its output at once, and nothing
   runs. Change the source, and it runs.
 - **A build that makes files, or a script, passed on it** (cargo build, a bundle, `run-tests.sh`):
   it runs again, and the queue says it passed before. Its output may have changed since, and a

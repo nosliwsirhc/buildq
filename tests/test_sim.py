@@ -396,13 +396,44 @@ class Export(SimCase):
         for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
                      "--filter", "-p", "-F"):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
-        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS | {"python3.13", "python2", "py.test", "gcc-16", "clang++-22"}
+        tools = (bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS
+                 | {"python3.13", "python2", "py.test", "gcc", "g++", "clang", "clang++", "cc", "c++",
+                    "gcc-16", "clang++-22", "cc-14", "c++-14", "mypy", "pyright", "basedpyright"})
         self.assertTrue(sim.Simulation.GRANT_TOOLS <= bq_tools.HONORS_GRANT_TOOLS)
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)
-        for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):
-            self.assertEqual(sim.anonymous_argv(argv), argv)
-            self.assertEqual(bq_commands.restart_safe(sim.anonymous_argv(argv)), bq_commands.restart_safe(argv))
+        for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"],
+                     ["cmake", "--build", "out"], ["cmake", "--build", "out", "--target", "test"],
+                     ["cmake", "--build", "out", "--target", "install"], ["cmake", "--build", "--preset", "ci"],
+                     ["zig", "build", "test", "--release"], ["zig", "build", "test", "-j"],
+                     ["zig", "cc", "-c", "foo.c"], ["zig", "test-obj", "foo.zig"],
+                     ["gradlew", "test"], ["gradle", "assembleRelease"], ["gradlew", "testDebugUnitTest"],
+                     ["gradlew", ":secretmod:testDebugUnitTest"], ["gradlew", ":secretmod:publishRelease"],
+                     ["ctest"], ["ctest", "-T"], ["ctest", "--build-and-test"],
+                     ["uv", "run", "-m", "unittest"], ["uv", "run", "python3", "-m", "pytest"],
+                     ["uv", "run", "--frozen", "pytest", "tests/secret.py"], ["uv", "run", "--no-sync", "pytest"]):
+            anon = sim.anonymous_argv(argv)
+            self.assertNotIn("secretmod", json.dumps(anon))
+            self.assertNotIn("secret.py", json.dumps(anon))
+            self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(argv), (argv, anon))
+        self.assertEqual(sim.anonymous_argv(["cmake", "--workflow", "--preset", "ci"])[:3],
+                         ["cmake", "--workflow", "--preset"])
+        # Key -> export -> anonymize -> replay preserves both restart_safe and honors_grant.
+        for raw in (["zig", "build", "test", "-Doptimize=ReleaseSafe"],
+                    ["zig", "build", "-j8", "test"],
+                    ["cmake", "--build", "out", "--target", "ALL_BUILD"],
+                    ["ctest", "-j8"],
+                    ["ctest", "-T", "Submit"],
+                    ["ctest", "--add-notes", "n.txt"],
+                    ["gradle", "assembleRelease"],
+                    ["gradle", "--max-workers=8", "test"]):
+            key_words = bq_commands.command_words(raw)
+            exported = " ".join(key_words).split()  # as metrics.db stores and sim.export_builds splits it
+            self.assertEqual(bq_commands.command_words(exported), key_words, raw)
+            anon = sim.anonymous_argv(exported)
+            self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(raw), (raw, exported, anon))
+            self.assertEqual(bq_tools.honors_grant_for(anon[0], anon[1:]),
+                             bq_tools.honors_grant_for(raw[0], raw[1:]), (raw, exported, anon))
         key = lambda argv: bq_commands.command_words(sim.anonymous_argv(argv))  # noqa: E731
         self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
 
@@ -805,9 +836,21 @@ class LoadBuildqd(SimCase):
         os.makedirs(state)
         s = sim.Simulation(scenario([]), CONFIG, BUILDQD, state, name="buildqd_hg")
         t = type("T", (), {"argv": ["zig", "build"], "jobserver": None})()
-        self.assertFalse(s.honors_grant(t))
-        s.mod.patch("honors_grant_tool", lambda name: name == "zig")
-        self.assertTrue(s.honors_grant(t))
+        self.assertTrue(s.honors_grant(t))  # head's tools.py honors `zig build`
+        # Invocation-aware grant detection: non-build zig, uv run <non-global-env tool>, and explicit worker overrides do NOT honor grants.
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["zig", "test", "a.zig"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["zig", "build", "-j4"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["uv", "run", "pytest", "-n", "8"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["uv", "run", "zig", "build", "test"], "jobserver": None})()))
+        self.assertTrue(s.honors_grant(type("T", (), {"argv": ["uv", "run", "cargo", "test"], "jobserver": None})()))
+        self.assertTrue(s.honors_grant(type("T", (), {"argv": ["uv", "build"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["cmake", "--build", "out", "-j", "8"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["ctest", "-j8"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["gradle", "--max-workers=8", "test"], "jobserver": None})()))
+        t_other = type("T", (), {"argv": ["custom-cc", "build"], "jobserver": None})()
+        self.assertFalse(s.honors_grant(t_other))
+        s.mod.patch("honors_grant_for", lambda name, _args=None: name == "custom-cc")
+        self.assertTrue(s.honors_grant(t_other))
         s.mod = base_pkg
         self.assertFalse(s.honors_grant(t))  # pre-registry base uses frozen GRANT_TOOLS
         self.assertTrue(s.honors_grant(type("T", (), {"argv": ["cargo", "build"], "jobserver": None})()))

@@ -1158,6 +1158,50 @@ class ShimRules(unittest.TestCase):
         self.assertTrue(self.shim.heavy("dotnet", ["run", "--", "--no-build"]))
         self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--", "--no-build"]), ["build"])
 
+    def test_cmake_ctest_zig_and_gradle_shim_rules(self):
+        # Shim option tables stay in exact parity with tools.py.
+        self.assertEqual(self.shim.GRADLE_VALUE_OPTIONS, set(tools.GRADLE_VALUE_OPTIONS))
+        self.assertEqual(self.shim.ZIG_BUILD_VALUE_OPTIONS, set(tools.ZIG_BUILD_VALUE_OPTIONS))
+        # cmake: only --build and --workflow are heavy; configure / -P / -E / presets list are light.
+        for args in (["--build", "build"], ["--build", "--preset", "ci"], ["--workflow", "--preset", "ci"],
+                     ["--build", "build", "--target", "watch"]):
+            self.assertTrue(self.shim.heavy("cmake", args), args)
+        for args in (["-B", "build", "-S", "."], ["--build", "--list-presets"], ["--build", "--help"],
+                     ["-P", "script.cmake", "--build", "x"], ["-E", "echo", "--build"], ["--version"]):
+            self.assertFalse(self.shim.heavy("cmake", args), args)
+        # ctest: heavy unless dry-run / listing / info (`-V` is verbose, `-R watch` is a test regex).
+        for args in ([], ["-V"], ["-VV"], ["-R", "watch"], ["--test-dir", "build", "--output-on-failure"],
+                     ["--preset", "unit"]):
+            self.assertTrue(self.shim.heavy("ctest", args), args)
+        for args in (["-N"], ["--show-only"], ["--show-only=json-v1"], ["--list-presets"],
+                     ["--print-labels"], ["--version"], ["-H"]):
+            self.assertFalse(self.shim.heavy("ctest", args), args)
+        # zig: build/test/compile are heavy; run, watch, fuzz, webui, time-report, listen, test-cmd, fmt, cc, and info are light.
+        for args in (["build"], ["build", "test"], ["build", "-Doptimize=ReleaseFast"],
+                     ["build", "test", "--", "--watch"], ["build", "--summary", "all", "test"],
+                     ["test", "src/main.zig"], ["test-obj", "src/main.zig"],
+                     ["build-exe", "src/main.zig"], ["build-exe", "src/main.zig", "-l", "m"],
+                     ["build-lib", "src/lib.zig"], ["build-obj", "src/a.zig"]):
+            self.assertTrue(self.shim.heavy("zig", args), args)
+        for args in (["build", "run"], ["build", "-freference-trace", "run"], ["build", "--watch"],
+                     ["build", "--fuzz"], ["build", "--webui"], ["build", "--webui=127.0.0.1:0"],
+                     ["build", "test", "--time-report"], ["build", "--help"], ["build", "-l"],
+                     ["test", "--help"], ["test", "--listen=-", "a.zig"],
+                     ["test", "--test-cmd", "./runner", "a.zig"],
+                     ["run", "src/main.zig"], ["fmt", "."], ["cc", "-c", "a.c"],
+                     ["ast-check", "a.zig"], ["version"], ["env"]):
+            self.assertFalse(self.shim.heavy("zig", args), args)
+        # gradle/gradlew: compile/test tasks are heavy; daemon lifecycle, continuous, dry-run, and query tasks are light.
+        for args in (["test"], [":app:assembleDebug"], ["clean", "test"], [], ["-p", "sub", "check"],
+                     ["test", "--tests", "watch"], ["help", "--", "assemble"]):
+            self.assertTrue(self.shim.heavy("gradle", args), args)
+            self.assertTrue(self.shim.heavy("gradlew", args), args)
+        for args in (["--stop"], ["--status"], ["--foreground"], ["-t", "test"], ["--continuous", "test"],
+                     ["-qt", "test"], ["-Ut", "test"], ["-qm", "test"], ["-m", "test"], ["--dry-run", "test"],
+                     ["--task-graph", "test"], ["--export-keys", "tasks"],
+                     ["tasks"], ["help"], [":app:dependencies"], ["clean"], ["bootRun"], ["--version"]):
+            self.assertFalse(self.shim.heavy("gradle", args), args)
+
 
 
 class ClientAndGuardHelpers(unittest.TestCase):
@@ -1306,7 +1350,8 @@ class ToolsRegistry(unittest.TestCase):
         self.assertEqual(tools.JOBSERVER_TOOLS, frozenset({"cargo", "make", "gmake", "ninja"}))
         self.assertEqual(tools.MAKEFLAGS_JOBSERVER_TOOLS, frozenset({"make", "gmake", "ninja"}))
         self.assertEqual(tools.HONORS_GRANT_TOOLS,
-                         frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"}))
+                         frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "ctest",
+                                    "go", "gradle", "gradlew", "zig", "uv"}))
         self.assertEqual(tools.CONTAINER_TOOLS, frozenset({"docker", "podman", "buildah"}))
         self.assertTrue(tools.NOT_SCRIPT_TOOLS <= commands.NOT_SCRIPTS)
         self.assertIs(tools.lookup("cargo"), tools.REGISTRY["cargo"])
@@ -1319,14 +1364,16 @@ class ToolsRegistry(unittest.TestCase):
         cfg = config.Config(config.tomllib.loads('restartable_scripts = ["eslint", "tsc", "vitest"]\n' + BASE_CONFIG),
                             128 * GIB, 32)
         self.assertEqual(cfg.restartable_scripts, frozenset({"eslint", "tsc", "vitest"}))
-        # Pattern lookup fallback supports versioned tool names (e.g. gcc-16 in PR 2) and not_script validation.
-        pat_spec = tools.ToolSpec(names=("gcc",), name_pattern=re.compile(r"gcc-\d+"), honors_grant=True)
-        with mock.patch.object(tools, "_PATTERN_SPECS", (pat_spec,)):
-            self.assertIs(tools.lookup("gcc-16"), pat_spec)
-            self.assertTrue(tools.honors_grant_tool("gcc-16"))
-            self.assertTrue(tools.is_not_script("gcc-16"))
-            with self.assertRaisesRegex(ValueError, "not tools: gcc-16"):
-                config.Config(config.tomllib.loads('restartable_scripts = ["gcc-16"]\n' + BASE_CONFIG),
+        # Built-in pattern specs match versioned C/C++ compilers and Python interpreters and reject them as scripts.
+        self.assertIs(tools.lookup("gcc-16"), tools.REGISTRY["gcc"])
+        self.assertIs(tools.lookup("clang++-22"), tools.REGISTRY["clang++"])
+        self.assertIs(tools.lookup("cc-14"), tools.REGISTRY["cc"])
+        self.assertIs(tools.lookup("c++-14"), tools.REGISTRY["c++"])
+        self.assertIs(tools.lookup("python3.14"), tools.REGISTRY["python3"])
+        self.assertTrue(tools.is_not_script("gcc-16"))
+        for tool_name in ("gcc-16", "clang++-22", "cc-14", "c++-14", "zig", "ctest", "mypy", "pyright", "python3.14"):
+            with self.assertRaisesRegex(ValueError, f"not tools: {re.escape(tool_name)}"):
+                config.Config(config.tomllib.loads(f'restartable_scripts = ["{tool_name}"]\n' + BASE_CONFIG),
                               128 * GIB, 32)
 
     def test_shim_positional_items_parity(self):
@@ -1349,6 +1396,9 @@ class ToolsRegistry(unittest.TestCase):
         self.assertEqual(env_cargo["MSBUILDDISABLENODEREUSE"], "1")
         self.assertEqual(env_cargo["UseSharedCompilation"], "false")
         self.assertEqual(env_cargo["CMAKE_BUILD_PARALLEL_LEVEL"], "4")
+        self.assertEqual(env_cargo["CTEST_PARALLEL_LEVEL"], "4")
+        self.assertEqual(env_cargo["UV_CONCURRENT_BUILDS"], "4")
+        self.assertEqual(env_cargo["GRADLE_OPTS"], "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=4")
         self.assertEqual(env_cargo["GOMAXPROCS"], "4")
 
         env_make_serial = tools.env_for("make", ["all"], 4, 8, "/tmp/js", False)
@@ -1364,20 +1414,21 @@ class ToolsRegistry(unittest.TestCase):
         def append_flag(_t, args, g, _js, _tt, _env):
             args.append(f"-j{g}")
             return args
-        mut_spec = tools.ToolSpec(names=("zig",), rewrite_argv=append_flag)
-        with mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "zig": mut_spec}):
-            self.assertEqual(tools.rewrite_argv_for("zig", ["zig", "build"], 0, 4, None), ["zig", "build", "-j4"])
+        mut_spec = tools.ToolSpec(names=("mocktool",), rewrite_argv=append_flag)
+        with mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "mocktool": mut_spec}):
+            self.assertEqual(tools.rewrite_argv_for("mocktool", ["mocktool", "build"], 0, 4, None),
+                             ["mocktool", "build", "-j4"])
         # Cargo subcommand classification uses the same credential/URL redaction and `--` truncation as command_words.
         self.assertFalse(commands.restart_safe(["cargo", "--", "test"]))
         self.assertFalse(commands.reusable_check(["cargo", "--", "test"]))
         url_arg = '--config=http.proxy="http://proxy.example:8080"'
         self.assertFalse(commands.restart_safe(["cargo", url_arg, "test"]))
         self.assertFalse(commands.reusable_check(["cargo", url_arg, "test"]))
-        # cargo_cold remains Cargo-only even if another tool registers a cold detector.
-        fake_cold = tools.ToolSpec(names=("zig",), is_cold=lambda *_: True)
-        with mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "zig": fake_cold}):
-            self.assertTrue(commands.is_cold(["zig", "build"], "/tmp", {}))
-            self.assertFalse(commands.cargo_cold(["zig", "build"], "/tmp", {}))
+        # cargo_cold remains Cargo-only even when another tool (zig) reports cold.
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "build.zig"), "w").close()
+            self.assertTrue(commands.is_cold(["zig", "build"], tmp, {}))
+            self.assertFalse(commands.cargo_cold(["zig", "build"], tmp, {}))
 
 
 class MergeEnvVars(DaemonCase):
@@ -1385,10 +1436,10 @@ class MergeEnvVars(DaemonCase):
 
     def test_merge_env_vars_scopes_to_emitting_callback_and_cleans_parallel_json(self):
         merged_spec = tools.ToolSpec(
-            names=("gradle",),
-            merge_env_vars=("GRADLE_OPTS",),
+            names=("mergetool",),
+            merge_env_vars=("MERGE_TEST_OPTS",),
             global_env=lambda g, _w, _js, _tt, cenv: {
-                "GRADLE_OPTS": f"{(cenv or {}).get('GRADLE_OPTS', '')} -Dorg.gradle.workers.max={g}".strip()
+                "MERGE_TEST_OPTS": f"{(cenv or {}).get('MERGE_TEST_OPTS', '')} -w={g}".strip()
             },
         )
         direct_merger = tools.ToolSpec(
@@ -1397,11 +1448,11 @@ class MergeEnvVars(DaemonCase):
             direct_env=lambda _t, _a, g, _w, _js, _tt, cenv: {"MAKEFLAGS": f"{(cenv or {}).get('MAKEFLAGS', '')} -j{g}"},
         )
         with mock.patch.object(tools, "SPECS", (*tools.SPECS, merged_spec, direct_merger)), \
-             mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "gradle": merged_spec, "othertool": direct_merger}):
-            t = self.submit(("cargo", "build"), env={"GRADLE_OPTS": "-Xmx4g", "GOMAXPROCS": "2"})
+             mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "mergetool": merged_spec, "othertool": direct_merger}):
+            t = self.submit(("cargo", "build"), env={"MERGE_TEST_OPTS": "-Xmx4g", "GOMAXPROCS": "2"})
             with open(os.path.join(t.dir, "parallel.json")) as f:
                 parallel = json.load(f)
-            self.assertEqual(parallel["GRADLE_OPTS"], f"-Xmx4g -Dorg.gradle.workers.max={t.granted}")
+            self.assertEqual(parallel["MERGE_TEST_OPTS"], f"-Xmx4g -w={t.granted}")
             self.assertNotIn("GOMAXPROCS", parallel)  # plain key still defers to caller's value
             # Unrelated direct_env merge declaration for MAKEFLAGS must NOT disable caller precedence for ninja.
             n = self.submit(("ninja", "all"), env={"MAKEFLAGS": "-k"})
@@ -1425,6 +1476,424 @@ class MergeEnvVars(DaemonCase):
             with self.assertRaises(OSError):
                 common.write_json(target, {"GRADLE_OPTS": "-Dhttp.proxyPassword=secret"})
         self.assertFalse(any(name.startswith("parallel.json") for name in os.listdir(self.tmp.name)))
+
+
+class SystemCompilers(DaemonCase):
+    """First-class support for Gradle, CMake/CTest, Zig, GCC/Clang, and Python/uv."""
+
+    def words(self, *argv):
+        return " ".join(commands.command_words(list(argv)))
+
+    def test_gradle_keys_env_merge_classification_and_write_dirs(self):
+        self.assertEqual(self.words("./gradlew", "-p", "apps/android", ":app:testDebugUnitTest",
+                                    "--tests", "com.example.FooTest"),
+                         "gradlew :app:testDebugUnitTest")
+        self.assertEqual(self.words("gradle", "-x", "lint", "assembleRelease", "check"),
+                         "gradle assembleRelease check")
+        self.assertEqual(self.words("gradle", "--export-keys", "build"), "gradle build")
+        # GRADLE_OPTS merges defaults into caller's value without clobbering (preserving quoted
+        # values and not being fooled by property text embedded inside another property).
+        quoted = '-Dfoo="-Dorg.gradle.daemon=true -Dorg.gradle.workers.max=9" -Xmx4g'
+        t1 = self.submit(("./gradlew", "test"), env={"GRADLE_OPTS": quoted}, cwd=self.workdir("g1"))
+        with open(os.path.join(t1.dir, "parallel.json")) as f:
+            p1 = json.load(f)
+        self.assertEqual(p1["GRADLE_OPTS"], f"-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t1.granted} {quoted}")
+        # Requeue re-merges idempotently from original caller env without duplicating flags.
+        self.daemon.requeue(t1, self.now + 10)
+        self.daemon.schedule(self.now + 11)
+        with open(os.path.join(t1.dir, "parallel.json")) as f:
+            p1_again = json.load(f)
+        self.assertEqual(p1_again["GRADLE_OPTS"], f"-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t1.granted} {quoted}")
+        self.finish(t1)
+
+        t2 = self.submit(("./gradlew", "--system-prop=org.gradle.daemon=true", "test"),
+                         env={"GRADLE_OPTS": "-Xmx4g"}, cwd=self.workdir("g2"))
+        with open(os.path.join(t2.dir, "parallel.json")) as f:
+            self.assertEqual(json.load(f)["GRADLE_OPTS"], f"-Dorg.gradle.workers.max={t2.granted} -Xmx4g")
+        self.finish(t2)
+
+        t3 = self.submit(("./gradlew", "--daemon", "--max-workers=3", "test"),
+                         env={"GRADLE_OPTS": "-Xmx4g"}, cwd=self.workdir("g3"))
+        with open(os.path.join(t3.dir, "parallel.json")) as f:
+            self.assertNotIn("GRADLE_OPTS", json.load(f))
+        self.finish(t3)
+
+        t4 = self.submit(("./gradlew", "--stop"), cwd=self.workdir("g4"))
+        with open(os.path.join(t4.dir, "parallel.json")) as f:
+            self.assertNotIn("GRADLE_OPTS", json.load(f))
+        self.finish(t4)
+
+        # Inline `env GRADLE_OPTS=-Xmx2g`, wrapped `nice -n 10 env GRADLE_OPTS=...`, and `env -i ...` preserve defaults.
+        t_inline = self.submit(("env", "GRADLE_OPTS=-Xmx2g", "./gradlew", "test"), cwd=self.workdir("g_in"))
+        self.assertEqual(t_inline.exec_argv, [
+            "env", f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_inline.granted} -Xmx2g",
+            "./gradlew", "test",
+        ])
+        self.finish(t_inline)
+        t_nice = self.submit(("nice", "-n", "10", "env", "GRADLE_OPTS=-Xmx2g", "./gradlew", "test"),
+                             cwd=self.workdir("g_nice"))
+        self.assertEqual(t_nice.exec_argv, [
+            "nice", "-n", "10", "env",
+            f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_nice.granted} -Xmx2g",
+            "./gradlew", "test",
+        ])
+        self.finish(t_nice)
+        t_reset = self.submit(("env", "-i", "PATH=/usr/bin", "./gradlew", "test"), cwd=self.workdir("g_reset"))
+        self.assertEqual(t_reset.exec_argv, [
+            "env", "-i", "PATH=/usr/bin",
+            f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_reset.granted}",
+            "./gradlew", "test",
+        ])
+        self.finish(t_reset)
+        t_dash_reset = self.submit(("env", "--", "-", "./gradlew", "test"), cwd=self.workdir("g_dash_reset"))
+        self.assertEqual(t_dash_reset.exec_argv, [
+            "env", "--", "-",
+            f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_dash_reset.granted}",
+            "./gradlew", "test",
+        ])
+        self.finish(t_dash_reset)
+        t_unset = self.submit(("env", "-u", "GRADLE_OPTS", "./gradlew", "test"),
+                              env={"GRADLE_OPTS": "-Xmx8g"}, cwd=self.workdir("g_unset"))
+        self.assertEqual(t_unset.exec_argv, [
+            "env", "-u", "GRADLE_OPTS",
+            f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_unset.granted}",
+            "./gradlew", "test",
+        ])
+        self.finish(t_unset)
+        # Non-Gradle `env -i` does not get GRADLE_OPTS injected into its argv.
+        t_cargo_reset = self.submit(("env", "-i", "PATH=/usr/bin", "cargo", "build"), cwd=self.workdir("g_cargo"))
+        self.assertIsNone(t_cargo_reset.exec_argv)
+        self.finish(t_cargo_reset)
+
+        # Wrapper script inherits GRADLE_OPTS via global_env.
+        t5 = self.submit(("bash", "ci/android.sh"), env={"GRADLE_OPTS": "-Xmx6g"}, cwd=self.workdir("g5"))
+        with open(os.path.join(t5.dir, "parallel.json")) as f:
+            self.assertEqual(json.load(f)["GRADLE_OPTS"],
+                             f"-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t5.granted} -Xmx6g")
+        self.finish(t5)
+
+        # restart_safe (ordinary Gradle tasks are restart-safe, NOT auto-reusable since they write reports/classes).
+        for argv in (("./gradlew", ":app:testDebugUnitTest"), ("./gradlew", ":app:assembleRelease"),
+                     ("gradle", "compileKotlin"), ("gradle", "build"), ("gradle", "check"),
+                     ("gradle", "lintDebug"), ("gradle", "ktlintCheck"), ("gradle", "detekt"),
+                     ("gradle", "spotlessCheck"), ("gradle", "test", "--tests", "FooTest")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+        for argv in (("./gradlew", "publish"), ("./gradlew", "assembleAndUpload"), ("gradle", "clean"),
+                     ("gradle", "installDebug"), ("gradle", "connectedDebugAndroidTest"), ("gradle", "bootRun"),
+                     ("gradle", "run"), ("gradle", "ktlintFormat"), ("gradle", "spotlessApply"),
+                     ("gradle", "lintFix"), ("gradle", "-t", "test"), ("gradle", "-qt", "test"),
+                     ("gradle", "-Ut", "test"), ("gradle", "--continuous", "test"), ("gradle", "--write-locks", "test"),
+                     ("gradle", "-qMsha256", "test"), ("gradle", "-I", "init.gradle", "test"),
+                     ("gradle", "-qIinit.gradle", "test"), ("gradle", "--init-script=init.gradle", "test"),
+                     ("gradle", "--stop"), ("gradle", "--", "test"), ("gradle",)):
+            self.assertFalse(commands.restart_safe(list(argv)), argv)
+
+        # paths_inside rejects gradle -p / -qp / --project-dir while allowing -D/-P properties with C.
+        self.assertTrue(commands.paths_inside(["./gradlew", ":app:testDebugUnitTest", "-PConfig=1"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["gradle", "-p", "sub", "test"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["gradle", "-qp", "sub", "test"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["gradle", "--project-dir=sub", "test"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["gradle", "-b", "../other/build.gradle", "test"], "/r", "/r"))
+
+        # write_dirs finds root, task-named subprojects (`:app:assemble`), and GRADLE_USER_HOME.
+        home = os.path.expanduser("~")
+        proj = tempfile.mkdtemp(prefix=".buildq-gradle-", dir=home)
+        self.addCleanup(shutil.rmtree, proj, True)
+        sub = os.path.join(proj, "app")
+        os.makedirs(sub)
+        open(os.path.join(proj, "settings.gradle.kts"), "w").close()
+        open(os.path.join(sub, "build.gradle.kts"), "w").close()
+        gcache = os.path.join(proj, "gcache")
+        dirs = commands.write_dirs_of(proj, {"GRADLE_USER_HOME": gcache}, ["./gradlew", ":app:assemble"])
+        self.assertEqual(set(dirs), {os.path.realpath(os.path.join(proj, "build")),
+                                     os.path.realpath(os.path.join(sub, "build")),
+                                     os.path.realpath(gcache)})
+
+    def test_cmake_and_ctest_keys_env_classification_and_write_dirs(self):
+        self.assertEqual(self.words("cmake", "--build", "build/release", "--config", "Release", "--target", "app"),
+                         "cmake --build release --config Release --target app")
+        self.assertEqual(self.words("cmake", "--build", "--preset", "ci", "-t", "b", "a"),
+                         "cmake --build --preset ci --target a --target b")
+        self.assertEqual(self.words("cmake", "--workflow", "--preset", "ci"), "cmake --workflow --preset ci")
+        self.assertEqual(self.words("cmake", "-D", "FOO=1", "-B", "build", "-S", "."), "cmake")
+        self.assertEqual(self.words("ctest", "--preset", "unit", "-C", "Release", "-R", "auth"),
+                         "ctest --preset unit -C Release -R auth")
+
+        t = self.submit(("ctest", "--test-dir", "build"), cwd=self.workdir("ct1"))
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            parallel = json.load(f)
+        self.assertEqual(parallel["CTEST_PARALLEL_LEVEL"], str(t.granted))
+        self.assertEqual(parallel["CMAKE_BUILD_PARALLEL_LEVEL"], str(t.granted))
+        self.finish(t)
+
+        t_caller = self.submit(("ctest",), env={"CTEST_PARALLEL_LEVEL": "2"}, cwd=self.workdir("ct2"))
+        with open(os.path.join(t_caller.dir, "parallel.json")) as f:
+            self.assertNotIn("CTEST_PARALLEL_LEVEL", json.load(f))
+        self.finish(t_caller)
+
+        for argv in (("cmake", "--build", "build"),
+                     ("cmake", "--build", "build", "--clean-first", "--target", "all", "test"),
+                     ("cmake", "--build", "build", "--target", "ALL_BUILD"),
+                     ("ctest", "--test-dir", "build", "--output-on-failure"),
+                     ("ctest", "--build-config", "Release"),
+                     ("ctest", "--preset", "unit")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+        for argv in (("cmake", "--build", "--preset", "ci"),
+                     ("cmake", "--build", "build", "--target", "CHECK"),
+                     ("cmake", "--build", "build", "--target", "install"),
+                     ("cmake", "--build", "build", "--target", "all;install"),
+                     ("cmake", "--build", "build", "--target", "component/install"),
+                     ("cmake", "--build", "build", "--target", "ExperimentalSubmit"),
+                     ("cmake", "--build", "build", "--target", "custom_target"),
+                     ("cmake", "--build", "build", "-t", "all", "install"),
+                     ("cmake", "--build", "build", "--", "install"),
+                     ("cmake", "-B", "build", "-S", "."),
+                     ("cmake", "-P", "deploy.cmake", "--build", "x"),
+                     ("cmake", "--build", "--list-presets"),
+                     ("cmake", "--build"),
+                     ("ctest", "-D", "Nightly"), ("ctest", "-MExperimental"),
+                     ("ctest", "-TSubmit"), ("ctest", "-S", "script.cmake"),
+                     ("ctest", "-SP", "script.cmake"), ("ctest", "--script-new-process", "script.cmake"),
+                     ("ctest", "--test-action", "Submit"), ("ctest", "--test-model", "Nightly"),
+                     ("ctest", "--extra-submit", "report.xml"), ("ctest", "--add-notes", "n.txt"),
+                     ("ctest", "--build-and-test", ".", "build", "--test-command", "./deploy.sh")):
+            self.assertFalse(commands.restart_safe(list(argv)), argv)
+        self.assertEqual(self.words("ctest", "-T", "Submit"), "ctest -T")
+        self.assertEqual(self.words("ctest", "--build-and-test", ".", "build"), "ctest --build-and-test")
+        # Neither cmake --build nor ctest is auto-reusable (ctest runs prebuilt binaries, not source).
+        self.assertFalse(commands.reusable_check(["cmake", "--build", "build"]))
+        self.assertFalse(commands.reusable_check(["ctest", "--test-dir", "build"]))
+
+        home = os.path.expanduser("~")
+        proj = tempfile.mkdtemp(prefix=".buildq-cmake-", dir=home)
+        self.addCleanup(shutil.rmtree, proj, True)
+        self.assertEqual(commands.write_dirs_of(proj, {}, ["cmake", "--build", "out"]),
+                         [os.path.realpath(os.path.join(proj, "out"))])
+        self.assertEqual(commands.write_dirs_of(proj, {}, ["cmake", "-E", "echo", "-B", "notes"]), [])
+        self.assertEqual(commands.write_dirs_of(proj, {}, ["ctest", "--test-dir", "out"]),
+                         [os.path.realpath(os.path.join(proj, "out"))])
+
+    def test_zig_keys_argv_rewrite_classification_cold_and_write_dirs(self):
+        self.assertEqual(self.words("zig", "build", "test", "-Doptimize=ReleaseSafe"), "zig build test --release")
+        self.assertEqual(self.words("zig", "build", "--release=fast", "-Dtarget=x86_64-linux"), "zig build --release")
+        self.assertEqual(self.words("zig", "build", "-j8", "test"), "zig build test -j")
+        self.assertEqual(self.words("zig", "build", "-freference-trace", "test"), "zig build test")
+        self.assertEqual(self.words("zig", "build", "--summary", "all", "test"), "zig build test")
+        self.assertEqual(self.words("zig", "test", "-O", "ReleaseSafe", "src/main.zig"),
+                         "zig test -O ReleaseSafe main.zig")
+        self.assertEqual(self.words("zig", "cc", "-O2", "-c", "src/foo.c", "-o", "build/foo.o"),
+                         "zig cc -c -O2 foo.c")
+
+        # zig build injects -j<granted> unless caller passed -j/--watch/--fuzz/--webui/--time-report/--help.
+        t1 = self.submit(("zig", "build", "test"), cwd=self.workdir("z1"))
+        self.assertEqual((t1.state, t1.exec_argv), ("running", ["zig", "build", f"-j{t1.granted}", "test"]))
+        self.finish(t1)
+        t2 = self.submit(("env", "FOO=1", "zig", "build", "--", "--arg"), cwd=self.workdir("z2"))
+        self.assertEqual((t2.state, t2.exec_argv), ("running", ["env", "FOO=1", "zig", "build", f"-j{t2.granted}", "--", "--arg"]))
+        self.finish(t2)
+        for idx, argv in enumerate((("zig", "build", "-j4"), ("zig", "build", "-j", "4"), ("zig", "build", "--watch"),
+                                    ("zig", "build", "--fuzz"), ("zig", "build", "--webui"),
+                                    ("zig", "build", "test", "--time-report"),
+                                    ("zig", "build", "--help"), ("zig", "test", "src/main.zig"))):
+            t = self.submit(argv, cwd=self.workdir(f"z_{idx}"))
+            self.assertEqual((t.state, t.exec_argv), ("running", None), argv)
+            self.finish(t)
+
+        for argv in (("zig", "build"), ("zig", "build", "test"), ("zig", "build", "install"),
+                     ("zig", "build", "--summary", "all", "test"),
+                     ("zig", "test", "src/main.zig"), ("zig", "build-exe", "src/main.zig"),
+                     ("zig", "ast-check", "src/main.zig"), ("zig", "cc", "-c", "a.c")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+        for argv in (("zig", "build", "run"), ("zig", "build", "-freference-trace", "deploy"),
+                     ("zig", "build", "deploy"), ("zig", "build", "--prefix", "/usr/local"),
+                     ("zig", "build", "-p", "/tmp/out"), ("zig", "build", "--", "--arg"),
+                     ("zig", "build", "--watch"), ("zig", "build", "--fuzz"), ("zig", "build", "--webui"),
+                     ("zig", "build", "test", "--time-report"), ("zig", "test", "a.zig", "@flags.rsp"),
+                     ("zig", "test", "--test-cmd", "./deploy.sh", "src/main.zig"),
+                     ("zig", "test", "--listen=-", "src/main.zig"),
+                     ("zig", "cc", "-wrapper", "./wrap.sh", "a.c"),
+                     ("zig", "run", "src/main.zig"), ("zig", "fmt", ".")):
+            self.assertFalse(commands.restart_safe(list(argv)), argv)
+        for argv in (("zig", "test", "src/main.zig"), ("zig", "ast-check", "src/main.zig")):
+            self.assertTrue(commands.reusable_check(list(argv)), argv)
+        for argv in (("zig", "test", "--test-no-exec", "src/main.zig"), ("zig", "test", "-fno-emit-bin", "src/main.zig"),
+                     ("zig", "test", "--show-builtin", "src/main.zig"), ("zig", "test", "src/main.zig", "@flags.rsp"),
+                     ("zig", "test", "-femit-bin=out", "src/main.zig"),
+                     ("zig", "test", "--test-cmd", "runner", "src/main.zig"), ("zig", "test", "--watch", "src/main.zig"),
+                     ("zig", "test", "--listen=-", "src/main.zig"), ("zig", "test", "--help", "src/main.zig"),
+                     ("zig", "test", "--verbose-llvm-ir=analysis.ll", "src/main.zig"),
+                     ("zig", "test", "--verbose-llvm-bc=analysis.bc", "src/main.zig"),
+                     ("zig", "test"), ("zig", "build", "test"), ("zig", "build-exe", "src/main.zig")):
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+
+        home = os.path.expanduser("~")
+        proj = tempfile.mkdtemp(prefix=".buildq-zig-", dir=home)
+        self.addCleanup(shutil.rmtree, proj, True)
+        nested = os.path.join(proj, "nested")
+        os.makedirs(nested)
+        open(os.path.join(nested, "build.zig"), "w").close()
+        self.assertTrue(commands.is_cold(["zig", "build", "--build-file", "nested/build.zig"], proj, {}))
+        self.assertFalse(commands.is_cold(["zig", "test", "a.zig"], nested, {}))
+        os.makedirs(os.path.join(nested, ".zig-cache"))
+        self.assertFalse(commands.is_cold(["zig", "build", "--build-file", "nested/build.zig"], proj, {}))
+        self.assertEqual(set(commands.write_dirs_of(proj, {}, ["zig", "build", "--build-file", "nested/build.zig",
+                                                               "--prefix", "custom-out"])),
+                         {os.path.realpath(os.path.join(nested, ".zig-cache")),
+                          os.path.realpath(os.path.join(nested, "zig-out")),
+                          os.path.realpath(os.path.join(proj, "custom-out"))})
+
+    def test_direct_c_cpp_compilers_and_python_uv(self):
+        # Direct C/C++
+        self.assertEqual(self.words("gcc", "-O2", "-Wall", "-Iinclude", "-c", "src/foo.c", "-o", "build/foo.o"),
+                         "gcc -c -O2 foo.c")
+        self.assertEqual(self.words("clang++-22", "-std=c++23", "-O3", "-flto=auto", "-fsyntax-only", "src/bar.cpp"),
+                         "clang++-22 -fsyntax-only -O3 -flto bar.cpp")
+        self.assertEqual(self.words("cc-14", "-fsyntax-only", "a.c"), "cc-14 -fsyntax-only a.c")
+        for argv in (("gcc", "-c", "a.c"), ("g++-16", "a.cpp", "-o", "a"), ("clang", "-fsyntax-only", "a.c"),
+                     ("clang++-22", "-O2", "a.cpp"), ("cc", "a.c"), ("c++", "a.cpp"),
+                     ("cc-14", "a.c"), ("c++-14", "a.cpp")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+        for argv in (("gcc", "-wrapper", "./wrap.sh", "a.c"), ("gcc", "@args.rsp"), ("gcc", "-I", "@args.rsp", "a.c")):
+            self.assertFalse(commands.restart_safe(list(argv)), argv)
+        for argv in (("gcc", "-fsyntax-only", "src/a.c"), ("clang++-22", "-std=c++23", "-Wall", "-fsyntax-only", "a.cpp"),
+                     ("cc-14", "-fsyntax-only", "a.c")):
+            self.assertTrue(commands.reusable_check(list(argv)), argv)
+        for argv in (("gcc", "-c", "a.c"), ("gcc", "-I", "-fsyntax-only", "a.c"),
+                     ("clang", "-Xanalyzer", "-fsyntax-only", "a.c"), ("gcc", "--", "-fsyntax-only", "a.c"),
+                     ("gcc", "-fsyntax-only", "@args.rsp"), ("gcc", "-fsyntax-only", "-I", "@args.rsp", "a.c"),
+                     ("gcc", "-fsyntax-only", "-x", "c", "-", "a.c"), ("gcc", "-###", "-fsyntax-only", "a.c"),
+                     ("gcc", "-fsyntax-only", "-dumpversion", "a.c"), ("gcc", "-fsyntax-only", "-dumpmachine", "a.c"),
+                     ("gcc", "-fsyntax-only", "-print-search-dirs", "a.c"), ("gcc", "-fsyntax-only", "--help=warnings", "a.c"),
+                     ("clang", "-fsyntax-only", "-emit-ast", "a.c"), ("clang", "-fsyntax-only", "--precompile", "a.cppm"),
+                     ("gcc", "-fsyntax-only", "-fdiagnostics-set-output=sarif:file=a.sarif", "a.c"),
+                     ("gcc", "-fsyntax-only", "-fdeps-file=a.ddi", "a.c"),
+                     ("gcc", "-fsyntax-only", "-MD", "a.c"), ("gcc", "-fsyntax-only", "-Wp,-MD,foo.d", "a.c"),
+                     ("clang", "-fsyntax-only", "-serialize-diagnostics", "a.dia", "a.c"),
+                     ("clang", "-fsyntax-only", "--serialize-diagnostics", "a.dia", "a.c"),
+                     ("clang", "-fsyntax-only", "-Xclang", "-emit-ast", "a.c"),
+                     ("gcc", "-fsyntax-only", "-fdump-tree-all", "a.c"),
+                     ("gcc", "-fsyntax-only", "-o", "out", "a.c"), ("gcc", "-fsyntax-only", "-oout", "a.c"),
+                     ("gcc", "--save-temps", "-fsyntax-only", "a.c"),
+                     ("gcc", "-fsyntax-only", "--version", "a.c"), ("gcc", "-fsyntax-only", "-x", "c", "-")):
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+        self.assertTrue(commands.paths_inside(["gcc", "-fsyntax-only", "-fPIC", "-DCONFIG=1", "a.c"], "/r", "/r"))
+        # Both Fedora-style (/usr/bin/clang-22) and Debian/Ubuntu-style (/usr/lib/llvm-18/bin/clang) resolve trusted.
+        for resolved in ("/usr/bin/clang-22", "/usr/lib/llvm-18/bin/clang"):
+            with mock.patch.object(commands.os.path, "realpath",
+                                   side_effect=lambda p, r=resolved: r if p == "/usr/bin/clang" else os.path.abspath(p)):
+                self.assertTrue(commands.paths_inside(["env", "CC=/usr/bin/clang", "gcc", "-fsyntax-only", "a.c"],
+                                                      "/r", "/r"), resolved)
+        self.assertFalse(commands.paths_inside(["clang", "-working-directory", "sub", "-fsyntax-only", "a.c"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["cc", "-fsyntax-only", "a.c"], "/r", "/r", env={"CPATH": "/shared/inc"}))
+        self.assertFalse(commands.paths_inside(["uv", "run", "--no-sync", "gcc", "-fsyntax-only", "a.c"],
+                                               "/r", "/r", env={"CPATH": "/shared/inc"}))
+        self.assertFalse(commands.paths_inside(["gcc", "-fsyntax-only", "a.c"], "/r", "/r",
+                                               env={"C_INCLUDE_PATH": "/shared/inc"}))
+        self.assertFalse(commands.paths_inside(["env", "CC=/tmp/evil-cc", "gcc", "-fsyntax-only", "a.c"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["gcc", "-fsyntax-only", "../outside.c"], "/r", "/r"))
+        # Symlink inside a trusted tool folder pointing outside must NOT be exempted.
+        with tempfile.TemporaryDirectory() as tmp:
+            outside_cc = os.path.join(tmp, "clang")
+            open(outside_cc, "w").close()
+            fake_local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
+            link = os.path.join(fake_local_bin, "clang-9999")
+            with mock.patch.object(commands.os.path, "realpath", side_effect=lambda p: outside_cc if p == link else os.path.abspath(p)):
+                self.assertFalse(commands._trusted_tool_variable(f"CC={link}"))
+        # Bare `--` doesn't raise IndexError in command_words.
+        self.assertEqual(commands.command_words(["--"]), ["?"])
+
+        # Python, pytest, mypy, pyright, uv
+        self.assertEqual(self.words("pytest", "-k", "auth", "tests/test_auth.py::test_login"), "pytest test_auth.py")
+        self.assertEqual(self.words("uv", "run", "--frozen", "pytest", "tests/test_a.py"), "uv run pytest test_a.py")
+        self.assertEqual(self.words("uv", "run", "--", "pytest", "tests/test_a.py"), "uv run pytest test_a.py")
+        self.assertEqual(self.words("uv", "run", "-m", "unittest", "discover"), "uv run -m unittest")
+        self.assertEqual(self.words("uv", "run", "python3", "-m", "pytest"), "uv run python3 -m pytest")
+        self.assertEqual(self.words("uv", "run", "python3", "-X", "dev", "script.py"), "uv run python3 script.py")
+        self.assertEqual(self.words("mypy", "--shadow-file", "a.py", "b.py", "-p", "buildq", "src/"), "mypy -p buildq src")
+        self.assertEqual(self.words("pyright", "--python-version", "3.14", "--project", "pyrightconfig.json", "src/"),
+                         "pyright src")
+
+        t = self.submit(("uv", "build"), cwd=self.workdir("uv1"))
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            self.assertEqual(json.load(f)["UV_CONCURRENT_BUILDS"], str(t.granted))
+        self.finish(t)
+
+        for argv in (("pytest", "tests/"), ("py.test", "-q", "tests/"), ("python3", "-m", "unittest", "discover"),
+                     ("python3", "-u", "-m", "pytest", "tests/"), ("python3", "-u", "-m", "unittest", "discover"),
+                     ("python3.14", "-B", "-X", "dev", "-m", "pytest", "tests/"), ("mypy", "src/"),
+                     ("pyright", "src/"), ("basedpyright", "src/"),
+                     ("uv", "run", "--no-sync", "--frozen", "--no-dev", "pytest", "tests/"),
+                     ("uv", "run", "--no-sync", "-m", "unittest", "discover"),
+                     ("uv", "run", "--no-sync", "--", "pytest"),
+                     ("uv", "run", "--no-sync", "python3", "-m", "mypy", "src/")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+            self.assertTrue(commands.reusable_check(list(argv)), argv)
+        # Plain `uv run pytest`, `uv run --reinstall pytest`, and `uv build` are restart-safe, not auto-reusable.
+        for argv in (("uv", "build"), ("uv", "run", "pytest", "tests/"),
+                     ("uv", "run", "--reinstall", "pytest", "tests/"),
+                     ("uv", "run", "--no-sync", "--refresh", "pytest", "tests/")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+        for argv in (("pytest", "--cov=app"), ("pytest", "--junitxml=out.xml"), ("pytest", "--lf"),
+                     ("pytest", "--stepwise-reset"), ("pytest", "--collect-only"), ("pytest", "--collectonly"),
+                     ("pytest", "--co"), ("pytest", "--setup-only"), ("pytest", "--setuponly"),
+                     ("pytest", "--setupplan"), ("pytest", "--fixtures"), ("pytest", "--funcargs"),
+                     ("pytest", "--cache-show=foo"), ("pytest", "--debug"), ("pytest", "--debug=trace.log"),
+                     ("pytest", "--version"), ("pytest", "-qV", "tests/"), ("pytest", "-qh", "tests/"),
+                     ("pytest", "-o", "addopts="), ("pytest", "-oaddopts="), ("pytest", "-qo", "addopts="),
+                     ("pytest", "--pdb"), ("pytest", "--pdbcls", "x:y"), ("pytest", "-f"), ("pytest", "-qf"),
+                     ("pytest", "@args.txt"),
+                     ("mypy", "--html-report", "out", "src/"), ("mypy", "--install-types", "src/"),
+                     ("mypy", "--shadow-file", "a.py", "b.py", "a.py"),
+                     ("mypy", "-c", "pass"), ("mypy", "-cpass"), ("mypy", "-vV", "src/"), ("mypy", "-vh", "src/"),
+                     ("mypy", "--timing-stats", "t.txt", "src/"), ("mypy", "--perf-stats-file=p.json", "src/"),
+                     ("mypy", "--version"), ("mypy", "@args.txt"),
+                     ("pyright", "--outputjson", "src/"), ("pyright", "--writebaseline"),
+                     ("pyright", "-V"), ("pyright", "@inputs"), ("pyright", "--command", "pass"),
+                     ("basedpyright", "--gitlabcodequality", "report.json", "src/"),
+                     ("pyright", "--verifytypes", "pkg"), ("pyright", "--version"),
+                     ("python3", "-m", "unittest", "--help"), ("python3", "-m", "unittest", "-vh")):
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+        for argv in (("pytest", "--pdb"), ("pytest", "--pdbcls", "x:y"), ("pytest", "-f"), ("pytest", "-qf"),
+                     ("pytest", "@args.txt"), ("mypy", "--install-types", "src/"), ("mypy", "@args.txt"),
+                     ("pyright", "--writebaseline"), ("pyright", "@inputs"), ("python3", "-c", "import pytest"),
+                     ("python3", "script.py"), ("python3", "-i", "-m", "pytest"), ("python3", "-u", "tests.py"),
+                     ("uv", "run", "-s", "script.py"), ("uv", "run", "--directory", "sub", "pytest"),
+                     ("uv", "run", "--unknown-flag", "pytest"), ("uv", "run", "bash", "deploy.sh"),
+                     ("uv", "run", "uv", "run", "pytest"), ("uv", "run", "--with=pytest", "bash", "deploy.sh"),
+                     ("uv", "publish")):
+            self.assertFalse(commands.restart_safe(list(argv)), argv)
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+        self.assertFalse(commands.paths_inside(["pytest", "--rootdir=sub", "tests/"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["uv", "--project", "sub", "run", "pytest"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["uv", "run", "--project=sub", "pytest"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["uv", "--directory", "sub", "run", "pytest"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["uv", "run", "--no-sync", "pytest"], "/r", "/r",
+                                               env={"UV_WORKING_DIR": "/other"}))
+        self.assertFalse(commands.paths_inside(["uv", "run", "--no-sync", "pytest"], "/r", "/r",
+                                               env={"UV_PROJECT": "/other"}))
+        self.assertFalse(commands.paths_inside(["env", "UV_WORKING_DIR=/other", "uv", "run", "pytest"], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["pytest", "tests/"], "/r", "/r",
+                                               env={"PYTEST_ADDOPTS": "--junitxml=out.xml"}))
+        self.assertFalse(commands.paths_inside(["pytest", "tests/"], "/r", "/r",
+                                               env={"PYTEST_ADDOPTS": "--collect-only"}))
+        self.assertFalse(commands.paths_inside(["pnpm", "exec", "pytest", "tests/"], "/r", "/r",
+                                               env={"PYTEST_ADDOPTS": "--collect-only"}))
+        self.assertTrue(commands.paths_inside(["pytest", "-kTestClient", "tests/"], "/r", "/r",
+                                              env={"PYTEST_ADDOPTS": "-q"}))
+        self.assertTrue(commands.paths_inside(["python3", "-m", "pytest", "-kTestClient", "tests/"], "/r", "/r"))
+        self.assertTrue(commands.paths_inside(["uv", "run", "--no-sync", "pytest", "-kTestClient", "tests/"], "/r", "/r"))
+        self.assertTrue(commands.paths_inside(["uv", "run", "--no-sync", "python3", "-m", "pytest", "-kTestClient", "tests/"],
+                                              "/r", "/r"))
+        # Daemon admission checks config [env] defaults (e.g. PYTEST_ADDOPTS=--collect-only) before dedupe.
+        self.daemon.cfg.env = {"PYTEST_ADDOPTS": "--collect-only"}
+        repo = self.workdir("cfg_env_repo")
+        t_cfg = self.submit(("pytest", "tests/"), cwd=repo,
+                            source={"repo": repo, "commit": "a" * 40, "dirty": False, "fingerprint": "0" * 32})
+        self.assertIsNone(t_cfg.dedupe)
+        self.finish(t_cfg)
+        self.daemon.cfg.env = {}
 
 
 if __name__ == "__main__":

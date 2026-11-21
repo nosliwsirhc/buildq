@@ -515,16 +515,23 @@ class Simulation:
     GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"})
 
     def honors_grant(self, ticket) -> bool:
-        """Tools registered with honors_grant=True hold to their grant; a script (a shell or an
-        interpreter running one) does under a jobserver, through the cargo or make it runs; anything
-        else (vitest, eslint, vite, storybook, node, a JS package script) runs at its own pace."""
-        tool, _ = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
-        check = getattr(self.mod, "honors_grant_tool", None)
-        if check is not None:
-            if check(tool):
+        """Tools registered with honors_grant=True hold to their grant (checked per invocation when
+        honors_grant_for is available, e.g. `zig build` vs `zig test`, or unwrapping `uv run`); a
+        script (a shell or an interpreter running one) does under a jobserver, through the cargo or
+        make it runs; anything else (vitest, eslint, vite, storybook, node, a JS package script)
+        runs at its own pace."""
+        tool, args = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
+        check_for = getattr(self.mod, "honors_grant_for", None)
+        if check_for is not None:
+            if check_for(tool, args):
                 return True
-        elif tool in getattr(self.mod, "HONORS_GRANT_TOOLS", self.GRANT_TOOLS):
-            return True
+        else:
+            check = getattr(self.mod, "honors_grant_tool", None)
+            if check is not None:
+                if check(tool):
+                    return True
+            elif tool in getattr(self.mod, "HONORS_GRANT_TOOLS", self.GRANT_TOOLS):
+                return True
         if tool in self.mod.SHELLS or tool in self.mod.INTERPRETERS - {"node", "deno", "bun"} \
                 or re.fullmatch(r"python3(\.\d+)?", tool):
             return bool(ticket.jobserver)
@@ -1065,13 +1072,15 @@ def hashed(prefix: str, word: str) -> str:
 # everywhere, which the lane rules and restart_safe read. Anything else (a script, a package, a
 # test filter) is hashed.
 PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
-    vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t""".split())
+    vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t
+    assemble compile ast-check build-exe build-lib build-obj test-obj cc c++ mypy pyright basedpyright""".split())
 # Tools an anonymized trace names (a command's first word); any other first word is hashed.
 # (The daemon's shells and interpreters are among them: honors_grant and the lane rules read the tool.)
 PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
-    eslint playwright storybook python python3 pytest py.test uv dotnet msbuild make gmake ninja cmake docker
-    podman buildah bash sh zsh dash ksh fish ruby perl git go gradle mvn java""".split())
-PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?|(?:gcc|g\+\+|clang|clang\+\+)-\d+")  # versioned tools
+    eslint playwright storybook python python3 pytest py.test mypy pyright basedpyright uv dotnet msbuild
+    make gmake ninja cmake ctest zig gcc g++ clang clang++ cc c++ docker podman buildah bash sh zsh dash
+    ksh fish ruby perl git go gradle gradlew mvn java""".split())
+PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?|(?:gcc|g\+\+|clang|clang\+\+|cc|c\+\+)-\d+")  # versioned tools
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 
@@ -1090,10 +1099,25 @@ PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches
     --workspace --all-features --no-default-features --features --package --no-run --no-fail-fast --locked
     --offline --frozen --jobs --load-average --test-threads --filter --recursive --noEmit --watch --run
     --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard
-    --doc""".split())
+    --doc --build --workflow --preset --config --clean-first --test-dir --max-workers --no-daemon --daemon
+    --no-sync --no-dev --build-and-test --dashboard --test-model --test-action --script
+    --script-new-process --add-notes --track --group --submit --extra-submit --submit-index
+    --http-header --http1.0 --tomorrow-tag --overwrite --test-command""".split())
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
-KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
+KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"}),
+                "--target": frozenset({"all", "test", "check", "ALL_BUILD"})}
 TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test
+GRADLE_ANON_UNSAFE = re.compile(
+    r"(publish|upload|deploy|install|uninstall|push|format|apply|fix|clean|connected|instrumented|"
+    r"firebase|bundletool|run|serve|start|stop|migrate|seed|drop|destroy|delete|remove|sign|promote|distribute)",
+    re.I,
+)
+GRADLE_ANON_SAFE = re.compile(
+    r"^(?:build|assemble|bundle|compile|classes|testClasses|jar|war|test|check|verify|lint|"
+    r"ktlintCheck|detekt|spotlessCheck|checkstyle|pmd|spotbugs|jacocoTestReport)(?:[A-Z0-9].*)?$"
+)
+UV_RUN_SAFE_ANON_FLAGS = frozenset({"--frozen", "--locked", "--no-sync", "--no-dev", "--offline", "-q", "--quiet",
+                                    "-v", "--verbose", "-m", "--module"})
 
 
 def option_value(name: str, value: str) -> str:
@@ -1127,13 +1151,59 @@ def anonymous_option(word: str) -> str:
     return hashed("w", word)
 
 
+def _anon_gradle_task(word: str) -> str:
+    """Anonymize a project-qualified Gradle task (`:secret:testDebugUnitTest` -> `test`) while
+    preserving restart_safe without exposing module or variant names."""
+    leaf = word.rsplit(":", 1)[-1]
+    if not leaf or not GRADLE_ANON_SAFE.fullmatch(leaf) or GRADLE_ANON_UNSAFE.search(leaf):
+        return hashed("w", word)
+    if leaf.startswith("test"):
+        return "test"
+    if leaf.startswith(("check", "lint", "ktlint", "detekt", "spotless", "pmd", "spotbugs")):
+        return "check"
+    if leaf.startswith("assemble"):
+        return "assemble"
+    return "build"
+
+
 def anonymous_argv(argv: list[str]) -> list[str]:
     """A command as an anonymized trace keeps it (see above): `cargo test -p test` becomes
     `cargo test -p w9f86d0`; `python3 -m unittest discover -s tests` keeps all but `tests`."""
     if not argv:
         return []
-    python = bool(re.fullmatch(r"python[0-9.]*", os.path.basename(argv[0])))
-    out = [argv[0] if argv[0] in PUBLIC_TOOLS or PUBLIC_TOOL.fullmatch(argv[0]) else hashed("w", argv[0])]
+    head = argv[0]
+    if head == "uv" and len(argv) >= 3 and argv[1] == "run":
+        out = ["uv", "run"]
+        i = 2
+        is_module = False
+        while i < len(argv) and argv[i].startswith("-"):
+            w = argv[i]
+            if w == "--":
+                out.append(w)
+                i += 1
+                break
+            if w in UV_RUN_SAFE_ANON_FLAGS:
+                if w in ("-m", "--module"):
+                    is_module = True
+                out.append(w)
+                i += 1
+            else:
+                break
+        rest = argv[i:]
+        if rest:
+            if is_module:
+                out.append(rest[0] if rest[0] in PUBLIC_WORDS else hashed("w", rest[0]))
+                for before, word in zip(rest, rest[1:]):
+                    out.append(anonymous_option(word) if word.startswith("-") else hashed("w", word))
+            elif not rest[0].startswith("-"):
+                out.extend(anonymous_argv(rest))
+            else:
+                for before, word in zip([argv[i - 1], *rest], rest):
+                    out.append(anonymous_option(word) if word.startswith("-") else hashed("w", word))
+        return out
+    python = bool(re.fullmatch(r"python[0-9.]*", os.path.basename(head)))
+    gradle = os.path.basename(head) in ("gradle", "gradlew")
+    out = [head if head in PUBLIC_TOOLS or PUBLIC_TOOL.fullmatch(head) else hashed("w", head)]
     leading = True  # still among the subcommands it starts with
     for before, word in zip(argv, argv[1:]):
         if leading and (word in TOOLCHAINS or (python and word == "-m")):
@@ -1143,6 +1213,8 @@ def anonymous_argv(argv: list[str]) -> list[str]:
             out.append(anonymous_option(word))
         elif leading and word in PUBLIC_WORDS:
             out.append(word)
+        elif leading and gradle:
+            out.append(_anon_gradle_task(word))
         else:
             leading = False
             keep = (before in COUNT_OPTIONS and word.isdigit()) or word in KNOWN_VALUES.get(before, ())

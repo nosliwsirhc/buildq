@@ -8,15 +8,20 @@ Telling agents to use the queue works most of the time. Two optional pieces make
 
 - **Shims** (`./install.sh --shims`, then put `~/.local/share/buildq/shims` first on `PATH`, after
   anything else that changes it, such as nvm or rustup). The shims stand in for `cargo`, `pnpm`,
-  `npm`, `npx`, `yarn`, `make`, `ninja` and `dotnet`. A heavy command runs as `buildq run -- <the
-  real tool> ...`: any cargo subcommand that compiles (everything but `fmt`, `metadata`, `tree`,
-  `clean` and the like, external subcommands included), npm and pnpm scripts named like
-  `build*`, `test*`, `lint*` or `e2e*`, `vitest run`, `make` (except long-running targets such as
-  `dev` or `up`), `dotnet build/test`. Anything else, and any watch mode, runs directly, as does
-  everything inside a build, in GitHub Actions jobs (`GITHUB_ACTIONS` and `RUNNER_NAME` set; `CI=true`
-  alone isn't enough, since people set it to turn watch modes off), and under rust-analyzer.
-  `cargo run` and `dotnet run` build in the queue, then run the program directly, with stdin.
-  `BUILDQ_SHIM=off` turns them off for one command.
+  `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet`, plus `cmake`, `ctest`, `zig` and
+  `gradle` when those binaries exist on `PATH` (absent optional tools aren't linked, so wrappers
+  like `command -v gradle || ./gradlew` keep working).
+  A heavy command runs as `buildq run -- <the real tool> ...`: any cargo subcommand that compiles
+  (everything but `fmt`, `metadata`, `tree`, `clean` and the like, external subcommands included),
+  npm and pnpm scripts named like `build*`, `test*`, `lint*` or `e2e*`, `vitest run`, `make`
+  (except long-running targets such as `dev` or `up`), `dotnet build/test`, `cmake --build` /
+  `--workflow`, `ctest` (except `--show-only`/`--list-presets`), `zig build/test/build-exe/
+  build-lib/build-obj`, and `gradle` build/test tasks (except `--stop`/`--status`/dry-runs/
+  continuous mode). Anything else, and any watch mode, runs directly, as does everything inside a
+  build, in GitHub Actions jobs (`GITHUB_ACTIONS` and `RUNNER_NAME` set; `CI=true` alone isn't
+  enough, since people set it to turn watch modes off), and under rust-analyzer. `cargo run` and
+  `dotnet run` build in the queue, then run the program directly, with stdin. `BUILDQ_SHIM=off`
+  turns them off for one command.
 - **The Rust guard** (`./install.sh --rustc-guard=~/src,~/work`). Cargo runs every `rustc` under those
   directories through `buildq-rustc-guard`, which refuses to compile unless the process is inside a
   buildq build. It checks the build's cgroup, which the kernel sets and an environment variable
