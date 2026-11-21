@@ -13,7 +13,6 @@ import traceback
 
 from . import commands, common, machine, tools
 from .commands import MAKE_FLAG_VARS
-from .tools import JOBSERVER_TOOLS, MAKEFLAGS_JOBSERVER_TOOLS
 from .common import FINISHED, GIB, MIB, PENDING
 from .config import CI_LONG_WAITS
 from .runners import Jobserver
@@ -510,7 +509,7 @@ class SchedulerMixin:
         already running can still write below it."""
         paths = [*(t.disk_paths or [t.cwd]), self.state_dir]
         remote = str((t.env or {}).get("DOCKER_HOST") or (t.env or {}).get("CONTAINER_HOST") or "")
-        if commands._tool_and_args(t.argv)[0] in ("docker", "podman", "buildah") and not remote.startswith(("tcp:", "ssh:")):
+        if tools.uses_container_storage(commands._tool_and_args(t.argv)[0]) and not remote.startswith(("tcp:", "ssh:")):
             for path in self.cfg.container_storage:  # (a build on a remote engine writes there, not here)
                 try:
                     os.stat(path)
@@ -908,7 +907,7 @@ class SchedulerMixin:
                 raise OSError("its environment file is missing")
             stripped = commands.strip_wrappers(t.argv)
             tool = os.path.basename((stripped or ["?"])[0])
-            known = tool in JOBSERVER_TOOLS
+            known = tools.uses_jobserver(tool)
             wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
             # An inherited jobserver passed by descriptor is dead in the build's service: drop it,
             # and give the build buildq's, unless the caller still brings make flags of its own.
@@ -931,20 +930,23 @@ class SchedulerMixin:
                 t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
                 t.tokens_out = t.js.out
             tool_at = len(t.argv) - len(stripped)  # (a wrapper's own words stay: env -u -j make)
-            t.exec_argv = tools.rewrite_argv_for(tool, t.argv, tool_at, granted, t.jobserver)
+            t.exec_argv = tools.rewrite_argv_for(tool, t.argv, tool_at, granted, t.jobserver,
+                                                 lane.test_threads, env)
             # buildq's settings go in a file of their own, so a build that is queued again after a
             # restart gets fresh ones.
             ours = self.build_env(t, caller_env=env)
-            # The caller's own settings win; an empty make variable is no setting (a make recipe
-            # exports MAKEFLAGS= and MFLAGS=), so buildq's flags go in its place.
-            given = {k for k in env if k not in MAKE_FLAG_VARS or str(env[k]).strip()}
+            # The caller's own settings win, except keys declared in MERGE_ENV_VARS (which a tool
+            # merges with `caller_env` itself) and empty make variables (a make recipe exports
+            # MAKEFLAGS= and MFLAGS=), so buildq's flags go in their place.
+            given = {k for k in env
+                     if k not in tools.MERGE_ENV_VARS and (k not in MAKE_FLAG_VARS or str(env[k]).strip())}
             parallel = {k: v for k, v in ours.items() if k not in given}
             for k, rest in cleaned.items():
                 # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
                 # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)
-                mine = ours.get(k) or (f"-j{t.want} --jobserver-auth=fifo:{t.jobserver}"
+                mine = ours.get(k) or (tools.jobserver_flags(t.want, t.jobserver)
                                        if t.jobserver and k != "CARGO_MAKEFLAGS"
-                                       and tool in MAKEFLAGS_JOBSERVER_TOOLS else "")
+                                       and tools.uses_makeflags_jobserver(tool) else "")
                 parallel[k] = commands.with_make_flags(rest, mine)
             common.write_json(os.path.join(t.dir, "parallel.json"), parallel)
             self.runner.prepare(t, self.cfg.slice)

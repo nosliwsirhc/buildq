@@ -1301,23 +1301,33 @@ class PackagePlumbing(unittest.TestCase):
 class ToolsRegistry(unittest.TestCase):
     """Single source of truth in buildq.tools stays consistent with commands, scheduler, and sim."""
 
-    def test_derived_sets_and_duplicate_registration_guard(self):
+    def test_derived_sets_pattern_lookup_and_config_compatibility(self):
         self.assertEqual(tools.JOBSERVER_TOOLS, frozenset({"cargo", "make", "gmake", "ninja"}))
         self.assertEqual(tools.MAKEFLAGS_JOBSERVER_TOOLS, frozenset({"make", "gmake", "ninja"}))
         self.assertEqual(tools.HONORS_GRANT_TOOLS,
                          frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"}))
-        self.assertTrue(tools.REGISTERED_TOOL_NAMES <= commands.NOT_SCRIPTS)
+        self.assertEqual(tools.CONTAINER_TOOLS, frozenset({"docker", "podman", "buildah"}))
+        self.assertTrue(tools.NOT_SCRIPT_TOOLS <= commands.NOT_SCRIPTS)
         self.assertIs(tools.lookup("cargo"), tools.REGISTRY["cargo"])
         self.assertIsNone(tools.lookup("not-a-tool"))
         with self.assertRaisesRegex(ValueError, "already registered"):
             tools.build_registry((tools.ToolSpec(names=("cargo",)), tools.ToolSpec(names=("cargo",))))
         with self.assertRaises(TypeError):
             tools.REGISTRY["x"] = tools.ToolSpec(names=("x",))  # type: ignore[index]
+        # Backwards compatibility: configs that listed JS check tools in restartable_scripts still load.
+        cfg = config.Config(config.tomllib.loads('restartable_scripts = ["eslint", "tsc", "vitest"]\n' + BASE_CONFIG),
+                            128 * GIB, 32)
+        self.assertEqual(cfg.restartable_scripts, frozenset({"eslint", "tsc", "vitest"}))
+        # Pattern lookup fallback supports versioned tool names (e.g. gcc-16 in PR 2).
+        pat_spec = tools.ToolSpec(names=("gcc",), name_pattern=re.compile(r"gcc-\d+"), honors_grant=True)
+        with mock.patch.object(tools, "_PATTERN_SPECS", (pat_spec,)):
+            self.assertIs(tools.lookup("gcc-16"), pat_spec)
+            self.assertTrue(tools.honors_grant_tool("gcc-16"))
 
-    def test_env_and_rewrite_argv_via_registry(self):
+    def test_env_rewrite_argv_and_cargo_redaction_parity(self):
         env_cargo = tools.env_for("cargo", ["build"], 4, 8, "/tmp/js", False)
         self.assertEqual(env_cargo["BUILDQ_CORES"], "4")
-        self.assertEqual(env_cargo["CARGO_MAKEFLAGS"], "-j8 --jobserver-auth=fifo:/tmp/js")
+        self.assertEqual(env_cargo["CARGO_MAKEFLAGS"], tools.jobserver_flags(8, "/tmp/js"))
         self.assertNotIn("MAKEFLAGS", env_cargo)
         self.assertEqual(env_cargo["DOTNET_PROCESSOR_COUNT"], "4")
         self.assertEqual(env_cargo["MSBUILDDISABLENODEREUSE"], "1")
@@ -1328,12 +1338,42 @@ class ToolsRegistry(unittest.TestCase):
         env_make_serial = tools.env_for("make", ["all"], 4, 8, "/tmp/js", False)
         self.assertNotIn("MAKEFLAGS", env_make_serial)
         env_make_par = tools.env_for("make", ["-j8", "all"], 4, 8, "/tmp/js", False)
-        self.assertEqual(env_make_par["MAKEFLAGS"], "-j8 --jobserver-auth=fifo:/tmp/js")
+        self.assertEqual(env_make_par["MAKEFLAGS"], tools.jobserver_flags(8, "/tmp/js"))
         self.assertEqual(tools.rewrite_argv_for("make", ["env", "-u", "-j", "make", "-j8", "all"], 3, 4, "/tmp/js"),
                          ["env", "-u", "-j", "make", "all"])
         self.assertIsNone(tools.rewrite_argv_for("make", ["env", "-u", "-j", "make", "all"], 3, 4, "/tmp/js"))
+        self.assertIsNone(tools.rewrite_argv_for("make", [], 0, 4, "/tmp/js"))
+        # Cargo subcommand classification uses the same credential/URL redaction and `--` truncation as command_words.
         self.assertFalse(commands.restart_safe(["cargo", "--", "test"]))
         self.assertFalse(commands.reusable_check(["cargo", "--", "test"]))
+        url_arg = '--config=http.proxy="http://proxy.example:8080"'
+        self.assertFalse(commands.restart_safe(["cargo", url_arg, "test"]))
+        self.assertFalse(commands.reusable_check(["cargo", url_arg, "test"]))
+        # cargo_cold remains Cargo-only even if another tool registers a cold detector.
+        fake_cold = tools.ToolSpec(names=("zig",), is_cold=lambda *_: True)
+        with mock.patch.object(tools, "REGISTRY", {**tools.REGISTRY, "zig": fake_cold}):
+            self.assertTrue(commands.is_cold(["zig", "build"], "/tmp", {}))
+            self.assertFalse(commands.cargo_cold(["zig", "build"], "/tmp", {}))
+
+
+class MergeEnvVars(DaemonCase):
+    """ToolSpec.merge_env_vars passes merged caller env values through SchedulerMixin.start()."""
+
+    def test_merge_env_vars_bypasses_given_filter_while_plain_keys_keep_caller_precedence(self):
+        merged_spec = tools.ToolSpec(
+            names=("gradle",),
+            merge_env_vars=("GRADLE_OPTS",),
+            global_env=lambda g, _w, _js, _tt, cenv: {
+                "GRADLE_OPTS": f"{(cenv or {}).get('GRADLE_OPTS', '')} -Dorg.gradle.workers.max={g}".strip()
+            },
+        )
+        with mock.patch.object(tools, "SPECS", (*tools.SPECS, merged_spec)), \
+             mock.patch.object(tools, "MERGE_ENV_VARS", tools.MERGE_ENV_VARS | {"GRADLE_OPTS"}):
+            t = self.submit(("cargo", "build"), env={"GRADLE_OPTS": "-Xmx4g", "GOMAXPROCS": "2"})
+        with open(os.path.join(t.dir, "parallel.json")) as f:
+            parallel = json.load(f)
+        self.assertEqual(parallel["GRADLE_OPTS"], f"-Xmx4g -Dorg.gradle.workers.max={t.granted}")
+        self.assertNotIn("GOMAXPROCS", parallel)  # plain key still defers to caller's value
 
 
 if __name__ == "__main__":

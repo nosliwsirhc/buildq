@@ -510,17 +510,20 @@ class Simulation:
         job.honors_grant = self.honors_grant(ticket)
         self.jobs[ticket.id] = job
 
-    # Tools that hold to the cores buildq grants them: a jobserver's tokens or CARGO_BUILD_JOBS (cargo,
-    # make, ninja), DOTNET_PROCESSOR_COUNT, CMAKE_BUILD_PARALLEL_LEVEL. JS tools and test runners
-    # (vitest, eslint, node) start a worker per core the machine has, jobserver or not.
+    # Frozen historical fallback for pre-registry `base` daemons lacking `buildq.tools`.
+    # Newer daemons supply `honors_grant_tool()` / `HONORS_GRANT_TOOLS` directly.
     GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"})
 
     def honors_grant(self, ticket) -> bool:
-        """cargo, make, ninja, dotnet, cmake and go hold to their grant; a script (a shell or an
+        """Tools registered with honors_grant=True hold to their grant; a script (a shell or an
         interpreter running one) does under a jobserver, through the cargo or make it runs; anything
         else (vitest, eslint, vite, storybook, node, a JS package script) runs at its own pace."""
         tool, _ = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
-        if tool in getattr(self.mod, "HONORS_GRANT_TOOLS", self.GRANT_TOOLS):
+        check = getattr(self.mod, "honors_grant_tool", None)
+        if check is not None:
+            if check(tool):
+                return True
+        elif tool in getattr(self.mod, "HONORS_GRANT_TOOLS", self.GRANT_TOOLS):
             return True
         if tool in self.mod.SHELLS or tool in self.mod.INTERPRETERS - {"node", "deno", "bun"} \
                 or re.fullmatch(r"python3(\.\d+)?", tool):

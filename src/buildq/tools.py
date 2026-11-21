@@ -10,6 +10,7 @@ import re
 from types import MappingProxyType
 
 SCRIPT_WORD = re.compile(r"[a-z][a-z_-]{0,23}")
+CREDENTIAL_OR_ASSIGN = re.compile(r"://|^[^@\s/]+:[^@\s]*@|^[^-][^=]*=")
 CARGO_VALUE_OPTIONS = frozenset({
     "--manifest-path", "--target-dir", "-j", "--jobs", "--color", "--config",
     "-Z", "--profile", "--target", "-F", "--features", "--bin", "--test",
@@ -20,16 +21,25 @@ VERIFY_CARGO = frozenset({"check", "c", "clippy", "test", "t", "nextest"})
 RESTART_CARGO = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "doc", "d", "nextest", "bench"})
 
 
-def positionals(args: list[str], value_options: Collection[str] = frozenset()) -> list[str]:
+def redact_args(args: list[str]) -> list[str]:
+    """Replace URLs, user:pass@, and plain assignments so credentials never enter keys or subcommands."""
+    return ["…" if CREDENTIAL_OR_ASSIGN.search(a) else a for a in args]
+
+
+def positional_items(args: list[str], value_options: Collection[str] = frozenset()) -> list[tuple[int, str]]:
     out, skip = [], False
-    for arg in args:
+    for i, arg in enumerate(args):
         if skip:
             skip = False
         elif arg.startswith("-"):
             skip = arg in value_options
         else:
-            out.append(arg)
+            out.append((i, arg))
     return out
+
+
+def positionals(args: list[str], value_options: Collection[str] = frozenset()) -> list[str]:
+    return [arg for _, arg in positional_items(args, value_options)]
 
 
 def option_values(args: list[str], names: Collection[str]) -> list[str]:
@@ -67,6 +77,11 @@ def without_jobs(argv: list[str]) -> list[str]:
     return out
 
 
+def jobserver_flags(want: int, jobserver: str) -> str:
+    """GNU make 4.4+ / cargo / ninja FIFO jobserver flags."""
+    return f"-j{want} --jobserver-auth=fifo:{jobserver}"
+
+
 def no_emit(args: list[str]) -> bool:
     """Whether tsc's --noEmit is in effect at the end of its arguments (`--noEmit false` turns it off)."""
     on, i = False, 0
@@ -87,22 +102,31 @@ class ToolSpec:
     """Declarative specification of how buildq classifies, sizes, and isolates a compiler or tool."""
 
     names: tuple[str, ...]
+    # Optional regex matched as a fallback in lookup() for versioned tool binaries (e.g. gcc-16).
+    name_pattern: re.Pattern[str] | None = None
     honors_grant: bool = False
     jobserver: bool = False
     makeflags_jobserver: bool = False
+    container_storage: bool = False
+    # True when these names must be rejected in `restartable_scripts` config validation.
+    not_script: bool = True
+    # Env var names whose values this tool explicitly merges with `caller_env` (exempted from
+    # scheduler.start()'s `given` filter so returned merged values take effect; returning without
+    # the key lets the caller's existing value stand unchanged).
+    merge_env_vars: tuple[str, ...] = ()
     command_words: Callable[[str, list[str], Collection[str]], list[str]] | None = None
     restart_safe: Callable[[str, list[str]], bool] | None = None
     reusable_check: Callable[[str, list[str]], bool] | None = None
-    # Exported to every build (so wrapper scripts invoking this tool inherit core limits); receives
-    # `caller_env` so a tool can merge into an existing caller variable without clobbering it.
+    # Exported to every build (so wrapper scripts invoking this tool inherit core limits).
     global_env: Callable[[int, int, str | None, bool, dict | None], dict[str, str]] | None = None
     # Exported only when this tool is the direct command (e.g. MAKEFLAGS for make -j / ninja).
     direct_env: Callable[[str, list[str], int, int, str | None, bool, dict | None], dict[str, str]] | None = None
-    # Optional argv adjustment when this tool is the direct command (e.g. stripping -j for jobserver).
-    rewrite_argv: Callable[[str, list[str], int, int, str | None], list[str] | None] | None = None
-    # Extra output directories to watch in `buildq top` when this tool runs.
+    # Optional args rewrite when this tool is the direct command; receives only the tool's own
+    # args (without executable or wrappers) and returns replacement args or None.
+    rewrite_argv: Callable[[str, list[str], int, str | None, bool, dict | None], list[str] | None] | None = None
+    # Extra output directories to watch in `buildq top` when this tool runs (receives tool args).
     write_dirs: Callable[[str, list[str], str, dict], list[str]] | None = None
-    # Whether this invocation looks like a cold build from scratch.
+    # Whether this invocation looks like a cold build from scratch (receives tool args).
     is_cold: Callable[[str, list[str], str, dict], bool] | None = None
 
 
@@ -133,7 +157,7 @@ def _cargo_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[s
 
 def _cargo_subcommand(args: list[str]) -> str:
     before = args[:args.index("--")] if "--" in args else args
-    words = _cargo_words("cargo", before, ())
+    words = _cargo_words("cargo", redact_args(before), ())
     return words[1] if len(words) > 1 else ""
 
 
@@ -148,20 +172,20 @@ def _cargo_reusable_check(_tool: str, args: list[str]) -> bool:
 
 def _cargo_global_env(granted: int, want: int, jobserver: str | None, test_threads: bool,
                       _caller_env: dict | None) -> dict[str, str]:
-    g, w = str(granted), str(want)
+    g = str(granted)
     values: dict[str, str] = {}
     if test_threads:
         values["RUST_TEST_THREADS"] = g
         values["NEXTEST_TEST_THREADS"] = g
     if jobserver:
         # cargo reads CARGO_MAKEFLAGS first and hands its jobserver to build scripts.
-        values["CARGO_MAKEFLAGS"] = f"-j{w} --jobserver-auth=fifo:{jobserver}"
+        values["CARGO_MAKEFLAGS"] = jobserver_flags(want, jobserver)
     else:
         values["CARGO_BUILD_JOBS"] = g  # no tokens to bound it, so cargo is told the number
     return values
 
 
-def _cargo_write_dirs(_tool: str, _argv: list[str], cwd: str, env: dict) -> list[str]:
+def _cargo_write_dirs(_tool: str, _args: list[str], cwd: str, env: dict) -> list[str]:
     if env.get("CARGO_TARGET_DIR"):
         return []  # already tracked globally in commands.write_dirs_of
     here = os.path.abspath(cwd)
@@ -174,7 +198,7 @@ def _cargo_write_dirs(_tool: str, _argv: list[str], cwd: str, env: dict) -> list
     return []
 
 
-def _cargo_is_cold(_tool: str, argv: list[str], cwd: str, env: dict) -> bool:
+def _cargo_is_cold(_tool: str, args: list[str], cwd: str, env: dict) -> bool:
     """Whether a cargo command will build from scratch: its target directory has no build of that
     profile yet. History of warm builds says little about a cold one."""
     target = env.get("CARGO_TARGET_DIR")
@@ -196,8 +220,8 @@ def _cargo_is_cold(_tool: str, argv: list[str], cwd: str, env: dict) -> bool:
         if root is None:
             return False
         target = os.path.join(root, "target")
-    profile = "release" if "--release" in argv else "debug"
-    profiles = option_values(argv, {"--profile"})
+    profile = "release" if "--release" in args else "debug"
+    profiles = option_values(args, {"--profile"})
     if profiles:
         profile = {"dev": "debug", "test": "debug", "bench": "release"}.get(profiles[0], profiles[0])
     return not os.path.isdir(os.path.join(target, profile))
@@ -207,29 +231,27 @@ def _make_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[st
     return [tool] + [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
 
 
+def _makeflags_env(granted: int, want: int, jobserver: str | None) -> dict[str, str]:
+    return {"MAKEFLAGS": jobserver_flags(want, jobserver) if jobserver else f"-j{granted}"}
+
+
 def _make_direct_env(_tool: str, args: list[str], granted: int, want: int, jobserver: str | None,
                      _test_threads: bool, _caller_env: dict | None) -> dict[str, str]:
     # make runs in parallel only when asked (-j): a Makefile not written for it can break.
-    if not asks_for_jobs(args):
-        return {}
-    if jobserver:
-        return {"MAKEFLAGS": f"-j{want} --jobserver-auth=fifo:{jobserver}"}
-    return {"MAKEFLAGS": f"-j{granted}"}
+    return _makeflags_env(granted, want, jobserver) if asks_for_jobs(args) else {}
 
 
-def _make_rewrite_argv(_tool: str, argv: list[str], tool_at: int, _granted: int,
-                       jobserver: str | None) -> list[str] | None:
-    if jobserver and asks_for_jobs(argv[tool_at + 1:]):
-        return argv[:tool_at] + without_jobs(argv[tool_at:])  # its -j would make it ignore the jobserver
+def _make_rewrite_argv(_tool: str, args: list[str], _granted: int, jobserver: str | None,
+                       _test_threads: bool, _caller_env: dict | None) -> list[str] | None:
+    if jobserver and asks_for_jobs(args):
+        return without_jobs(args)  # its -j would make it ignore the jobserver
     return None
 
 
 def _ninja_direct_env(_tool: str, _args: list[str], granted: int, want: int, jobserver: str | None,
                       _test_threads: bool, _caller_env: dict | None) -> dict[str, str]:
     # ninja is parallel by design.
-    if jobserver:
-        return {"MAKEFLAGS": f"-j{want} --jobserver-auth=fifo:{jobserver}"}
-    return {"MAKEFLAGS": f"-j{granted}"}
+    return _makeflags_env(granted, want, jobserver)
 
 
 def _ninja_restart_safe(_tool: str, args: list[str]) -> bool:
@@ -258,22 +280,15 @@ def _dotnet_global_env(granted: int, _want: int, _jobserver: str | None, _test_t
 def _js_words(tool: str, rest: list[str], labels: Collection[str]) -> list[str]:
     words = [tool]
     words += [f"--filter {f}" for f in sorted(set(option_values(rest, {"--filter", "-F"})))]
-    at, skip = [], False  # where each positional word is (not an option's value)
-    for i, arg in enumerate(rest):
-        if skip:
-            skip = False
-        elif arg.startswith("-"):
-            skip = arg in JS_VALUE_OPTIONS
-        else:
-            at.append(i)
-    verb = rest[at[0]] if at and rest[at[0]] in ("run", "run-script", "exec", "x", "dlx") else None
+    items = positional_items(rest, JS_VALUE_OPTIONS)
+    verb = items[0][1] if items and items[0][1] in ("run", "run-script", "exec", "x", "dlx") else None
     if verb:
-        at = at[1:]
-    words += [rest[i] for i in at[:1]]
+        items = items[1:]
+    words += [arg for _, arg in items[:1]]
     # A package script in script_labels takes a label too (`verify:push docs`): the word right after
     # it, not an option's value; only a script it runs, not a binary (exec, x, dlx).
-    if at and rest[at[0]] in labels and verb not in ("exec", "x", "dlx"):
-        after = rest[at[0] + 1:][:1]
+    if items and items[0][1] in labels and verb not in ("exec", "x", "dlx"):
+        after = rest[items[0][0] + 1:][:1]
         if after and SCRIPT_WORD.fullmatch(after[0]):
             words.append(after[0])
     return words
@@ -347,16 +362,19 @@ SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         names=("tsc", "vue-tsc"),
+        not_script=False,  # kept out of NOT_SCRIPTS for backwards config.toml compatibility
         restart_safe=lambda _t, _a: True,
         reusable_check=lambda _t, a: no_emit(a),
     ),
     ToolSpec(
         names=("eslint",),
+        not_script=False,  # kept out of NOT_SCRIPTS for backwards config.toml compatibility
         restart_safe=lambda _t, _a: True,
         reusable_check=lambda _t, _a: True,
     ),
     ToolSpec(
         names=("vitest",),
+        not_script=False,  # kept out of NOT_SCRIPTS for backwards config.toml compatibility
         restart_safe=lambda _t, _a: True,
         reusable_check=_vitest_reusable_check,
     ),
@@ -366,70 +384,108 @@ SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         names=("docker", "podman", "buildah"),
+        container_storage=True,
     ),
 )
 
 REGISTRY: Mapping[str, ToolSpec] = build_registry(SPECS)
+_PATTERN_SPECS: tuple[ToolSpec, ...] = tuple(s for s in SPECS if s.name_pattern is not None)
 JOBSERVER_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.jobserver for n in s.names)
 MAKEFLAGS_JOBSERVER_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.makeflags_jobserver for n in s.names)
 HONORS_GRANT_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.honors_grant for n in s.names)
+CONTAINER_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.container_storage for n in s.names)
+MERGE_ENV_VARS: frozenset[str] = frozenset(v for s in SPECS for v in s.merge_env_vars)
+NOT_SCRIPT_TOOLS: frozenset[str] = frozenset(n for s in SPECS if s.not_script for n in s.names)
 REGISTERED_TOOL_NAMES: frozenset[str] = frozenset(REGISTRY)
 
 
 def lookup(tool: str) -> ToolSpec | None:
-    return REGISTRY.get(tool)
+    spec = REGISTRY.get(tool)
+    if spec is not None:
+        return spec
+    for spec in _PATTERN_SPECS:
+        if spec.name_pattern and spec.name_pattern.fullmatch(tool):
+            return spec
+    return None
 
 
 # ---- Dispatch helpers (distinct names from commands.* to avoid sim.py facade collisions) ----
 
 
+def honors_grant_tool(tool: str) -> bool:
+    spec = lookup(tool)
+    return bool(spec and spec.honors_grant)
+
+
+def uses_jobserver(tool: str) -> bool:
+    spec = lookup(tool)
+    return bool(spec and spec.jobserver)
+
+
+def uses_makeflags_jobserver(tool: str) -> bool:
+    spec = lookup(tool)
+    return bool(spec and spec.makeflags_jobserver)
+
+
+def uses_container_storage(tool: str) -> bool:
+    spec = lookup(tool)
+    return bool(spec and spec.container_storage)
+
+
 def words_for(tool: str, rest: list[str], labels: Collection[str] = ()) -> list[str] | None:
-    spec = REGISTRY.get(tool)
+    spec = lookup(tool)
     if spec and spec.command_words:
         return spec.command_words(tool, rest, labels)
     return None
 
 
 def is_restart_safe(tool: str, args: list[str]) -> bool:
-    spec = REGISTRY.get(tool)
+    spec = lookup(tool)
     return bool(spec and spec.restart_safe and spec.restart_safe(tool, args))
 
 
 def is_reusable_check(tool: str, args: list[str]) -> bool:
-    spec = REGISTRY.get(tool)
+    spec = lookup(tool)
     return bool(spec and spec.reusable_check and spec.reusable_check(tool, args))
 
 
 def env_for(tool: str, args: list[str], granted: int, want: int, jobserver: str | None,
             test_threads: bool, caller_env: dict | None = None) -> dict[str, str]:
-    """Parallelism and cgroup-containment env vars for a build (caller's own settings win later)."""
+    """Parallelism and cgroup-containment env vars for a build (caller's own settings win later,
+    except keys declared in `MERGE_ENV_VARS`, which a tool merges with `caller_env` itself)."""
     values: dict[str, str] = {"BUILDQ_CORES": str(granted)}
     for spec in SPECS:
         if spec.global_env:
             values.update(spec.global_env(granted, want, jobserver, test_threads, caller_env))
-    direct = REGISTRY.get(tool)
+    direct = lookup(tool)
     if direct and direct.direct_env:
         values.update(direct.direct_env(tool, args, granted, want, jobserver, test_threads, caller_env))
     return values
 
 
-def rewrite_argv_for(tool: str, argv: list[str], tool_at: int, granted: int,
-                     jobserver: str | None) -> list[str] | None:
-    spec = REGISTRY.get(tool)
-    if spec and spec.rewrite_argv:
-        return spec.rewrite_argv(tool, argv, tool_at, granted, jobserver)
-    return None
+def rewrite_argv_for(tool: str, argv: list[str], tool_at: int, granted: int, jobserver: str | None,
+                     test_threads: bool = False, caller_env: dict | None = None) -> list[str] | None:
+    if tool_at >= len(argv):
+        return None
+    spec = lookup(tool)
+    if not (spec and spec.rewrite_argv):
+        return None
+    args = argv[tool_at + 1:]
+    rewritten = spec.rewrite_argv(tool, args, granted, jobserver, test_threads, caller_env)
+    if rewritten is None or rewritten == args:
+        return None
+    return argv[:tool_at + 1] + rewritten
 
 
-def write_dirs_for(tool: str, argv: list[str], cwd: str, env: dict) -> list[str]:
-    spec = REGISTRY.get(tool)
+def write_dirs_for(tool: str, args: list[str], cwd: str, env: dict) -> list[str]:
+    spec = lookup(tool)
     if spec and spec.write_dirs:
-        return spec.write_dirs(tool, argv, cwd, env)
+        return spec.write_dirs(tool, args, cwd, env)
     return []
 
 
-def is_cold_for(tool: str, argv: list[str], cwd: str, env: dict) -> bool:
-    spec = REGISTRY.get(tool)
+def is_cold_for(tool: str, args: list[str], cwd: str, env: dict) -> bool:
+    spec = lookup(tool)
     if spec and spec.is_cold:
-        return spec.is_cold(tool, argv, cwd, env)
+        return spec.is_cold(tool, args, cwd, env)
     return False

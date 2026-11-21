@@ -116,7 +116,7 @@ SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 INTERPRETERS = {"python", "python3", "node", "deno", "ruby", "perl", "bun"}
 # Names restartable_scripts refuses: tools and wrappers, not scripts (listing `git` would make `git
 # push` restartable).
-NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | tools.REGISTERED_TOOL_NAMES
+NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | tools.NOT_SCRIPT_TOOLS
                | {"env", "timeout", "rustc", "kubectl", "aws", "gh", "ssh", "scp", "rsync",
                   "curl", "wget", "xargs", "parallel", "busybox", "uv", "uvx", "just", "mvn",
                   "gradle", "gradlew", "terraform", "pytest", "jest", "sbt", "heavy-run", "buildq",
@@ -230,7 +230,7 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
     if not t:
         return ["?"]
     # Nothing that could hold a credential reaches a key, not even through basename().
-    t = [t[0]] + ["…" if re.search(r"://|^[^@\s/]+:[^@\s]*@|^[^-][^=]*=", a) else a for a in t[1:]]
+    t = [t[0]] + tools.redact_args(t[1:])
     tool = os.path.basename(t[0])
     rest = t[1:]
     matched = tools.words_for(tool, rest, labels)
@@ -653,7 +653,7 @@ def write_dirs_of(cwd: str, env: dict, argv: list[str]) -> list[str]:
         found.append(os.path.join(cwd, target))
     stripped = strip_wrappers(argv)
     if stripped:
-        found.extend(tools.write_dirs_for(os.path.basename(stripped[0]), stripped, cwd, env))
+        found.extend(tools.write_dirs_for(os.path.basename(stripped[0]), stripped[1:], cwd, env))
     if env.get("TMPDIR"):
         found.append(os.path.join(cwd, env["TMPDIR"]))
     kept: list[str] = []
@@ -688,10 +688,15 @@ def is_cold(argv: list[str], cwd: str, env: dict) -> bool:
     stripped = strip_wrappers(argv)
     if not stripped:
         return False
-    return tools.is_cold_for(os.path.basename(stripped[0]), stripped, cwd, env)
+    return tools.is_cold_for(os.path.basename(stripped[0]), stripped[1:], cwd, env)
 
 
-cargo_cold = is_cold
+def cargo_cold(argv: list[str], cwd: str, env: dict) -> bool:
+    """Cargo-only wrapper over `is_cold` (kept for callers expecting Cargo-only semantics)."""
+    stripped = strip_wrappers(argv)
+    if not stripped or os.path.basename(stripped[0]) != "cargo":
+        return False
+    return tools.is_cold_for("cargo", stripped[1:], cwd, env)
 
 
 SECRET_IN_URL = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")
