@@ -359,7 +359,8 @@ class Daemon(GitHubMixin, SchedulerMixin):
         # here, so a retry that joins another build uses it up too.
         place = self.vacated.pop((cwd, tuple(argv), lane_name, t.caller), None) if t.caller else None
         source = commands.sane_source(msg.get("source"))
-        if source and source.get("repo") and commands.paths_inside(argv, cwd, source["repo"], env):
+        effective_env = {**self.cfg.env, **env} if self.cfg.env else env
+        if source and source.get("repo") and commands.paths_inside(argv, cwd, source["repo"], effective_env):
             settings = [t.timeout, t.umask, t.rlimits, t.cores_given, t.mem_given, self.cfg.env]
             t.source, t.dedupe = source, commands.dedupe_key(source, argv, cwd, lane_name, env, settings)
         elif source:

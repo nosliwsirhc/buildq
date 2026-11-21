@@ -56,7 +56,7 @@ GRADLE_LIGHT_TASK = re.compile(
     r"(^|:)(help|tasks|projects|properties|dependencies|dependencyInsight|components|model|"
     r"outgoingVariants|resolvableConfigurations|clean|wrapper|init|bootRun|run)$", re.I
 )
-GRADLE_SHORT_LIGHT = re.compile(r"-[qidswamtuSvh?]*[tmvh?][qidswamtuSvh?]*")
+GRADLE_SHORT_LIGHT = re.compile(r"-[qidswamtuUSvh?]*[tmvh?][qidswamtuUSvh?]*")
 GRADLE_VALUE_OPTIONS = {
     "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-g", "--gradle-user-home",
     "-I", "--init-script", "-x", "--exclude-task", "--max-workers", "--console", "--console-unicode",
@@ -201,12 +201,16 @@ def heavy(tool: str, args: list[str]) -> bool:
         sub = args[0] if args and not args[0].startswith("-") else ""
         rest = args[1:]
         before = rest[: rest.index("--")] if "--" in rest else rest
-        if any(a in ("-h", "--help", "-l", "--list-steps", "--watch", "--fuzz", "--webui", "--listen")
-               or a.startswith(("--watch=", "--webui=", "--listen=")) for a in before):
+        if any(a in ("-h", "--help", "--watch", "--fuzz", "--webui", "--listen", "--time-report")
+               or a.startswith(("--watch=", "--webui=", "--listen=", "--time-report=")) for a in before):
             return False
         if sub == "build":
+            if {"-l", "--list-steps"} & set(before):
+                return False
             steps = positionals(before, ZIG_BUILD_VALUE_OPTIONS)
             return not steps or not all(MAKE_LIGHT_TARGET.search(s) for s in steps)
+        if sub == "test" and any(a == "--test-cmd" or a.startswith("--test-cmd=") for a in before):
+            return False
         return sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj")
     if tool in ("gradle", "gradlew"):
         sep = args.index("--") if "--" in args else len(args)

@@ -60,8 +60,9 @@ has_real_tool() {
   local name=$1 dir cand real_shimdir real_dir real_shim
   real_shimdir=$(realpath -m -- "$shimdir" 2>/dev/null || printf '%s' "$shimdir")
   real_shim=$(realpath -m -- "$bindir/buildq-shim" 2>/dev/null || printf '%s' "$bindir/buildq-shim")
-  local IFS=:
-  for dir in $PATH; do
+  local -a dirs
+  IFS=: read -r -a dirs <<< "$PATH"
+  for dir in "${dirs[@]}"; do
     [[ -n "$dir" ]] || continue
     real_dir=$(realpath -m -- "$dir" 2>/dev/null || printf '%s' "$dir")
     [[ "$real_dir" == "$real_shimdir" ]] && continue

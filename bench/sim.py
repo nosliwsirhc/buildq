@@ -1073,7 +1073,7 @@ def hashed(prefix: str, word: str) -> str:
 # test filter) is hashed.
 PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
     vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t
-    assemble compile ast-check build-exe build-lib build-obj mypy pyright basedpyright""".split())
+    assemble compile ast-check build-exe build-lib build-obj test-obj cc c++ mypy pyright basedpyright""".split())
 # Tools an anonymized trace names (a command's first word); any other first word is hashed.
 # (The daemon's shells and interpreters are among them: honors_grant and the lane rules read the tool.)
 PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
@@ -1100,7 +1100,8 @@ PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches
     --offline --frozen --jobs --load-average --test-threads --filter --recursive --noEmit --watch --run
     --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard
     --doc --build --workflow --preset --config --clean-first --test-dir --max-workers --no-daemon --daemon
-    --no-sync --no-dev""".split())
+    --no-sync --no-dev --build-and-test --dashboard --test-model --test-action --script
+    --script-new-process --extra-submit --test-command""".split())
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
 KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"}),
                 "--target": frozenset({"all", "test", "check"})}
@@ -1211,7 +1212,7 @@ def anonymous_argv(argv: list[str]) -> list[str]:
             out.append(anonymous_option(word))
         elif leading and word in PUBLIC_WORDS:
             out.append(word)
-        elif leading and gradle and ":" in word:
+        elif leading and gradle:
             out.append(_anon_gradle_task(word))
         else:
             leading = False

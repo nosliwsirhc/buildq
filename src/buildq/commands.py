@@ -230,6 +230,8 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
     # `uv run -- CMD` uses `--` before its inner command; `_uv_words` handles both delimiters.
     if "--" in t and os.path.basename(t[0]) != "uv":
         t = t[: t.index("--")]
+    if not t:
+        return ["?"]
     # Nothing that could hold a credential reaches a key, not even through basename().
     t = [t[0]] + tools.redact_args(t[1:])
     tool = os.path.basename(t[0])
@@ -304,7 +306,7 @@ def reusable_check(argv: list[str]) -> bool:
     answers it. Commands that produce files (builds, docs, bundles) and package scripts, which might
     do anything, never do."""
     tool, args = sure_tool_and_args(argv)  # (a wrapper with options: no tool, so no reuse)
-    if any(a in INFO_FLAGS or WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
+    if any(a in INFO_FLAGS or a.startswith("--help=") or WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
         return False
     if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
         return False  # `--reporter html`
@@ -434,7 +436,8 @@ OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # (RUSTC_WRAPPER=/x/w.sh) runs for every compile and might read anything, and CARGO_HOME's config
 # can point dependencies at a folder: those are still checked.
 TOOL_FOLDER = r"(/usr(/local)?/s?bin|/s?bin|/home/[^/]+/\.cargo/bin|/home/[^/]+/\.local/bin)"
-TOOL_FOLDER_RE = re.compile(rf"^{TOOL_FOLDER}(/.*)?$")
+# Debian/Ubuntu install `/usr/bin/clang` as a symlink to `/usr/lib/llvm-<N>/bin/clang`.
+CC_RESOLVED_FOLDER_RE = re.compile(rf"^({TOOL_FOLDER}|/usr/lib/llvm-\d+/bin)(/.*)?$")
 TOOL_VARIABLE = re.compile(rf"PATH={TOOL_FOLDER}(:{TOOL_FOLDER})*|RUSTUP_HOME=/home/[^/]+/\.rustup|"
                            r"(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)="
                            r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)")
@@ -450,7 +453,7 @@ def _trusted_tool_variable(arg: str) -> bool:
     if "/" not in val:
         return True  # bare compiler name; resolved via PATH
     # Resolve symlinks so a ~/.local/bin/clang -> ~/Code/llvm/bin/clang link isn't exempted.
-    return bool(TOOL_FOLDER_RE.fullmatch(os.path.realpath(val)))
+    return bool(CC_RESOLVED_FOLDER_RE.fullmatch(os.path.realpath(val)))
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
 UNREADABLE = re.compile(r"""[\x00-\x1f\\"'`$\[\]{}]|://""")  # (and control characters: cargo splits at \x1f)
@@ -511,6 +514,65 @@ def wrapper_settings(argv: list[str]) -> set[int]:
     return out
 
 
+def wrapper_env_sites(argv: list[str], tool_at: int) -> tuple[dict[str, int], int | None]:
+    """Walk wrapper tokens in `argv[:tool_at]` as `strip_wrappers` does, returning:
+    - `inline_idx`: map from variable name to the last `VAR=val` index set by `env`/`sudo`;
+    - `reset_insert_at`: if an `env -i`/`-`/`--ignore-environment` clears the inherited env,
+      the index inside that `env` command's assignment section where defaults can be inserted."""
+    inline_idx: dict[str, int] = {}
+    reset_insert_at: int | None = None
+    i = 0
+    while i < tool_at:
+        head = os.path.basename(argv[i])
+        if ASSIGNMENT.match(argv[i]):
+            i += 1
+        elif head == "env":
+            rest = env_command(argv[i + 1:tool_at])
+            if rest is None:
+                break
+            cmd_at = tool_at - len(rest)
+            opts_end = cmd_at
+            while opts_end > i + 1 and "=" in argv[opts_end - 1] and not argv[opts_end - 1].startswith("-"):
+                opts_end -= 1
+            k = i + 1
+            while k < opts_end:
+                opt = argv[k]
+                if opt == "--":
+                    break
+                if opt in ("-", "--ignore-environment") or (re.fullmatch(r"-[i0v]+", opt) and "i" in opt):
+                    inline_idx.clear()
+                    reset_insert_at = cmd_at
+                elif opt in ("-u", "--unset", "-C", "--chdir"):
+                    k += 1  # skip its value (e.g. `env -u -i`)
+                k += 1
+            for k_idx in range(opts_end, cmd_at):
+                k, _ = argv[k_idx].split("=", 1)
+                inline_idx[k] = k_idx
+            i = cmd_at
+        elif head == "timeout":
+            i += 1
+            while i < tool_at and argv[i].startswith("-"):
+                opt = argv[i]
+                i += 2 if opt in ("-s", "-k", "--signal", "--kill-after") and i + 1 < tool_at else 1
+            i += 1  # duration
+        elif head in WRAPPERS:
+            i += 1
+            while i < tool_at and argv[i].startswith("-"):
+                opt = argv[i]
+                i += 2 if opt in VALUE_OPTIONS and i + 1 < tool_at else 1
+            if head in ("taskset", "chrt"):
+                while i < tool_at and re.fullmatch(r"[0-9a-fA-Fx,\-]+", argv[i]):
+                    i += 1
+            if head == "sudo":
+                while i < tool_at and ASSIGNMENT.match(argv[i]):
+                    k, _ = argv[i].split("=", 1)
+                    inline_idx[k] = i
+                    i += 1
+        else:
+            break
+    return inline_idx, reset_insert_at
+
+
 def moving_words(argv: list[str]) -> list[str]:
     """The words of a command that may move it to another folder (CHANGES_FOLDER): all but those of
     a known tool's non-chdir options whose value or flag name may contain `C` (cargo `-pCore`/`-Fcli`,
@@ -534,6 +596,24 @@ def moving_words(argv: list[str]) -> list[str]:
         return argv[1:at] + [a for a in t[1:] if not a.startswith(("-k", "-m"))]
     if tool == "mypy":
         return argv[1:at] + [a for a in t[1:] if not a.startswith(("-p", "-m"))]
+    # Also apply pytest/mypy exemptions when invoked through `python3 -m` or `uv run`.
+    if tool in ("python", "python3") or re.fullmatch(r"python3\.\d+", tool):
+        call = tools._python_module_call(t[1:])
+        if call and call[0] in ("pytest", "mypy"):
+            exempt = ("-k", "-m") if call[0] == "pytest" else ("-p", "-m")
+            mod_at = len(t) - len(call[1])
+            return argv[1:at + mod_at] + [a for a in call[1] if not a.startswith(exempt)]
+    if tool == "uv":
+        parsed = tools._uv_parse_strict(t[1:])
+        if parsed and parsed[0] == "run":
+            _, inner, is_module, _ = parsed
+            inner_at = len(t) - len(inner)
+            if is_module and inner[0] in ("pytest", "mypy"):
+                exempt = ("-k", "-m") if inner[0] == "pytest" else ("-p", "-m")
+                return argv[1:at + inner_at + 1] + [a for a in inner[1:] if not a.startswith(exempt)]
+            if not is_module and os.path.basename(inner[0]) in ("pytest", "py.test", "mypy"):
+                exempt = ("-k", "-m") if os.path.basename(inner[0]) != "mypy" else ("-p", "-m")
+                return argv[1:at + inner_at + 1] + [a for a in inner[1:] if not a.startswith(exempt)]
     return argv[1:]
 
 
@@ -551,6 +631,11 @@ def _uses_pytest(tool: str, args: list[str]) -> bool:
                 return inner[0] == "pytest"
             return _uses_pytest(os.path.basename(inner[0]), inner[1:])
     return False
+
+
+def _uses_direct_cc(tool: str, args: list[str]) -> bool:
+    spec = tools.lookup(tool)
+    return bool((spec and "gcc" in spec.names) or (tool == "zig" and args[:1] in (["cc"], ["c++"])))
 
 
 def paths_inside(argv: list[str], cwd: str, top: str, env: dict | None = None) -> bool:
@@ -587,20 +672,33 @@ def paths_inside(argv: list[str], cwd: str, top: str, env: dict | None = None) -
             effective_env[k] = v
     if "vitest" in basenames and any(re.fullmatch(r"-[A-Za-z]*r(=.*)?", a) for a in words):
         return False  # vitest's short --root, grouped (-sr) or with its value (-r=..) too
-    if {"gradle", "gradlew"} & basenames and any(re.fullmatch(r"-[qidswamtuS]*p.*", a) for a in words):
+    if {"gradle", "gradlew"} & basenames and any(re.fullmatch(r"-[qidswamtuUS]*p.*", a) for a in words):
         return False  # gradle's short --project-dir (standalone or clustered, e.g. -qp)
     if "uv" in basenames:
         if any(a == "--project" or a.startswith("--project=") for a in words):
             return False  # uv's --project moves project discovery to another folder
         if any(effective_env.get(k) for k in ("UV_WORKING_DIR", "UV_PROJECT", "UV_ENV_FILE")):
             return False  # env redirects uv to another directory or external .env file
-    if effective_env.get("PYTEST_ADDOPTS") and _uses_pytest(tool, stripped[1:]):
+    sure_tool, sure_args = sure_tool_and_args(argv)
+    if effective_env.get("PYTEST_ADDOPTS") and (
+        _uses_pytest(tool, stripped[1:]) or _uses_pytest(sure_tool, sure_args)
+    ):
         try:
             extra = shlex.split(str(effective_env["PYTEST_ADDOPTS"]))
         except ValueError:
             return False
         if not reusable_check(["pytest", *extra]) or not paths_inside(["pytest", *extra], cwd, top):
             return False
+    if _uses_direct_cc(tool, stripped[1:]) or _uses_direct_cc(sure_tool, sure_args):
+        for var in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH"):
+            raw = effective_env.get(var)
+            if not raw:
+                continue
+            for entry in str(raw).split(os.pathsep):
+                candidate = os.path.join(cwd, os.path.expanduser(entry)) if entry else cwd
+                path = os.path.realpath(candidate)
+                if path != root and not path.startswith(root + os.sep):
+                    return False
     if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
         return False  # sudo's options include -D, its own --chdir
     skip = operands = False
