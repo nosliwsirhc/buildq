@@ -930,9 +930,9 @@ def filters_in_use(git: GitReader, top: str, root: bytes, folders: set[bytes]) -
 
 def caller() -> str | None:
     """Who is submitting, for fair shares: BUILDQ_CALLER if set, else the agent session (Claude
-    Code's session, a Codex or T3 thread), else the unit this client runs in (a CI runner's
-    service, a terminal's scope). Agents that share a terminal or tmux server and set none of these
-    can set BUILDQ_CALLER apart."""
+    Code's session, a Codex, T3 or Antigravity thread), else the unit this client runs in (a CI
+    runner's service, a terminal's scope). Agents that share a terminal or tmux server and set none
+    of these can set BUILDQ_CALLER apart."""
     for name in ("BUILDQ_CALLER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "T3CODE_THREAD_ID",
                  "ANTIGRAVITY_CONVERSATION_ID"):
         named = os.environ.get(name, "").strip()
@@ -1286,15 +1286,19 @@ def tail_offset(path: str, lines: int) -> int:
         if lines <= 0:
             return size
         with open(path, "rb") as f:
-            block, offset, seen = 1 << 16, size, 0
+            block, offset, seen, target = 1 << 16, size, 0, None
             while offset > 0:
                 prev = offset
                 offset = max(0, offset - block)
                 f.seek(offset)
                 chunk = f.read(prev - offset)
+                if not chunk:
+                    break
+                if target is None:
+                    target = lines + (1 if chunk.endswith(b"\n") else 0)
                 n = chunk.count(b"\n")
-                if seen + n > lines:
-                    need = lines + 1 - seen
+                if seen + n >= target:
+                    need = target - seen
                     cut = len(chunk)
                     for _ in range(need):
                         cut = chunk.rfind(b"\n", 0, cut)

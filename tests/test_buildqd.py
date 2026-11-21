@@ -282,13 +282,13 @@ class Admission(DaemonCase):
         self.finish(first)
         self.machine.mem_available = 25 * GIB  # under a quarter of 128G: memory is scarce
         self.assertTrue(self.daemon.memory_moving())
-        second = self.submit(mem="4G")
+        second = self.submit(lane="web")  # 4G lane: fits in the 15G above the 10G floor once PSI clears
         self.assertEqual(second.reason_cat, "memory-pressure")
         self.machine.psi_mem = 0.0
         self.daemon.schedule(self.now)
         self.assertEqual(second.state, "running")
         self.machine.psi_cpu = 80.0
-        third = self.submit(mem="4G")
+        third = self.submit(lane="web")
         self.assertEqual(third.reason_cat, "cpu-pressure")
 
     def test_too_big_for_the_machine(self):
@@ -1210,12 +1210,14 @@ class SameSource(DaemonCase):
     def test_the_environment_that_counts(self):
         digest = buildqd.env_digest
         self.assertEqual(digest({"PATH": "/bin", "PWD": "/a", "SHLVL": "1", "CLAUDE_CODE_SESSION_ID": "x",
-                                 "ANTIGRAVITY_SOURCE_METADATA": "call-1", "ANTIGRAVITY_CONVERSATION_ID": "c1",
-                                 "ANTIGRAVITY_TRAJECTORY_ID": "t1", "ANTIGRAVITY_CSRF_TOKEN": "tok1"}),
+                                 "ANTIGRAVITY_AGENT": "1", "ANTIGRAVITY_SOURCE_METADATA": "call-1",
+                                 "ANTIGRAVITY_CONVERSATION_ID": "c1", "ANTIGRAVITY_TRAJECTORY_ID": "t1",
+                                 "ANTIGRAVITY_CSRF_TOKEN": "tok1", "ANTIGRAVITY_LS_ADDRESS": "localhost:1"}),
                          digest({"PATH": "/bin", "PWD": "/b", "SHLVL": "2", "CLAUDE_CODE_SESSION_ID": "y",
-                                 "ANTIGRAVITY_SOURCE_METADATA": "call-2", "ANTIGRAVITY_CONVERSATION_ID": "c2",
-                                 "ANTIGRAVITY_TRAJECTORY_ID": "t2", "ANTIGRAVITY_CSRF_TOKEN": "tok2"}))
-        for name in ("DATABASE_URL", "API_TOKEN", "SESSION_BACKEND", "DB_PASSWORD"):
+                                 "ANTIGRAVITY_AGENT": "1", "ANTIGRAVITY_SOURCE_METADATA": "call-2",
+                                 "ANTIGRAVITY_CONVERSATION_ID": "c2", "ANTIGRAVITY_TRAJECTORY_ID": "t2",
+                                 "ANTIGRAVITY_CSRF_TOKEN": "tok2", "ANTIGRAVITY_LS_ADDRESS": "localhost:2"}))
+        for name in ("DATABASE_URL", "API_TOKEN", "SESSION_BACKEND", "DB_PASSWORD", "ANTIGRAVITY_CUSTOM_FLAG"):
             self.assertNotEqual(digest({name: "a"}), digest({name: "b"}), name)
 
 
@@ -1442,13 +1444,13 @@ class AgentProcesses(unittest.TestCase):
         os.symlink(sys.executable, self.fake)
         self.thread = f"test-thread-{os.getpid()}-{time.time()}"
 
-    def session(self):
+    def session(self, exe=None, env=None):
         """A stand-in agent session that runs one child, as an agent runs a build client. The child
         reads from the session, so it ends when the session does."""
         code = ("import subprocess; p = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL); "
                 "print(p.pid, flush=True); p.wait()")
-        proc = subprocess.Popen([self.fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
-                                env={**os.environ, "T3CODE_THREAD_ID": self.thread})
+        proc = subprocess.Popen([exe or self.fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True,
+                                env=env if env is not None else {**os.environ, "T3CODE_THREAD_ID": self.thread})
 
         def stop():
             if proc.poll() is None:
@@ -1484,25 +1486,16 @@ class AgentProcesses(unittest.TestCase):
             self.assertFalse(buildqd.AGENT_EXE.search(exe), exe)
 
     def test_antigravity_process_counts_as_an_agent(self):
-        fake = os.path.join(self.tmp.name, "antigravity")
-        os.symlink(sys.executable, fake)
-        code = ("import subprocess; p = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL); "
-                "print(p.pid, flush=True); p.wait()")
-        proc = subprocess.Popen([fake, "-I", "-c", code], stdout=subprocess.PIPE, text=True)
-
-        def stop():
-            if proc.poll() is None:
-                proc.kill()
+        for name in ("antigravity", "agy"):
+            fake = os.path.join(self.tmp.name, name)
+            os.symlink(sys.executable, fake)
+            proc, child = self.session(exe=fake, env=os.environ)
+            above = buildqd.agents_above(child)
+            self.assertEqual(above[0][0], proc.pid, name)
+            self.assertTrue(buildqd.proc_alive(*above[0]), name)
+            proc.kill()
             proc.wait()
-            proc.stdout.close()
-        self.addCleanup(stop)
-        child = int(proc.stdout.readline())
-        above = buildqd.agents_above(child)
-        self.assertEqual(above[0][0], proc.pid)
-        self.assertTrue(buildqd.proc_alive(*above[0]))
-        proc.kill()
-        proc.wait()
-        self.assertFalse(buildqd.proc_alive(*above[0]))
+            self.assertFalse(buildqd.proc_alive(*above[0]), name)
 
 
 class SheddingMemory(DaemonCase):
@@ -1964,11 +1957,15 @@ class SheddingMemory(DaemonCase):
             self.assertEqual(runner.result(t), "")
         t.unit = "buildq-test.service"
         cases = [
-            ("Result=signal\nOOMKills=0\nManagedOOMKills=38\n", "oom-kill"),
-            ("Result=signal\nOOMKills=1\nManagedOOMKills=0\n", "oom-kill"),
-            ("Result=signal\nOOMKills=0\nManagedOOMKills=0\n", "signal"),
-            ("Result=oom-kill\n", "oom-kill"),
-            ("Result=exit-code\nOOMKills=[not set]\nManagedOOMKills=\n", "exit-code"),
+            ("LoadState=not-found\nResult=success\nOOMKills=18446744073709551615\nManagedOOMKills=18446744073709551615\n", ""),
+            ("LoadState=loaded\nResult=signal\nOOMKills=18446744073709551615\nManagedOOMKills=18446744073709551615\n", "signal"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=18446744073709551615\nManagedOOMKills=2\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=1\nManagedOOMKills=18446744073709551615\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=0\nManagedOOMKills=38\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=1\nManagedOOMKills=0\n", "oom-kill"),
+            ("LoadState=loaded\nResult=signal\nOOMKills=0\nManagedOOMKills=0\n", "signal"),
+            ("LoadState=loaded\nResult=oom-kill\n", "oom-kill"),
+            ("LoadState=loaded\nResult=exit-code\nOOMKills=[not set]\nManagedOOMKills=\n", "exit-code"),
         ]
         for stdout, expected in cases:
             with mock.patch.object(buildqd.subprocess, "run",
@@ -2971,18 +2968,36 @@ class GitHubStatuses(DaemonCase):
         t3 = t2 + 1200
         self.drain(t3)
         self.assertEqual((post["tries"], post["next"]), (3, t3 + 2400))
+        # A newer verdict for the same commit/check during backoff preserves backoff and first timestamp.
+        self.now = t3 + 100
+        newer = self.submit(("cargo", "test"), cwd=t.cwd, source=SOURCE, again=True)
+        self.finish(newer, 1, after=10)
+        self.settle()
+        (replaced,) = self.daemon.status_posts
+        self.assertEqual((replaced["state"], replaced["first"], replaced["next"],
+                          replaced["tries"], replaced.get("missing")),
+                         ("failure", first, t3 + 2400, 3, True))
+        # Pushing resets backoff and persists the reset across a daemon restart.
+        self.now = t3 + 200
         push = self.submit(("git", "push"), source=SOURCE)
         self.finish(push, 0)
-        self.assertEqual(post["tries"], 0)
-        self.assertLessEqual(post["next"], push.ended)
+        self.assertEqual(replaced["tries"], 0)
+        self.assertLessEqual(replaced["next"], push.ended)
+        saved = buildqd.read_json(os.path.join(self.state, "github-statuses.json"))
+        self.assertEqual(saved["queue"][0]["tries"], 0)
+        self.assertLessEqual(saved["queue"][0]["next"], push.ended)
         with mock.patch.object(buildqd, "log") as log:
             self.daemon.send_status_posts(first + buildqd.Daemon.STATUS_MISSING_MAX_AGE + 1)
         self.assertEqual(self.daemon.status_posts, [])
         self.assertTrue(any("6 hours" in str(c) for c in log.call_args_list), log.call_args_list)
 
     def test_permanent_http_errors_drop_immediately_while_rate_limits_retry(self):
-        for msg in ("gh: Not Found (HTTP 404)", "gh: Resource not accessible by integration (HTTP 403)",
-                    "gh: Validation Failed (HTTP 422)\nState is invalid"):
+        for msg in ("gh: Bad credentials (HTTP 401)",
+                    "gh: Not Found (HTTP 404)",
+                    "gh: Resource not accessible by integration (HTTP 403)",
+                    "gh: Validation Failed (HTTP 422)\nState is invalid",
+                    "gh: Validation Failed (HTTP 422)\nThis commit has reached the maximum number of statuses"):
+            self.now += 60  # strictly increasing order so note_status() never suppresses a later case
             self.daemon.gh = [sys.executable, "-c", f"import sys; sys.stderr.write({msg!r}); sys.exit(1)"]
             t = self.submit(("cargo", "test"), source=SOURCE, again=True)
             self.finish(t, 0)
@@ -2991,6 +3006,7 @@ class GitHubStatuses(DaemonCase):
                 self.drain(self.now + 60)
             self.assertEqual(self.daemon.status_posts, [], msg)
             self.assertTrue(any("not retrying" in str(c) for c in log.call_args_list), (msg, log.call_args_list))
+        self.now += 60
         self.daemon.gh = [sys.executable, "-c",
                           "import sys; sys.stderr.write('gh: API rate limit exceeded (HTTP 403)'); sys.exit(1)"]
         t = self.submit(("cargo", "test"), source=SOURCE, again=True)
@@ -3849,6 +3865,16 @@ class Cores(DaemonCase):
         self.daemon.cfg.lanes[t.lane].jobserver = "off"
         self.daemon.schedule(self.now + 11)
         self.assertEqual((t.state, t.exec_argv), ("running", None))
+        # Also cleared on the check_starting() recovery path and defensively in start().
+        t2 = self.submit(("make", "-j8", "all"), cwd=self.workdir("two"))
+        t2.state, t2.launcher, t2.exec_argv = "starting", None, ["make", "all"]
+        self.runner.running.discard(t2.id)
+        self.runner.unit_state = lambda ticket: "gone"
+        self.daemon.check_starting(t2, self.now + 20)
+        self.assertEqual((t2.state, t2.exec_argv), ("queued", None))
+        t2.exec_argv = ["make", "all"]  # stale on disk from an older daemon version
+        self.daemon.schedule(self.now + 21)
+        self.assertEqual((t2.state, t2.exec_argv), ("running", None))
 
     def test_test_threads_are_set_only_where_the_lane_asks(self):
         self.daemon.cfg.lanes["heavy"].test_threads = True
@@ -4777,6 +4803,12 @@ class ShimRules(unittest.TestCase):
                          ["-C", "run", "build", "--bin", "x"])
         self.assertEqual(self.shim.build_then_run("cargo", ["-C", "r", "r", "--", "--flag"]),
                          ["-C", "r", "build"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project", "app", "--", "--no-build"]),
+                         ["build", "app"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "-p", "app", "-p:Configuration=Release"]),
+                         ["build", "app", "-p:Configuration=Release"])
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project=app.csproj", "--no-restore"]),
+                         ["build", "app.csproj"])
 
 
 class Keys(unittest.TestCase):
@@ -5883,7 +5915,10 @@ class ClientAndGuardHelpers(unittest.TestCase):
             check(b"a\nb\nc\n", -3, b"")
             check(b"a\nb\nc\nd\n", 2, b"c\nd\n")
             check(b"a\nb\nc\nd\n", 10, b"a\nb\nc\nd\n")
-            check(b"a\nb\nc\nd", 2, b"b\nc\nd")
+            check(b"a\nb\nc\nd", 2, b"c\nd")
+            check(b"a\nb\nc\nd", 1, b"d")
+            check(b"a\nb", 2, b"a\nb")
+            check(b"only", 1, b"only")
             # Multi-chunk (> 200 KiB): both many short lines and lines wider than one 64 KiB chunk.
             many = b"".join(f"line-{i:06d}-{'x' * 40}\n".encode() for i in range(4500))
             self.assertGreater(len(many), 200_000)

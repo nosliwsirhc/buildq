@@ -10,10 +10,11 @@ finished, with its estimate, wait, cores, peak memory and time spent waiting on 
 ## When memory is tight
 
 When less than twice `mem_floor` is available, or every task on the machine has
-stalled on memory at once 5% of the time, buildq records every 30 seconds what is available, swap
+stalled on memory at once 5% of the time while memory is scarce (less than the greater of twice
+`mem_floor` or a quarter of RAM), buildq records every 30 seconds what is available, swap
 and memory pressure, and the six cgroups holding the most memory, builds or not: Docker
 containers, CI runners, editors, agent sessions. It stops once more than 2.5 times `mem_floor` is
-free, with memory pressure under 1%, for half a minute. The lines go to the journal at warning priority (`journalctl --user -u
+free, with memory pressure under 1% or memory no longer scarce, for half a minute. The lines go to the journal at warning priority (`journalctl --user -u
 buildq -p warning`) and to `~/.local/state/buildq/memory.log`, which is synced to disk with each
 entry: after a reset the journal can be missing its last minutes, and `memory.log` isn't.
 

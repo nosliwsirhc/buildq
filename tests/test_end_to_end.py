@@ -518,7 +518,7 @@ class Enforcement(Harness):
                                          cwd=self.work, capture_output=True, text=True, timeout=60)
         self.assertEqual(dotnet_app_flag.returncode, 0, dotnet_app_flag.stderr)
         dbuild2, drun2 = dotnet_app_flag.stdout.splitlines()
-        self.assertRegex(dbuild2, r"^dotnet build --project app job=[0-9a-f-]{36}$")
+        self.assertRegex(dbuild2, r"^dotnet build app job=[0-9a-f-]{36}$")
         self.assertEqual(drun2, "dotnet run --project app --no-build -- --no-build job=none")
 
     def test_run_runs_cargo_commands_that_never_compile_at_once(self):

@@ -986,8 +986,8 @@ def own_pids():
                 continue
 
 
-# Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run), Codex, and Antigravity.
-AGENT_COMM = ("claude", "codex", "antigravity")
+# Agent sessions (#71): Claude Code (the CLI, and the copies T3 and the desktop app run), Codex, and Antigravity (including its `agy` CLI).
+AGENT_COMM = ("claude", "codex", "antigravity", "agy")
 AGENT_EXE = re.compile(r"/\.?claude/(versions|remote/ccd-cli)/[^/]+$")
 T3_THREAD_VAR = "T3CODE_THREAD_ID"  # T3 sets it for a thread's agent process, and so for all that runs
 
@@ -1010,8 +1010,8 @@ def is_agent(pid: int, strict: bool = False) -> bool:
 
 def agents_above(pid) -> list[list[int]]:
     """The agent sessions a client runs under: [pid, start ticks] of the client and each of its
-    ancestors that is a Claude Code or Codex process, nearest first (an agent may run another).
-    Empty for CI, a terminal, a script."""
+    ancestors that is a Claude Code, Codex or Antigravity process, nearest first (an agent may run
+    another). Empty for CI, a terminal, a script."""
     found = []
     for _ in range(64):
         stat = proc_stat(pid) if isinstance(pid, int) and pid > 1 else None
@@ -1922,8 +1922,9 @@ VOLATILE_ENV = re.compile(
     r"SSH_CLIENT|SSH_CONNECTION|SSH_TTY|GPG_TTY|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_ID|XDG_ACTIVATION_TOKEN|"
     r"INVOCATION_ID|JOURNAL_STREAM|MANAGERPID|MANAGERPIDFDID|SYSTEMD_EXEC_PID|NOTIFY_SOCKET|LISTEN_(PID|FDS|FDNAMES)|"
     r"CLAUDE_PID|CLAUDE_CODE_(SESSION_ID|CHILD_SESSION|SESSION_ATTENDED|MESSAGING_SOCKET|MESSAGING_TOKEN)|"
-    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|ANTIGRAVITY_[A-Z0-9_]+|KITTY_WINDOW_ID|WEZTERM_PANE|"
-    r"VSCODE_GIT_IPC_HANDLE|VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
+    r"T3CODE_THREAD_ID|CODEX_(THREAD|SESSION)_ID|"
+    r"ANTIGRAVITY_(AGENT|AGENTAPI_EXE|APP_DATA_DIR|CONVERSATION_ID|CSRF_TOKEN|LS_ADDRESS|LS_VERSION|PROJECT_ID|SOURCE_METADATA|TRAJECTORY_ID)|"
+    r"KITTY_WINDOW_ID|WEZTERM_PANE|VSCODE_GIT_IPC_HANDLE|VSCODE_IPC_HOOK_CLI|BUILDQ_(AS|FALLBACK|SOURCE|CALLER|SOCKET|BIN)")
 
 
 def env_digest(env: dict[str, str]) -> str:
@@ -2877,17 +2878,18 @@ class SystemdRunner:
         if not ticket.unit:
             return ""
         try:
-            out = subprocess.run(["systemctl", "--user", "show", "-p", "Result,OOMKills,ManagedOOMKills", ticket.unit],
+            out = subprocess.run(["systemctl", "--user", "show", "-p", "LoadState,Result,OOMKills,ManagedOOMKills", ticket.unit],
                                  stdin=DEVNULL, capture_output=True, text=True, timeout=5).stdout
         except (OSError, subprocess.SubprocessError):
             return ""
         props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if props.get("LoadState") == "not-found":
+            return ""
+        # systemd prints UINT64_MAX (18446744073709551615) when an OOM counter is unavailable;
+        # sane_count() rejects that sentinel alongside non-numeric or negative values.
         for key in ("OOMKills", "ManagedOOMKills"):
-            try:
-                if int(props.get(key) or 0) > 0:
-                    return "oom-kill"
-            except ValueError:
-                pass
+            if int(sane_count(props.get(key)) or 0) > 0:
+                return "oom-kill"
         return props.get("Result", "").strip()
 
     def cleanup(self, ticket):
@@ -3493,7 +3495,8 @@ class Daemon:
         if isinstance(statuses, list):
             self.status_posts = statuses
         elif isinstance(statuses, dict):
-            self.status_posts = statuses.get("queue") or []
+            queued = statuses.get("queue")
+            self.status_posts = queued if isinstance(queued, list) else []
             seen = statuses.get("seen")
             self.status_seen = {str(k): list(v) for k, v in seen.items() if isinstance(v, list)} \
                 if isinstance(seen, dict) else {}
@@ -4536,7 +4539,8 @@ class Daemon:
         local failure on the way to a fix is noise on a pull request). Results are ordered by when
         their builds ended, not when their checks did: an older result never replaces a newer one.
         A commit that isn't on GitHub yet is tried again after the next `git push` run through buildq
-        from that repository, and every ten minutes, for a day. A build from a GitHub Actions job never
+        from that repository, and with exponential backoff (10 minutes up to 2 hours) for up to 6
+        hours (24 hours for transient/network errors). A build from a GitHub Actions job never
         posts success: the job reports its own result, and on a pull request its commit is usually a
         merge commit the pull request doesn't show. Its failure can still turn a green buildq posted
         on the same commit red."""
@@ -4571,12 +4575,23 @@ class Daemon:
             if id(p) not in in_flight:
                 self.status_posts.remove(p)
         took = fmt_duration((t.ended or now) - (t.started or now))
-        self.status_posts.append({
+        firsts = [p["first"] for p in pending if isinstance(p.get("first"), (int, float))]
+        nexts = [p["next"] for p in pending if isinstance(p.get("next"), (int, float))]
+        post = {
             "repo": src["remote"], "sha": src["commit"], "state": "success" if t.state == "succeeded" else "failure",
             "context": context, "where": where, "order": order,
             "description": (f"passed on the shared build machine in {took}" if t.state == "succeeded" else
                             f"failed (exit {t.exit}) on the shared build machine")[:140],
-            "first": now, "next": now, "ticket": t.id})
+            "first": min([now, *firsts]), "next": max([now, *nexts]), "ticket": t.id}
+        if pending:
+            tries = max(int(sane_count(p.get("tries")) or 0) for p in pending)
+            if tries:
+                post["tries"] = tries
+            if any(p.get("missing") for p in pending):
+                post["missing"] = True
+            if any(p.get("logged") for p in pending):
+                post["logged"] = True
+        self.status_posts.append(post)
         self.save_status_posts()
 
     def save_status_posts(self) -> None:
@@ -4600,11 +4615,11 @@ class Daemon:
         """Classify a failed `gh api` status post: 'missing' (commit not on GitHub yet),
         'permanent' (4xx client error that retrying won't fix), or 'transient'."""
         lower = error.lower()
-        if "no commit found" in lower or ("http 422" in lower and "commit" in lower):
+        if "no commit found" in lower:
             return "missing"
         if "rate limit" in lower or "abuse" in lower:
             return "transient"
-        if re.search(r"\bHTTP 4(00|03|04|22)\b", error):
+        if re.search(r"\bHTTP 4(00|01|03|04|22)\b", error):
             return "permanent"
         return "transient"
 
@@ -5144,6 +5159,7 @@ class Daemon:
                 t.js = Jobserver(t.jobserver, create=True)
                 t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
                 t.tokens_out = t.js.out
+            t.exec_argv = None
             if t.jobserver and tool in ("make", "gmake", "ninja") and asks_for_jobs(t.argv[1:]):
                 tool_at = len(t.argv) - len(strip_wrappers(t.argv))  # (a wrapper's own words stay: env -u -j make)
                 t.exec_argv = t.argv[:tool_at] + without_jobs(t.argv[tool_at:])  # its -j would make it ignore the jobserver
@@ -5197,12 +5213,13 @@ class Daemon:
         ramping = sum(max(0.0, t.est_cores - t.cores_now) for t in self.active()
                       if t.started and now - t.started < cfg.ramp_seconds and t not in elastic)
         cpu_cap = cfg.cpu_target * m.ncpu
-        waiting = next((t for t in self.queue(now) if t.reason_cat == "cpu" or t.held_for == "cores"), None)
+        queued = self.queue(now)
+        waiting = next((t for t in queued if t.reason_cat == "cpu" or t.held_for == "cores"), None)
         spare = cpu_cap - max(m.busy, m.busy_now) - ramping - (waiting.need if waiting else 0)
         free_mem = m.mem_available - sum(self.still_to_grow(t, now) for t in self.active()) - cfg.mem_floor
         changed = []
         idle_grown = 0  # cores handed out from measured idle ones this pass
-        waiting_for_memory = any(t.reason_cat == "memory" for t in self.queue(now))
+        waiting_for_memory = any(t.reason_cat == "memory" for t in queued)
         if spare >= 1 and free_mem > 0 and not waiting_for_memory:
             growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted
                               and (t.release_at is None or t.release_revoked)),
@@ -5475,7 +5492,7 @@ class Daemon:
                     return False  # the build stays starting until the name is free
                 self.close_jobserver(t, remove=True)
                 self.drop_queries(t)  # (this attempt is over)
-                t.state, t.started, t.unit, t.cg, t.granted = "queued", None, None, None, 0
+                t.state, t.started, t.unit, t.cg, t.exec_argv, t.granted = "queued", None, None, None, None, 0
                 self.save(t)
                 log(f"requeued {t.id}: it hadn't started when the daemon stopped")
             else:
@@ -5619,10 +5636,14 @@ class Daemon:
         except Exception as e:  # the analytics must never cost a build its ending
             self.metrics.trouble(f"can't record {t.id} for the analytics: {e!r}")
         if t.state == "succeeded" and command_words(t.argv)[:2] == ["git", "push"] and t.source:
+            nudged = False
             for post in self.status_posts:  # a push may have brought commits that were waiting
                 if post.get("repo") == t.source.get("remote"):
                     post["next"] = now
                     post["tries"] = 0
+                    nudged = True
+            if nudged:
+                self.save_status_posts()
         waits = ""
         if t.mem_wait_some >= 1 or t.mem_high:
             waits = (f"; waited on memory {t.mem_wait_some:.0f}s ({t.mem_wait_full:.0f}s with all of it waiting)"
@@ -5961,9 +5982,10 @@ class Daemon:
         """While memory is tight, say every half minute how much is free and which cgroups hold the
         most, builds or not, so that if the machine stalls and has to be reset, there is a record of
         what filled it. Tight is less than twice mem_floor available, or every task on the machine
-        stalled on memory at once 5% of the time (memory "full"; "some" also counts one build slowed
-        at its own MemoryHigh, which is normal). It is no longer tight once more than 2.5 times
-        mem_floor is available and "full" is under 1% for half a minute.
+        stalled on memory at once 5% of the time (memory "full") while memory is scarce (under the
+        greater of twice mem_floor or a quarter of RAM; "some" also counts one build slowed at its
+        own MemoryHigh, which is normal). It is no longer tight once more than 2.5 times mem_floor
+        is available and either "full" is under 1% or memory is no longer scarce, for half a minute.
 
         Nothing slow happens here, on the daemon's loop: memory.log is written and synced by a
         thread of its own, and the cgroups are walked by another."""

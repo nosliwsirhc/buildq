@@ -171,6 +171,6 @@ the news without polling:
 | `BUILDQ_FALLBACK` | what `buildq run` does when the daemon can't be reached. Unset: wait for it. `fail`: exit 75. `run`: run the command unqueued. Anything else: a command prefix to run it through instead. |
 | `BUILDQ_AS` | the name of a wrapper in front of buildq. buildq's hints then name the wrapper's commands, so its users are told what they type (`wrapper --submit <command>`, not `buildq submit -- <command>`). The wrapper must take `--submit COMMAND...`, `--wait TICKET [--timeout D]`, `--status [TICKET]`, `--logs TICKET` and `--cancel TICKET` and pass them to buildq's commands of the same names; that is all the hints use. |
 | `BUILDQ_SOURCE` | `off` stops the client recording the source a build is of (no joining or reuse then) |
-| `BUILDQ_CALLER` | who is submitting, for fair shares; by default the agent session (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `T3CODE_THREAD_ID`), else the cgroup the client runs in (a CI runner's service, a terminal's scope) |
+| `BUILDQ_CALLER` | who is submitting, for fair shares; by default the agent session (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `T3CODE_THREAD_ID`, `ANTIGRAVITY_CONVERSATION_ID`), else the cgroup the client runs in (a CI runner's service, a terminal's scope) |
 | `BUILDQ_JOB`, `BUILDQ_TICKET` | set inside every build to its ticket. A `buildq run` inside a build runs its command directly, because the build already holds a turn. buildq checks that the build really is running. |
 | `BUILDQ_CORES` | set inside every build: the cores it was given |
