@@ -225,10 +225,11 @@ def repo_name(cwd: str) -> str:
 
 def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> list[str]:
     t = strip_wrappers(argv)
-    if "--" in t:
-        t = t[: t.index("--")]
     if not t:
         return ["?"]
+    # `uv run -- CMD` uses `--` before its inner command; `_uv_words` handles both delimiters.
+    if "--" in t and os.path.basename(t[0]) != "uv":
+        t = t[: t.index("--")]
     # Nothing that could hold a credential reaches a key, not even through basename().
     t = [t[0]] + tools.redact_args(t[1:])
     tool = os.path.basename(t[0])
@@ -278,7 +279,8 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
 
 
 WRITING_FLAG = re.compile(r"--(fix|fix-type|write|bless|update|update-snapshots|updateSnapshot|watch|watchAll|"
-                          r"allow-dirty|no-run)(=.*)?|-[uw]")
+                          r"allow-dirty|no-run)(=.*)?")
+INFO_FLAGS = frozenset({"--help", "-h", "--version"})
 # Options that write a file the caller may read next (a report, coverage, test results): a reused
 # pass wouldn't write it.
 REPORT_OPTIONS = {"-o", "--output-file", "--outputFile", "--coverage", "--logger", "--results-directory",
@@ -294,12 +296,15 @@ def _tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
 
 def reusable_check(argv: list[str]) -> bool:
     """A command whose only result is a verdict on the source: cargo check, clippy, test or nextest
-    run, dotnet test, `tsc --noEmit`, eslint, `vitest run`, with nothing that writes (--fix, -u,
-    --update-snapshots, watch modes, --no-run, which keeps the test binaries for later). A second
-    pass on the same source tells nothing the first didn't, so the first answers it. Commands that
-    produce files (builds, docs, bundles) and package scripts, which might do anything, never do."""
+    run, dotnet test, `tsc --noEmit`, eslint, `vitest run`, `zig test`/`ast-check`,
+    `gcc`/`clang -fsyntax-only`, `pytest`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `mypy`,
+    `pyright`, `uv run --no-sync <check>`, with nothing that writes (--fix, -u,
+    --update-snapshots, watch modes, --no-run, which keeps the test binaries for later) or asks for
+    help/version. A second pass on the same source tells nothing the first didn't, so the first
+    answers it. Commands that produce files (builds, docs, bundles) and package scripts, which might
+    do anything, never do."""
     tool, args = sure_tool_and_args(argv)  # (a wrapper with options: no tool, so no reuse)
-    if any(WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
+    if any(a in INFO_FLAGS or WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
         return False
     if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
         return False  # `--reporter html`
@@ -420,7 +425,7 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
 # vitest's --root and --dir, pytest's --rootdir, npm's --prefix, yarn's and bun's --cwd, gradle's
 # --project-dir, and ctest's --test-dir.
 CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--c(h(d(i(r)?)?)?)?(=.*)?|--di(r(e(c(t(o(r(y)?)?)?)?)?)?)?(=.*)?"
-                            r"|--(root|rootdir|prefix|cwd|project-dir|test-dir)(=.*)?")
+                            r"|--(root|rootdir|prefix|cwd|project-dir|test-dir)(=.*)?|-working-directory(=.*)?")
 OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, not what it reads: not checked
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # Variables that name tools, not source (where to find them, a compiler cache in front of rustc): a
@@ -429,10 +434,23 @@ OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # (RUSTC_WRAPPER=/x/w.sh) runs for every compile and might read anything, and CARGO_HOME's config
 # can point dependencies at a folder: those are still checked.
 TOOL_FOLDER = r"(/usr(/local)?/s?bin|/s?bin|/home/[^/]+/\.cargo/bin|/home/[^/]+/\.local/bin)"
+TOOL_FOLDER_RE = re.compile(rf"^{TOOL_FOLDER}(/.*)?$")
 TOOL_VARIABLE = re.compile(rf"PATH={TOOL_FOLDER}(:{TOOL_FOLDER})*|RUSTUP_HOME=/home/[^/]+/\.rustup|"
                            r"(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)="
-                           r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)|"
-                           rf"(CC|CXX)=({TOOL_FOLDER}/)?(cc|c\+\+|gcc|g\+\+|clang|clang\+\+)(-\d+)?")
+                           r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)")
+CC_TOOL_VARIABLE = re.compile(rf"(CC|CXX)=({TOOL_FOLDER}/)?(cc|c\+\+|gcc|g\+\+|clang|clang\+\+)(-\d+)?")
+
+
+def _trusted_tool_variable(arg: str) -> bool:
+    if TOOL_VARIABLE.fullmatch(arg):
+        return True
+    if not CC_TOOL_VARIABLE.fullmatch(arg):
+        return False
+    val = arg.split("=", 1)[1]
+    if "/" not in val:
+        return True  # bare compiler name; resolved via PATH
+    # Resolve symlinks so a ~/.local/bin/clang -> ~/Code/llvm/bin/clang link isn't exempted.
+    return bool(TOOL_FOLDER_RE.fullmatch(os.path.realpath(val)))
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
 UNREADABLE = re.compile(r"""[\x00-\x1f\\"'`$\[\]{}]|://""")  # (and control characters: cargo splits at \x1f)
@@ -495,17 +513,47 @@ def wrapper_settings(argv: list[str]) -> set[int]:
 
 def moving_words(argv: list[str]) -> list[str]:
     """The words of a command that may move it to another folder (CHANGES_FOLDER): all but those of
-    cargo's own options that start with an option taking a value (`-pCore`, `-Fcli`: a package, a
-    feature) (#48). What follows cargo's `--` is still read: a custom test harness may take -C."""
+    a known tool's non-chdir options whose value or flag name may contain `C` (cargo `-pCore`/`-Fcli`,
+    C/C++ `-fPIC`/`-DCONFIG=1`/`-ICore`, Gradle `-D...`/`-P...`, pytest `-k...`/`-m...`, mypy
+    `-p...`/`-m...`) (#48). What follows cargo's `--` is still read: a custom test harness may take -C."""
     t = strip_wrappers(argv)
     at = len(argv) - len(t)
-    if not t or os.path.basename(t[0]) != "cargo":
+    if not t:
         return argv[1:]
-    end = t.index("--") if "--" in t else len(t)
-    return argv[1:at] + [a for i, a in enumerate(t[1:], 1) if i >= end or a[:2] not in ("-p", "-F", "-j", "-Z")]
+    tool = os.path.basename(t[0])
+    if tool == "cargo":
+        end = t.index("--") if "--" in t else len(t)
+        return argv[1:at] + [a for i, a in enumerate(t[1:], 1) if i >= end or a[:2] not in ("-p", "-F", "-j", "-Z")]
+    spec = tools.lookup(tool)
+    if (spec and "gcc" in spec.names) or (tool == "zig" and t[1:2] in (["cc"], ["c++"])):
+        exempt = ("-f", "-W", "-D", "-U", "-I", "-L", "-l", "-m", "-O", "-std=", "-g", "-x")
+        return argv[1:at] + [a for a in t[1:] if not a.startswith(exempt)]
+    if tool in ("gradle", "gradlew"):
+        return argv[1:at] + [a for a in t[1:] if not a.startswith(("-D", "-P"))]
+    if tool in ("pytest", "py.test"):
+        return argv[1:at] + [a for a in t[1:] if not a.startswith(("-k", "-m"))]
+    if tool == "mypy":
+        return argv[1:at] + [a for a in t[1:] if not a.startswith(("-p", "-m"))]
+    return argv[1:]
 
 
-def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
+def _uses_pytest(tool: str, args: list[str]) -> bool:
+    if tool in ("pytest", "py.test"):
+        return True
+    if tool in ("python", "python3") or re.fullmatch(r"python3\.\d+", tool):
+        call = tools._python_module_call(args)
+        return bool(call and call[0] == "pytest")
+    if tool == "uv":
+        parsed = tools._uv_parse_strict(args)
+        if parsed and parsed[0] == "run":
+            _, inner, is_module, _ = parsed
+            if is_module:
+                return inner[0] == "pytest"
+            return _uses_pytest(os.path.basename(inner[0]), inner[1:])
+    return False
+
+
+def paths_inside(argv: list[str], cwd: str, top: str, env: dict | None = None) -> bool:
     """Every path the command names is inside the tree whose source was recorded, so an earlier
     result for the same source answers for it. A path is any part of any word (path_pieces) with a
     slash or starting with . or ~, or one that names something that exists (`-p external`, a
@@ -513,7 +561,8 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     - a command with a word buildq can't read for certain (UNREADABLE: quotes, escapes, brackets,
       $, a URL; `--config 'paths=["../other"]'`): it is refused, not guessed at;
     - one that moves to another folder, or the folder its paths are read from (env -C, --chdir,
-      make -C, vitest --root, sudo given options): what its paths name can't be told here;
+      make -C, vitest --root, clang -working-directory, uv UV_WORKING_DIR/UV_PROJECT, sudo given
+      options): what its paths name can't be told here;
     - one pointed elsewhere (`--manifest-path ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`,
       `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`).
     An output folder (--target-dir, CARGO_TARGET_DIR, eslint's --cache-location) is where it writes,
@@ -523,22 +572,39 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
     inside the tree) isn't seen: --again runs such a build regardless."""
     root = os.path.realpath(top)
     words = argv[1:]
-    tool = os.path.basename(strip_wrappers(argv)[0]) if strip_wrappers(argv) else ""
+    stripped = strip_wrappers(argv)
+    tool = os.path.basename(stripped[0]) if stripped else ""
     if any(UNREADABLE.search(a) for a in argv):
         return False  # what it names can't be read for certain
     if any(CHANGES_FOLDER.fullmatch(a) for a in moving_words(argv)):
         return False
-    if "vitest" in (os.path.basename(a) for a in argv) and any(re.fullmatch(r"-[A-Za-z]*r(=.*)?", a) for a in words):
+    basenames = {os.path.basename(a) for a in argv}
+    setting = wrapper_settings(argv)  # where a wrapper sets variables (env X=1, sudo X=1)
+    effective_env = dict(env) if env else {}
+    for idx in sorted(setting):
+        if "=" in argv[idx]:
+            k, v = argv[idx].split("=", 1)
+            effective_env[k] = v
+    if "vitest" in basenames and any(re.fullmatch(r"-[A-Za-z]*r(=.*)?", a) for a in words):
         return False  # vitest's short --root, grouped (-sr) or with its value (-r=..) too
-    if {"gradle", "gradlew"} & {os.path.basename(a) for a in argv} and any(re.fullmatch(r"-p.*", a) for a in words):
-        return False  # gradle's short --project-dir
-    if "uv" in (os.path.basename(a) for a in argv) and any(a == "--project" or a.startswith("--project=") for a in words):
-        return False  # uv's --project moves project discovery to another folder
+    if {"gradle", "gradlew"} & basenames and any(re.fullmatch(r"-[qidswamtuS]*p.*", a) for a in words):
+        return False  # gradle's short --project-dir (standalone or clustered, e.g. -qp)
+    if "uv" in basenames:
+        if any(a == "--project" or a.startswith("--project=") for a in words):
+            return False  # uv's --project moves project discovery to another folder
+        if any(effective_env.get(k) for k in ("UV_WORKING_DIR", "UV_PROJECT", "UV_ENV_FILE")):
+            return False  # env redirects uv to another directory or external .env file
+    if effective_env.get("PYTEST_ADDOPTS") and _uses_pytest(tool, stripped[1:]):
+        try:
+            extra = shlex.split(str(effective_env["PYTEST_ADDOPTS"]))
+        except ValueError:
+            return False
+        if not reusable_check(["pytest", *extra]) or not paths_inside(["pytest", *extra], cwd, top):
+            return False
     if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
         return False  # sudo's options include -D, its own --chdir
     skip = operands = False
     named = [argv[0]] if "/" in argv[0] and not argv[0].startswith("/") else []  # ../other/check.sh
-    setting = wrapper_settings(argv)  # where a wrapper sets variables (env X=1, sudo X=1)
     for i, arg in [(0, a) for a in named] + list(enumerate(words, 1)):
         if skip:
             skip = False
@@ -551,7 +617,7 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
             continue
         if arg.startswith(tuple(o + "=" for o in OUTPUT_OPTIONS) + OUTPUT_VARIABLES):
             continue
-        if i in setting and TOOL_VARIABLE.fullmatch(arg):
+        if i in setting and _trusted_tool_variable(arg):
             continue  # a variable saying where tools are, set for the command (not an argument to it)
         for value in path_pieces(arg, tool, operands):
             candidate = os.path.join(cwd, os.path.expanduser(value))

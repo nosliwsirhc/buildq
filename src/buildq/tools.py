@@ -7,6 +7,7 @@ from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 import os
 import re
+import shlex
 from types import MappingProxyType
 
 SCRIPT_WORD = re.compile(r"[a-z][a-z_-]{0,23}")
@@ -106,6 +107,8 @@ class ToolSpec:
     # Optional regex matched as a fallback in lookup() for versioned tool binaries (e.g. gcc-16).
     name_pattern: re.Pattern[str] | None = None
     honors_grant: bool = False
+    # Optional invocation-aware grant check (e.g. only `zig build`, or unwrapping `uv run`).
+    honors_grant_args: Callable[[str, list[str]], bool] | None = None
     jobserver: bool = False
     makeflags_jobserver: bool = False
     container_storage: bool = False
@@ -325,11 +328,10 @@ GRADLE_VALUE_OPTIONS = frozenset({
     "-I", "--init-script", "-x", "--exclude-task", "--max-workers", "--console", "--console-unicode",
     "--warning-mode", "--priority", "--include-build", "--project-cache-dir",
     "--configuration-cache-problems", "-F", "--dependency-verification", "-M",
-    "--write-verification-metadata", "--export-keys", "--update-locks", "--develocity-url",
+    "--write-verification-metadata", "--update-locks", "--develocity-url",
     "--develocity-plugin-version", "--tests", "-D", "--system-prop", "-P", "--project-prop",
 })
-GRADLE_DAEMON_PROP = re.compile(r"(?:^|[\s\"'])-Dorg\.gradle\.daemon=")
-GRADLE_WORKERS_PROP = re.compile(r"(?:^|[\s\"'])-Dorg\.gradle\.workers\.max=")
+GRADLE_SHORT_UNSAFE_RESTART = re.compile(r"-[qidswamtuS]*(?:t[qidswamtuSvh?]*|[MI].*)")
 GRADLE_UNSAFE_LEAF = re.compile(
     r"(publish|upload|deploy|install|uninstall|push|format|apply|fix|clean|connected|instrumented|"
     r"firebase|bundletool|run|serve|start|stop|migrate|seed|drop|destroy|delete|remove|sign|promote|distribute)",
@@ -339,28 +341,32 @@ GRADLE_RESTART_LEAF = re.compile(
     r"^(?:build|assemble|bundle|compile|classes|testClasses|jar|war|test|check|verify|lint|"
     r"ktlintCheck|detekt|spotlessCheck|checkstyle|pmd|spotbugs|jacocoTestReport)(?:[A-Z0-9].*)?$"
 )
-GRADLE_CHECK_LEAF = re.compile(
-    r"^(?:test(?!Classes$|Jar$)|check|lint|ktlintCheck|detekt|spotlessCheck|checkstyle|pmd|spotbugs)(?:[A-Z0-9].*)?$"
-)
-GRADLE_CHECK_UNSAFE_LEAF = re.compile(r"(report|export|dump|generate|baseline)", re.I)
 
 
 def _gradle_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]:
     return [tool] + positionals(rest, GRADLE_VALUE_OPTIONS)[:2]
 
 
+def _gradle_opts_tokens(raw: str) -> list[str]:
+    try:
+        return shlex.split(raw)
+    except ValueError:
+        return raw.split()
+
+
 def _gradle_merged_opts(granted: int, caller_env: dict | None, *,
                         skip_daemon: bool = False, skip_workers: bool = False) -> dict[str, str]:
     existing = str((caller_env or {}).get("GRADLE_OPTS") or "")
+    tokens = _gradle_opts_tokens(existing)
     add: list[str] = []
     # Keep Gradle inside the build's cgroup and capped to granted workers unless caller set them.
-    if not skip_daemon and not GRADLE_DAEMON_PROP.search(existing):
+    if not skip_daemon and not any(tok.startswith("-Dorg.gradle.daemon=") for tok in tokens):
         add.append("-Dorg.gradle.daemon=false")
-    if not skip_workers and not GRADLE_WORKERS_PROP.search(existing):
+    if not skip_workers and not any(tok.startswith("-Dorg.gradle.workers.max=") for tok in tokens):
         add.append(f"-Dorg.gradle.workers.max={granted}")
     if not add:
         return {}
-    # Prepend defaults so JVM's last-wins -D precedence always preserves caller flags.
+    # Prepend defaults so JVM's last-wins -D precedence always preserves caller flags and quoting.
     return {"GRADLE_OPTS": f"{' '.join(add)} {existing}".strip()}
 
 
@@ -374,13 +380,19 @@ def _gradle_direct_env(_tool: str, args: list[str], granted: int, _want: int, _j
     before = args[:args.index("--")] if "--" in args else args
     if {"--stop", "--status", "--foreground"} & set(before):
         return {}
-    has_daemon = (any(a in ("--daemon", "--no-daemon") or a.startswith("-Dorg.gradle.daemon=") for a in before)
-                  or any(a in ("-D", "--system-prop") and b.startswith("org.gradle.daemon=")
-                         for a, b in zip(before, before[1:])))
-    has_workers = (any(a == "--max-workers" or a.startswith(("--max-workers=", "-Dorg.gradle.workers.max="))
-                       for a in before)
-                   or any(a in ("-D", "--system-prop") and b.startswith("org.gradle.workers.max=")
-                          for a, b in zip(before, before[1:])))
+    has_daemon = (
+        any(a in ("--daemon", "--no-daemon")
+            or a.startswith(("-Dorg.gradle.daemon=", "--system-prop=org.gradle.daemon=")) for a in before)
+        or any(a in ("-D", "--system-prop") and b.startswith("org.gradle.daemon=")
+               for a, b in zip(before, before[1:]))
+    )
+    has_workers = (
+        any(a == "--max-workers"
+            or a.startswith(("--max-workers=", "-Dorg.gradle.workers.max=", "--system-prop=org.gradle.workers.max="))
+            for a in before)
+        or any(a in ("-D", "--system-prop") and b.startswith("org.gradle.workers.max=")
+               for a, b in zip(before, before[1:]))
+    )
     return _gradle_merged_opts(granted, caller_env, skip_daemon=has_daemon, skip_workers=has_workers)
 
 
@@ -388,8 +400,11 @@ def _gradle_restart_safe(_tool: str, args: list[str]) -> bool:
     if "--" in args:
         return False
     if any(a in ("-t", "--continuous", "--stop", "--status", "--foreground", "--write-locks",
-                 "--update-locks", "--refresh-keys", "-M", "--write-verification-metadata", "--export-keys")
-           or a.startswith(("--update-locks=", "--write-verification-metadata=", "--export-keys=", "-M"))
+                 "--update-locks", "--refresh-keys", "-M", "--write-verification-metadata",
+                 "--export-keys", "-I", "--init-script")
+           or a.startswith(("--update-locks=", "--write-verification-metadata=", "--export-keys=",
+                            "--init-script=", "-M", "-I"))
+           or GRADLE_SHORT_UNSAFE_RESTART.fullmatch(a)
            for a in args):
         return False
     tasks = positionals(args, GRADLE_VALUE_OPTIONS)
@@ -398,22 +413,6 @@ def _gradle_restart_safe(_tool: str, args: list[str]) -> bool:
     for task in tasks:
         leaf = task.rsplit(":", 1)[-1]
         if not leaf or not GRADLE_RESTART_LEAF.fullmatch(leaf) or GRADLE_UNSAFE_LEAF.search(leaf):
-            return False
-    return True
-
-
-def _gradle_reusable_check(_tool: str, args: list[str]) -> bool:
-    if not _gradle_restart_safe("gradle", args):
-        return False
-    if any(a in ("-x", "--exclude-task", "-a", "--no-rebuild", "-m", "--dry-run", "--task-graph",
-                 "--profile", "--scan", "--problems-report", "--property-upgrade-report",
-                 "--debug-jvm", "--develocity-url")
-           or a.startswith(("-x", "--exclude-task=", "--develocity-url=", "--debug-jvm="))
-           for a in args):
-        return False
-    for task in positionals(args, GRADLE_VALUE_OPTIONS):
-        leaf = task.rsplit(":", 1)[-1]
-        if not GRADLE_CHECK_LEAF.fullmatch(leaf) or GRADLE_CHECK_UNSAFE_LEAF.search(leaf):
             return False
     return True
 
@@ -444,6 +443,13 @@ def _gradle_write_dirs(_tool: str, args: list[str], cwd: str, env: dict) -> list
     root = settings_root or nearest_build
     if root:
         dirs.append(os.path.join(root, "build"))
+        for task in positionals(before, GRADLE_VALUE_OPTIONS):
+            if ":" in task:
+                parts = [p for p in task.split(":")[:-1] if p]
+                if parts:
+                    subproj = os.path.join(root, *parts)
+                    if os.path.isdir(subproj):
+                        dirs.append(os.path.join(subproj, "build"))
     if nearest_build and nearest_build != root:
         dirs.append(os.path.join(nearest_build, "build"))
     return dirs
@@ -452,32 +458,36 @@ def _gradle_write_dirs(_tool: str, args: list[str], cwd: str, env: dict) -> list
 # ---- CMake & CTest --------------------------------------------------------------------------
 
 CMAKE_CONFIGURE_VALUE_OPTIONS = frozenset({
-    "-S", "-B", "-G", "-A", "-T", "-C", "--preset", "--toolchain", "--install-prefix",
+    "-S", "-B", "-G", "-A", "-T", "-C", "-D", "-U", "--preset", "--toolchain", "--install-prefix",
 })
-CMAKE_UNSAFE_TARGET = re.compile(
-    r"^(?:install|uninstall|package|package_source|deploy|upload|publish|clean)(?:[-_/].*)?$", re.I
-)
+CMAKE_SAFE_TARGETS = frozenset({"all", "test", "check", "all_build"})
 
 
 def _cmake_build_targets(before: list[str]) -> list[str]:
-    """Collect all targets passed to cmake --build's `-t <tgt>...` / `--target <tgt>...`."""
-    targets: list[str] = []
+    """Collect all targets passed to cmake --build's `-t <tgt>...` / `--target <tgt>...`,
+    applying CMake's `;`-separated list semantics (`all;install` -> `['all', 'install']`)."""
+    raw: list[str] = []
     i = 0
     while i < len(before):
         arg = before[i]
         if arg in ("-t", "--target"):
             i += 1
             while i < len(before) and not before[i].startswith("-"):
-                targets.append(before[i])
+                raw.append(before[i])
                 i += 1
             continue
         if arg.startswith("--target="):
             val = arg[len("--target="):]
             if val:
-                targets.append(val)
+                raw.append(val)
         elif arg.startswith("-t") and len(arg) > 2:
-            targets.append(arg[2:])
+            raw.append(arg[2:])
         i += 1
+    targets: list[str] = []
+    for item in raw:
+        for piece in item.split(";"):
+            if piece:
+                targets.append(piece)
     return targets
 
 
@@ -502,15 +512,23 @@ def _cmake_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[s
 
 
 def _cmake_restart_safe(_tool: str, args: list[str]) -> bool:
+    # A build preset can hide an `install` or custom mutating target, and `--` forwards arbitrary
+    # targets to the native build tool; require an explicit build dir and standard safe targets.
     if "--" in args or args[:1] != ["--build"]:
         return False
-    if any(a in ("--list-presets", "--help", "-h", "--version") or a.startswith("--list-presets=") for a in args):
+    if len(args) < 2 or args[1].startswith("-"):
         return False
-    has_dir = len(args) > 1 and not args[1].startswith("-")
-    has_preset = any(a == "--preset" or a.startswith("--preset=") for a in args[1:])
-    if not (has_dir or has_preset):
+    if any(a in ("--preset", "--list-presets", "--help", "-h", "--version")
+           or a.startswith(("--preset=", "--list-presets=")) for a in args[1:]):
         return False
-    return not any(CMAKE_UNSAFE_TARGET.match(t) for t in _cmake_build_targets(args))
+    return all(t.lower() in CMAKE_SAFE_TARGETS for t in _cmake_build_targets(args))
+
+
+def _cmake_honors_grant(_tool: str, args: list[str]) -> bool:
+    before = args[:args.index("--")] if "--" in args else args
+    if before[:1] != ["--build"]:
+        return False
+    return not any(a in ("-j", "--parallel") or a.startswith(("-j", "--parallel=")) for a in before[1:])
 
 
 def _cmake_write_dirs(_tool: str, args: list[str], cwd: str, _env: dict) -> list[str]:
@@ -518,7 +536,7 @@ def _cmake_write_dirs(_tool: str, args: list[str], cwd: str, _env: dict) -> list
     dirs: list[str] = []
     if before[:1] == ["--build"] and len(before) > 1 and not before[1].startswith("-"):
         dirs.append(os.path.join(cwd, before[1]))
-    elif before[:1] not in ("-E", "-P", "--install", "--workflow"):
+    elif not before or before[0] not in ("-E", "-P", "--install", "--workflow"):
         for b in option_values(before, {"-B"}):
             dirs.append(os.path.join(cwd, b))
     return dirs
@@ -532,10 +550,17 @@ def _ctest_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[s
     return words
 
 
+CTEST_UNSAFE_LONG = re.compile(
+    r"--(?:dashboard|test-model|test-action|script|script-new-process|add-notes|track|group|submit|"
+    r"extra-submit|submit-index|http-header|http1\.0|tomorrow-tag|overwrite|build-and-test|"
+    r"test-command|build-[a-z-]+)(=.*)?$"
+)
+
+
 def _ctest_restart_safe(_tool: str, args: list[str]) -> bool:
-    # Dashboard submission (-D, -M, -T) and arbitrary CTest scripts (-S, -SP) may upload or mutate.
-    return not any(re.fullmatch(r"-(?:D|M|T|S).*|--(?:script|dashboard|track|submit|dashboard-model)(=.*)?", a)
-                   for a in args)
+    # Restrict to ordinary test mode: reject dashboard submission (-D/-M/-T/-A), CTest scripts
+    # (-S/-SP/--script*), and delegated --build-and-test / --test-command modes.
+    return not any(re.fullmatch(r"-(?:D|M|T|S|A).*", a) or CTEST_UNSAFE_LONG.fullmatch(a) for a in args)
 
 
 def _ctest_write_dirs(_tool: str, args: list[str], cwd: str, _env: dict) -> list[str]:
@@ -548,21 +573,59 @@ CC_VALUE_OPTIONS = frozenset({
     "-o", "-x", "-I", "-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-L", "-l",
     "-D", "-U", "-MF", "-MT", "-MQ", "-MJ", "-target", "--target", "-arch", "-sysroot", "--sysroot",
     "-B", "-Xclang", "-Xlinker", "-Xpreprocessor", "-Xassembler", "-u", "-T", "-e", "-soname",
-    "-rpath", "-aux-info",
+    "-rpath", "-aux-info", "-wrapper", "-dumpdir", "-dumpbase", "-serialize-diagnostics",
+    "--serialize-diagnostics", "-gen-cdb-fragment-path", "-load", "-working-directory",
 })
 CC_OPT_FLAG = re.compile(r"-O(?:[0-3sgz]|fast)?$")
+CC_EMIT_EXACT = frozenset({
+    "-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-MG", "-MP", "-save-temps", "--coverage",
+    "-Xpreprocessor", "-Xclang", "-Xlinker", "-Xassembler", "--analyze", "-analyze",
+    "--serialize-diagnostics", "-serialize-diagnostics", "--write-dependencies",
+    "--write-user-dependencies", "--dependencies", "-dumpdir", "-fstack-usage", "-fcallgraph-info",
+    "-gen-cdb-fragment-path", "-load",
+})
+CC_EMIT_PREFIXES = (
+    "-o", "-MF", "-MT", "-MQ", "-MJ", "--output", "-save-temps=", "-ftime-trace", "-fprofile",
+    "-dumpbase", "-aux-info", "-ftest-coverage", "-Wp,", "-fdump-", "-fdiagnostics-format=",
+    "-fdiagnostics-add-output=", "-save-stats", "-fmodule-output", "-fplugin",
+    "--serialize-diagnostics=", "-serialize-diagnostics=",
+)
+
+
+def _cc_scan(args: list[str]) -> tuple[list[str], list[str], bool]:
+    """Scan C/C++ compiler args consuming option values cleanly -> (options, positionals, has_rsp)."""
+    opts: list[str] = []
+    pos: list[str] = []
+    has_rsp = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("@"):
+            has_rsp = True
+            i += 1
+        elif arg == "-":
+            pos.append(arg)
+            i += 1
+        elif arg.startswith("-"):
+            opts.append(arg)
+            i += 2 if arg in CC_VALUE_OPTIONS and i + 1 < len(args) else 1
+        else:
+            pos.append(arg)
+            i += 1
+    return opts, pos, has_rsp
 
 
 def _cc_flag_and_source_words(rest: list[str]) -> list[str]:
-    words = [f for f in ("-c", "-S", "-E", "-shared", "-fsyntax-only") if f in rest]
-    opt = next((a for a in rest if CC_OPT_FLAG.fullmatch(a)), None)
+    opts, pos, _ = _cc_scan(rest)
+    words = [f for f in ("-c", "-S", "-E", "-shared", "-fsyntax-only") if f in opts]
+    opt = next((a for a in opts if CC_OPT_FLAG.fullmatch(a)), None)
     if opt:
         words.append(opt)
-    if any(a == "-flto" or a.startswith("-flto=") for a in rest):
+    if any(a == "-flto" or a.startswith("-flto=") for a in opts):
         words.append("-flto")
-    pos = positionals(rest, CC_VALUE_OPTIONS)
-    if pos:
-        words.append(os.path.basename(pos[0]))
+    files = [p for p in pos if p != "-"]
+    if files:
+        words.append(os.path.basename(files[0]))
     else:
         outs = option_values(rest, {"-o"})
         if outs:
@@ -574,15 +637,24 @@ def _cc_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]
     return [tool] + _cc_flag_and_source_words(rest)
 
 
+def _cc_restart_safe(_tool: str, args: list[str]) -> bool:
+    opts, _, has_rsp = _cc_scan(args)
+    if has_rsp:
+        return False  # response file could pass -wrapper or unexpected options
+    return not any(a == "-wrapper" or a.startswith("-wrapper=") for a in opts)
+
+
 def _cc_reusable_check(_tool: str, args: list[str]) -> bool:
-    if "-fsyntax-only" not in args:
+    opts, pos, has_rsp = _cc_scan(args)
+    if has_rsp or "-fsyntax-only" not in opts:
         return False
-    if any(a in ("-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-MG", "-MP", "-save-temps", "--coverage")
-           or a.startswith(("-o", "-MF", "-MT", "-MQ", "-MJ", "--output", "-save-temps=", "-ftime-trace",
-                            "-fprofile", "-dumpbase", "-aux-info", "-ftest-coverage"))
-           for a in args):
+    if any(a == "-wrapper" or a.startswith("-wrapper=") for a in opts):
         return False
-    return bool(positionals(args, CC_VALUE_OPTIONS))
+    if any(a in CC_EMIT_EXACT or a.startswith(CC_EMIT_PREFIXES) for a in opts):
+        return False
+    if "-" in pos:
+        return False  # reads stdin
+    return bool(pos)
 
 
 # ---- Zig ------------------------------------------------------------------------------------
@@ -590,13 +662,19 @@ def _cc_reusable_check(_tool: str, args: list[str]) -> bool:
 ZIG_BUILD_VALUE_OPTIONS = frozenset({
     "-j", "-p", "--prefix", "--prefix-lib-dir", "--prefix-exe-dir", "--prefix-include-dir",
     "--sysroot", "--search-prefix", "--libc", "--cache-dir", "--global-cache-dir", "--zig-lib-dir",
-    "--build-file", "--build-runner", "--seed", "--maxrss", "--color", "-freference-trace",
+    "--build-file", "--build-runner", "--seed", "--maxrss", "--color",
+    "--summary", "--debounce", "--system", "--port",
 })
 ZIG_COMPILE_VALUE_OPTIONS = frozenset({
     "-O", "-target", "-mcpu", "-M", "--dep", "--name", "--cache-dir", "--global-cache-dir",
-    "--zig-lib-dir", "--test-filter", "--test-name-prefix", "--test-cmd", "--listen", "-I", "-L",
+    "--zig-lib-dir", "--test-filter", "--test-name-prefix", "--test-cmd", "-I", "-L",
     "-l", "-isystem", "-dirafter", "-idirafter", "-framework", "-F", "-rpath", "-T", "--script", "-ofmt",
 })
+
+
+def _zig_is_long_running(args: list[str]) -> bool:
+    return any(a in ("--watch", "--fuzz", "--webui", "--listen")
+               or a.startswith(("--webui=", "--listen=")) for a in args)
 
 
 def _zig_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]:
@@ -606,15 +684,14 @@ def _zig_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str
     sub_args = rest[1:]
     if sub == "build":
         words = [tool, "build"] + positionals(sub_args, ZIG_BUILD_VALUE_OPTIONS)[:2]
-        for a in sub_args:
-            if a.startswith("-Doptimize=") and a[len("-Doptimize="):]:
-                words.append(f"-Doptimize {a[len('-Doptimize='):]}")
-            elif a.startswith("-Dtarget=") and a[len("-Dtarget="):]:
-                words.append(f"-Dtarget {a[len('-Dtarget='):]}")
-            elif a.startswith("--release=") and a[len("--release="):]:
-                words.append(f"--release {a[len('--release='):]}")
-            elif a == "--release":
-                words.append("--release")
+        is_release = any(
+            (a.startswith("-Doptimize=") and a[len("-Doptimize="):].startswith("Release"))
+            or (a.startswith("--release=") and a[len("--release="):] not in ("", "off"))
+            or a == "--release"
+            for a in sub_args
+        )
+        if is_release:
+            words.append("--release")
         return words
     if sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj", "ast-check", "run"):
         words = [tool, sub]
@@ -627,12 +704,19 @@ def _zig_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str
     return [tool, sub] + [os.path.basename(p.rstrip("/")) or p for p in positionals(sub_args)[:1]]
 
 
+def _zig_honors_grant(_tool: str, args: list[str]) -> bool:
+    if args[:1] != ["build"]:
+        return False
+    before = args[:args.index("--")] if "--" in args else args
+    return not asks_for_jobs(before) and not _zig_is_long_running(before)
+
+
 def _zig_rewrite_argv(_tool: str, args: list[str], granted: int, _jobserver: str | None,
                       _test_threads: bool, _caller_env: dict | None) -> list[str] | None:
     if args[:1] != ["build"]:
         return None
     before = args[:args.index("--")] if "--" in args else args
-    if asks_for_jobs(before) or ({"--watch", "--help", "-h", "-l", "--list-steps"} & set(before)):
+    if asks_for_jobs(before) or _zig_is_long_running(before) or ({"--help", "-h", "-l", "--list-steps"} & set(before)):
         return None
     return [args[0], f"-j{granted}", *args[1:]]
 
@@ -642,7 +726,7 @@ def _zig_restart_safe(_tool: str, args: list[str]) -> bool:
         return False
     sub, rest = args[0], args[1:]
     before = rest[:rest.index("--")] if "--" in rest else rest
-    if "--watch" in before:
+    if _zig_is_long_running(before):
         return False
     if sub == "build":
         if "--" in rest:
@@ -650,18 +734,33 @@ def _zig_restart_safe(_tool: str, args: list[str]) -> bool:
         if any(a == "-p" or a.startswith(("-p", "--prefix")) for a in before):
             return False
         return set(positionals(before, ZIG_BUILD_VALUE_OPTIONS)) <= {"install", "test", "check", "build"}
-    return sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj", "ast-check", "cc", "c++")
+    if sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj", "ast-check"):
+        if any(a == "--test-cmd" or a.startswith("--test-cmd=") for a in before):
+            return False
+        return True
+    if sub in ("cc", "c++"):
+        return _cc_restart_safe(sub, rest)
+    return False
 
 
 def _zig_reusable_check(_tool: str, args: list[str]) -> bool:
     if not args or args[0] not in ("test", "ast-check"):
         return False
     rest = args[1:]
-    if any(a in ("--watch", "--test-no-exec", "--test-cmd", "-o", "--output")
-           or a.startswith(("--test-cmd=", "-femit-", "--output="))
+    if _zig_is_long_running(rest):
+        return False
+    if any(a in ("--test-no-exec", "--test-cmd", "-o", "--output", "--verbose-llvm-ir", "--verbose-llvm-bc")
+           or a.startswith(("--test-cmd=", "-femit-", "--output=", "--verbose-llvm-ir=", "--verbose-llvm-bc="))
            for a in rest):
         return False
     return bool(positionals(rest, ZIG_COMPILE_VALUE_OPTIONS))
+
+
+def _zig_project_root(before: list[str], cwd: str) -> str | None:
+    bfiles = option_values(before, {"--build-file"})
+    if bfiles:
+        return os.path.dirname(os.path.abspath(os.path.join(cwd, bfiles[-1])))
+    return _find_marker_root(cwd, ("build.zig",))
 
 
 def _zig_write_dirs(_tool: str, args: list[str], cwd: str, env: dict) -> list[str]:
@@ -672,7 +771,10 @@ def _zig_write_dirs(_tool: str, args: list[str], cwd: str, env: dict) -> list[st
     before = args[:args.index("--")] if "--" in args else args
     for val in option_values(before, {"--cache-dir", "--global-cache-dir"}):
         dirs.append(os.path.join(cwd, val))
-    root = _find_marker_root(cwd, ("build.zig",))
+    if args[:1] == ["build"]:
+        for val in option_values(before, {"-p", "--prefix"}):
+            dirs.append(os.path.join(cwd, val))
+    root = _zig_project_root(before, cwd)
     if root:
         dirs.append(os.path.join(root, ".zig-cache"))
         if args[:1] == ["build"]:
@@ -690,7 +792,7 @@ def _zig_is_cold(_tool: str, args: list[str], cwd: str, env: dict) -> bool:
     elif env.get("ZIG_LOCAL_CACHE_DIR"):
         cache = os.path.join(cwd, env["ZIG_LOCAL_CACHE_DIR"])
     else:
-        root = _find_marker_root(cwd, ("build.zig",))
+        root = _zig_project_root(before, cwd)
         if root is None:
             return False
         cache = os.path.join(root, ".zig-cache")
@@ -704,14 +806,16 @@ PYTEST_VALUE_OPTIONS = frozenset({
     "--tb", "--show-capture", "--capture", "--junitxml", "--junit-xml", "--rootdir", "--basetemp",
     "--confcutdir", "--ignore", "--ignore-glob", "--deselect", "--durations", "--durations-min",
     "--log-level", "--log-format", "--log-file", "--cov", "--cov-report", "--cov-config", "--html",
-    "--json-report-file", "-W", "--filterwarnings", "--verbosity", "-r",
+    "--json-report-file", "-W", "--filterwarnings", "--verbosity", "-r", "--pdbcls",
 })
 PYTEST_NON_REUSABLE = frozenset({
     "--lf", "--last-failed", "--ff", "--failed-first", "--nf", "--new-first", "--sw", "--stepwise",
-    "--stepwise-skip", "--cache-clear", "--cov", "--cov-report", "--junitxml", "--junit-xml",
-    "--html", "--json-report", "--json-report-file", "--resultlog", "--log-file", "--basetemp",
-    "-o", "--override-ini", "--snapshot-update", "--update-goldens", "--benchmark-save",
-    "--benchmark-autosave", "--benchmark-json",
+    "--stepwise-skip", "--stepwise-reset", "--sw-reset", "--cache-clear", "--cov", "--cov-report",
+    "--junitxml", "--junit-xml", "--html", "--json-report", "--json-report-file", "--resultlog",
+    "--log-file", "--basetemp", "-o", "--override-ini", "--snapshot-update", "--update-goldens",
+    "--benchmark-save", "--benchmark-autosave", "--benchmark-json",
+    "--collect-only", "--co", "--setup-only", "--setup-plan", "--setup-show", "--fixtures",
+    "--fixtures-per-test", "--markers", "--cache-show", "-V", "--version", "-h", "--help",
 })
 PYTEST_NON_REUSABLE_PREFIXES = (
     "--cov=", "--cov-report=", "--junitxml=", "--junit-xml=", "--html=", "--json-report=",
@@ -729,18 +833,29 @@ def _pytest_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[
 
 
 def _pytest_restart_safe(_tool: str, args: list[str]) -> bool:
-    return not any(a in ("-f", "--looponfail", "--pdb", "--trace") or a.startswith("--pdbcls=") for a in args)
+    return not any(
+        a.startswith("@")
+        or a in ("-f", "--looponfail", "--pdb", "--pdbcls", "--trace")
+        or a.startswith("--pdbcls=")
+        or re.fullmatch(r"-[qvxsbl]*f.*", a)
+        for a in args
+    )
 
 
 def _pytest_reusable_check(_tool: str, args: list[str]) -> bool:
     if not _pytest_restart_safe("pytest", args):
         return False
-    return not any(a in PYTEST_NON_REUSABLE or a.startswith(PYTEST_NON_REUSABLE_PREFIXES) for a in args)
+    return not any(
+        a in PYTEST_NON_REUSABLE
+        or a.startswith(PYTEST_NON_REUSABLE_PREFIXES)
+        or re.fullmatch(r"-[qvxsbl]*o.*", a)
+        for a in args
+    )
 
 
 MYPY_VALUE_OPTIONS = frozenset({
     "--config-file", "--cache-dir", "--python-version", "--platform", "--package", "-p", "--module",
-    "-m", "--exclude", "--follow-imports", "--shadow-file", "--output", "--junit-xml", "--html-report",
+    "-m", "-c", "--command", "--exclude", "--follow-imports", "--output", "--junit-xml", "--html-report",
     "--xml-report", "--txt-report", "--linecount-report", "--linecoverage-report",
     "--lineprecision-report", "--cobertura-xml-report", "--any-exprs-report", "--xslt-html-report",
     "--xslt-txt-report", "--custom-typeshed-dir", "--custom-typing-module", "--python-executable",
@@ -751,28 +866,44 @@ def _mypy_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[st
     words = [tool]
     words += [f"-p {p}" for p in option_values(rest, {"-p", "--package"})[:1]]
     words += [f"-m {m}" for m in option_values(rest, {"-m", "--module"})[:1]]
-    words += [os.path.basename(p.rstrip("/")) or p for p in positionals(rest, MYPY_VALUE_OPTIONS)[:2]]
-    return words
+    pos: list[str] = []
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        if arg == "--shadow-file":  # takes 2 args: SOURCE SHADOW
+            i += 3
+            continue
+        if arg in MYPY_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        pos.append(os.path.basename(arg.rstrip("/")) or arg)
+        i += 1
+    return words + pos[:2]
 
 
 def _mypy_restart_safe(_tool: str, args: list[str]) -> bool:
-    return not any(a in ("--install-types", "--non-interactive", "-w", "--watch") for a in args)
+    return not any(a.startswith("@") or a in ("--install-types", "--non-interactive", "-w", "--watch") for a in args)
 
 
 def _mypy_reusable_check(_tool: str, args: list[str]) -> bool:
     if not _mypy_restart_safe("mypy", args):
         return False
     return not any(
-        a in ("--junit-xml", "--output", "--stats", "--dump-graph", "--dump-deps")
-        or a.startswith(("--junit-xml=", "--output="))
+        a in ("-c", "--command", "-V", "--version", "-h", "--help",
+              "--junit-xml", "--output", "--stats", "--dump-graph", "--dump-deps")
+        or a.startswith(("--command=", "--junit-xml=", "--output="))
         or re.fullmatch(r"--[a-z-]+-report(=.*)?", a)
         for a in args
     )
 
 
 PYRIGHT_VALUE_OPTIONS = frozenset({
-    "-p", "--project", "--pythonpath", "--pythonversion", "--pythonplatform", "--typeshedpath",
-    "--venvpath", "--level", "--baselinefile", "--createstub",
+    "-p", "--project", "--pythonpath", "--python-path", "--pythonversion", "--python-version",
+    "--pythonplatform", "--python-platform", "--typeshedpath", "--typeshed-path", "--venvpath",
+    "--venv-path", "--level", "--baselinefile", "--createstub", "--verifytypes", "--gitlabcodequality",
 })
 
 
@@ -788,8 +919,12 @@ def _pyright_restart_safe(_tool: str, args: list[str]) -> bool:
 def _pyright_reusable_check(_tool: str, args: list[str]) -> bool:
     if not _pyright_restart_safe("pyright", args):
         return False
-    return not any(a in ("--outputjson", "--stats", "--baselinefile")
-                   or a.startswith("--baselinefile=") for a in args)
+    return not any(
+        a in ("--outputjson", "--stats", "--baselinefile", "--gitlabcodequality", "--verifytypes",
+              "--version", "--help", "-h")
+        or a.startswith(("--baselinefile=", "--gitlabcodequality=", "--verifytypes="))
+        for a in args
+    )
 
 
 def _python_module_call(args: list[str]) -> tuple[str, list[str]] | None:
@@ -830,7 +965,7 @@ def _python_module_restart_safe(mod: str, mod_args: list[str]) -> bool:
 
 def _python_module_reusable_check(mod: str, mod_args: list[str]) -> bool:
     if mod == "unittest":
-        return True
+        return not any(a in ("-h", "--help") for a in mod_args)
     if mod == "pytest":
         return _pytest_reusable_check("pytest", mod_args)
     if mod == "mypy":
@@ -875,6 +1010,10 @@ UV_STRICT_RUN_VALUE_OPTIONS = frozenset({
     "--with-requirements", "-p", "--python", "--package", "--python-preference", "--resolution",
     "--prerelease", "--fork-strategy", "--exclude-newer", "--link-mode", "--color",
 })
+UV_REUSE_FORBIDDEN_FLAGS = frozenset({
+    "--refresh", "--reinstall", "--exact", "--all-extras", "--all-groups",
+    "-w", "--with", "--with-requirements", "--extra", "--no-extra", "--group", "--no-group", "--only-group",
+})
 
 
 def _uv_words(tool: str, rest: list[str], labels: Collection[str]) -> list[str]:
@@ -883,7 +1022,8 @@ def _uv_words(tool: str, rest: list[str], labels: Collection[str]) -> list[str]:
         return [tool]
     sub_idx, sub = items[0]
     if sub != "run":
-        return [tool] + [arg for _, arg in items[:2]]
+        before = rest[:rest.index("--")] if "--" in rest else rest
+        return [tool] + positionals(before, UV_TOP_VALUE_OPTIONS)[:2]
     after = rest[sub_idx + 1:]
     is_module = False
     i = 0
@@ -904,6 +1044,8 @@ def _uv_words(tool: str, rest: list[str], labels: Collection[str]) -> list[str]:
             continue
         break
     inner = after[i:]
+    if "--" in inner:
+        inner = inner[:inner.index("--")]
     if not inner:
         return [tool, "run"]
     if is_module:
@@ -918,14 +1060,19 @@ def _uv_words(tool: str, rest: list[str], labels: Collection[str]) -> list[str]:
         call = _python_module_call(inner_args)
         if call:
             return [tool, "run", inner_tool, f"-m {call[0]}"]
+        pos = positionals(inner_args, {"-m", "-c", "-W", "-X"})
+        return [tool, "run", inner_tool] + [os.path.basename(p.rstrip("/")) or p for p in pos[:1]]
     return [tool, "run", inner_tool] + [os.path.basename(p.rstrip("/")) or p for p in positionals(inner_args)[:1]]
 
 
-def _uv_parse_strict(args: list[str]) -> tuple[str, list[str], bool] | None:
-    """Strictly parse `uv [safe-flags] build|run [safe-opts] [--] CMD`; None for unknown options."""
+def _uv_parse_strict(args: list[str]) -> tuple[str, list[str], bool, list[str]] | None:
+    """Strictly parse `uv [safe-flags] build|run [safe-opts] [--] CMD`; None for unknown options.
+    Returns `(subcommand, inner_argv, is_module, run_option_names)`."""
     i = 0
+    top_opts: list[str] = []
     while i < len(args) and args[i].startswith("-"):
         if args[i] in UV_STRICT_TOP_FLAGS:
+            top_opts.append(args[i])
             i += 1
             continue
         return None
@@ -934,10 +1081,11 @@ def _uv_parse_strict(args: list[str]) -> tuple[str, list[str], bool] | None:
     sub = args[i]
     i += 1
     if sub == "build":
-        return "build", args[i:], False
+        return "build", args[i:], False, top_opts
     if sub != "run":
         return None
     is_module = False
+    run_opts = list(top_opts)
     while i < len(args) and args[i].startswith("-"):
         arg = args[i]
         if arg == "--":
@@ -945,31 +1093,64 @@ def _uv_parse_strict(args: list[str]) -> tuple[str, list[str], bool] | None:
             break
         if arg in ("-m", "--module"):
             is_module = True
+            run_opts.append(arg)
             i += 1
             continue
         if arg in UV_STRICT_RUN_FLAGS:
+            run_opts.append(arg)
             i += 1
             continue
         if arg in UV_STRICT_RUN_VALUE_OPTIONS:
             if i + 1 >= len(args):
                 return None
+            run_opts.append(arg)
             i += 2
             continue
         opt_name, eq, _ = arg.partition("=")
         if eq and opt_name in UV_STRICT_RUN_VALUE_OPTIONS:
+            run_opts.append(opt_name)
             i += 1
             continue
         return None
     if i >= len(args):
         return None
-    return "run", args[i:], is_module
+    return "run", args[i:], is_module, run_opts
+
+
+def _uv_honors_grant(_tool: str, args: list[str]) -> bool:
+    items = positional_items(args, UV_TOP_VALUE_OPTIONS)
+    if not items:
+        return True
+    sub_idx, sub = items[0]
+    if sub != "run":
+        return sub in ("build", "sync", "pip", "lock", "export", "venv", "tool")
+    after = args[sub_idx + 1:]
+    i = 0
+    while i < len(after):
+        arg = after[i]
+        if arg == "--":
+            i += 1
+            break
+        if arg in UV_RUN_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        break
+    if i >= len(after):
+        return False
+    inner_tool = os.path.basename(after[i])
+    if inner_tool == "uv":
+        return False
+    return honors_grant_for(inner_tool, after[i + 1:])
 
 
 def _uv_restart_safe(_tool: str, args: list[str]) -> bool:
     parsed = _uv_parse_strict(args)
     if not parsed:
         return False
-    sub, inner, is_module = parsed
+    sub, inner, is_module, _ = parsed
     if sub == "build":
         return True
     if is_module:
@@ -984,8 +1165,10 @@ def _uv_reusable_check(_tool: str, args: list[str]) -> bool:
     parsed = _uv_parse_strict(args)
     if not parsed:
         return False
-    sub, inner, is_module = parsed
-    if sub != "run":
+    sub, inner, is_module, run_opts = parsed
+    # Require explicit --no-sync and no refresh/reinstall/dependency-setup flags so reuse never
+    # skips syncing .venv or installing requested packages.
+    if sub != "run" or "--no-sync" not in run_opts or (UV_REUSE_FORBIDDEN_FLAGS & set(run_opts)):
         return False
     if is_module:
         return _python_module_reusable_check(inner[0], inner[1:])
@@ -1040,6 +1223,7 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         names=("cmake",),
         honors_grant=True,
+        honors_grant_args=_cmake_honors_grant,
         command_words=_cmake_words,
         restart_safe=_cmake_restart_safe,
         global_env=lambda g, _w, _js, _tt, _env: {"CMAKE_BUILD_PARALLEL_LEVEL": str(g)},
@@ -1059,7 +1243,8 @@ SPECS: tuple[ToolSpec, ...] = (
         merge_env_vars=("GRADLE_OPTS",),
         command_words=_gradle_words,
         restart_safe=_gradle_restart_safe,
-        reusable_check=_gradle_reusable_check,
+        # Ordinary Gradle test/check/lint tasks write XML/HTML reports and build artifacts by
+        # default; let Gradle's own up-to-date checks or explicit --reuse handle reuse.
         global_env=_gradle_global_env,
         direct_env=_gradle_direct_env,
         write_dirs=_gradle_write_dirs,
@@ -1067,6 +1252,7 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         names=("zig",),
         honors_grant=True,
+        honors_grant_args=_zig_honors_grant,
         command_words=_zig_words,
         restart_safe=_zig_restart_safe,
         reusable_check=_zig_reusable_check,
@@ -1076,14 +1262,15 @@ SPECS: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         names=("gcc", "g++", "clang", "clang++", "cc", "c++"),
-        name_pattern=re.compile(r"(?:gcc|g\+\+|clang|clang\+\+)-\d+"),
+        name_pattern=re.compile(r"(?:gcc|g\+\+|clang|clang\+\+|cc|c\+\+)-\d+"),
         command_words=_cc_words,
-        restart_safe=lambda _t, _a: True,
+        restart_safe=_cc_restart_safe,
         reusable_check=_cc_reusable_check,
     ),
     ToolSpec(
         names=("uv",),
         honors_grant=True,
+        honors_grant_args=_uv_honors_grant,
         command_words=_uv_words,
         restart_safe=_uv_restart_safe,
         reusable_check=_uv_reusable_check,
@@ -1127,7 +1314,7 @@ SPECS: tuple[ToolSpec, ...] = (
         names=("tsc", "vue-tsc"),
         not_script=False,  # kept out of NOT_SCRIPTS for backwards config.toml compatibility
         restart_safe=lambda _t, _a: True,
-        reusable_check=lambda _t, a: no_emit(a),
+        reusable_check=lambda _t, a: "-w" not in a and no_emit(a),
     ),
     ToolSpec(
         names=("eslint",),
@@ -1173,9 +1360,17 @@ def lookup(tool: str) -> ToolSpec | None:
 # ---- Dispatch helpers (distinct names from commands.* to avoid sim.py facade collisions) ----
 
 
-def honors_grant_tool(tool: str) -> bool:
+def honors_grant_for(tool: str, args: list[str] | None = None) -> bool:
     spec = lookup(tool)
-    return bool(spec and spec.honors_grant)
+    if not spec:
+        return False
+    if args is not None and spec.honors_grant_args is not None:
+        return spec.honors_grant_args(tool, args)
+    return spec.honors_grant
+
+
+def honors_grant_tool(tool: str) -> bool:
+    return honors_grant_for(tool, None)
 
 
 def is_not_script(tool: str) -> bool:

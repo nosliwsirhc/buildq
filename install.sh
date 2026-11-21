@@ -3,10 +3,10 @@
 # Install buildq for the current user. No root needed.
 #
 #   ./install.sh                 install or upgrade, then enable and (re)start the daemon
-#   ./install.sh --shims         also put cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet,
-#                                cmake, ctest, zig and gradle shims in ~/.local/share/buildq/shims,
-#                                which send heavy commands through the queue; put that directory
-#                                first on PATH (it says how)
+#   ./install.sh --shims         also put cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet
+#                                (plus cmake, ctest, zig and gradle when installed on PATH) shims in
+#                                ~/.local/share/buildq/shims, which send heavy commands through
+#                                the queue; put that directory first on PATH (it says how)
 #   ./install.sh --rustc-guard=DIR[,DIR...]
 #                                also make buildq-rustc-guard cargo's rustc wrapper for everything
 #                                under each DIR (DIR/.cargo/config.toml), so Rust compiles there
@@ -51,7 +51,28 @@ cargo_config=${CARGO_HOME:-$HOME/.cargo}/config.toml
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # docker isn't among them: an image build's work runs in dockerd, outside the build's cgroup, so the
 # queue can't measure it (see the README).
-shim_tools=(cargo pnpm npm npx yarn make gmake ninja dotnet cmake ctest zig gradle)
+shim_tools=(cargo pnpm npm npx yarn make gmake ninja dotnet)
+# Optional compiler shims are linked only when a real binary exists outside $shimdir, so scripts
+# using `command -v gradle || ./gradlew` never trip over a shim for an absent tool.
+optional_shim_tools=(cmake ctest zig gradle)
+
+has_real_tool() {
+  local name=$1 dir cand real_shimdir real_dir real_shim
+  real_shimdir=$(realpath -m -- "$shimdir" 2>/dev/null || printf '%s' "$shimdir")
+  real_shim=$(realpath -m -- "$bindir/buildq-shim" 2>/dev/null || printf '%s' "$bindir/buildq-shim")
+  local IFS=:
+  for dir in $PATH; do
+    [[ -n "$dir" ]] || continue
+    real_dir=$(realpath -m -- "$dir" 2>/dev/null || printf '%s' "$dir")
+    [[ "$real_dir" == "$real_shimdir" ]] && continue
+    cand=$dir/$name
+    if [[ -f "$cand" && -x "$cand" ]]; then
+      [[ "$(realpath -m -- "$cand" 2>/dev/null || printf '%s' "$cand")" == "$real_shim" ]] && continue
+      return 0
+    fi
+  done
+  return 1
+}
 guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
 skill_list=$confdir/skill-links    # every skill link made, for --uninstall
 # Where coding agents look for skills: each is used only if the agent's own directory exists.
@@ -406,8 +427,17 @@ for option in "$@"; do
   case $option in
     --shims)
       mkdir -p "$shimdir"
+      installed_shims=("${shim_tools[@]}")
       for tool in "${shim_tools[@]}"; do ln -sfn "$bindir/buildq-shim" "$shimdir/$tool"; done
-      say "shims for ${shim_tools[*]} are in $shimdir. Put it first on PATH, at the end of ~/.bashrc:"
+      for tool in "${optional_shim_tools[@]}"; do
+        if has_real_tool "$tool"; then
+          ln -sfn "$bindir/buildq-shim" "$shimdir/$tool"
+          installed_shims+=("$tool")
+        elif [[ -L "$shimdir/$tool" ]]; then
+          rm -f "$shimdir/$tool"
+        fi
+      done
+      say "shims for ${installed_shims[*]} are in $shimdir. Put it first on PATH, at the end of ~/.bashrc:"
       say "    export PATH=\"$shimdir:\$PATH\""
       ;;
     --skill) ;;  # done above: it needs neither systemd nor the daemon

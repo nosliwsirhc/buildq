@@ -56,18 +56,20 @@ GRADLE_LIGHT_TASK = re.compile(
     r"(^|:)(help|tasks|projects|properties|dependencies|dependencyInsight|components|model|"
     r"outgoingVariants|resolvableConfigurations|clean|wrapper|init|bootRun|run)$", re.I
 )
+GRADLE_SHORT_LIGHT = re.compile(r"-[qidswamtuSvh?]*[tmvh?][qidswamtuSvh?]*")
 GRADLE_VALUE_OPTIONS = {
     "-p", "--project-dir", "-b", "--build-file", "-c", "--settings-file", "-g", "--gradle-user-home",
     "-I", "--init-script", "-x", "--exclude-task", "--max-workers", "--console", "--console-unicode",
     "--warning-mode", "--priority", "--include-build", "--project-cache-dir",
     "--configuration-cache-problems", "-F", "--dependency-verification", "-M",
-    "--write-verification-metadata", "--export-keys", "--update-locks", "--develocity-url",
+    "--write-verification-metadata", "--update-locks", "--develocity-url",
     "--develocity-plugin-version", "--tests", "-D", "--system-prop", "-P", "--project-prop",
 }
 ZIG_BUILD_VALUE_OPTIONS = {
     "-j", "-p", "--prefix", "--prefix-lib-dir", "--prefix-exe-dir", "--prefix-include-dir",
     "--sysroot", "--search-prefix", "--libc", "--cache-dir", "--global-cache-dir", "--zig-lib-dir",
-    "--build-file", "--build-runner", "--seed", "--maxrss", "--color", "-freference-trace",
+    "--build-file", "--build-runner", "--seed", "--maxrss", "--color",
+    "--summary", "--debounce", "--system", "--port",
 }
 JS_TOOLS = {"vitest", "vite", "tsc", "vue-tsc", "playwright", "storybook", "build-storybook", "jest", "eslint",
             "next", "nuxt", "astro"}
@@ -162,6 +164,15 @@ def never_builds(tool: str, args: list[str]) -> bool:
 
 
 def heavy(tool: str, args: list[str]) -> bool:
+    if tool == "ctest":
+        # Checked before INFO and watching(): `-V` is verbose (heavy), and `-R watch` is a test regex.
+        if any(a in ("-N", "--show-only", "--list-presets", "--print-labels", "--help", "-h", "-H",
+                     "-help", "-usage", "/?", "--version", "-version", "/V", "/version")
+               or a.startswith(("--show-only=", "--list-presets=", "--help-", "--version=",
+                                "-version=", "/V=", "/version="))
+               for a in args):
+            return False
+        return True
     if args and all(a in INFO for a in args):
         return False
     if tool == "cargo":
@@ -180,6 +191,33 @@ def heavy(tool: str, args: list[str]) -> bool:
         if pos[:1] == ["run"] and "--no-build" in before:
             return False  # caller explicitly asked to run without building
         return pos[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
+    if tool == "cmake":
+        before = args[: args.index("--")] if "--" in args else args
+        if any(a in ("--help", "-h", "--version", "--list-presets")
+               or a.startswith(("--help-", "--list-presets=")) for a in before):
+            return False
+        return before[:1] in (["--build"], ["--workflow"])
+    if tool == "zig":
+        sub = args[0] if args and not args[0].startswith("-") else ""
+        rest = args[1:]
+        before = rest[: rest.index("--")] if "--" in rest else rest
+        if any(a in ("-h", "--help", "-l", "--list-steps", "--watch", "--fuzz", "--webui", "--listen")
+               or a.startswith(("--watch=", "--webui=", "--listen=")) for a in before):
+            return False
+        if sub == "build":
+            steps = positionals(before, ZIG_BUILD_VALUE_OPTIONS)
+            return not steps or not all(MAKE_LIGHT_TARGET.search(s) for s in steps)
+        return sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj")
+    if tool in ("gradle", "gradlew"):
+        sep = args.index("--") if "--" in args else len(args)
+        before, after = args[:sep], args[sep + 1:]
+        if any(a in ("--stop", "--status", "--foreground", "-t", "--continuous", "-m", "--dry-run",
+                     "--task-graph", "-v", "--version", "-h", "--help", "-?")
+               or GRADLE_SHORT_LIGHT.fullmatch(a) for a in before):
+            return False
+        # After `--`, Gradle stops parsing built-in options; remaining tokens are tasks and task options.
+        tasks = positionals(before, GRADLE_VALUE_OPTIONS) + positionals(after, {"--tests"})
+        return not tasks or not all(GRADLE_LIGHT_TASK.search(t) for t in tasks)
     if watching(args):
         return False
     if tool in ("npm", "pnpm", "yarn", "bun"):
@@ -205,34 +243,6 @@ def heavy(tool: str, args: list[str]) -> bool:
         targets = [a for a in positionals(args, {"-C", "-f", "-j", "-l", "-o", "-W", "--directory", "--file"})
                    if "=" not in a]
         return not targets or not all(MAKE_LIGHT_TARGET.search(t) for t in targets)
-    if tool == "cmake":
-        before = args[: args.index("--")] if "--" in args else args
-        if any(a in ("--help", "-h", "--version", "--list-presets")
-               or a.startswith(("--help-", "--list-presets=")) for a in before):
-            return False
-        return before[:1] in (["--build"], ["--workflow"])
-    if tool == "ctest":
-        if any(a in ("-N", "--show-only", "--list-presets", "--help", "-h", "--version")
-               or a.startswith(("--show-only=", "--list-presets=", "--help-")) for a in args):
-            return False
-        return True
-    if tool == "zig":
-        sub = args[0] if args and not args[0].startswith("-") else ""
-        rest = args[1:]
-        before = rest[: rest.index("--")] if "--" in rest else rest
-        if any(a in ("-h", "--help", "-l", "--list-steps") for a in before) or watching(before):
-            return False
-        if sub == "build":
-            steps = positionals(before, ZIG_BUILD_VALUE_OPTIONS)
-            return not steps or not all(MAKE_LIGHT_TARGET.search(s) for s in steps)
-        return sub in ("test", "test-obj", "build-exe", "build-lib", "build-obj")
-    if tool in ("gradle", "gradlew"):
-        before = args[: args.index("--")] if "--" in args else args
-        if {"--stop", "--status", "--foreground", "-t", "--continuous", "-m", "--dry-run",
-            "--task-graph", "-v", "--version", "-h", "--help", "-?"} & set(before):
-            return False
-        tasks = positionals(before, GRADLE_VALUE_OPTIONS)
-        return not tasks or not all(GRADLE_LIGHT_TASK.search(t) for t in tasks)
     if tool in ("docker", "podman"):
         pos = positionals(args)
         return pos[:1] == ["build"] or pos[:2] in (["buildx", "build"], ["compose", "build"], ["image", "build"])

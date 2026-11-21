@@ -933,11 +933,22 @@ class SchedulerMixin:
             t.exec_argv = tools.rewrite_argv_for(tool, t.argv, tool_at, granted, t.jobserver,
                                                  lane.test_threads, env)
             # buildq's settings go in a file of their own, so a build that is queued again after a
-            # restart gets fresh ones. Pass cleaned make flags so a merge callback never sees a
-            # dropped fd jobserver.
-            cleaned_env = {**env, **cleaned} if cleaned else env
+            # restart gets fresh ones. Pass cleaned make flags plus any inline wrapper assignments
+            # (`env GRADLE_OPTS=-Xmx2g gradle test`) so a merge callback sees the effective value.
+            cleaned_env = {**env, **cleaned} if cleaned else dict(env)
+            inline_idx: dict[str, int] = {}
+            for idx in sorted(commands.wrapper_settings(t.argv)):
+                if idx < tool_at and "=" in t.argv[idx]:
+                    k, v = t.argv[idx].split("=", 1)
+                    inline_idx[k] = idx
+                    cleaned_env[k] = v
             ours, merged = tools.env_with_merged(tool, stripped[1:], t.granted, t.want, t.jobserver,
                                                  lane.test_threads, cleaned_env)
+            for k in merged:
+                if k in inline_idx and k in ours:
+                    argv_out = list(t.exec_argv) if t.exec_argv is not None else list(t.argv)
+                    argv_out[inline_idx[k]] = f"{k}={ours[k]}"
+                    t.exec_argv = argv_out
             # The caller's own settings win, except keys explicitly merged by the emitting tool
             # callback and empty make variables (a make recipe exports MAKEFLAGS= and MFLAGS=).
             given = {k for k in env

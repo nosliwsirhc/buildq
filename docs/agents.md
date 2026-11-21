@@ -8,7 +8,9 @@ Telling agents to use the queue works most of the time. Two optional pieces make
 
 - **Shims** (`./install.sh --shims`, then put `~/.local/share/buildq/shims` first on `PATH`, after
   anything else that changes it, such as nvm or rustup). The shims stand in for `cargo`, `pnpm`,
-  `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet`, `cmake`, `ctest`, `zig` and `gradle`.
+  `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet`, plus `cmake`, `ctest`, `zig` and
+  `gradle` when those binaries exist on `PATH` (absent optional tools aren't linked, so wrappers
+  like `command -v gradle || ./gradlew` keep working).
   A heavy command runs as `buildq run -- <the real tool> ...`: any cargo subcommand that compiles
   (everything but `fmt`, `metadata`, `tree`, `clean` and the like, external subcommands included),
   npm and pnpm scripts named like `build*`, `test*`, `lint*` or `e2e*`, `vitest run`, `make`

@@ -398,15 +398,27 @@ class Export(SimCase):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
         tools = (bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS
                  | {"python3.13", "python2", "py.test", "gcc", "g++", "clang", "clang++", "cc", "c++",
-                    "gcc-16", "clang++-22", "mypy", "pyright", "basedpyright"})
+                    "gcc-16", "clang++-22", "cc-14", "c++-14", "mypy", "pyright", "basedpyright"})
         self.assertTrue(sim.Simulation.GRANT_TOOLS <= bq_tools.HONORS_GRANT_TOOLS)
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)
         for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"],
-                     ["cmake", "--build", "out"], ["zig", "build", "test"], ["gradlew", "test"], ["ctest"]):
-            if argv[0] != "cmake":
-                self.assertEqual(sim.anonymous_argv(argv), argv)
-            self.assertEqual(bq_commands.restart_safe(sim.anonymous_argv(argv)), bq_commands.restart_safe(argv))
+                     ["cmake", "--build", "out"], ["cmake", "--build", "out", "--target", "test"],
+                     ["cmake", "--build", "out", "--target", "install"], ["cmake", "--build", "--preset", "ci"],
+                     ["zig", "build", "test", "--release"], ["gradlew", "test"],
+                     ["gradlew", ":secretmod:testDebugUnitTest"], ["gradlew", ":secretmod:publishRelease"],
+                     ["ctest"], ["uv", "run", "-m", "unittest"], ["uv", "run", "python3", "-m", "pytest"],
+                     ["uv", "run", "--frozen", "pytest", "tests/secret.py"], ["uv", "run", "--no-sync", "pytest"]):
+            anon = sim.anonymous_argv(argv)
+            self.assertNotIn("secretmod", json.dumps(anon))
+            self.assertNotIn("secret.py", json.dumps(anon))
+            self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(argv), (argv, anon))
+        self.assertEqual(sim.anonymous_argv(["cmake", "--workflow", "--preset", "ci"])[:3],
+                         ["cmake", "--workflow", "--preset"])
+        # Export -> anonymize -> key round-trip preserves restart_safe and hides secrets.
+        key_words = bq_commands.command_words(["zig", "build", "test", "-Doptimize=ReleaseSafe"])
+        self.assertEqual(bq_commands.command_words(key_words), key_words)
+        self.assertEqual(bq_commands.restart_safe(sim.anonymous_argv(key_words)), True)
         key = lambda argv: bq_commands.command_words(sim.anonymous_argv(argv))  # noqa: E731
         self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
 
@@ -809,10 +821,16 @@ class LoadBuildqd(SimCase):
         os.makedirs(state)
         s = sim.Simulation(scenario([]), CONFIG, BUILDQD, state, name="buildqd_hg")
         t = type("T", (), {"argv": ["zig", "build"], "jobserver": None})()
-        self.assertTrue(s.honors_grant(t))  # head's tools.py honors zig
+        self.assertTrue(s.honors_grant(t))  # head's tools.py honors `zig build`
+        # Invocation-aware grant detection: `zig test` and `uv run pytest -n 8` do NOT honor grants.
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["zig", "test", "a.zig"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["zig", "build", "-j4"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["uv", "run", "pytest", "-n", "8"], "jobserver": None})()))
+        self.assertTrue(s.honors_grant(type("T", (), {"argv": ["uv", "build"], "jobserver": None})()))
+        self.assertFalse(s.honors_grant(type("T", (), {"argv": ["cmake", "--build", "out", "-j", "8"], "jobserver": None})()))
         t_other = type("T", (), {"argv": ["custom-cc", "build"], "jobserver": None})()
         self.assertFalse(s.honors_grant(t_other))
-        s.mod.patch("honors_grant_tool", lambda name: name == "custom-cc")
+        s.mod.patch("honors_grant_for", lambda name, _args=None: name == "custom-cc")
         self.assertTrue(s.honors_grant(t_other))
         s.mod = base_pkg
         self.assertFalse(s.honors_grant(t))  # pre-registry base uses frozen GRANT_TOOLS
