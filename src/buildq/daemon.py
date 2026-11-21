@@ -390,7 +390,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         elif agent:
             t.agents = {t.submission or f"anon-{tid}": agent}
         t.git_env = {k: v for k, v in env.items() if GIT_ENV.fullmatch(k)}
-        t.cold = commands.cargo_cold(argv, cwd, env)
+        t.cold = commands.is_cold(argv, cwd, env)
         t.max_log = self.cfg.max_log
         job_env = dict(env)
         for key, value in self.cfg.env.items():

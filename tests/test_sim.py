@@ -14,7 +14,7 @@ for path in (os.path.join(ROOT, "src"), os.path.join(ROOT, "bench")):
         sys.path.insert(0, path)
 
 import sim  # noqa: E402
-from buildq import commands as bq_commands, metrics as bq_metrics  # noqa: E402
+from buildq import commands as bq_commands, metrics as bq_metrics, tools as bq_tools  # noqa: E402
 scenarios = sim.builtin
 GIB = sim.GIB
 CONFIG = sim.DEFAULT_CONFIG
@@ -396,7 +396,8 @@ class Export(SimCase):
         for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
                      "--filter", "-p", "-F"):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
-        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | sim.Simulation.GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        self.assertEqual(sim.Simulation.GRANT_TOOLS, bq_tools.HONORS_GRANT_TOOLS)
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)
         for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):

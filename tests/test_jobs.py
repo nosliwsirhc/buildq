@@ -17,7 +17,7 @@ from unittest import mock
 if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from helpers import BASE_CONFIG, BUILDQD, DaemonCase, FakeMachine, FakeRunner, GIB, MIB, ROOT  # noqa: E402
-from buildq import client, commands, common, config, daemon, history, machine, runners, scheduler, ticket  # noqa: E402
+from buildq import client, commands, common, config, daemon, history, machine, runners, scheduler, ticket, tools  # noqa: E402
 
 
 class Cores(DaemonCase):
@@ -1296,6 +1296,44 @@ class PackagePlumbing(unittest.TestCase):
                                  env=env, capture_output=True, text=True, timeout=30)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn('"default_lane"', res.stdout)
+
+
+class ToolsRegistry(unittest.TestCase):
+    """Single source of truth in buildq.tools stays consistent with commands, scheduler, and sim."""
+
+    def test_derived_sets_and_duplicate_registration_guard(self):
+        self.assertEqual(tools.JOBSERVER_TOOLS, frozenset({"cargo", "make", "gmake", "ninja"}))
+        self.assertEqual(tools.MAKEFLAGS_JOBSERVER_TOOLS, frozenset({"make", "gmake", "ninja"}))
+        self.assertEqual(tools.HONORS_GRANT_TOOLS,
+                         frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"}))
+        self.assertTrue(tools.REGISTERED_TOOL_NAMES <= commands.NOT_SCRIPTS)
+        self.assertIs(tools.lookup("cargo"), tools.REGISTRY["cargo"])
+        self.assertIsNone(tools.lookup("not-a-tool"))
+        with self.assertRaisesRegex(ValueError, "already registered"):
+            tools.build_registry((tools.ToolSpec(names=("cargo",)), tools.ToolSpec(names=("cargo",))))
+        with self.assertRaises(TypeError):
+            tools.REGISTRY["x"] = tools.ToolSpec(names=("x",))  # type: ignore[index]
+
+    def test_env_and_rewrite_argv_via_registry(self):
+        env_cargo = tools.env_for("cargo", ["build"], 4, 8, "/tmp/js", False)
+        self.assertEqual(env_cargo["BUILDQ_CORES"], "4")
+        self.assertEqual(env_cargo["CARGO_MAKEFLAGS"], "-j8 --jobserver-auth=fifo:/tmp/js")
+        self.assertNotIn("MAKEFLAGS", env_cargo)
+        self.assertEqual(env_cargo["DOTNET_PROCESSOR_COUNT"], "4")
+        self.assertEqual(env_cargo["MSBUILDDISABLENODEREUSE"], "1")
+        self.assertEqual(env_cargo["UseSharedCompilation"], "false")
+        self.assertEqual(env_cargo["CMAKE_BUILD_PARALLEL_LEVEL"], "4")
+        self.assertEqual(env_cargo["GOMAXPROCS"], "4")
+
+        env_make_serial = tools.env_for("make", ["all"], 4, 8, "/tmp/js", False)
+        self.assertNotIn("MAKEFLAGS", env_make_serial)
+        env_make_par = tools.env_for("make", ["-j8", "all"], 4, 8, "/tmp/js", False)
+        self.assertEqual(env_make_par["MAKEFLAGS"], "-j8 --jobserver-auth=fifo:/tmp/js")
+        self.assertEqual(tools.rewrite_argv_for("make", ["env", "-u", "-j", "make", "-j8", "all"], 3, 4, "/tmp/js"),
+                         ["env", "-u", "-j", "make", "all"])
+        self.assertIsNone(tools.rewrite_argv_for("make", ["env", "-u", "-j", "make", "all"], 3, 4, "/tmp/js"))
+        self.assertFalse(commands.restart_safe(["cargo", "--", "test"]))
+        self.assertFalse(commands.reusable_check(["cargo", "--", "test"]))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,22 @@ import os
 import re
 import shlex
 
+from . import tools
+from .tools import (
+    CARGO_VALUE_OPTIONS,
+    JOBSERVER_TOOLS,
+    JS_TOOLS,
+    JS_VALUE_OPTIONS,
+    RESTART_CARGO,
+    SCRIPT_WORD,
+    VERIFY_CARGO,
+    asks_for_jobs,
+    no_emit,
+    option_values,
+    positionals,
+    without_jobs,
+)
+
 MAKE_FLAG_VARS = ("MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS")
 FD_JOBSERVER = re.compile(r"--jobserver-(?:auth|fds)=-?\d+,-?\d+")
 # A word of make flags as make splits them: whitespace ends a word unless a backslash escapes it (a
@@ -100,25 +116,16 @@ SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 INTERPRETERS = {"python", "python3", "node", "deno", "ruby", "perl", "bun"}
 # Names restartable_scripts refuses: tools and wrappers, not scripts (listing `git` would make `git
 # push` restartable).
-NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | {"env", "timeout", "git", "cargo", "rustc", "dotnet", "make",
-                                                    "gmake", "ninja", "cmake", "docker", "podman", "buildah",
-                                                    "npm", "pnpm", "yarn", "npx", "pnpx", "bunx", "kubectl", "aws",
-                                                    "gh", "ssh", "scp", "rsync", "curl", "wget", "xargs",
-                                                    "parallel", "busybox", "uv", "uvx", "just", "mvn", "gradle",
-                                                    "gradlew", "go", "terraform", "pytest", "jest", "sbt",
-                                                    "heavy-run", "buildq", "flock", "systemd-run", "run0", "pkexec",
-                                                    "nix-shell", "firejail", "xvfb-run", "strace", "valgrind", "tsx",
-                                                    "ts-node", "zx", "pwsh", "nodejs"})
+NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | tools.REGISTERED_TOOL_NAMES
+               | {"env", "timeout", "rustc", "kubectl", "aws", "gh", "ssh", "scp", "rsync",
+                  "curl", "wget", "xargs", "parallel", "busybox", "uv", "uvx", "just", "mvn",
+                  "gradle", "gradlew", "terraform", "pytest", "jest", "sbt", "heavy-run", "buildq",
+                  "flock", "systemd-run", "run0", "pkexec", "nix-shell", "firejail", "xvfb-run",
+                  "strace", "valgrind", "tsx", "ts-node", "zx", "pwsh", "nodejs"})
 # (and any versioned interpreter or shell: python2, python3.12, pypy3, node22, bash5 …; the list can't
 # be complete)
 NOT_SCRIPT_PATTERN = re.compile(r"(python|pypy|node|ruby|perl|php|lua|bash|zsh|ksh|dash|sh|fish)[0-9.]*")
-JS_TOOLS = {"npm", "pnpm", "yarn", "npx", "pnpx", "bunx"}
-CARGO_VALUE_OPTIONS = {"--manifest-path", "--target-dir", "-j", "--jobs", "--color", "--config",
-                       "-Z", "--profile", "--target", "-F", "--features", "--bin", "--test",
-                       "--example", "--bench", "-p", "--package", "--exclude", "--message-format"}
-JS_VALUE_OPTIONS = {"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-JOBSERVER_TOOLS = {"cargo", "make", "gmake", "ninja"}
 PYTHON_VALUE_OPTIONS = {"-m", "-c", "-W", "-X"}  # python's options that take the next word
 SAFE_WORD = re.compile(r"^@?[A-Za-z0-9_.,+:%/-]{1,64}$")  # "@scope/pkg" is an npm package, not an address
 
@@ -182,33 +189,6 @@ def strip_wrappers(argv: list[str]) -> list[str]:
     return t
 
 
-def positionals(args: list[str], value_options: set[str] = frozenset()) -> list[str]:
-    out, skip = [], False
-    for arg in args:
-        if skip:
-            skip = False
-        elif arg.startswith("-"):
-            skip = arg in value_options
-        else:
-            out.append(arg)
-    return out
-
-
-def option_values(args: list[str], names: set[str]) -> list[str]:
-    values = []
-    for i, arg in enumerate(args):
-        if arg in names:
-            if i + 1 < len(args):
-                values.append(args[i + 1])
-            continue
-        for name in names:
-            if name.startswith("--") and arg.startswith(name + "="):
-                values.append(arg[len(name) + 1:])
-            elif len(name) == 2 and not arg.startswith("--") and arg.startswith(name) and len(arg) > 2:
-                values.append(arg[2:])
-    return values
-
-
 def git_toplevel(cwd: str) -> str | None:
     d = os.path.abspath(cwd)
     while True:
@@ -243,9 +223,6 @@ def repo_name(cwd: str) -> str:
         return os.path.basename(top)
 
 
-SCRIPT_WORD = re.compile(r"[a-z][a-z_-]{0,23}")
-
-
 def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> list[str]:
     t = strip_wrappers(argv)
     if "--" in t:
@@ -256,38 +233,11 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
     t = [t[0]] + ["…" if re.search(r"://|^[^@\s/]+:[^@\s]*@|^[^-][^=]*=", a) else a for a in t[1:]]
     tool = os.path.basename(t[0])
     rest = t[1:]
-    words = [tool]
-    if tool == "cargo":
-        if rest and rest[0].startswith("+"):
-            rest = rest[1:]
-        words += positionals(rest, CARGO_VALUE_OPTIONS)[:1]
-        words += [f"-p {p}" for p in sorted(set(option_values(rest, {"-p", "--package"})))]
-        words += [f"--profile {p}" for p in option_values(rest, {"--profile"})]
-        words += [f for f in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc")
-                  if f in rest]
-    elif tool in JS_TOOLS:
-        words += [f"--filter {f}" for f in sorted(set(option_values(rest, {"--filter", "-F"})))]
-        at, skip = [], False  # where each positional word is (not an option's value)
-        for i, arg in enumerate(rest):
-            if skip:
-                skip = False
-            elif arg.startswith("-"):
-                skip = arg in JS_VALUE_OPTIONS
-            else:
-                at.append(i)
-        verb = rest[at[0]] if at and rest[at[0]] in ("run", "run-script", "exec", "x", "dlx") else None
-        if verb:
-            at = at[1:]
-        words += [rest[i] for i in at[:1]]
-        # A package script in script_labels takes a label too (`verify:push docs`): the word right after
-        # it, not an option's value; only a script it runs, not a binary (exec, x, dlx).
-        if at and rest[at[0]] in labels and verb not in ("exec", "x", "dlx"):
-            after = rest[at[0] + 1:][:1]
-            if after and SCRIPT_WORD.fullmatch(after[0]):
-                words.append(after[0])
-    elif tool == "git":
-        words += positionals(rest, {"-C", "-c", "--git-dir", "--work-tree"})[:1]
+    matched = tools.words_for(tool, rest, labels)
+    if matched is not None:
+        words = matched
     elif tool in SHELLS or re.fullmatch(r"python3(\.\d+)?", tool) or tool in INTERPRETERS:
+        words = [tool]
         if rest[:1] and not rest[0].startswith("-") and os.path.basename(rest[0]) in labels:
             # A script named in script_labels takes a label as the argument right after it, naming
             # what it runs (`persistent-cargo-target.sh architecture …` and `… rust-tests …` are
@@ -320,10 +270,8 @@ def command_words(argv: list[str], labels: "frozenset[str] | tuple" = ()) -> lis
                     break
             module = [f"-m {m}" for m in option_values(rest[:first], {"-m"})[:1]] if "python" in tool else []
             words += module + [os.path.basename(p) for p in pos[:1]]
-    elif tool in ("make", "gmake", "ninja"):
-        words += [a for a in positionals(rest, {"-C", "-f", "-j", "-l", "-o", "-W"}) if "=" not in a][:2]
     else:
-        words += [os.path.basename(p) for p in positionals(rest)[:2]]
+        words = [tool] + [os.path.basename(p) for p in positionals(rest)[:2]]
     # Keys are logged and kept; nothing that could be a secret goes into one.
     return [w if all(SAFE_WORD.match(part) and not TOKEN_LIKE.match(part) for part in w.split(" ")) else "…"
             for w in words]
@@ -335,8 +283,6 @@ WRITING_FLAG = re.compile(r"--(fix|fix-type|write|bless|update|update-snapshots|
 # pass wouldn't write it.
 REPORT_OPTIONS = {"-o", "--output-file", "--outputFile", "--coverage", "--logger", "--results-directory",
                   "--collect", "--diag", "--junit", "--reporter-file"}
-VERIFY_CARGO = {"check", "c", "clippy", "test", "t", "nextest"}
-RESTART_CARGO = {"build", "b", "check", "c", "clippy", "test", "t", "doc", "d", "nextest", "bench"}
 
 
 def _tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
@@ -355,25 +301,9 @@ def reusable_check(argv: list[str]) -> bool:
     tool, args = sure_tool_and_args(argv)  # (a wrapper with options: no tool, so no reuse)
     if any(WRITING_FLAG.fullmatch(a) or writes_report(a) for a in args):
         return False
-    if tool == "vitest" and any(re.fullmatch(r"-[A-Za-z]*[uw][A-Za-z]*(=.*)?", a) for a in args):
-        return False  # -u or -w grouped with other flags (-ut adds: updates snapshots) (#50)
     if any(a in ("--reporter", "--reporters") and writes_report(f"{a}={b}") for a, b in zip(args, args[1:])):
         return False  # `--reporter html`
-    if tool == "dotnet" and any(re.match(r"-[ld](:|$)", a) or re.search(r"CollectCoverage", a) for a in args):
-        return False  # dotnet test's short --logger and --diag, and coverage through MSBuild
-    if tool == "cargo":
-        words = command_words(["cargo", *args])
-        sub = words[1] if len(words) > 1 else ""
-        return sub in VERIFY_CARGO and (sub != "nextest" or "run" in args)
-    if tool == "dotnet":
-        return positionals(args)[:1] == ["test"]
-    if tool in ("tsc", "vue-tsc"):
-        return no_emit(args)
-    if tool == "eslint":
-        return True
-    if tool == "vitest":
-        return positionals(args)[:1] == ["run"]
-    return False
+    return tools.is_reusable_check(tool, args)
 
 
 def writes_report(arg: str) -> bool:
@@ -383,21 +313,6 @@ def writes_report(arg: str) -> bool:
     if name in REPORT_OPTIONS:
         return True
     return bool(re.fullmatch(r"--reporter(s)?[=:]?(html|junit|json|lcov|teamcity|blob).*", arg))
-
-
-def no_emit(args: list[str]) -> bool:
-    """Whether tsc's --noEmit is in effect at the end of its arguments (`--noEmit false` turns it off)."""
-    on, i = False, 0
-    while i < len(args):
-        arg = args[i]
-        if arg == "--noEmit":
-            on = True
-            if i + 1 < len(args) and args[i + 1] in ("true", "false"):
-                on, i = args[i + 1] == "true", i + 1
-        elif arg.startswith("--noEmit="):
-            on = arg.split("=", 1)[1] == "true"
-        i += 1
-    return on
 
 
 SURE_WRAPPERS = {"nice", "ionice", "nohup", "setsid", "stdbuf", "time", "command", "exec", "sudo", "doas"}
@@ -496,14 +411,7 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
     else:
         return False
     tool, args = sure_tool_and_args(argv)
-    if tool == "cargo":
-        words = command_words(["cargo", *args])
-        return (words[1] if len(words) > 1 else "") in RESTART_CARGO
-    if tool == "dotnet":
-        return positionals(args)[:1] in (["build"], ["test"])
-    if tool == "ninja":  # a custom target (install, deploy) might do anything
-        return set(positionals(args, {"-C", "-f", "-j", "-k", "-l", "-d", "-t", "-w"})) <= {"all", "test", "check"}
-    return tool in ("tsc", "vue-tsc", "eslint", "vitest")
+    return tools.is_restart_safe(tool, args)
 
 
 # Options that move a command to another folder, or the folder its paths are read from: -C in any
@@ -736,22 +644,16 @@ def within_home(path: str) -> str | None:
 
 
 def write_dirs_of(cwd: str, env: dict, argv: list[str]) -> list[str]:
-    """Where a build fills the disk, for `buildq top`: its CARGO_TARGET_DIR (for cargo with none,
-    the target/ beside the nearest Cargo.lock) and its TMPDIR, in the environment it runs with.
+    """Where a build fills the disk, for `buildq top`: its CARGO_TARGET_DIR, tool-specific build
+    output folders (e.g. target/ beside Cargo.lock), and its TMPDIR, in the environment it runs with.
     Only folders inside the user's home count, and none inside another."""
     found = []
     target = env.get("CARGO_TARGET_DIR")
     if target:
         found.append(os.path.join(cwd, target))
-    elif command_words(argv)[:1] == ["cargo"]:
-        here = os.path.abspath(cwd)
-        for _ in range(12):
-            if os.path.exists(os.path.join(here, "Cargo.lock")):
-                found.append(os.path.join(here, "target"))
-                break
-            if os.path.dirname(here) == here:
-                break
-            here = os.path.dirname(here)
+    stripped = strip_wrappers(argv)
+    if stripped:
+        found.extend(tools.write_dirs_for(os.path.basename(stripped[0]), stripped, cwd, env))
     if env.get("TMPDIR"):
         found.append(os.path.join(cwd, env["TMPDIR"]))
     kept: list[str] = []
@@ -781,56 +683,15 @@ def disk_paths_of(cwd: str, env: dict) -> list[str]:
     return paths
 
 
-def asks_for_jobs(args: list[str]) -> bool:
-    return any(a == "-j" or re.fullmatch(r"-j\d+", a) or a == "--jobs" or a.startswith("--jobs=") for a in args)
-
-
-def without_jobs(argv: list[str]) -> list[str]:
-    """argv with make's or ninja's -j/--jobs options removed, so the build's jobserver decides."""
-    out, skip = [], False
-    for i, a in enumerate(argv):
-        if skip:
-            skip = False
-            continue
-        if a in ("-j", "--jobs"):
-            skip = i + 1 < len(argv) and argv[i + 1].isdigit()
-            continue
-        if re.fullmatch(r"-j\d+", a) or a.startswith("--jobs="):
-            continue
-        out.append(a)
-    return out
-
-
-def cargo_cold(argv: list[str], cwd: str, env: dict) -> bool:
-    """Whether a cargo command will build from scratch: its target directory has no build of that
-    profile yet. History of warm builds says little about a cold one."""
-    t = strip_wrappers(argv)
-    if not t or os.path.basename(t[0]) != "cargo":
+def is_cold(argv: list[str], cwd: str, env: dict) -> bool:
+    """Whether a build looks cold (no existing output for its profile yet)."""
+    stripped = strip_wrappers(argv)
+    if not stripped:
         return False
-    target = env.get("CARGO_TARGET_DIR")
-    if target:
-        target = os.path.join(cwd, target)
-    else:
-        d = os.path.abspath(cwd)
-        root = None
-        while True:
-            if os.path.exists(os.path.join(d, "Cargo.lock")):
-                root = d
-                break
-            if os.path.exists(os.path.join(d, "Cargo.toml")):
-                root = root or d
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        if root is None:
-            return False
-        target = os.path.join(root, "target")
-    profile = "release" if "--release" in t else "debug"
-    profiles = option_values(t, {"--profile"})
-    if profiles:
-        profile = {"dev": "debug", "test": "debug", "bench": "release"}.get(profiles[0], profiles[0])
-    return not os.path.isdir(os.path.join(target, profile))
+    return tools.is_cold_for(os.path.basename(stripped[0]), stripped, cwd, env)
+
+
+cargo_cold = is_cold
 
 
 SECRET_IN_URL = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")

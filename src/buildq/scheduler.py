@@ -11,8 +11,9 @@ import threading
 import time
 import traceback
 
-from . import commands, common, machine
-from .commands import JOBSERVER_TOOLS, MAKE_FLAG_VARS
+from . import commands, common, machine, tools
+from .commands import MAKE_FLAG_VARS
+from .tools import JOBSERVER_TOOLS, MAKEFLAGS_JOBSERVER_TOOLS
 from .common import FINISHED, GIB, MIB, PENDING
 from .config import CI_LONG_WAITS
 from .runners import Jobserver
@@ -875,34 +876,12 @@ class SchedulerMixin:
         self.budget.update(held_mem=held_mem + sum(mem for _, mem, _ in ci_holds),
                            held_cores=held_cpu + sum(cores for _, _, cores in ci_holds))
 
-    def build_env(self, t: Ticket) -> dict:
+    def build_env(self, t: Ticket, caller_env: dict | None = None) -> dict:
         """Parallelism for the build's tools, unless the caller chose its own."""
-        g, w = str(t.granted), str(t.want)
-        values = {"BUILDQ_CORES": g, "CMAKE_BUILD_PARALLEL_LEVEL": g, "GOMAXPROCS": g,
-                  # .NET: MSBuild sizes its worker nodes from the processor count, and node reuse
-                  # leaves workers behind after the build, holding memory nobody accounts for.
-                  "DOTNET_PROCESSOR_COUNT": g, "MSBUILDDISABLENODEREUSE": "1",
-                  # ...and the shared compiler server would compile outside the build's cgroup.
-                  "UseSharedCompilation": "false"}
-        if self.lane(t.lane).test_threads:
-            values.update({"RUST_TEST_THREADS": g, "NEXTEST_TEST_THREADS": g})
         args = commands.strip_wrappers(t.argv)
         tool = os.path.basename(args[0]) if args else ""
-        # make runs in parallel only when asked (-j): a Makefile not written for it can break. Its
-        # -j is then replaced by the build's jobserver (see start()), since a -j on the command
-        # line makes make ignore the jobserver. ninja is parallel by design. Other tools get the
-        # jobserver through CARGO_MAKEFLAGS, which cargo reads first and hands to build scripts.
-        parallel_make = tool == "ninja" or (tool in ("make", "gmake") and commands.asks_for_jobs(args[1:]))
-        if t.jobserver:
-            flags = f"-j{w} --jobserver-auth=fifo:{t.jobserver}"
-            values["CARGO_MAKEFLAGS"] = flags
-            if parallel_make:
-                values["MAKEFLAGS"] = flags
-        else:
-            values["CARGO_BUILD_JOBS"] = g  # no tokens to bound it, so cargo is told the number
-            if parallel_make:
-                values["MAKEFLAGS"] = f"-j{g}"
-        return values
+        return tools.env_for(tool, args[1:], t.granted, t.want, t.jobserver,
+                             self.lane(t.lane).test_threads, caller_env)
 
     def start(self, t: Ticket, now: float, granted: int) -> None:
         lane = self.lane(t.lane)
@@ -927,7 +906,8 @@ class SchedulerMixin:
             env = common.read_json(env_path)
             if not isinstance(env, dict):
                 raise OSError("its environment file is missing")
-            tool = os.path.basename((commands.strip_wrappers(t.argv) or ["?"])[0])
+            stripped = commands.strip_wrappers(t.argv)
+            tool = os.path.basename((stripped or ["?"])[0])
             known = tool in JOBSERVER_TOOLS
             wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
             # An inherited jobserver passed by descriptor is dead in the build's service: drop it,
@@ -950,13 +930,11 @@ class SchedulerMixin:
                 t.js = Jobserver(t.jobserver, create=True)
                 t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
                 t.tokens_out = t.js.out
-            t.exec_argv = None
-            if t.jobserver and tool in ("make", "gmake", "ninja") and commands.asks_for_jobs(t.argv[1:]):
-                tool_at = len(t.argv) - len(commands.strip_wrappers(t.argv))  # (a wrapper's own words stay: env -u -j make)
-                t.exec_argv = t.argv[:tool_at] + commands.without_jobs(t.argv[tool_at:])  # its -j would make it ignore the jobserver
+            tool_at = len(t.argv) - len(stripped)  # (a wrapper's own words stay: env -u -j make)
+            t.exec_argv = tools.rewrite_argv_for(tool, t.argv, tool_at, granted, t.jobserver)
             # buildq's settings go in a file of their own, so a build that is queued again after a
             # restart gets fresh ones.
-            ours = self.build_env(t)
+            ours = self.build_env(t, caller_env=env)
             # The caller's own settings win; an empty make variable is no setting (a make recipe
             # exports MAKEFLAGS= and MFLAGS=), so buildq's flags go in its place.
             given = {k for k in env if k not in MAKE_FLAG_VARS or str(env[k]).strip()}
@@ -966,7 +944,7 @@ class SchedulerMixin:
                 # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)
                 mine = ours.get(k) or (f"-j{t.want} --jobserver-auth=fifo:{t.jobserver}"
                                        if t.jobserver and k != "CARGO_MAKEFLAGS"
-                                       and tool in ("make", "gmake", "ninja") else "")
+                                       and tool in MAKEFLAGS_JOBSERVER_TOOLS else "")
                 parallel[k] = commands.with_make_flags(rest, mine)
             common.write_json(os.path.join(t.dir, "parallel.json"), parallel)
             self.runner.prepare(t, self.cfg.slice)
