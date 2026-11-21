@@ -76,20 +76,30 @@ arguments name no path outside the tree:
   others wait for. A resent submission gets the same answer it got the first time. A
   joiner's `--notify` runs when it ends;
 - is answered by an earlier pass within `reuse_window` (2 hours) if the command is a check: cargo
-  check, clippy, test or `nextest run`, dotnet test, `tsc --noEmit`, eslint, `vitest run`, with no
-  `--fix`, `-u` (grouped too: vitest's `-ut`), `--update-snapshots`, watch mode or `--no-run`, run directly or behind a wrapper
-  buildq can read for certain (`env` with exact options, `timeout DURATION`, `nice`/`time` with no
-  options: behind `ionice -c3` or `nice -n 5`, say, it isn't). The command is run, not read by a
+  check, clippy, test or `nextest run`, dotnet test, `zig test` or `zig ast-check`, `gcc`/`g++`/
+  `clang`/`clang++`/`cc`/`c++` with `-fsyntax-only`, `pytest`, `mypy`, `pyright`/`basedpyright`,
+  `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv run --no-sync <check>` (explicit `--no-sync`
+  is required so reuse never skips `.venv` syncing), `tsc --noEmit`, eslint, `vitest run` — none
+  with mutating, dry-run, info, response-file (`@file`), or watch flags (`--fix`, vitest's `-u`/
+  `-ut`, `--update-snapshots`, `--no-run`, `--collect-only`, etc.) — run directly or behind a
+  wrapper buildq can read for certain (`env` with exact options, `timeout DURATION`, `nice`/`time`
+  with no options: behind `ionice -c3` or `nice -n 5`, say, it isn't). Gradle and CTest are not
+  auto-reused without `--reuse` (Gradle writes build/test reports by default; CTest runs prebuilt
+  binaries). The command is run, not read by a
   shell, so `X=1 cargo test` names a program called `X=1`: write `env X=1 cargo test`. `npx BIN`
   and `pnpm exec BIN` (with no pnpm options) are read as BIN. A check that moves to another folder
-  or reads its paths from one (`env -C`, `make -C`, `sudo -D`, `vitest --root`) or names a path
+  or reads its paths from one (`env -C`, `make -C`, `sudo -D`, `vitest --root`, `pytest --rootdir`,
+  `gradle -p`/`--project-dir`, `ctest --test-dir`, `clang -working-directory`, `uv --project`/
+  `UV_WORKING_DIR`/`UV_PROJECT`/`UV_ENV_FILE`) or names a path
   outside the tree whose source was recorded, anywhere in a word (`--manifest-path
-  ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`)
+  ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`, or C/C++
+  include env vars like `CPATH` and `PYTEST_ADDOPTS` flags)
   is never answered from an earlier pass; nor is one with a word buildq can't read for certain
   (quotes, escapes, brackets, `$` or a URL in it, as a `--config` TOML value has): that costs a run,
   never a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`, eslint's
   `--cache-location`) doesn't count, nor do variables that say where tools are (`PATH`,
-  `RUSTUP_HOME`, `RUSTC_WRAPPER=…/sccache`) when a wrapper sets them (`env PATH=… cargo test`), or
+  `RUSTUP_HOME`, `RUSTC_WRAPPER=…/sccache`, or `CC`/`CXX` pointing to a standard system compiler
+  folder including `/usr/lib/llvm-*/bin`) when a wrapper sets them (`env PATH=… cargo test`), or
   cargo's own `-p`/`-F` values run on (`-pCore`). Source that no
   word names isn't seen (a path dependency outside the tree, a `[patch]` in a config file, a
   symlinked folder): `--again` runs such a build regardless. `run` prints that run's output

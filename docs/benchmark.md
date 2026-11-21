@@ -161,7 +161,8 @@ it was.
 **Never commit a real trace.** It holds your repositories' names, the commands your sessions ran
 and who ran them. `--anonymize` hashes repository names, workspaces, callers and lanes other than
 the usual ones (`heavy`, `check`, `web` …), and drops build names. Of each command it keeps what
-the replay needs and no more: a known tool (`cargo`, `pnpm`, `python3`, `make` …), the public
+the replay needs and no more: a known tool (`cargo`, `pnpm`, `python3`, `make`, `gradle`/`gradlew`,
+`cmake`, `ctest`, `zig`, `gcc`/`clang`, `pytest`, `mypy`, `pyright`, `uv` …), the public
 subcommands the command starts with (`cargo test`, `pnpm exec vitest run`,
 `python3 -m unittest discover`), short options and common public long ones (`--release`,
 `--all-features`, `--filter` …), counts (`-j 8`, `--jobs=8`) and cargo's built-in profiles
@@ -188,9 +189,11 @@ simulation, and that part is simplified:
   source checks, wait messages, pruning, GitHub statuses, hooks and the analytics.
 - **The machine's readings:** busy cores and CPU pressure are ten-second averages, as the daemon's
   are; free memory is read each second.
-- **Cores:** a build of a tool that holds to its grant (cargo, make, ninja, dotnet, or anything with a
-  jobserver) keeps busy the cores it is granted, up to its recorded average; any other tool (vitest,
-  node) keeps busy its recorded average whatever it was granted, as it starts a worker per core. From
+- **Cores:** a build of a tool that holds to its grant (`cargo`, `make`, `ninja`, `dotnet`, `go`,
+  `cmake --build`, `ctest`, `gradle`/`gradlew`, `zig build`, `uv`, or anything with a jobserver,
+  unless the invocation sets its own `-j`/`--parallel`/`--max-workers` override) keeps busy the
+  cores it is granted, up to its recorded average; any other tool (`vitest`, `node`, `pytest`)
+  keeps busy its recorded average whatever it was granted, as it starts a worker per core. From
   its first second. When builds want more cores than the machine has, everyone slows down evenly.
 - **Run time:** a build has the recorded run's work to do. With fewer cores than it used, it takes
   longer in proportion; it never goes faster than it was recorded.

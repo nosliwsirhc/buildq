@@ -80,9 +80,11 @@ tables, and [docs/design.md](design.md#analytics) describes every column).
   - `CI` before the command of a CI job's build.
 
   The folders are its `CARGO_TARGET_DIR` (for cargo with none, the `target/` beside its
-  `Cargo.lock`) and its `TMPDIR`, only those inside your home. They're measured with `ionice -c3
-  du -sx` in the background, each at most every five minutes. "≥" means only in part, "…" not
-  yet, "?" it couldn't be, and "*" a folder another running build shares.
+  `Cargo.lock`), its `TMPDIR`, and tool-specific build or cache folders (`cmake` `--build`/`-B`
+  dirs, `ctest --test-dir`, `gradle` `build/` and `GRADLE_USER_HOME`, `zig` `.zig-cache`, `zig-out`
+  and cache/prefix dirs), only those inside your home. They're measured with `ionice -c3 du -sx`
+  in the background, each at most every five minutes. "≥" means only in part, "…" not yet, "?" it
+  couldn't be, and "*" a folder another running build shares.
 - **Waiting:** the waiting builds in the order they get a turn, each with a bar of how long it has
   waited against the longest wait, what it needs, and why it waits, in the daemon's words. A build
   waiting for memory says how much the free room lacks ("short"). `⚑ in line` marks a build that

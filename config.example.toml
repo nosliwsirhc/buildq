@@ -108,7 +108,7 @@ make_room_spare_after = "0"
 # or straight after its interpreter (`bash ci/wrap.sh …`), not inside `bash -c "…"`. A listed script
 # that runs the command after its `--` (a wrapper) counts only if that command does. By file name:
 # every script of that name counts, wherever it is; and only when buildq can read the command for
-# certain (a wrapper given options, such as `nice -n 5` or `env -u X`, isn't read through). List
+# certain (a wrapper given options such as `nice -n 5` or `ionice -c3` isn't read through; `env -u X` is). List
 # only scripts that never push, commit, upload, deploy, send or change anything outside their own
 # build output. Common tool names are refused, but the list of them can't be complete.
 # restartable_scripts = ["persistent-cargo-target.sh"]
@@ -271,7 +271,8 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 
 # Lane rules pick the lane for a build whose caller names none: the first whose pattern (a Python
 # regular expression) matches the command's key words, such as "cargo test -p api",
-# "pnpm --filter web build" or "dotnet build", wins.
+# "pnpm --filter web build", "dotnet build", "gradlew :app:test", "cmake --build build" or
+# "zig build", wins.
 #
 # [[lane_rules]]
 # match = "^(pnpm|npm|yarn) (verify:push|verify-push)"   # runs the Rust suite too

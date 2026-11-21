@@ -9,12 +9,60 @@ How buildq works inside. The [README](../README.md) covers installing it, and [U
 | `buildq` | The client: submits builds, follows them, shows status. It never runs a build itself (except in a fallback). |
 | `buildqd` | The daemon: holds the queue, measures the machine and the builds, decides who starts and with how many cores, starts builds, resizes their jobservers, keeps history. |
 | `buildqd --supervise DIR` | The supervisor: one per build, inside its service. Runs the command, writes its output and exit status. |
-| `buildq-shim` | Optional: stands in for `cargo`, `pnpm`, ... on `PATH` and sends heavy invocations through `buildq run`. |
+| `buildq-shim` | Optional: standalone zero-import wrapper on `PATH` for `cargo`, `pnpm`, `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet` (plus `cmake`, `ctest`, `zig` and `gradle` when installed) that sends heavy invocations through `buildq run`. |
 | `buildq-rustc-guard` | Optional: cargo's rustc wrapper; refuses compiles outside a buildq build. |
 | `skills/buildq/SKILL.md` | The page for coding agents on using the queue, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end: always installed (`buildq help agents` prints it), and linked into the agents' skill directories with `install.sh --skill`. |
 | `buildq.socket` | Holds the Unix socket (`$XDG_RUNTIME_DIR/buildq.sock`, mode 0600) so it stays open while the daemon restarts. |
 | `buildq.service` | Runs the daemon. `KillMode=process`: stopping the daemon stops nothing else. |
 | `buildq.slice` | The parent of every build's service: one CPU and IO weight for all builds, and a memory backstop. |
+
+### Code layout
+
+The Python code lives in the `src/buildq/` package, with no third-party dependencies (Python 3.11+
+standard library only):
+
+| Module | Role |
+| ------ | ---- |
+| `common.py` | Shared constants, XDG paths, logging, atomic JSON helpers, and size/duration parsing. |
+| `tools.py` | Declarative tool and compiler registry (`ToolSpec` / `SPECS`). Leaf module with no internal imports. |
+| `commands.py` | Wrapper unwrapping, command keys, environment hashing, path/source safety checks, and `MAKEFLAGS` rewriting. |
+| `config.py` | `config.toml` loading, schema validation, and lane configuration (`Lane`, `Config`). |
+| `machine.py` | Linux `/proc`, PSI, cgroup v2, disk space, `flock` slots, and agent-session process inspection. |
+| `ticket.py` | Ticket model, persistence, cgroup measurement, and client connection tracking. |
+| `history.py` | `history.jsonl` persistence and memory/core/duration estimation. |
+| `runners.py` | `SystemdRunner`, `DirectRunner`, and the GNU make FIFO jobserver. |
+| `supervisor.py` | `buildqd --supervise DIR`: output capping, timeout enforcement, process-group cleanup, and `result.json`. |
+| `scheduler.py` | Admission, queue ordering, jobserver rebalancing, memory shedding, `release_after_peak`, slice guard, and memory watch. |
+| `metrics.py` | Background SQLite writer (`metrics.db`), per-minute/hourly rollups, and cgroup memory consumers. |
+| `github.py` | Asynchronous `gh api` commit status posting with backoff and permanent-error classification. |
+| `daemon.py` | Unix socket server, ticket lifecycle, restart recovery, and `buildqd` entrypoint. |
+| `client.py` | `buildq` CLI (`submit`, `run`, `wait`, `status`, `list`, `logs`, `cancel`, `pause`, `report`, `query`, `source`). |
+| `top.py` | `buildq top`: live curses monitor and `--once` snapshot renderer. |
+
+`bin/buildq` (with `bin/buildqd` symlinked to it) is a thin launcher that imports `buildq.client`
+or `buildq.daemon`. When installed by `install.sh`, the package goes into a versioned release
+directory under `$PREFIX/lib/buildq/v-XXXXXX` with a `current` symlink baked into the launcher,
+and earlier releases stay in place so running processes aren't disturbed across upgrades; staged
+validation and rollback guard the publish. `bin/buildq-shim` stays standalone so shimmed commands
+pay no package-import cost.
+
+### Tool registry (`src/buildq/tools.py`)
+
+Per-compiler and per-tool rules live in one declarative table (`SPECS` of frozen `ToolSpec`
+entries) rather than scattered `if tool == ...` branches across the daemon, scheduler and simulator.
+Each `ToolSpec` registers exact binary names plus an optional `name_pattern` (for versioned names
+such as `gcc-14`, `clang-18`, `python3.12`) and any of these hooks:
+
+- **`command_words`**: extracts the history/lane-rule key words while redacting credentials and assignments.
+- **`honors_grant` / `honors_grant_args`**: whether this tool (or specific invocation, e.g. `cmake --build` without `-j` or `zig build` without `-j`) respects buildq's core grant.
+- **`jobserver` / `makeflags_jobserver`**: GNU make FIFO jobserver support (`cargo`, `make`/`gmake`, `ninja`).
+- **`global_env` / `direct_env` / `merge_env_vars`**: parallelism and cgroup-containment environment variables. `global_env` runs for every build (so wrapper scripts inherit limits like `CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `GOMAXPROCS`, and merged `GRADLE_OPTS`); `direct_env` supersedes it for direct invocations. Variables listed in `merge_env_vars` (currently `GRADLE_OPTS`) explicitly merge into caller values and bypass the scheduler's "skip if caller set" filter only for the callback that emitted them.
+- **`rewrite_argv`**: optional command-line rewrite for direct invocations (stripping `-j` for jobserver `make`/`ninja`, injecting `-j<cores>` for direct `zig build`).
+- **`restart_safe` / `reusable_check`**: whether a stopped build can safely start over, and whether a passing run can answer a repeat submission on the same source.
+- **`write_dirs` / `is_cold` / `container_storage` / `not_script`**: extra output/cache folders for `buildq top`, cold-build detection (`cargo`, `zig build`), container storage disk checks, and `restartable_scripts` refusal.
+
+Adding a new compiler means adding one `ToolSpec` to `src/buildq/tools.py` (plus optional shim
+routing in `bin/buildq-shim` and `install.sh` if it should be shimmed on `PATH`).
 
 ## A ticket's life
 
@@ -31,15 +79,18 @@ queued ──► starting ──► running ──► succeeded | failed
 2. **Queue.** Every second, the daemon refreshes each queued ticket's estimate (history and
    configuration may have changed), puts the queue in order, and starts every ticket that fits.
 3. **Start.** The daemon fixes the build's cores (and the memory they need), creates its jobserver
-   if it gets one, writes the parallelism settings to `parallel.json`, saves the ticket with the
+   if it gets one, applies any tool `rewrite_argv` or inline `env` merge into `exec_argv`, writes
+   the parallelism settings to `parallel.json` (mode 0600), saves the ticket with the
    name its service will have, and runs
    `systemd-run --user --unit=buildq-<uuid>.service --slice=buildq.slice --property=... -- buildqd --supervise DIR`.
    The ticket is `starting` until `systemd-run` returns (killed after 60 s if it hangs), then
    `running`.
 4. **Supervise.** The supervisor claims `env.json` by renaming it (so a second supervisor for the
    same build, from a late launch after a restart, finds nothing and runs nothing), records its own
-   pid, deletes the environment once read (it can hold secrets), adds `parallel.json`'s settings that
-   the caller didn't set, applies the caller's soft limits, and holds the build's jobserver open for
+   pid, reads and deletes both `env.json` and `parallel.json` immediately (either can hold secrets,
+   since merged variables such as `GRADLE_OPTS` carry caller values), applies `parallel.json`
+   (settings the caller didn't set, plus explicitly merged variables), applies the caller's soft
+   limits, and holds the build's jobserver open for
    the build's whole life. It runs the command in a process group of its own with stdin closed and
    stdout and stderr on two pipes, copying them to `stdout.log`, `stderr.log` and the combined
    `output.log`, each capped (keeping the end); it reads in bounded batches so a flood of output can't
@@ -305,9 +356,11 @@ up to its want of whatever is free. *Want* comes from history:
 | used, on average over the run, more than 1.2 × what it was given, plus 0.5 | it ignores the job count: it is "rigid", and needs what it used (up to the lane's `max_cores` and the CPU target) |
 
 The largest want among recent runs counts, clamped to the lane's `min_cores` and `max_cores`. A
-cold cargo build wants `max_cores`. A rigid build gets no jobserver, and its minimum is its want.
+cold cargo or zig build wants `max_cores`. A rigid build gets no jobserver, and its minimum is its want.
 
-The cores reach the build through its environment (see [Cores](scheduling.md#cores)), and, unless the caller brought
+The cores reach the build through its environment (see [Cores](scheduling.md#cores)), through
+command-line rewrites where a tool has no environment variable (`zig build` without `-j` gets
+`-j<cores>`), and, unless the caller brought
 its own `MAKEFLAGS`, through a jobserver: a FIFO in the ticket's directory, named in
 `CARGO_MAKEFLAGS` (and, for ninja and a `make -j`, in `MAKEFLAGS`, with the command's `-j` removed)
 as `--jobserver-auth=fifo:PATH`. It holds `granted − 1` tokens, since every client of a jobserver has
@@ -343,7 +396,11 @@ stops one build even when a stop takes a few seconds to land.
    its service is empty, `requeue()`:
    - if it was cancelled meanwhile, finalizes it as cancelled;
    - if it isn't safe to start over (`restart_safe()`: a cargo build, check, test, clippy, doc,
-     nextest or bench, a dotnet build or test, tsc, eslint, vitest or ninja; a script listed in
+     nextest or bench; a dotnet build or test; gradle/gradlew build or test tasks; `cmake --build`
+     with an explicit build dir and standard safe targets; ordinary `ctest` runs; `zig` build,
+     test, compile or `ast-check`; `gcc`/`clang` without `-wrapper` or `@file`; `pytest`, `mypy`,
+     `pyright`/`basedpyright`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv build` or
+     `uv run <safe>`; `tsc`, `eslint`, `vitest` or `ninja`; a script listed in
      `restartable_scripts`, if the command after its `--`, if any, is too; or `--restartable`),
      fails it with a reason, as a script might upload or push before it compiles;
    - otherwise queues it again: the old service is unloaded in the background (the next attempt's
@@ -447,8 +504,11 @@ unknown id, changes nothing), and the build carries on. A cancel that names no s
 (`buildq cancel`) is refused while more than one waits, unless it says `--all`. A build being
 stopped to be queued again can be joined too. Failing that, a ticket that succeeded within `reuse_window` answers it if
 the command is a check (`reusable_check()`: cargo check, clippy, test or `nextest run`, dotnet
-test, `tsc --noEmit`, eslint, `vitest run`; none with `--fix`, `-u`, `--update*`, `--watch*`,
-`--allow-dirty` or `--no-run`) or the caller passed `--reuse`, and its source was verified.
+test, `zig test` or `zig ast-check`, `gcc`/`clang -fsyntax-only`, `pytest`, `mypy`,
+`pyright`/`basedpyright`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv run --no-sync <check>`,
+`tsc --noEmit`, eslint, `vitest run`; none with `--fix`, vitest's `-u`, `--update*`, `--watch*`,
+`--allow-dirty`, `--no-run`, dry-run/info flags, or `@file` response files; Gradle and CTest are
+deliberately excluded without `--reuse`) or the caller passed `--reuse`, and its source was verified.
 Otherwise it runs, and the client says it passed before. `--again` skips all of it.
 
 **Verified.** The build runs on whatever is on disk when it starts, which may have changed since it
@@ -510,10 +570,13 @@ The client draws it with `curses`; there's nothing to install. Each refresh does
 - its `write_dirs`, its swap and its wait record.
 
 The daemon works out `write_dirs` when the build is submitted, from the environment it runs with
-(configured defaults included):
+(configured defaults included) and the tool registry (`tools.write_dirs_for()`):
 - its `CARGO_TARGET_DIR`, or for a cargo command with none, the `target/` beside the nearest
   `Cargo.lock`;
-- its `TMPDIR`.
+- its `TMPDIR`;
+- tool-specific build or cache directories: CMake `--build`/`-B` dirs, CTest `--test-dir`, Gradle
+  `GRADLE_USER_HOME`/`-g` and root/subproject `build/` dirs, and Zig `ZIG_LOCAL_CACHE_DIR`/
+  `ZIG_GLOBAL_CACHE_DIR`/`--cache-dir`/`-p`/`.zig-cache`/`zig-out`.
 
 Only folders inside the user's home count, none inside another. They're saved with the ticket and
 checked again on load.
@@ -720,6 +783,10 @@ work:
 | ------- | ----- |
 | `env X=1 nice -n 5 cargo +nightly test --locked -p api --lib -- --nocapture` | `cargo test -p api --lib` |
 | `pnpm --filter web run build` | `pnpm --filter web build` |
+| `./gradlew :app:test --no-daemon` | `gradlew :app:test` |
+| `cmake --build build --target all` | `cmake --build build --target all` |
+| `zig build -Doptimize=ReleaseSafe` | `zig build --release` |
+| `uv run --no-sync pytest tests/test_api.py -k auth` | `uv run pytest test_api.py` |
 | `git -C repo push --force-with-lease` | `git push` |
 | `bash ./scripts/ci.sh --fast` | `bash ci.sh` |
 
@@ -791,7 +858,8 @@ watch any of them, cancel any of them (its own or not), and pause or resume the 
 the same user included. A build's environment is readable by any of them while it is queued
 (`env.json`, mode 0600, kept across a daemon restart, and written again when a build stopped for
 memory is queued again), and from the running build's processes (`/proc/<pid>/environ`) after.
-Everything the daemon writes is private to the user (umask 077). A build's environment is kept on
-disk only until its supervisor reads it. Status, logs and history show commands with `NAME=value`
+Everything the daemon writes is private to the user (umask 077). Both `env.json` and `parallel.json`
+(which can carry caller values inside merged variables such as `GRADLE_OPTS`) are kept on disk only
+until the supervisor reads them, and both are removed on finalization if a build never starts. Status, logs and history show commands with `NAME=value`
 arguments and passwords in URLs hidden, and history keys hold no word that could be a secret. The
 daemon runs only what its own user submitted, as that user.

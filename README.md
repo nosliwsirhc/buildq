@@ -56,11 +56,11 @@ whenever a build arrives or ends.
 | --- | --- |
 | **Admission by measurement** | A build starts when its expected peak memory fits in what is free, after setting aside room for running builds to grow into. While other builds run, it also waits for free cores and low CPU pressure, unless its lane doesn't wait for CPU. [How it decides](docs/scheduling.md#when-a-build-starts) |
 | **Learned sizes** | Peak memory, peak cores and time are recorded per command, and the next run is planned with them. [Estimates](docs/scheduling.md#estimates) |
-| **Cores that follow the load** | Each build starts with the cores that are free and memory allows, between its lane's minimum and what its history says it can use. Cargo, `make -j` and Ninja builds get a jobserver of their own, which buildq resizes with the load. [Cores](docs/scheduling.md#cores) has the conditions. |
+| **Cores that follow the load** | Each build starts with the cores that are free and memory allows, between its lane's minimum and what its history says it can use. buildq passes the grant through each tool's environment (`CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `GRADLE_OPTS`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `GOMAXPROCS`) or CLI (`zig build -j`), and gives Cargo, `make -j` and Ninja builds a jobserver of their own that is resized live with the load. [Cores](docs/scheduling.md#cores) has the conditions. |
 | **Quick builds first** | Lanes have priorities; at the same priority, after fair shares, the build expected to finish soonest goes first. A build that has waited `starve_seconds` goes ahead of them all, so slow builds aren't passed for ever. A front-end lane can have turns of its own and never wait for CPU. [Order](docs/scheduling.md#order) |
 | **CI first, if you want** | With `ci_first`, a GitHub Actions step gets a head start and holds the room it needs from builds of its priority or lower, so a release is less likely to time out in the queue. A build that has waited three times `starve_seconds` or was stopped to free memory still goes ahead of it, unless the step has waited `ci_deadline`: then it goes first, the oldest such step first, except before a build that has queued twelve times `starve_seconds`. With `make_room_for_ci`, a step that has waited that long for memory stops the newest agent builds that can safely start over. [CI jobs](docs/ci.md) |
 | **Caps** | Lanes give their builds systemd limits (`MemoryHigh`, `MemoryMax`, CPU and IO weights). All builds share one slice, whose memory limit the daemon keeps in line with what the machine has free, so when other work grows, builds are slowed or stopped, not the machine. |
-| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build in place while memory is low and falling, and stops one when it gets critically low, before the machine can stall. A compile or test run (cargo, dotnet, ninja, tsc, eslint, vitest) or a build submitted with `--restartable` (or run by a script the machine lists in `restartable_scripts`) is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
+| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build in place while memory is low and falling, and stops one when it gets critically low, before the machine can stall. A compile or test run (cargo, dotnet, gradle/gradlew, cmake `--build`, ctest, zig, gcc/clang, pytest/unittest/mypy/pyright/uv, tsc, eslint, vitest, ninja) or a build submitted with `--restartable` (or run by a script the machine lists in `restartable_scripts`) is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
 | **One build per source** | A repeat submission (the same command on the same source, in the same directory, lane, environment and settings) joins the build already queued or running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
 | **Fair shares** | At the same priority, the caller (a session, a CI runner) with fewer builds running goes first. |
 | **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` waits for it, streams its output and exits with its code; builds have no stdin or terminal. [Using buildq](docs/usage.md) |
@@ -85,9 +85,9 @@ cd buildq
 ```
 
 `install.sh` does the following:
-- puts `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` in `~/.local/bin` (`PREFIX` changes that), with the Python it checked written into them (`PYTHON` chooses it; a virtualenv's is replaced by the Python it was made from), so a different `python3` on `PATH` later can't break them;
+- puts `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` in `~/.local/bin` and the `buildq` Python package in a versioned directory under `~/.local/lib/buildq/current` (`PREFIX` changes both), with the Python it checked written into the launchers (`PYTHON` chooses it; a virtualenv's is replaced by the Python it was made from), so a different `python3` on `PATH` later can't break them and an upgrade can't disturb already-running builds;
 - writes `~/.config/buildq/config.toml` if there isn't one;
-- installs `buildq.socket`, `buildq.service` and `buildq.slice` into `~/.config/systemd/user`, with a fixed memory backstop for all builds together (75%/85% of memory, in `buildq.slice.d`);
+- installs `buildq.socket`, `buildq.service` and `buildq.slice` into `~/.config/systemd/user`, with a fixed memory backstop for all builds together (75%/85% of memory) and a drop-in that turns off per-slice `systemd-oomd` pressure kills on `buildq.slice` (leaving system oomd intact), both in `buildq.slice.d`;
 - starts the daemon.
 
 While the daemon runs, it lowers the slice's limit below that backstop to what builds hold plus
@@ -153,7 +153,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | [CI jobs](docs/ci.md) | queueing a workflow step on a self-hosted runner, `ci_first`, a new step's first run |
 | [Operating buildq](docs/operations.md) | logs, the memory watch, restarts, files, analytics, `buildq top`, configuration errors, reboots, reports, GitHub statuses |
 | [Benchmarking](docs/benchmark.md) | replaying builds against the scheduler: scenarios, comparing two versions or configurations, a trace from your machine |
-| [Design](docs/design.md) | the internals: the daemon, the protocol, the analytics schema |
+| [Design](docs/design.md) | the internals: code layout, the tool registry, the daemon, the protocol, the analytics schema |
 | [config.example.toml](config.example.toml) | every setting, with what it does |
 
 ## Limitations
