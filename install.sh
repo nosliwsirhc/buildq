@@ -722,6 +722,10 @@ shim_tools="cargo pnpm npm npx yarn make gmake ninja dotnet"
 # using `command -v gradle || ./gradlew` never trip over a shim for an absent tool.
 optional_shim_tools="cmake ctest zig gradle"
 state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
+case $state_dir in
+  '~')   state_dir=$HOME ;;
+  '~/'*) state_dir=$HOME/${state_dir#'~/'} ;;
+esac
 guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
 skill_list=$confdir/skill-links    # every skill link made, for --uninstall
 
@@ -796,6 +800,16 @@ os.replace(tmp, path)
 EOF
 }
 
+mono_cs() {
+  if [ -r /proc/uptime ]; then
+    IFS='. ' read -r _us _ucs _ < /proc/uptime || return 1
+    _ucs=${_ucs#0}
+    printf '%s' "$(( _us * 100 + ${_ucs:-0} ))"
+    return 0
+  fi
+  return 1
+}
+
 daemon_lock_held() {
   _lock=$state_dir/buildqd.lock
   [ -f "$_lock" ] || return 1
@@ -825,22 +839,42 @@ if [ "$do_uninstall" = yes ]; then
       exit 1
     fi
     [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out"
-    # Unconditionally monitor buildqd.lock for a bounded >=2s wall-clock window (fast non-blocking
-    # flock probes, never 2s-retrying socket calls inside the loop) to catch a starting/unresponsive
-    # daemon or an init supervisor (OpenRC, runit, s6, dinit) respawning buildqd between crashes.
-    _deadline=$(( $(date +%s) + 3 ))
-    while :; do
-      if daemon_lock_held; then
-        say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
-        say "Disable and stop that service first, then re-run ./install.sh --uninstall."
-        exit 1
-      fi
-      [ "$(date +%s)" -ge "$_deadline" ] && break
-      sleep 0.2 2>/dev/null || sleep 1
-    done
+    # Unconditionally monitor buildqd.lock for a monotonic ~2.2 s window (strictly within 2–3 s,
+    # using fast non-blocking flock probes and never 2 s-retrying socket calls inside the loop) to
+    # catch a starting/unresponsive daemon or an init supervisor respawning buildqd between crashes.
+    _now_cs=$(mono_cs || printf '')
+    if [ -n "$_now_cs" ]; then
+      _end_cs=$(( _now_cs + 220 ))
+      while :; do
+        if daemon_lock_held; then
+          say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
+          say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+          exit 1
+        fi
+        _now_cs=$(mono_cs || printf '%s' "$_end_cs")
+        [ "$_now_cs" -ge "$_end_cs" ] && break
+        sleep 0.2 2>/dev/null || sleep 1
+      done
+    else
+      _w=0
+      while [ "$_w" -lt 11 ]; do
+        if daemon_lock_held; then
+          say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
+          say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+          exit 1
+        fi
+        sleep 0.2 2>/dev/null || { sleep 1; _w=$((_w + 4)); }
+        _w=$((_w + 1))
+      done
+    fi
     # One final bounded socket probe (only when a socket path exists) followed by a final lock check.
+    _cfg_sock=${BUILDQ_SOCKET:-}
+    case $_cfg_sock in
+      '~')   _cfg_sock=$HOME ;;
+      '~/'*) _cfg_sock=$HOME/${_cfg_sock#'~/'} ;;
+    esac
     _sock_present=no
-    for _sp in "${BUILDQ_SOCKET:-}" "$state_dir/run/buildq.sock" "/tmp/buildq-$(id -u)/buildq.sock"; do
+    for _sp in "$_cfg_sock" "$state_dir/run/buildq.sock" "/tmp/buildq-$(id -u)/buildq.sock"; do
       [ -n "$_sp" ] && [ -S "$_sp" ] && { _sock_present=yes; break; }
     done
     if [ "$_sock_present" = yes ] && "$bindir/buildq" ping >/dev/null 2>&1; then
