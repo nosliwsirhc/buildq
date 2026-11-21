@@ -369,14 +369,15 @@ class CgroupRunner:
 
     def note_slice_guard_intent(self, value: str) -> bool:
         """Persist `(prev_written, last_written)` BEFORE writing a lowered `<builds>/memory.max`
-        (skipping redundant disk writes when the value already matches within one page). Returns
-        False if the recovery record could not be persisted."""
+        (skipping redundant disk writes when the confirmed live value already matches within one
+        page). Does NOT advance `_last_guard_written` until the kernel write succeeds, so repeated
+        failed kernel writes with different targets can never displace the last confirmed live
+        value from `prev_written`. Returns False if the recovery record could not be persisted."""
         prev = getattr(self, "_last_guard_written", None)
         if prev is not None and self._limits_match(prev, str(value)):
             return True
         bpath = self._baseline_path()
         if not bpath or not self.builds_dir:
-            self._last_guard_written = str(value)
             return True
         bid = machine.boot_id() or ""
         base = self.initial_memory_max or "max"
@@ -385,7 +386,6 @@ class CgroupRunner:
                 bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
                                    "baseline": base, "prev_written": prev, "last_written": str(value)})
             )
-            self._last_guard_written = str(value)
             return True
         except OSError:
             return False
@@ -408,10 +408,10 @@ class CgroupRunner:
                     pass
             return
         actual = machine.cgroup_memory_max(self.builds_dir) or str(value) if self.builds_dir else str(value)
-        if getattr(self, "_last_guard_written", None) == actual:
-            return
         prev = getattr(self, "_last_guard_written", None)
         self._last_guard_written = actual
+        if prev == actual:
+            return
         if bpath and self.builds_dir:
             bid = machine.boot_id() or ""
             base = self.initial_memory_max or "max"

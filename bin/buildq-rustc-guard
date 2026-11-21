@@ -52,7 +52,8 @@ matches_build_cgroup() {
   case $cg_line in
     */"$slice_name"/buildq-${uuid_pat}.service) return 0 ;;
     */"$slice_name"/buildq-${uuid_pat}-r*.service)
-      rest=${cg_line##*-r}
+      unit=${cg_line##*/}
+      rest=${unit#buildq-${uuid_pat}-r}
       is_valid_retry "${rest%.service}" && return 0 ;;
     */builds/buildq-${uuid_pat}|*/builds/buildq-${uuid_pat}/*) return 0 ;;
     */builds/buildq-${uuid_pat}-r*)

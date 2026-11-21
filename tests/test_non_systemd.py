@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -268,9 +269,11 @@ class CgroupRunnerUnit(unittest.TestCase):
             f.write(f"{12 * GIB + 4096}\n")
         r2 = self._make_runner()
         self.assertEqual(r2.initial_memory_max, str(16 * GIB))
-        # Simulate crash between writing new intent (8G) and updating memory.max (still 12G+4096):
-        # prev_written preserves recovery of the original 16G baseline!
+        # Simulate crash after two failed kernel writes with different targets (8G then 6G) while
+        # live memory.max stays at 12G+4096: prev_written MUST keep 12G+4096 (never displaced by
+        # unconfirmed intents) so restart still recovers the original 16G baseline!
         self.assertTrue(r2.note_slice_guard_intent(str(8 * GIB)))
+        self.assertTrue(r2.note_slice_guard_intent(str(6 * GIB)))
         r3 = self._make_runner()
         self.assertEqual(r3.initial_memory_max, str(16 * GIB))
         d.guard_slice(stopping=True)
@@ -443,15 +446,36 @@ class FallbacksUnit(unittest.TestCase):
                 # Uses ticket grant (3), not caller-overridable BUILDQ_CORES (99), and marks make_fixed.json.
                 self.assertEqual(env["MAKEFLAGS"], "-j3")
                 self.assertTrue(os.path.isfile(os.path.join(tmp, "make_fixed.json")))
-                # Verify _effective_wrapper_cwd handles -CDIR and non-chaining repeated -C in one env.
+                # Verify _effective_wrapper_cwd handles -CDIR, non-chaining repeated -C, and -u/--unset before -C.
                 self.assertEqual(supervisor._effective_wrapper_cwd(["env", "-Ca", "-Cb", "make"], 3, "/base"), "/base/b")
                 self.assertEqual(supervisor._effective_wrapper_cwd(["env", "-C", "a", "env", "-Cb", "make"], 5, "/base"), "/base/a/b")
+                self.assertEqual(supervisor._effective_wrapper_cwd(["env", "-u", "FOO", "-C", "sub", "make"], 5, "/base"), "/base/sub")
+                self.assertEqual(supervisor._effective_wrapper_cwd(["env", "--unset", "env", "-C", "sub", "make"], 5, "/base"), "/base/sub")
+                self.assertEqual(supervisor._effective_wrapper_cwd(["nice", "-n", "5", "env", "-u", "X", "-C", "sub", "make"], 8, "/base"), "/base/sub")
             finally:
                 os.close(r_fd)
                 try:
                     os.close(w_fd)
                 except OSError:
                     pass
+
+    def test_rustc_guard_rejects_malformed_systemd_retry_suffix(self):
+        # Verify matches_build_cgroup inside bin/buildq-rustc-guard rejects `...-rbad-r2.service`.
+        guard_text = read_text(os.path.join(ROOT, "bin", "buildq-rustc-guard"))
+        start = guard_text.index("uuid_pat=")
+        end = guard_text.index('matches_build_cgroup "$cgroup"')
+        script = (
+            guard_text[start:end]
+            + "uuid=12345678-1234-1234-1234-123456789abc\n"
+            + 'matches_build_cgroup "0::/user.slice/buildq.slice/buildq-${uuid}-r2.service" buildq.slice || exit 11\n'
+            + 'matches_build_cgroup "0::/user.slice/buildq.slice/buildq-${uuid}-rbad-r2.service" buildq.slice && exit 12\n'
+            + 'matches_build_cgroup "0::/user.slice/buildq.slice/buildq-${uuid}-r.service" buildq.slice && exit 13\n'
+            + 'matches_build_cgroup "0::/buildq-alice/user/builds/buildq-${uuid}-rbad-r2" buildq.slice && exit 14\n'
+            + 'matches_build_cgroup "0::/buildq-alice/user/builds/buildq-${uuid}-r2" buildq.slice || exit 15\n'
+            + "exit 0\n"
+        )
+        res = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(res.returncode, 0, res.stderr)
 
     def test_is_init_supervised_handles_openrc_15char_comm_and_dinit_pid1(self):
         # OpenRC's `supervise-daemon` is truncated to 15 chars (`supervise-daemo`) in /proc/<pid>/comm.
@@ -635,10 +659,18 @@ properties = { MemoryMax = "48M" }
             time.sleep(0.05)
         rec = common.read_json(os.path.join(self.state, "tickets", tid, "ticket.json"))
         t = types.SimpleNamespace(id=tid, pid=rec["pid"], pid_start=rec["pid_start"])
+        # Stop the daemon before manually freezing `t` so the daemon's 1 s `shed_memory` tick
+        # (which sees abundant free RAM) doesn't race to auto-thaw the build mid-assertion.
+        self.assertEqual(self.q("daemon", "stop").returncode, 0)
         runner = runners.DirectRunner()
         runner.freeze(t, True)
-        time.sleep(0.15)
-        own, took, _ = runner.freeze_state(t)
+        deadline = time.time() + 5
+        own = took = False
+        while time.time() < deadline:
+            own, took, _ = runner.freeze_state(t)
+            if own and took:
+                break
+            time.sleep(0.05)
         self.assertTrue(own)
         self.assertTrue(took)
         snap1 = read_text(flag)
@@ -646,6 +678,7 @@ properties = { MemoryMax = "48M" }
         snap2 = read_text(flag)
         self.assertEqual(snap1, snap2, "process kept writing while SIGSTOP-paused")
         runner.freeze(t, False)
+        self.assertEqual(self.q("daemon", "start").returncode, 0)
         self.assertEqual(self.q("wait", tid, "--timeout", "30s").returncode, 0)
 
     def test_direct_runner_subreaper_tracks_and_cleans_orphaned_env_cleared_grandchild(self):
@@ -709,6 +742,264 @@ properties = { MemoryMax = "48M" }
         zero = self.q("daemon", "logs", "--tail", "0")
         self.assertEqual(zero.returncode, 0, zero.stderr)
         self.assertEqual(zero.stdout, "")
+
+
+class InstallScriptTests(unittest.TestCase):
+    INSTALL_SH = os.path.join(ROOT, "install.sh")
+
+    def _stub_bin(self, tmpdir: str, stubs: dict[str, str], copy_host: tuple[str, ...] = ()) -> str:
+        bindir = os.path.join(tmpdir, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        for name in copy_host:
+            real = shutil.which(name)
+            if real:
+                os.symlink(real, os.path.join(bindir, name))
+        for name, body in stubs.items():
+            p = os.path.join(bindir, name)
+            with open(p, "w") as f:
+                f.write(body)
+            os.chmod(p, 0o755)
+        return bindir
+
+    def test_help_and_check_succeed_under_posix_sh(self):
+        res_h = subprocess.run(["/bin/sh", self.INSTALL_SH, "--help"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res_h.returncode, 0, res_h.stderr)
+        self.assertIn("--check", res_h.stdout)
+        self.assertIn("--install-deps", res_h.stdout)
+
+        res_c = subprocess.run(["/bin/sh", self.INSTALL_SH, "--check"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res_c.returncode, 0, res_c.stdout + res_c.stderr)
+        self.assertIn("detected ", res_c.stdout)
+        self.assertIn("all requirements met", res_c.stdout)
+
+    def test_rejects_non_linux_os_with_friendly_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = self._stub_bin(tmp, {"uname": "#!/bin/sh\necho Darwin\n"})
+            res = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--check"],
+                env={"PATH": f"{bindir}:{os.environ.get('PATH', '')}", "HOME": tmp},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("only runs on Linux", res.stdout)
+            self.assertIn("macOS", res.stdout)
+
+    def test_detects_missing_deps_and_prints_pkg_manager_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Isolated PATH with no python3, no flock, plus fake apk + sudo + basic POSIX tools.
+            bindir = self._stub_bin(
+                tmp,
+                {
+                    "apk": "#!/bin/sh\nexit 0\n",
+                    "sudo": "#!/bin/sh\necho SHOULD_NOT_RUN_NONINTERACTIVE\nexit 99\n",
+                },
+                copy_host=("uname", "grep", "id", "install", "mktemp", "awk", "sed", "find"),
+            )
+            res = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--check"],
+                env={"PATH": bindir, "HOME": tmp},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("missing required prerequisites", res.stdout)
+            self.assertIn("Python 3.11+", res.stdout)
+            self.assertIn("flock", res.stdout)
+            self.assertIn("apk add python3 util-linux-misc", res.stdout)
+            self.assertNotIn("SHOULD_NOT_RUN_NONINTERACTIVE", res.stdout)
+
+    def test_install_deps_runs_detected_pkg_manager_and_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "installed.log")
+            real_py = sys.executable
+            real_flock = shutil.which("flock")
+            self.assertIsNotNone(real_flock)
+            bindir = self._stub_bin(
+                tmp,
+                {
+                    "sudo": (
+                        f"#!/bin/sh\n"
+                        f"printf '%s\\n' \"$*\" >> '{log}'\n"
+                        f"ln -sfn '{real_py}' '{tmp}/bin/python3'\n"
+                        f"ln -sfn '{real_flock}' '{tmp}/bin/flock'\n"
+                        f"exit 0\n"
+                    ),
+                    "apt-get": "#!/bin/sh\nexit 0\n",
+                },
+                copy_host=("uname", "grep", "id", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+            )
+            prefix = os.path.join(tmp, "prefix")
+            res = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--install-deps", "--no-start"],
+                env={
+                    "PATH": bindir,
+                    "HOME": tmp,
+                    "PREFIX": prefix,
+                    "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
+                    "XDG_DATA_HOME": os.path.join(tmp, "data"),
+                    "XDG_STATE_HOME": os.path.join(tmp, "state"),
+                },
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("prerequisites installed", res.stdout)
+            self.assertTrue(os.path.isfile(log))
+            logged = read_text(log)
+            self.assertIn("apt-get update", logged)
+            self.assertIn("apt-get install -y python3 util-linux", logged)
+            self.assertTrue(os.path.isfile(os.path.join(prefix, "bin", "buildq")))
+
+    def test_auto_discovers_python311_when_python3_is_too_old(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real_py = sys.executable
+            bindir = self._stub_bin(
+                tmp,
+                {
+                    "python3": "#!/bin/sh\nif [ \"$1\" = -c ]; then echo 3.10.12; exit 0; fi\nexit 1\n",
+                    "python3.11": f"#!/bin/sh\nexec '{real_py}' \"$@\"\n",
+                },
+                copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc"),
+            )
+            res = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--check"],
+                env={"PATH": bindir, "HOME": tmp},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("all requirements met", res.stdout)
+
+    def test_rejects_unknown_and_conflicting_options(self):
+        res1 = subprocess.run(["/bin/sh", self.INSTALL_SH, "--bogus"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res1.returncode, 2)
+        res2 = subprocess.run(["/bin/sh", self.INSTALL_SH, "--uninstall", "--shims"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res2.returncode, 2)
+
+    def test_full_install_shims_skill_rustc_guard_and_uninstall_under_posix_sh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            work = os.path.join(tmp, "work")
+            claude = os.path.join(tmp, ".claude")
+            os.makedirs(work)
+            os.makedirs(claude)
+            # Isolated PATH without systemctl so it exercises the non-systemd branch safely.
+            bindir = self._stub_bin(
+                tmp,
+                {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
+                copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+            )
+            env = {
+                "PATH": bindir,
+                "HOME": tmp,
+                "PREFIX": prefix,
+                "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
+                "XDG_DATA_HOME": os.path.join(tmp, "data"),
+                "XDG_STATE_HOME": os.path.join(tmp, "state"),
+                "CLAUDE_CONFIG_DIR": claude,
+            }
+            inst = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--no-start", "--shims", "--skill", f"--rustc-guard={work}"],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(inst.returncode, 0, inst.stdout + inst.stderr)
+            self.assertTrue(os.path.isfile(os.path.join(prefix, "bin", "buildq")))
+            self.assertTrue(os.path.islink(os.path.join(prefix, "bin", "buildqd")))
+            self.assertTrue(os.path.islink(os.path.join(tmp, "data", "buildq", "shims", "cargo")))
+            self.assertTrue(os.path.islink(os.path.join(claude, "skills", "buildq")))
+            guard_cfg = os.path.join(work, ".cargo", "config.toml")
+            self.assertTrue(os.path.isfile(guard_cfg))
+            self.assertIn("buildq-rustc-guard", read_text(guard_cfg))
+
+            uninst = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--uninstall"],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(uninst.returncode, 0, uninst.stdout + uninst.stderr)
+            self.assertFalse(os.path.exists(os.path.join(prefix, "bin", "buildq")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "data", "buildq", "shims")))
+            self.assertFalse(os.path.exists(os.path.join(claude, "skills", "buildq")))
+            self.assertNotIn("buildq-rustc-guard", read_text(guard_cfg))
+
+    def test_interactive_prompt_decline_and_accept_via_pty(self):
+        import pty
+        import select
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "sudo.log")
+            real_py = sys.executable
+            real_flock = shutil.which("flock")
+            bindir = self._stub_bin(
+                tmp,
+                {
+                    "sudo": (
+                        f"#!/bin/sh\n"
+                        f"printf '%s\\n' \"$*\" >> '{log}'\n"
+                        f"ln -sfn '{real_py}' '{tmp}/bin/python3'\n"
+                        f"ln -sfn '{real_flock}' '{tmp}/bin/flock'\n"
+                        f"exit 0\n"
+                    ),
+                    "apk": "#!/bin/sh\nexit 0\n",
+                },
+                copy_host=("uname", "grep", "id", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+            )
+
+            def run_with_tty_reply(reply: bytes, prefix: str) -> tuple[int, str]:
+                master, slave = pty.openpty()
+                try:
+                    p = subprocess.Popen(
+                        ["/bin/sh", self.INSTALL_SH, "--no-start"],
+                        stdin=slave, stdout=slave, stderr=slave,
+                        env={
+                            "PATH": bindir,
+                            "HOME": tmp,
+                            "PREFIX": prefix,
+                            "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
+                            "XDG_DATA_HOME": os.path.join(tmp, "data"),
+                            "XDG_STATE_HOME": os.path.join(tmp, "state"),
+                        },
+                        close_fds=True,
+                    )
+                    os.close(slave)
+                    slave = -1
+                    buf = bytearray()
+                    sent = False
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        r, _, _ = select.select([master], [], [], 0.2)
+                        if r:
+                            try:
+                                chunk = os.read(master, 4096)
+                            except OSError:
+                                break
+                            if not chunk:
+                                break
+                            buf.extend(chunk)
+                            if not sent and b"[y/N]" in buf:
+                                os.write(master, reply)
+                                sent = True
+                        elif p.poll() is not None:
+                            break
+                    rc = p.wait(timeout=10)
+                    return rc, buf.decode("utf-8", errors="replace")
+                finally:
+                    os.close(master)
+                    if slave >= 0:
+                        os.close(slave)
+
+            # 1) Pressing 'n' declines without invoking sudo.
+            rc_no, out_no = run_with_tty_reply(b"n\n", os.path.join(tmp, "p-no"))
+            self.assertNotEqual(rc_no, 0)
+            self.assertIn("[y/N]", out_no)
+            self.assertIn("skipped installing dependencies", out_no)
+            self.assertFalse(os.path.exists(log))
+
+            # 2) Pressing 'y' runs `sudo apk add python3 util-linux-misc` and completes install.
+            rc_yes, out_yes = run_with_tty_reply(b"y\n", os.path.join(tmp, "p-yes"))
+            self.assertEqual(rc_yes, 0, out_yes)
+            self.assertIn("prerequisites installed", out_yes)
+            self.assertIn("apk add python3 util-linux-misc", read_text(log))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "p-yes", "bin", "buildq")))
 
 
 if __name__ == "__main__":

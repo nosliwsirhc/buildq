@@ -47,7 +47,7 @@ Admission never overcommits, but other work can grow after a
 build starts: CI jobs, containers, a session. With `shed_memory` on (the default):
 
 - Below half of `mem_floor` available and still falling, buildq pauses the newest build holding
-  at least 1 GiB: systemd freezes it, so it asks for no more memory and uses no CPU (when memory
+  at least 1 GiB in place, so it asks for no more memory and uses no CPU (when memory
   is low but steady, pausing would free nothing, so nothing is paused). A paused build goes on once
   the machine has `mem_floor` free plus the room it may still grow into. Each attempt may be paused
   for five minutes in all: then it goes on if half the floor is free, and is not paused again, or
@@ -205,7 +205,7 @@ never queue behind long ones; memory still decides when they start.
 
 ## Lanes
 
-A lane is a kind of build: its default size, its priority, its systemd limits.
+A lane is a kind of build: its default size, its priority, and its resource limits.
 
 ```toml
 default_lane = "heavy"
@@ -233,12 +233,11 @@ match = "^(pnpm|npm|npx|yarn|vite|vitest|tsc|eslint|node) "
 lane = "web"
 ```
 
-[config.example.toml](../config.example.toml) lists every key. `properties` follow systemd's
-property names (`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUWeight`, `IOWeight`, `TasksMax`,
-`CPUQuota`, `Nice`): under `systemd` they are passed to `systemd-run --property` and checked by
-systemd on load; under `cgroup` they are translated directly to Linux cgroup v2 files (`memory.high`,
-`memory.max`, `memory.swap.max`, `cpu.weight`, `io.weight`, `pids.max`, `cpu.max`) plus `nice`;
-under `direct`, a 1 s daemon watchdog enforces `MemoryMax` and `nice` maps `Nice` or low `CPUWeight`.
+[config.example.toml](../config.example.toml) lists every key. `properties` use systemd's familiar
+limit names (`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUWeight`, `IOWeight`, `TasksMax`,
+`CPUQuota`, `Nice`): on systemd hosts they are passed straight to `systemd-run`; on non-systemd
+hosts with the `cgroup` runner they map directly to Linux cgroup v2 limits plus `nice`; and in
+`direct` mode a 1 s watchdog enforces `MemoryMax` while `nice` lowers CPU priority.
 Past `MemoryHigh` the kernel slows a
 build and reclaims its memory; past `MemoryMax` it stops that build alone. `CPUWeight` and
 `IOWeight` (default 100) say how the kernel shares an oversubscribed CPU or disk between builds: a

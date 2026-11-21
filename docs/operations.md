@@ -33,9 +33,10 @@ tickets are on disk, and the next daemon picks both up.
 They are in `~/.local/state/buildq`: `tickets/<id>/` (the ticket, its output log, its
 result), `history.jsonl` (one line per finished build; delete it to forget every estimate),
 `memory.log` (the memory watch, kept to about 1 MiB plus one older file), `metrics.db` (the
-analytics, below), `config.last-good.toml`, and on non-systemd hosts `buildqd.pid`, `buildqd.log`
-(plus `run/buildq.sock` when neither `XDG_RUNTIME_DIR` nor `/run/user/$UID` is available). Everything
-is private to the user.
+analytics, below), `config.last-good.toml`, `buildqd.lock` (ensures only one daemon runs for this
+state directory), `cgroup-slice-baseline.json` (used by the `cgroup` runner to restore the original
+memory ceiling after a crash), and on non-systemd hosts `buildqd.pid`, `buildqd.log`, and
+`run/buildq.sock`. Everything is private to the user.
 
 ## Analytics
 

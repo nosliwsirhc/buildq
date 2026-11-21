@@ -141,41 +141,61 @@ def _reap_all_children() -> None:
 
 def _effective_wrapper_cwd(argv: list[str], tool_at: int, base_cwd: str) -> str:
     """Resolve effective working directory if `env -C DIR` / `-CDIR` / `--chdir=DIR` wrappers
-    precede the tool. Repeated `-C` options within one `env` invocation replace each other relative
-    to that `env`'s starting cwd; a nested `env` starts from the outer `env`'s resolved cwd."""
+    precede the tool, walking wrappers identically to `commands.wrapper_env_sites`. Repeated `-C`
+    options within one `env` invocation replace each other relative to that `env`'s starting cwd;
+    a nested `env` starts from the outer `env`'s resolved cwd."""
     cwd = base_cwd
-    env_start = base_cwd
-    in_env = False
     i = 0
     while i < tool_at:
-        a = argv[i]
-        base = os.path.basename(a)
-        if base == "env":
-            in_env = True
-            env_start = cwd
+        head = os.path.basename(argv[i])
+        if commands.ASSIGNMENT.match(argv[i]):
             i += 1
-            continue
-        if in_env:
-            if a in ("-C", "--chdir") and i + 1 < tool_at:
-                nxt = argv[i + 1]
-                cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
-                i += 2
-                continue
-            if a.startswith("--chdir="):
-                nxt = a.split("=", 1)[1]
-                cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+        elif head == "env":
+            rest = commands.env_command(argv[i + 1:tool_at])
+            if rest is None:
+                break
+            cmd_at = tool_at - len(rest)
+            env_start = cwd
+            k = i + 1
+            while k < cmd_at and argv[k].startswith("-") and argv[k] != "-":
+                opt = argv[k]
+                k += 1
+                if opt == "--":
+                    break
+                if opt in ("-u", "--unset") and k < cmd_at:
+                    k += 1
+                elif opt in ("-C", "--chdir") and k < cmd_at:
+                    nxt = argv[k]
+                    cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+                    k += 1
+                elif opt.startswith("--chdir="):
+                    nxt = opt.split("=", 1)[1]
+                    cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+                elif opt.startswith("-C") and len(opt) > 2:
+                    nxt = opt[2:]
+                    cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+            i = cmd_at
+        elif head == "timeout":
+            i += 1
+            while i < tool_at and argv[i].startswith("-"):
+                opt = argv[i]
                 i += 1
-                continue
-            if a.startswith("-C") and len(a) > 2:
-                nxt = a[2:]
-                cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+                if opt in ("-s", "-k", "--signal", "--kill-after") and i < tool_at:
+                    i += 1
+            if i < tool_at:
+                i += 1  # duration
+        elif head in commands.WRAPPERS:
+            i += 1
+            while i < tool_at and argv[i].startswith("-"):
+                opt = argv[i]
                 i += 1
-                continue
-            if a == "--":
-                in_env = False
-            elif not a.startswith("-") and "=" not in a:
-                in_env = False
-        i += 1
+                if opt in commands.VALUE_OPTIONS and i < tool_at:
+                    i += 1
+            if head in ("taskset", "chrt"):
+                while i < tool_at and re.fullmatch(r"[0-9a-fA-Fx,\-]+", argv[i]):
+                    i += 1
+        else:
+            break
     return cwd
 
 

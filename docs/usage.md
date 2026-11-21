@@ -178,9 +178,9 @@ the news without polling:
 
 | Variable | Effect |
 | -------- | ------ |
-| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock`, else `/run/user/$UID/buildq.sock` if writable, else `<state_dir>/run/buildq.sock`) |
+| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock` or `/run/user/$UID/buildq.sock` on systemd hosts, and `~/.local/state/buildq/run/buildq.sock` on non-systemd hosts so background services and terminal sessions always share the same daemon) |
 | `BUILDQ_RUNNER` | override `runner` from `config.toml` (`auto`, `systemd`, `cgroup`, or `direct`) |
-| `BUILDQ_CGROUP_ROOT` | override `cgroup_root` from `config.toml` (delegated cgroup v2 path for the `cgroup` runner) |
+| `BUILDQ_CGROUP_ROOT` | override `cgroup_root` from `config.toml` (optional custom cgroup v2 folder for the `cgroup` runner) |
 | `BUILDQ_FALLBACK` | what `buildq run` does when the daemon can't be reached. Unset: wait for it. `fail`: exit 75. `run`: run the command unqueued. Anything else: a command prefix to run it through instead. |
 | `BUILDQ_AS` | the name of a wrapper in front of buildq. buildq's hints then name the wrapper's commands, so its users are told what they type (`wrapper --submit <command>`, not `buildq submit -- <command>`). The wrapper must take `--submit COMMAND...`, `--wait TICKET [--timeout D]`, `--status [TICKET]`, `--logs TICKET` and `--cancel TICKET` and pass them to buildq's commands of the same names; that is all the hints use. |
 | `BUILDQ_SOURCE` | `off` stops the client recording the source a build is of (no joining or reuse then) |

@@ -8,7 +8,7 @@ How buildq works inside. The [README](../README.md) covers installing it, and [U
 | ----- | ------------ |
 | `buildq` | The client: submits builds, follows them, shows status. It never runs a build itself (except in a fallback). |
 | `buildqd` | The daemon: holds the queue, measures the machine and the builds, decides who starts and with how many cores, starts builds, resizes their jobservers, keeps history. |
-| `buildqd --supervise DIR` | The supervisor: one per build, inside its service/cgroup/session. Sets `PR_SET_CHILD_SUBREAPER`, joins the build cgroup (under `cgroup`), runs the command, reaps orphaned descendants, and writes output and exit status. |
+| `buildqd --supervise DIR` | The supervisor: one per build, inside its service/cgroup/session. Sets `PR_SET_CHILD_SUBREAPER` under `cgroup`/`direct` (requiring it for `direct`), joins the build cgroup (under `cgroup`), probes GNU Make < 4.4 inside confinement, runs the command, reaps orphaned descendants, and writes output and exit status. |
 | `buildq-shim` | Optional: standalone zero-import wrapper on `PATH` for `cargo`, `pnpm`, `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet` (plus `cmake`, `ctest`, `zig` and `gradle` when installed) that sends heavy invocations through `buildq run`. |
 | `buildq-rustc-guard` | Optional: cargo's rustc wrapper; refuses compiles outside a buildq build. |
 | `skills/buildq/SKILL.md` | The page for coding agents on using the queue, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end: always installed (`buildq help agents` prints it), and linked into the agents' skill directories with `install.sh --skill`. |
@@ -82,8 +82,8 @@ queued ──► starting ──► running ──► succeeded | failed
    the parallelism settings to `parallel.json` (mode 0600), saves the ticket with its runner
    metadata, and launches `buildqd --supervise DIR` via the active runner:
    - `systemd`: `systemd-run --user --unit=buildq-<uuid>.service --slice=buildq.slice --property=...` (`starting` until `systemd-run` returns, killed after 60 s if it hangs, then `running`);
-   - `cgroup`: creates `<cgroup_root>/builds/buildq-<uuid>`, writes translated cgroup v2 limits (`memory.high`, `memory.max`, `memory.swap.max`, `cpu.weight`, `io.weight`, `pids.max`, `cpu.max`), and spawns the detached supervisor which moves itself into that cgroup before execing the build;
-   - `direct`: spawns the detached supervisor in a new session, applies `nice` priority when configured, and tracks its process tree via `/proc` (`smaps_rollup` PSS, CPU, 1 s `MemoryMax` watchdog, and `SIGSTOP`/`SIGCONT` pausing).
+   - `cgroup`: creates `<cgroup_root>/builds/buildq-<uuid>`, requires verified writes for every configured cgroup v2 limit (`memory.high`, `memory.max`, `memory.swap.max`, `cpu.weight`, `io.weight`, `pids.max`, `cpu.max`) before launch (failing closed and removing the empty cgroup on error), and spawns the detached supervisor which moves itself into that cgroup before execing the build;
+   - `direct`: spawns the detached supervisor in a new session (requiring `PR_SET_CHILD_SUBREAPER` so adopted descendants stay confined for cleanup), applies `nice` priority when configured, and tracks its process tree via `/proc` (`smaps_rollup` PSS, CPU + terminal `getrusage`, 1 s `MemoryMax` watchdog, and pidfd-verified `SIGSTOP`/`SIGCONT` pausing).
 4. **Supervise.** The supervisor claims `env.json` by renaming it (so a second supervisor for the
    same build, from a late launch after a restart, finds nothing and runs nothing), records its own
    pid, reads and deletes both `env.json` and `parallel.json` immediately (either can hold secrets,
@@ -413,10 +413,13 @@ stops one build even when a stop takes a few seconds to land.
    A run that finished on its own before the kill landed keeps its result.
 2. Below `mem_floor / 2`, at most every 10 seconds, and only while memory is still falling (by
    256 MiB or more over the last 10 s; freezing frees nothing, so it only helps against growth):
-   freeze the newest build holding at least 1 GiB, by writing its `cgroup.freeze` (`systemctl --user
-   freeze` where that can't be written), under the systemd runner (the direct runner has no cgroup
-   to freeze). A pause counts from when the cgroup's `cgroup.events` says it took (at once where
-   that can't be seen). A request not taken after 15 s is sent once more; after a minute a freeze
+   pause the newest build holding at least 1 GiB. Under `systemd` and `cgroup`, buildq writes
+   `cgroup.freeze` (`systemctl --user freeze` where that can't be written under `systemd`) and
+   verifies `cgroup.events`. Under `direct`, buildq sends `SIGSTOP`/`SIGCONT` via pidfd-verified
+   identities to the build's descendants first and then its supervisor, checking every live
+   descendant's `/proc/<pid>/stat` state before marking a freeze or thaw complete. A pause counts
+   from when it is verified in effect (at once where that can't be seen). A request not taken after
+   15 s is sent once more; after a minute a freeze
    that never took is undone (so it can't land later), counts nothing, and that attempt isn't
    paused again. Every tick, with no request pending, a build frozen or running against what its
    ticket says (a freeze that landed late, a thaw sent before a restart) is taken as it is. The supervisor is frozen with it; it treats
@@ -716,15 +719,18 @@ process on the machine, as a ten-second exponential average. `/proc/meminfo` giv
 `MemAvailable`, which counts reclaimable page cache as available. `/proc/pressure/*` gives PSI
 where the kernel has it.
 
-**A build.** From its service's cgroup, every second: cores from the change in `cpu.stat
-usage_usec` over five seconds (the peak counts only windows of three seconds or more), and memory
-as `anon + shmem + kernel − slab_reclaimable` from `memory.stat`. `memory.current` and
-`memory.peak` also count page cache, which a build fills with its own output. OOM kills come from
-`memory.events.local`, which the supervisor reads before its cgroup goes away; its `oom` count (an
-allocation about to fail at the build's own `MemoryMax`; `max` only counts reclaim there) says
-whether the kill came at the build's own limit (it needs more) or from outside (the slice's limit,
-systemd-oomd), which doesn't say the build needs more. A build that exits 137 with its peak
-near its lane's `MemoryMax` also counts as killed for memory.
+**A build.** Under `systemd` and `cgroup`, buildq reads the build's cgroup every second: cores from
+the change in `cpu.stat usage_usec` over five seconds (the peak counts only windows of three seconds
+or more), and memory as `anon + shmem + kernel − slab_reclaimable` from `memory.stat`.
+`memory.current` and `memory.peak` also count page cache, which a build fills with its own output.
+OOM kills come from `memory.events.local`, which the supervisor reads before its cgroup goes away;
+its `oom` count (an allocation about to fail at the build's own `MemoryMax`; `max` only counts
+reclaim there) says whether the kill came at the build's own limit (it needs more) or from outside
+(the slice's limit, systemd-oomd), which doesn't say the build needs more. Under `direct`, buildq
+measures the subreaper process tree every second via `/proc` (`smaps_rollup` anonymous + shared PSS
+and `/proc/<pid>/stat` CPU, plus terminal `getrusage` from the supervisor for sub-second builds),
+enforces `MemoryMax` via a 1 s watchdog (`cap_killed`), and counts a build that exits 137 near its
+lane's `MemoryMax` (or stopped by the watchdog) as killed for memory.
 
 **Memory waits.** From the cgroup's `memory.pressure`, the total time some of its tasks, and all of
 them, were stalled on memory (reclaim, swap-in, `MemoryHigh` throttling), and from
@@ -796,17 +802,24 @@ dropped first, and compacts itself as it grows.
 
 ## Restarts
 
-systemd owns the listening socket, so connections made while the daemon restarts wait in its
-backlog. Builds run in their own services and need nothing from the daemon. The next daemon reads
-every ticket directory:
+An exclusive `flock` on `<state_dir>/buildqd.lock` serializes daemon startups before state recovery
+or socket binding. On systemd hosts, `buildq.socket` owns the listening socket so connections made
+during a restart wait in its backlog. On non-systemd hosts, `buildq daemon restart` checks whether
+`buildqd` is managed by an init supervisor (OpenRC `supervise-daemon`, `runsv`, `s6-supervise`,
+`dinit`): if so, it stops the current daemon and waits for the supervisor to respawn it (preserving
+cgroup placement and supervision); otherwise it stops and relaunches `buildqd` directly. Under the
+`cgroup` runner, `cgroup-slice-baseline.json` persists the original `builds/memory.max` baseline
+before `slice_guard` lowers it so a crash never ratifies a temporary lowered cap as permanent.
+Builds run in their own services, cgroups, or sessions and need nothing from the daemon. The next
+daemon reads every ticket directory:
 
 - **queued** tickets stay queued, in their order;
 - **running** tickets are running again: their jobservers are reopened, and their turns end when
-  `result.json` appears or their service is gone;
-- **starting** tickets are checked again after ten seconds: running if their service has appeared;
-  still waiting while systemd has the service or a job to start it; queued again if systemd has
-  neither and `env.json` is still there (no supervisor ever claimed it); lost otherwise. A launch
-  that then finds the service already there adopts it.
+  `result.json` appears or their service/cgroup/supervisor is gone;
+- **starting** tickets are checked again after ten seconds: running if their service/cgroup/process
+  has appeared; still waiting while systemd has the service or a job to start it; queued again if
+  nothing started and `env.json` is still there (no supervisor ever claimed it); lost otherwise. A
+  launch that then finds the service already there adopts it.
 - tickets keep the runner they started under, whatever the configuration now says, and a cancel
   that was in progress is sent again.
 
@@ -815,12 +828,14 @@ is torn down.
 
 ## Configuration
 
-The daemon validates every key and range when it loads the file, and asks systemd to accept each
-lane's properties (`systemd-run --wait --property=... true`, a transient service, as builds run). A
-file that fails is reported in the
-journal, and the daemon keeps the configuration in force; at startup it uses
-`config.last-good.toml`, the last file that loaded, and only without one the defaults. `SIGHUP`
-(`systemctl --user reload buildq`) reloads.
+The daemon validates every key and range when it loads the file. Under `systemd`, it asks systemd
+to accept each lane's properties (`systemd-run --wait --property=... true`, a transient service, as
+builds run); under `cgroup`, `--check-config` validates lane property translation and performs a
+read-only check of the cgroup v2 root without writing to `/sys/fs/cgroup`; under `direct`, it
+validates `MemoryMax` and `Nice`/`CPUWeight`. A file that fails is reported in the daemon log, and
+the daemon keeps the configuration in force; at startup it uses `config.last-good.toml`, the last
+file that loaded, and only without one the defaults. `SIGHUP` (`buildq daemon reload` or
+`systemctl --user reload buildq`) reloads.
 
 ## Flock slots of an older semaphore script
 
@@ -851,7 +866,9 @@ descriptor exits once it has the lock, and on btrfs its device number differs fr
 
 ## Security
 
-The socket is in the user's runtime directory, mode 0600, and both ends check the peer's uid.
+On systemd hosts, the socket lives in `$XDG_RUNTIME_DIR/buildq.sock` (mode 0600); on non-systemd
+hosts, it lives in `<state_dir>/run/buildq.sock` inside a verified private `0700` directory owned by
+the user. Both ends check the peer's uid via `SO_PEERCRED`.
 That makes the user the trust boundary: every process the user runs can submit builds, list and
 watch any of them, cancel any of them (its own or not), and pause or resume the queue, CI jobs under
 the same user included. A build's environment is readable by any of them while it is queued

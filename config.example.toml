@@ -4,9 +4,9 @@
 # file and apply it without a restart:
 #
 #   buildqd --check-config
-#   systemctl --user reload buildq
+#   buildq daemon reload
 #
-# A file that doesn't load (or whose lane properties systemd refuses) is reported in the journal,
+# A file that doesn't load (or whose lane limits are rejected) is reported in the daemon log,
 # and the daemon keeps the last configuration that did load. Sizes take K, M, G or T, or a
 # percentage of the machine's memory ("10%"). Durations take s, m, h or d ("45m").
 
@@ -134,19 +134,18 @@ mem_margin = 1.15
 
 # ---- Running builds -------------------------------------------------------------------------
 
-# "systemd" runs each build as a transient user service (limits, measurement, clean stops);
-# "cgroup" uses Linux cgroup v2 directly without systemd (same kernel limits & freezer; needs a
-# writable delegated cgroup v2 directory via cgroup_root or init/cgroup-setup.sh);
-# "direct" runs builds as plain processes with /proc measurement, SIGSTOP/SIGCONT pausing and a
-# daemon MemoryMax watchdog (zero systemd, zero cgroups, zero root);
-# "auto" picks systemd, then cgroup, then direct.
+# How buildq runs and limits each build. Leave on "auto" unless you want to force a specific mode:
+#   "auto"    — automatically picks systemd, else cgroup v2 (if set up), else direct (works everywhere).
+#   "systemd" — runs each build as a transient systemd user service (Ubuntu, Fedora, Arch, Debian).
+#   "cgroup"  — uses Linux cgroup v2 directly without systemd (see init/README.md for boot setup).
+#   "direct"  — works on any Linux host, WSL2, or container with zero setup and no root.
 runner = "auto"
 
-# The slice the build services go in (systemd runner).
+# The systemd slice builds run in (used when runner is "systemd").
 slice = "buildq.slice"
 
-# Optional delegated cgroup v2 directory for the "cgroup" runner (e.g. "/sys/fs/cgroup/buildq-alice/user").
-# Empty (the default) auto-detects /sys/fs/cgroup/buildq-<user>/user or a writable delegated subtree.
+# Optional custom cgroup v2 folder for the "cgroup" runner (e.g. "/sys/fs/cgroup/buildq-alice/user").
+# Leave commented out to auto-detect the directory created by init/cgroup-setup.sh.
 # cgroup_root = "/sys/fs/cgroup/buildq-alice/user"
 
 # A build's output log keeps at most this much; past it, only the end is kept.
@@ -237,7 +236,7 @@ default_lane = "default"
 #   timeout = none      stop a build after this long unless its caller gives --timeout
 #   test_threads = false  also set RUST_TEST_THREADS / NEXTEST_TEST_THREADS to the build's cores
 #                       (they win over a project's own pinned thread counts, so off by default)
-#   properties = {}     systemd properties of the build's service (MemoryHigh, MemoryMax, ...)
+#   properties = {}     resource limits for builds in this lane (MemoryHigh, MemoryMax, CPUWeight, IOWeight, ...)
 #
 # Defining any lane replaces this default one.
 [lanes.default]
