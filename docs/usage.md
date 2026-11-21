@@ -115,7 +115,7 @@ daemon restart forgets the places. A build dropped off with `buildq
 submit` belongs to its ticket: agents wait on it in rounds (`buildq wait --timeout 9m`), so going
 unwatched between them means nothing, and it waits for its turn whoever is watching.
 
-One kind is cleaned up: a build dropped off from a Claude Code or Codex session that has since
+One kind is cleaned up: a build dropped off from a Claude Code, Codex or Antigravity session that has since
 ended (#71). The daemon notes which agent processes the `buildq submit` ran under. While the build
 is queued, it is cancelled once, for `abandoned_seconds` (10 min) on end, none of those processes
 has been running and nobody has waited on the ticket.

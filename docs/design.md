@@ -478,11 +478,11 @@ time per commit and context, and after a restart only the newest queued result p
 context is kept. The daemon sends at most two at once with `gh api`, in processes it doesn't wait on, and
 keeps the queue and what it has posted in
 `github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails
-permanently (HTTP 400, 403 other than rate limiting, 404, or a 422 other than a missing commit) is
+permanently (HTTP 400, 401, 403 other than rate limiting, 404, or a 422 other than a missing commit) is
 logged and dropped at once. Otherwise it is logged with `gh`'s message the first time and retried
-with exponential backoff (10 minutes up to 2 hours), at once after a `git push` run through buildq
-from the same repository succeeds, and dropped after 6 hours for a missing commit (HTTP 422 "No
-commit found") or a day for transient errors. With `github_status` off, nothing queued is sent.
+with exponential backoff (10 minutes up to 2 hours), at once for missing-commit posts after a
+`git push` run through buildq from the same repository succeeds, and dropped after 6 hours for a
+missing commit (HTTP 422 "No commit found") or a day for transient errors. With `github_status` off, nothing queued is sent.
 
 ## Fair shares and pausing
 
@@ -675,10 +675,11 @@ back by that cap. Numbers read back from `result.json` or `ticket.json` count on
 finite, non-negative and not absurdly large; anything else is ignored.
 
 **Memory watch.** While `MemAvailable` is under twice `mem_floor`, or memory `full avg10` is 5% or
-more, the daemon records every 30 seconds the machine's memory, swap and pressure. Memory `some`
+more while memory is scarce (under the greater of twice `mem_floor` or a quarter of RAM), the daemon
+records every 30 seconds the machine's memory, swap and pressure. Memory `some`
 doesn't count: one build slowed at its own `MemoryHigh` keeps it high on a machine with plenty
-free. Once more than 2.5 times `mem_floor` is available and `full` is under 1% for 30 seconds, it
-says memory is no longer tight. Going in and out of tight in between doesn't log more often.
+free. Once more than 2.5 times `mem_floor` is available and either `full` is under 1% or memory is
+no longer scarce for 30 seconds, it says memory is no longer tight. Going in and out of tight in between doesn't log more often.
 
 Nothing slow runs on the daemon's loop. The loop writes the machine's numbers to the journal at
 once (at warning priority) and puts them on a queue for `memory.log` in the state directory. A

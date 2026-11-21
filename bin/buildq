@@ -45,7 +45,7 @@ submitted it, and no stdin. `buildq run` streams its output to stdout and exits 
 code (128 + N if signal N ended it). Interrupting `buildq run` (Ctrl-C, SIGTERM, SIGHUP) cancels
 the build, and so does killing it outright, once no client has followed the build for the
 daemon's unwatched_seconds. A build dropped off with `buildq submit` runs on alone, unless the agent
-session (Claude Code, Codex) that dropped it off has ended and, for the daemon's abandoned_seconds,
+session (Claude Code, Codex, Antigravity) that dropped it off has ended and, for the daemon's abandoned_seconds,
 nobody has waited on it: then it's cancelled while still queued. `buildq run` with no options runs
 a cargo command that never compiles (cargo fmt, cargo metadata, cargo --version) at once, as the
 shim does.

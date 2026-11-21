@@ -178,7 +178,11 @@ def heavy(tool: str, args: list[str]) -> bool:
                    if "=" not in a]
         return not targets or not all(MAKE_LIGHT_TARGET.search(t) for t in targets)
     if tool == "dotnet":
-        return positionals(args)[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
+        before = args[: args.index("--")] if "--" in args else args
+        pos = positionals(before)
+        if pos[:1] == ["run"] and "--no-build" in before:
+            return False  # caller explicitly asked to run without building
+        return pos[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
     if tool in ("docker", "podman"):
         pos = positionals(args)
         return pos[:1] == ["build"] or pos[:2] in (["buildx", "build"], ["compose", "build"], ["image", "build"])
@@ -222,7 +226,7 @@ def build_then_run(tool: str, args: list[str]) -> list[str] | None:
     if tool == "dotnet":
         before = args[: args.index("--")] if "--" in args else args
         items = positional_items(before)
-        if not items or items[0][1] != "run":
+        if not items or items[0][1] != "run" or "--no-build" in before:
             return None
         i = items[0][0]
         raw = before[:i] + ["build"] + before[i + 1:]
@@ -231,17 +235,24 @@ def build_then_run(tool: str, args: list[str]) -> list[str] | None:
             if skip:
                 skip = False
                 continue
-            if a in ("--no-build", "--no-restore"):
-                continue
-            # `dotnet run` takes `--project <path>` / `-p <path>`; `dotnet build` takes `<path>` positionally
-            # (while `-p:Prop=Val` is an MSBuild property accepted by both).
-            if a in ("--project", "-p") and idx + 1 < len(raw):
+            # `dotnet run` takes `--project <path>` or `-p <path>` (while `-p <Name>=<Value>` and
+            # `-p:<Name>=<Value>` are MSBuild properties); `dotnet build` takes `<path>` positionally
+            # and accepts `-p:<Name>=<Value>` and `--no-restore`.
+            if a == "--project" and idx + 1 < len(raw):
                 build.append(raw[idx + 1])
                 skip = True
-            elif a.startswith(("--project=", "-p=")):
+            elif a == "-p" and idx + 1 < len(raw):
+                val = raw[idx + 1]
+                build.append(f"-p:{val}" if "=" in val else val)
+                skip = True
+            elif a.startswith("--project="):
                 val = a.split("=", 1)[1]
                 if val:
                     build.append(val)
+            elif a.startswith("-p="):
+                val = a.split("=", 1)[1]
+                if val:
+                    build.append(f"-p:{val}" if "=" in val else val)
             else:
                 build.append(a)
         return build

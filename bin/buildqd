@@ -14,7 +14,8 @@ machine is doing right now rather than from a fixed number of slots:
 
   Memory  The build's expected peak must fit in MemAvailable, less what every running build may
           still grow into (its expected peak minus what it holds now), less mem_floor. Never
-          skipped. No build starts while memory pressure (PSI "full") is above mem_psi_block.
+          skipped. No build starts while memory pressure (PSI "full") is above mem_psi_block and
+          available memory is scarce.
   CPU     The build's minimum cores must fit in what is free: cpu_target x cores, less the busy
           cores measured machine-wide (CI runners, containers and other users included), less the
           cores that builds started in the last ramp_seconds haven't reached yet, plus the cores
@@ -2872,9 +2873,11 @@ class SystemdRunner:
 
     def result(self, ticket) -> str:
         """systemd's Result for the build's service: "success", "exit-code", "signal", "oom-kill" (the
-        kernel or systemd-oomd stopped it for memory), ... or "" if systemd can't say. With
-        OOMPolicy=continue, systemd-oomd or kernel kills leave Result=signal while still incrementing
-        OOMKills / ManagedOOMKills, so those count as "oom-kill" too."""
+        kernel stopped it for memory), "managed-oom-kill" (systemd-oomd stopped it for slice/ancestor
+        pressure), ... or "" if systemd can't say. With OOMPolicy=continue, OOM kills leave
+        Result=signal while still incrementing OOMKills / ManagedOOMKills, so those are checked
+        explicitly (kernel OOMKills first so own-cap kills stay distinguishable from slice-pressure
+        managed kills)."""
         if not ticket.unit:
             return ""
         try:
@@ -2887,9 +2890,10 @@ class SystemdRunner:
             return ""
         # systemd prints UINT64_MAX (18446744073709551615) when an OOM counter is unavailable;
         # sane_count() rejects that sentinel alongside non-numeric or negative values.
-        for key in ("OOMKills", "ManagedOOMKills"):
-            if int(sane_count(props.get(key)) or 0) > 0:
-                return "oom-kill"
+        if int(sane_count(props.get("OOMKills")) or 0) > 0:
+            return "oom-kill"
+        if int(sane_count(props.get("ManagedOOMKills")) or 0) > 0:
+            return "managed-oom-kill"
         return props.get("Result", "").strip()
 
     def cleanup(self, ticket):
@@ -4647,27 +4651,35 @@ class Daemon:
                 if (post.get("order") or [0, ""]) >= (self.status_posted.get(where, {}).get("order") or [0, ""]):
                     self.status_posted.pop(where, None)
                     self.status_posted[where] = {"state": post["state"], "order": post.get("order") or [0, ""]}
-            elif not newer:
+            else:
                 kind = self._status_failure(error)
-                if kind == "permanent":
+                if not newer and kind == "permanent":
                     if post in self.status_posts:
                         self.status_posts.remove(post)
                     log(f"GitHub refused the status for {post['repo']}@{post['sha'][:8]} (not retrying): "
                         f"{error[:300] or f'gh exited {proc.returncode}'}", level=4)
-                else:
-                    tries = max(0, int(sane_count(post.get("tries")) or 0)) + 1
-                    post["tries"] = tries
-                    if kind == "missing":
-                        post["missing"] = True
-                    else:
-                        post.pop("missing", None)
-                    delay = min(self.STATUS_RETRY_MAX, self.STATUS_RETRY_BASE * (2 ** min(tries - 1, 10)))
-                    post["next"] = now + delay
-                    if not post.get("logged"):
-                        post["logged"] = True
-                        span = "6 hours" if post.get("missing") else "a day"
-                        log(f"GitHub didn't take the status for {post['repo']}@{post['sha'][:8]} (trying again with "
-                            f"backoff, for {span}): {error[:300] or f'gh exited {proc.returncode}'}", level=4)
+                elif kind != "permanent":
+                    # If a newer verdict arrived while this request was in flight, carry a missing-commit
+                    # or transient/rate-limit failure onto the surviving replacement so the send loop
+                    # below doesn't immediately retry the same commit or rate-limited API in this tick.
+                    target = (max((p for p in self.status_posts if p.get("where") == post.get("where")),
+                                  key=lambda p: p.get("order") or [0, ""], default=None)
+                              if newer else post)
+                    if target is not None:
+                        tries = max(0, int(sane_count(target.get("tries")) or 0)) + 1
+                        target["tries"] = tries
+                        if kind == "missing":
+                            target["missing"] = True
+                        else:
+                            target.pop("missing", None)
+                        delay = min(self.STATUS_RETRY_MAX, self.STATUS_RETRY_BASE * (2 ** min(tries - 1, 10)))
+                        target["next"] = max(target.get("next", 0), now + delay)
+                        if not target.get("logged"):
+                            target["logged"] = True
+                            span = "6 hours" if target.get("missing") else "a day"
+                            log(f"GitHub didn't take the status for {target['repo']}@{target['sha'][:8]} "
+                                f"(trying again with backoff, for {span}): "
+                                f"{error[:300] or f'gh exited {proc.returncode}'}", level=4)
             changed = True
         busy = {id(p) for _, p, _ in self.status_procs}
         for post in list(self.status_posts):
@@ -5153,6 +5165,7 @@ class Daemon:
             callers_own = any(k in env and str(env[k]).strip()
                               and (k not in cleaned or callers_jobs(split_make_flags(cleaned[k])[0]))
                               for k in MAKE_FLAG_VARS)  # (an empty one is no choice at all)
+            t.elastic = False
             if wanted and not t.rigid and not callers_own:
                 t.elastic = known  # it speaks the protocol even before it takes a token
                 t.jobserver = os.path.join(t.dir, "jobserver")
@@ -5428,10 +5441,12 @@ class Daemon:
                     if verdict is PENDING:
                         continue  # finalized on a later tick, with systemd's verdict
                     oom = verdict == "oom-kill"
+                    managed_oom = verdict == "managed-oom-kill"
                     error = None if t.cancel_requested else (
+                        "it was stopped for memory (systemd-oomd)" if managed_oom else
                         "it was stopped for memory (systemd-oomd or the kernel)" if oom else
                         f"the build ended without reporting an exit status ({verdict or 'killed?'})")
-                    self.finalize(t, now, None, lost=True, oom=oom, error=error)
+                    self.finalize(t, now, None, lost=True, oom=oom or managed_oom, learn_oom=oom, error=error)
 
     def attempt_seconds(self, t: Ticket, now: float | None) -> float:
         """Seconds into this attempt, pauses left out: the clock attempt_wall and the profile use."""
@@ -5492,7 +5507,7 @@ class Daemon:
                     return False  # the build stays starting until the name is free
                 self.close_jobserver(t, remove=True)
                 self.drop_queries(t)  # (this attempt is over)
-                t.state, t.started, t.unit, t.cg, t.exec_argv, t.granted = "queued", None, None, None, None, 0
+                t.state, t.started, t.unit, t.cg, t.exec_argv, t.granted, t.elastic = "queued", None, None, None, None, 0, False
                 self.save(t)
                 log(f"requeued {t.id}: it hadn't started when the daemon stopped")
             else:
@@ -5545,7 +5560,8 @@ class Daemon:
             t.jobserver, t.tokens_out = None, 0
 
     def finalize(self, t: Ticket, now: float, exit_code, oom: bool = False, timed_out: bool = False,
-                 error: str | None = None, lost: bool = False, result: dict | None = None) -> None:
+                 error: str | None = None, lost: bool = False, result: dict | None = None,
+                 learn_oom: bool | None = None) -> None:
         if t.state in FINISHED:
             return
         self.drop_queries(t)  # its attempt's answers are no use to anyone now
@@ -5557,7 +5573,9 @@ class Daemon:
         exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
         lane = self.lane(t.lane)
         t.exit = exit_code
-        t.oom = bool(oom or t.oom_kills) or (exit_code == 137 and bool(lane.mem_cap) and t.mem_peak >= 0.9 * lane.mem_cap)
+        own_oom = bool((oom if learn_oom is None else learn_oom) or t.oom_kills) or (
+            exit_code == 137 and bool(lane.mem_cap) and t.mem_peak >= 0.9 * lane.mem_cap)
+        t.oom = bool(oom) or own_oom
         t.timed_out = timed_out
         t.error = error or (f"timed out after {t.timeout or 0:.0f}s" if timed_out else None)
         t.ended = now
@@ -5593,13 +5611,14 @@ class Daemon:
         except OSError:
             pass
         # A run that a signal ended (a cancel, a timeout) shows how far it got, not what it needs,
-        # so it teaches nothing; a run the kernel killed for memory teaches that it needs more.
-        if t.oom and not t.measured:  # killed before it could be sampled: it needed at least its cap
+        # so it teaches nothing; a run the kernel killed for its own memory cap teaches that it
+        # needs more (a slice/ancestor managed-oom kill doesn't inflate this command's own estimate).
+        if own_oom and not t.measured:  # killed before it could be sampled: it needed at least its cap
             t.mem_peak = max(t.mem_peak, lane.mem_cap or t.est_mem)
             t.peak_cores = max(t.peak_cores, float(t.max_granted or 1))
         if exit_code is not None and exit_code < 128 and not t.measured and not t.oom:
             t.mem_peak = t.mem_peak or 0  # too quick to sample: it needed little, and that is worth knowing
-        learn = t.oom or (exit_code is not None and exit_code < 128 and (t.measured or wall < 2))
+        learn = own_oom or (exit_code is not None and exit_code < 128 and (t.measured or wall < 2))
         if learn and not t.cancel_requested and not timed_out:
             given = round(t.grant_area / wall, 1) if wall > 0 and t.grant_area else t.max_granted
             try:
@@ -5607,7 +5626,7 @@ class Daemon:
                     "key": t.key, "lane": t.lane, "t": round(time.time()), "wall": round(wall, 1), "exit": exit_code,
                     "peak_mem": t.mem_peak, "peak_cores": round(t.peak_cores, 2), "avg_cores": round(t.avg_cores, 2),
                     "granted": given, "mem_cores": t.peak_mem_cores or t.max_granted, "elastic": t.elastic,
-                    "cold": t.cold, "oom": t.oom, "mem_wait_some": round(t.mem_wait_some, 1),
+                    "cold": t.cold, "oom": own_oom, "mem_wait_some": round(t.mem_wait_some, 1),
                     "mem_wait_full": round(t.mem_wait_full, 1), "mem_high": t.mem_high,
                     "waited": round(t.wait_total, 1), "caller": t.caller,
                     "requeues": t.requeues,
@@ -5638,7 +5657,7 @@ class Daemon:
         if t.state == "succeeded" and command_words(t.argv)[:2] == ["git", "push"] and t.source:
             nudged = False
             for post in self.status_posts:  # a push may have brought commits that were waiting
-                if post.get("repo") == t.source.get("remote"):
+                if post.get("repo") == t.source.get("remote") and post.get("missing"):
                     post["next"] = now
                     post["tries"] = 0
                     nudged = True
