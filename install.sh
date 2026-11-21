@@ -666,6 +666,7 @@ ensure_dependencies() {
 
   if ! run_pkg_install "$pkg_mgr" "$_pkgs"; then
     say "package installation failed; install the prerequisites manually and re-run ./install.sh"
+    say "if your distribution's repositories don't include Python 3.11+ (e.g. Debian 11 or Ubuntu 20.04), install Python 3.11+ via pyenv or uv and run: PYTHON=/path/to/python3.11 ./install.sh"
     return 1
   fi
 
@@ -720,6 +721,7 @@ shim_tools="cargo pnpm npm npx yarn make gmake ninja dotnet"
 # Optional compiler shims are linked only when a real binary exists outside $shimdir, so scripts
 # using `command -v gradle || ./gradlew` never trip over a shim for an absent tool.
 optional_shim_tools="cmake ctest zig gradle"
+state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
 guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
 skill_list=$confdir/skill-links    # every skill link made, for --uninstall
 
@@ -794,6 +796,15 @@ os.replace(tmp, path)
 EOF
 }
 
+daemon_lock_held() {
+  _lock=$state_dir/buildqd.lock
+  [ -f "$_lock" ] || return 1
+  if (exec 8<"$_lock" && flock -n 8) 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 # ---- Uninstall -----------------------------------------------------------------------------------
 if [ "$do_uninstall" = yes ]; then
   acquire_lock
@@ -807,20 +818,41 @@ if [ "$do_uninstall" = yes ]; then
       fi
     fi
   elif [ -x "$bindir/buildq" ]; then
-    if "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
-      if ! "$bindir/buildq" daemon stop; then
-        say "couldn't stop buildqd; stop it (or disable its init service) first, then re-run ./install.sh --uninstall"
-        exit 1
-      fi
-      # Pause briefly so an init supervisor (OpenRC/runit/s6/dinit) respawning buildqd is caught
-      # before we delete the live binary out from under it.
-      sleep 0.5 2>/dev/null || sleep 1
-      if "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
-        say "buildqd restarted after stop (it is likely managed by an init service such as OpenRC, runit, s6, or dinit)."
-        say "Disable and stop that service first, then re-run ./install.sh --uninstall."
-        exit 1
-      fi
+    _had_live=no
+    if daemon_lock_held || "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
+      _had_live=yes
     fi
+    # Always attempt `buildq daemon stop` (never skip when socket is starting or unresponsive).
+    if ! _stop_out=$("$bindir/buildq" daemon stop 2>&1); then
+      [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out" >&2
+      say "couldn't stop buildqd; stop it (or disable its init service) first, then re-run ./install.sh --uninstall"
+      exit 1
+    fi
+    [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out"
+    case $_stop_out in
+      *stopped*) _had_live=yes ;;
+    esac
+    # Verify buildqd neither kept holding buildqd.lock (starting/unresponsive) nor respawned under
+    # an init supervisor (OpenRC, runit, s6, dinit) before we delete the installed binaries.
+    if daemon_lock_held; then
+      say "buildqd is still running (holding $state_dir/buildqd.lock); stop it or disable its init service first, then re-run ./install.sh --uninstall."
+      exit 1
+    fi
+    if [ "$_had_live" = yes ]; then
+      _w=0
+      while [ "$_w" -lt 10 ]; do
+        sleep 0.2 2>/dev/null || { sleep 1; _w=$((_w + 4)); }
+        if daemon_lock_held || "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
+          say "buildqd restarted after stop (it is likely managed by an init service such as OpenRC, runit, s6, or dinit)."
+          say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+          exit 1
+        fi
+        _w=$((_w + 1))
+      done
+    fi
+  elif daemon_lock_held; then
+    say "buildqd is still running (holding $state_dir/buildqd.lock); stop it first, then re-run ./install.sh --uninstall."
+    exit 1
   fi
   find_python || true
   keep_guard=no
@@ -1059,13 +1091,14 @@ fi
 
 if have_systemd; then
   add_temp "$unitdir/buildq.service.new.$$"
-  # Render systemd unit safely via Python so PREFIX paths with spaces, &, |, %, or $ stay valid.
+  # Render systemd unit safely via Python. Systemd applies C-unescaping and %-specifier expansion
+  # to the ExecStart executable path (argv[0]), NOT $VAR expansion — so never double `$`.
   "$python" -B -I - "$src/systemd/buildq.service" "$unitdir/buildq.service.new.$$" "$bindir" <<'EOF'
 import sys
 src_u, dst_u, bindir = sys.argv[1:4]
 exe = bindir.rstrip("/") + "/buildqd"
-esc = exe.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
-rendered = f'"{esc}"' if any(c.isspace() or c in "\"'\\;&$%" for c in exe) else exe
+esc = exe.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+rendered = f'"{esc}"' if any(c.isspace() or c in "\"'\\;&%" for c in exe) else exe
 text = open(src_u).read().replace("@BINDIR@/buildqd", rendered).replace("@BINDIR@", bindir)
 with open(dst_u, "w") as f:
     f.write(text)

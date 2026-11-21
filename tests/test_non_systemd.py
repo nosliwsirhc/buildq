@@ -962,9 +962,29 @@ class InstallScriptTests(unittest.TestCase):
             self.assertIn("restarted after stop", refused.stdout)
             self.assertTrue(os.path.exists(fake_bq))
 
-    def test_systemd_unit_quotes_prefix_with_spaces_and_ampersand(self):
+            # If buildqd is starting/unresponsive (socket/status dead, but buildqd.lock is held),
+            # `--uninstall` MUST still refuse to delete binaries.
+            import fcntl
+            with open(fake_bq, "w") as f:
+                f.write("#!/bin/sh\n[ \"$1\" = daemon ] && [ \"$2\" = stop ] && { echo 'buildqd is not running'; exit 0; }\nexit 3\n")
+            os.chmod(fake_bq, 0o755)
+            state_bq = os.path.join(tmp, "state", "buildq")
+            os.makedirs(state_bq, exist_ok=True)
+            lock_f = open(os.path.join(state_bq, "buildqd.lock"), "w")
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                refused_lock = subprocess.run(
+                    ["/bin/sh", self.INSTALL_SH, "--uninstall"],
+                    cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+                )
+                self.assertNotEqual(refused_lock.returncode, 0)
+                self.assertIn("buildqd.lock", refused_lock.stdout)
+                self.assertTrue(os.path.exists(fake_bq))
+            finally:
+                lock_f.close()
+
+    def test_systemd_unit_quotes_prefix_with_spaces_and_ampersand_without_doubling_dollar(self):
         with tempfile.TemporaryDirectory() as tmp:
-            prefix = os.path.join(tmp, "my tools & builds")
             bindir = self._stub_bin(
                 tmp,
                 {
@@ -974,21 +994,42 @@ class InstallScriptTests(unittest.TestCase):
                 copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
                            "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
             )
-            res = subprocess.run(
+            # 1) Spaces and & are safely quoted without sed expansion.
+            prefix1 = os.path.join(tmp, "my tools & builds")
+            res1 = subprocess.run(
                 ["/bin/sh", self.INSTALL_SH, "--no-start"],
                 env={
                     "PATH": bindir,
                     "HOME": tmp,
-                    "PREFIX": prefix,
-                    "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
-                    "XDG_DATA_HOME": os.path.join(tmp, "data"),
-                    "XDG_STATE_HOME": os.path.join(tmp, "state"),
+                    "PREFIX": prefix1,
+                    "XDG_CONFIG_HOME": os.path.join(tmp, "cfg1"),
+                    "XDG_DATA_HOME": os.path.join(tmp, "data1"),
+                    "XDG_STATE_HOME": os.path.join(tmp, "state1"),
                 },
                 capture_output=True, text=True, timeout=30,
             )
-            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-            unit = read_text(os.path.join(tmp, "cfg", "systemd", "user", "buildq.service"))
-            self.assertIn(f'ExecStart="{prefix}/bin/buildqd"', unit)
+            self.assertEqual(res1.returncode, 0, res1.stdout + res1.stderr)
+            unit1 = read_text(os.path.join(tmp, "cfg1", "systemd", "user", "buildq.service"))
+            self.assertIn(f'ExecStart="{prefix1}/bin/buildqd"', unit1)
+
+            # 2) Literal `$` in executable path is NOT doubled (systemd does not expand $ in argv[0]).
+            prefix2 = os.path.join(tmp, "build$q")
+            res2 = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--no-start"],
+                env={
+                    "PATH": bindir,
+                    "HOME": tmp,
+                    "PREFIX": prefix2,
+                    "XDG_CONFIG_HOME": os.path.join(tmp, "cfg2"),
+                    "XDG_DATA_HOME": os.path.join(tmp, "data2"),
+                    "XDG_STATE_HOME": os.path.join(tmp, "state2"),
+                },
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+            unit2 = read_text(os.path.join(tmp, "cfg2", "systemd", "user", "buildq.service"))
+            self.assertIn(f"ExecStart={prefix2}/bin/buildqd", unit2)
+            self.assertNotIn("$$", unit2)
 
     def test_python_pkg_selection_for_ubuntu_2204_and_rhel9_without_python3(self):
         # Verify python_pkg_for picks versioned Python 3.11+ even when no python3 exists yet.
