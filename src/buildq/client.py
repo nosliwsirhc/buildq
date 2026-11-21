@@ -1560,6 +1560,8 @@ def skill_file() -> str | None:
     pkg_dir = os.path.dirname(os.path.realpath(__file__))
     for path in (os.path.join(data, "buildq", "skill", "buildq", "SKILL.md"),
                  os.path.join(bin_dir, "..", "skills", "buildq", "SKILL.md"),
+                 os.path.join(bin_dir, "..", "share", "buildq", "skill", "buildq", "SKILL.md"),
+                 os.path.join(sys.prefix, "share", "buildq", "skill", "buildq", "SKILL.md"),
                  os.path.join(pkg_dir, "..", "..", "skills", "buildq", "SKILL.md")):
         if os.path.isfile(path):
             return path
@@ -1663,11 +1665,11 @@ def main(argv=None) -> int:
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
                 "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source,
                 "query": cmd_query, "top": _cmd_top}
-    return handlers[args.cmd](args)
+    try:
+        return handlers[args.cmd](args)
+    except KeyboardInterrupt:
+        return 130
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except KeyboardInterrupt:
-        sys.exit(130)
+    sys.exit(main())

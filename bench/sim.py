@@ -19,6 +19,7 @@ Stdlib only; Python 3.11+.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import re
 import importlib.machinery
@@ -55,6 +56,7 @@ class _BuildqdPackage:
 
     SUBMODULES = ("common", "commands", "config", "machine", "history", "metrics",
                   "runners", "ticket", "supervisor", "github", "scheduler", "daemon")
+    LOOKUP_ORDER = ("daemon", *(sub for sub in SUBMODULES if sub != "daemon"))
 
     def __init__(self, pkg_dir: str, name: str):
         # Clear any prior synthetic package of the same name so each simulation starts clean.
@@ -66,17 +68,18 @@ class _BuildqdPackage:
         pkg = importlib.util.module_from_spec(spec)
         sys.modules[name] = pkg
         spec.loader.exec_module(pkg)
-        self._mods = {}
-        for sub in self.SUBMODULES:
-            self._mods[sub] = importlib.import_module(f"{name}.{sub}")
+        mods = {sub: importlib.import_module(f"{name}.{sub}") for sub in self.SUBMODULES}
+        object.__setattr__(self, "_mods", mods)
 
     def __getattr__(self, attr: str):
-        for sub in ("daemon", "common", "config", "commands", "machine", "history",
-                    "metrics", "runners", "ticket", "supervisor", "github", "scheduler"):
+        for sub in self.LOOKUP_ORDER:
             mod = self._mods[sub]
             if hasattr(mod, attr):
                 return getattr(mod, attr)
         raise AttributeError(attr)
+
+    def __setattr__(self, attr: str, value) -> None:
+        raise AttributeError(f"use patch({attr!r}, ...) to modify synthetic buildq package attributes")
 
     def patch(self, attr: str, value) -> None:
         if attr in ("time", "uuid"):
@@ -89,14 +92,49 @@ class _BuildqdPackage:
                 setattr(mod, attr, value)
 
 
+def _launcher_pkg_dir(real_path: str) -> str | None:
+    """If `real_path` is a buildq package launcher (not a legacy single-file daemon), return its
+    `src/buildq` or installed `LIBDIR/buildq` directory; else None."""
+    try:
+        with open(real_path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=real_path)
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+    imports_buildq = any(
+        (isinstance(node, ast.ImportFrom) and node.module in ("buildq", "buildq.daemon"))
+        or (isinstance(node, ast.Import) and any(a.name in ("buildq", "buildq.daemon") for a in node.names))
+        for node in ast.walk(tree)
+    )
+    if not imports_buildq:
+        return None
+    libdir = None
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "LIBDIR" for t in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            libdir = node.value.value
+    candidates = []
+    if libdir:
+        candidates.append(os.path.join(os.path.realpath(libdir), "buildq"))
+    candidates.append(os.path.normpath(os.path.join(os.path.dirname(real_path), "..", "src", "buildq")))
+    for pkg_dir in candidates:
+        if os.path.isfile(os.path.join(pkg_dir, "__init__.py")) and os.path.isfile(os.path.join(pkg_dir, "daemon.py")):
+            return pkg_dir
+    raise FileNotFoundError(f"buildq package not found for launcher {real_path}")
+
+
 def load_buildqd(path: str, name: str):
     """buildqd as a module (legacy single-file) or isolated package (`src/buildq`), so two versions
     can be loaded side by side."""
     abs_path = os.path.abspath(path)
-    pkg_dir = os.path.normpath(os.path.join(os.path.dirname(abs_path), "..", "src", "buildq"))
-    if os.path.isfile(os.path.join(pkg_dir, "__init__.py")) and os.path.isfile(os.path.join(pkg_dir, "daemon.py")):
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(f"buildqd not found: {path}")
+    real_path = os.path.realpath(abs_path)
+    pkg_dir = _launcher_pkg_dir(real_path)
+    if pkg_dir is not None:
         return _BuildqdPackage(pkg_dir, name)
-    loader = importlib.machinery.SourceFileLoader(name, abs_path)
+    loader = importlib.machinery.SourceFileLoader(name, real_path)
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)

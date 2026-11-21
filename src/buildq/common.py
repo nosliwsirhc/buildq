@@ -28,13 +28,13 @@ _CLIENT_ENTRYPOINT: str | None = None
 def set_daemon_entrypoint(path: str) -> None:
     """Record the executable script path when invoked via `bin/buildqd` or an installed copy."""
     global _DAEMON_ENTRYPOINT
-    _DAEMON_ENTRYPOINT = os.path.realpath(path)
+    _DAEMON_ENTRYPOINT = os.path.abspath(path)
 
 
 def set_client_entrypoint(path: str) -> None:
     """Record the executable script path when invoked via `bin/buildq` or an installed copy."""
     global _CLIENT_ENTRYPOINT
-    _CLIENT_ENTRYPOINT = os.path.realpath(path)
+    _CLIENT_ENTRYPOINT = os.path.abspath(path)
 
 
 def daemon_command() -> list[str]:
@@ -47,19 +47,54 @@ def daemon_command() -> list[str]:
 def client_command() -> list[str]:
     """Command prefix to invoke buildq (used by the daemon for `buildq source`)."""
     if _DAEMON_ENTRYPOINT:
-        beside = os.path.join(os.path.dirname(_DAEMON_ENTRYPOINT), "buildq")
-        if os.path.isfile(beside):
-            return [sys.executable, beside]
+        for base in (os.path.dirname(_DAEMON_ENTRYPOINT), os.path.dirname(os.path.realpath(_DAEMON_ENTRYPOINT))):
+            beside = os.path.join(base, "buildq")
+            if os.path.isfile(beside):
+                return [sys.executable, beside]
     return [sys.executable, "-m", "buildq.client"]
 
 
 def client_bin_dir() -> str:
     """Directory holding the running `buildq` executable (for finding sibling buildq-shim)."""
+    candidates = []
     if _CLIENT_ENTRYPOINT:
-        return os.path.dirname(_CLIENT_ENTRYPOINT)
-    if sys.argv and sys.argv[0] and os.path.isfile(sys.argv[0]):
-        return os.path.dirname(os.path.realpath(sys.argv[0]))
-    return os.path.dirname(os.path.realpath(__file__))
+        candidates.extend([os.path.dirname(_CLIENT_ENTRYPOINT), os.path.dirname(os.path.realpath(_CLIENT_ENTRYPOINT))])
+    elif sys.argv and sys.argv[0] and os.path.isfile(sys.argv[0]):
+        candidates.extend([os.path.dirname(os.path.abspath(sys.argv[0])), os.path.dirname(os.path.realpath(sys.argv[0]))])
+    for directory in candidates:
+        if os.path.isfile(os.path.join(directory, "buildq-shim")):
+            return directory
+    return candidates[0] if candidates else os.path.dirname(os.path.realpath(__file__))
+
+
+def _uninstalled_pkg_root() -> str | None:
+    """Parent directory of `buildq` when invoked via `-m` from an uninstalled source tree."""
+    if _DAEMON_ENTRYPOINT is not None:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    import site
+    import sysconfig
+    installed = {os.path.realpath(p) for p in (
+        sysconfig.get_path("purelib"),
+        sysconfig.get_path("platlib"),
+        sysconfig.get_path("stdlib"),
+        *(site.getsitepackages() if hasattr(site, "getsitepackages") else ()),
+        *([site.getusersitepackages()] if hasattr(site, "getusersitepackages") else ()),
+    ) if p}
+    return None if root in installed else root
+
+
+def module_pythonpath(existing: str | None = None) -> str | None:
+    """PYTHONPATH value needed for child `-m buildq.*` processes when running uninstalled."""
+    root = _uninstalled_pkg_root()
+    if not root:
+        return None
+    if existing:
+        parts = existing.split(os.pathsep)
+        if root in (os.path.realpath(p) for p in parts if p):
+            return existing
+        return root + os.pathsep + existing
+    return root
 
 
 def runtime_dir() -> str:

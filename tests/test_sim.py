@@ -1,6 +1,4 @@
 """The replay simulator (bench/sim.py): it drives the real daemon, deterministically."""
-import importlib.machinery
-import importlib.util
 import json
 import os
 import io
@@ -10,23 +8,12 @@ import tempfile
 import unittest
 import unittest.mock
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(ROOT, "src")
-if SRC not in sys.path:
-    sys.path.insert(0, SRC)
-
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from helpers import ROOT, load_script  # noqa: E402
 from buildq import commands as bq_commands, metrics as bq_metrics  # noqa: E402
 
-
-def load(name, path):
-    loader = importlib.machinery.SourceFileLoader(name, path)
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-sim = load("sim", os.path.join(ROOT, "bench", "sim.py"))
+sim = load_script("sim", os.path.join(ROOT, "bench", "sim.py"))
 scenarios = sim.builtin
 GIB = sim.GIB
 CONFIG = sim.DEFAULT_CONFIG

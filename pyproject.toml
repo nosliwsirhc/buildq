@@ -15,5 +15,11 @@ dependencies = []
 buildq = "buildq.client:main"
 buildqd = "buildq.daemon:main"
 
+[tool.setuptools]
+script-files = ["bin/buildq-shim", "bin/buildq-rustc-guard"]
+
+[tool.setuptools.data-files]
+"share/buildq/skill/buildq" = ["skills/buildq/SKILL.md"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

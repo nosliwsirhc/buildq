@@ -28,7 +28,7 @@ from .common import DEVNULL, FINISHED, PENDING, UID, VERSION
 from .config import Config, Lane
 from .github import GitHubMixin
 from .history import History
-from .machine import Machine, T3_THREAD_VAR
+from .machine import Machine, T3_THREAD_VAR, user_manager_cgroup
 from .metrics import Metrics, WAIT_COLUMN, WAIT_COLUMNS
 from .runners import DirectRunner, Jobserver, SystemdRunner
 from .scheduler import SchedulerMixin
@@ -51,7 +51,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         self.machine = machine or Machine()
         self.tickets_dir = os.path.join(state_dir, "tickets")
         os.makedirs(self.tickets_dir, exist_ok=True)
-        self.cg_base = machine.user_manager_cgroup()
+        self.cg_base = user_manager_cgroup()
         self.override = runner  # tests pass a runner of their own
         self.runners = {"systemd": SystemdRunner(self.cg_base), "direct": DirectRunner()}
         if runner is not None:
@@ -628,7 +628,15 @@ class Daemon(GitHubMixin, SchedulerMixin):
             t = self.tickets.get(tid)
             if t is None or t.requeues != attempt:
                 continue
-            env = {"LC_ALL": "C", **t.git_env} if t.git_env else None
+            pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"))
+            if t.git_env:
+                env = {"LC_ALL": "C", **t.git_env}
+                if pypath:
+                    env["PYTHONPATH"] = pypath
+            elif pypath:
+                env = {**os.environ, "PYTHONPATH": pypath}
+            else:
+                env = None
             try:
                 proc = subprocess.Popen([*self.source_command, t.cwd], stdin=DEVNULL, stdout=subprocess.PIPE,
                                         stderr=DEVNULL, start_new_session=True, env=env)

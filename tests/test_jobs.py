@@ -16,8 +16,8 @@ from unittest import mock
 
 if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import BASE_CONFIG, BUILDQD, DaemonCase, FakeMachine, FakeRunner, GIB, MIB, ROOT, load_shim  # noqa: E402
-from buildq import client, commands, common, config, daemon, history, machine, runners, ticket  # noqa: E402
+from helpers import BASE_CONFIG, BUILDQD, DaemonCase, FakeMachine, FakeRunner, GIB, MIB, ROOT  # noqa: E402
+from buildq import client, commands, common, config, daemon, history, machine, runners, scheduler, ticket  # noqa: E402
 
 
 class Cores(DaemonCase):
@@ -695,11 +695,11 @@ class Estimates(DaemonCase):
         self.assertEqual(len(again.by_key["k"]), 1)
 
     def test_history_keeps_a_bounded_number_of_commands(self):
-        history = history.History(os.path.join(self.tmp.name, "h.jsonl"), max_keys=10)
+        h = history.History(os.path.join(self.tmp.name, "h.jsonl"), max_keys=10)
         for i in range(50):
-            history.add({"key": f"k{i}", "t": self.now, "peak_mem": 1, "peak_cores": 1.0})
-        self.assertEqual(len(history.by_key), 10)
-        self.assertIn("k49", history.by_key)
+            h.add({"key": f"k{i}", "t": self.now, "peak_mem": 1, "peak_cores": 1.0})
+        self.assertEqual(len(h.by_key), 10)
+        self.assertIn("k49", h.by_key)
 
 
 
@@ -898,7 +898,7 @@ class QueriesBelongToTheirAttempt(DaemonCase):
 
     def test_unreadable_container_storage_is_said_once(self):
         self.daemon.cfg.container_storage = ["/root/no-access"]
-        with mock.patch.object(machine.os, "stat", side_effect=PermissionError("denied")) as _, \
+        with mock.patch.object(scheduler.os, "stat", side_effect=PermissionError("denied")) as _, \
                 mock.patch.object(common, "log") as log:
             t = ticket.Ticket("x" * 36, ["docker", "build", "."], self.workdir(), "image", "k", self.now, self.tmp.name)
             t.disk_paths = []
@@ -1080,18 +1080,18 @@ class Sizes(unittest.TestCase):
         self.assertEqual(machine.slice_path("a-b.slice"), "a.slice/a-b.slice")
 
     def test_machine_reads_this_machine(self):
-        machine = machine.Machine()
+        m = machine.Machine()
         time.sleep(0.2)
-        machine.sample(time.monotonic())
-        self.assertGreater(machine.mem_available, 0)
-        self.assertLessEqual(machine.busy, machine.ncpu + 0.01)
+        m.sample(time.monotonic())
+        self.assertGreater(m.mem_available, 0)
+        self.assertLessEqual(m.busy, m.ncpu + 0.01)
 
 
 
 class ShimRules(unittest.TestCase):
     """#72: what `buildq run` runs at once instead of queueing, by the shim's own rule."""
 
-    shim = load_shim()
+    shim = client.shim_classifier()
 
     def setUp(self):
         patch = mock.patch.dict(os.environ)  # (whatever aliases the suite's own environment sets)

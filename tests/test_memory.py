@@ -715,7 +715,7 @@ class SliceGuard(DaemonCase):
         self.daemon.guard_slice = lambda stopping=False: (guarded.append(self.machine.mem_available), real(stopping))
         self.machine.sample = lambda tick: None  # the test sets the numbers
         start = time.monotonic()
-        with mock.patch.object(scheduler.time, "monotonic", side_effect=lambda: start + len(ticks)):
+        with mock.patch.object(daemon.time, "monotonic", side_effect=lambda: start + len(ticks)):
             ticks = []
             for available in (100, 100, 100, 98, 98, 98, 98):  # GiB: a 2G fall, then steady
                 self.machine.mem_available = available * GIB
@@ -728,7 +728,7 @@ class SliceGuard(DaemonCase):
         self.daemon.cfg.mem_floor = 60 * GIB  # less than twice the floor free: short
         for _ in range(3):
             ticks.append(0)
-            with mock.patch.object(scheduler.time, "monotonic", return_value=start + 100 + len(ticks) * 0.0):
+            with mock.patch.object(daemon.time, "monotonic", return_value=start + 100 + len(ticks) * 0.0):
                 self.daemon.tick(self.now + len(ticks))
         self.assertEqual(len(guarded), 3)  # every tick
 

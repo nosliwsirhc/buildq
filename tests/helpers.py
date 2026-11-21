@@ -20,13 +20,14 @@ from buildq.common import GIB, MIB  # noqa: E402
 
 BUILDQD = os.path.join(ROOT, "bin", "buildqd")
 BUILDQ = os.path.join(ROOT, "bin", "buildq")
+common.set_client_entrypoint(BUILDQ)
 common.log = lambda message, level=None: None  # keep test output readable
 
 
-def load_shim():
-    """Load the standalone bin/buildq-shim script as a module for rule unit tests."""
-    loader = importlib.machinery.SourceFileLoader("buildq_shim_test", os.path.join(ROOT, "bin", "buildq-shim"))
-    spec = importlib.util.spec_from_loader("buildq_shim_test", loader)
+def load_script(name: str, path: str):
+    """Load a standalone Python script file as a module."""
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module

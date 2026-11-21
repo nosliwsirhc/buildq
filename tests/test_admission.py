@@ -336,23 +336,23 @@ class Admission(DaemonCase):
         self.assertEqual((test.state, test.reason_cat), ("queued", "workspace"))
 
     def test_workspace_groups_are_checked(self):
-        def config(extra, base=BASE_CONFIG):
+        def make_config(extra, base=BASE_CONFIG):
             return config.Config(config.tomllib.loads(base + extra), 128 * GIB, 32)
-        cfg = config("[lanes.check]\n" + self.CHECK_LANE + "\n")
+        cfg = make_config("[lanes.check]\n" + self.CHECK_LANE + "\n")
         self.assertEqual((cfg.lanes["check"].workspace_group, cfg.summary()["lanes"]["check"]["workspace_group"]),
                          ("heavy", "heavy"))
         for bad, said in (('workspace_group = "carg"', "shared with no other lane"),
                           ('workspace_group = ""', "must be a name"),
                           ('workspace_group = "web"', "must be exclusive")):
             with self.assertRaisesRegex(ValueError, said, msg=bad):
-                config(f"[lanes.check]\ncores = 2\n{bad}\n")
+                make_config(f"[lanes.check]\ncores = 2\n{bad}\n")
         grouped = BASE_CONFIG.replace("[lanes.heavy]\n", '[lanes.heavy]\nworkspace_group = "cargo"\n')
         with self.assertRaisesRegex(ValueError, "lane heavy's group is 'cargo'"):
-            config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
+            make_config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
         with self.assertRaisesRegex(ValueError, "lane heavy's group is 'cargo'"):  # even with a third lane beside it
-            config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n'
-                   '[lanes.test]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
-        self.assertEqual(config('[lanes.check]\ncores = 2\nworkspace_group = "check"\n').lanes["check"].workspace_group,
+            make_config('[lanes.check]\ncores = 2\nworkspace_group = "heavy"\n'
+                        '[lanes.test]\ncores = 2\nworkspace_group = "heavy"\n', base=grouped)
+        self.assertEqual(make_config('[lanes.check]\ncores = 2\nworkspace_group = "check"\n').lanes["check"].workspace_group,
                          "check")  # naming itself: the default, said out loud
 
     def test_a_build_held_for_waiting_longest_holds_its_workspace(self):

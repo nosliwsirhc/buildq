@@ -25,6 +25,15 @@
 set -euo pipefail
 
 prefix=${PREFIX:-$HOME/.local}
+case $prefix in
+  ~) prefix=$HOME ;;
+  ~/*) prefix=$HOME/${prefix#~/} ;;
+  /*) ;;
+  *) prefix=$PWD/$prefix ;;
+esac
+if command -v -- "${PYTHON:-python3}" >/dev/null 2>&1; then
+  prefix=$("${PYTHON:-python3}" -c 'import os, sys; print(os.path.normpath(os.path.abspath(sys.argv[1])))' "$prefix")
+fi
 bindir=$prefix/bin
 libdir=$prefix/lib/buildq
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -103,6 +112,20 @@ put() {
 
 have_systemd() { command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; }
 
+# Serialize concurrent installs/uninstalls against the same prefix so release pruning can't race.
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || return 0
+  local lockdir=${XDG_RUNTIME_DIR:-$confdir}
+  if [[ ! -d "$lockdir" ]]; then
+    [[ "${1:-}" == "--uninstall" ]] && return 0
+    mkdir -p "$lockdir" 2>/dev/null || return 0
+  fi
+  local tag
+  tag=$(printf '%s' "$prefix" | cksum | awk '{print $1}')
+  exec 9>"$lockdir/buildq-install-$tag.lock"
+  flock 9
+}
+
 # Sets or clears build.rustc-wrapper in a cargo configuration, leaving everything else alone.
 rustc_wrapper() {
   "${python:-python3}" - "$cargo_config" "$1" <<'EOF'
@@ -144,6 +167,7 @@ EOF
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
+  acquire_lock --uninstall
   if have_systemd; then
     systemctl --user disable --now buildq.service buildq.socket 2>/dev/null || true
   fi
@@ -215,19 +239,26 @@ esac
 python=$chosen
 [[ -r /proc/stat && -r /proc/meminfo ]] || { say "buildq needs Linux (/proc/stat, /proc/meminfo)."; exit 1; }
 
+acquire_lock
 mkdir -p "$bindir" "$libdir" "$unitdir" "$confdir"
 staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
-trap 'rm -rf "$staged"' EXIT
 # Install the buildq Python package into a versioned directory and swap the `current` symlink
 # atomically, so running builds or CLI invocations never read half-replaced modules.
-release=$libdir/v-$$
-mkdir -p "$release"
+release=$(mktemp -d "$libdir/v-XXXXXX")
+swapped=no
+cleanup() {
+  rm -rf "$staged" "$libdir/current.new.$$" "$bindir/buildqd.new.$$"
+  if [[ $swapped != yes ]]; then
+    rm -rf "$release"
+  fi
+}
+trap cleanup EXIT
 cp -R "$src/src/buildq" "$release/buildq"
-find "$release/buildq" -name '__pycache__' -exec rm -rf {} +
+find "$release/buildq" -type d -name '__pycache__' -prune -exec rm -rf {} +
 ln -sfn "$release" "$libdir/current.new.$$"
 mv -Tf "$libdir/current.new.$$" "$libdir/current"
-for program in buildqd buildq; do
-  "$python" - "$src/bin/$program" "$staged/$program" "$python" "$libdir/current" <<'EOF'
+swapped=yes
+"$python" - "$src/bin/buildq" "$staged/buildq" "$python" "$libdir/current" <<'EOF'
 import sys
 src_path, dst_path, py, pkg_lib = sys.argv[1:5]
 lines = open(src_path).read().splitlines(keepends=True)
@@ -238,15 +269,18 @@ if "LIBDIR = None" not in text:
 with open(dst_path, "w") as f:
     f.write(text.replace("LIBDIR = None", f"LIBDIR = {pkg_lib!r}", 1))
 EOF
-  put 755 "$staged/$program" "$bindir/$program"
-done
+put 755 "$staged/buildq" "$bindir/buildq"
+ln -sfn buildq "$bindir/buildqd.new.$$"
+mv -Tf "$bindir/buildqd.new.$$" "$bindir/buildqd"
 # buildq-shim stays standalone (zero package-import overhead on every shimmed command).
 { printf '#!%s\n' "$python"; tail -n +2 "$src/bin/buildq-shim"; } >"$staged/buildq-shim"
 put 755 "$staged/buildq-shim" "$bindir/buildq-shim"
 put 755 "$src/bin/buildq-rustc-guard" "$bindir/buildq-rustc-guard"
 prune_old_releases() {
+  local active
+  active=$(readlink -f "$libdir/current" 2>/dev/null || true)
   for old in "$libdir"/v-*; do
-    if [[ -e "$old" && "$old" != "$release" ]]; then
+    if [[ -e "$old" && "$old" != "$release" && "$old" != "$active" ]]; then
       rm -rf "$old"
     fi
   done
