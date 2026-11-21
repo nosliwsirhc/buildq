@@ -818,10 +818,6 @@ if [ "$do_uninstall" = yes ]; then
       fi
     fi
   elif [ -x "$bindir/buildq" ]; then
-    _had_live=no
-    if daemon_lock_held || "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
-      _had_live=yes
-    fi
     # Always attempt `buildq daemon stop` (never skip when socket is starting or unresponsive).
     if ! _stop_out=$("$bindir/buildq" daemon stop 2>&1); then
       [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out" >&2
@@ -829,26 +825,32 @@ if [ "$do_uninstall" = yes ]; then
       exit 1
     fi
     [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out"
-    case $_stop_out in
-      *stopped*) _had_live=yes ;;
-    esac
-    # Verify buildqd neither kept holding buildqd.lock (starting/unresponsive) nor respawned under
-    # an init supervisor (OpenRC, runit, s6, dinit) before we delete the installed binaries.
-    if daemon_lock_held; then
-      say "buildqd is still running (holding $state_dir/buildqd.lock); stop it or disable its init service first, then re-run ./install.sh --uninstall."
+    # Unconditionally monitor buildqd.lock for a bounded >=2s wall-clock window (fast non-blocking
+    # flock probes, never 2s-retrying socket calls inside the loop) to catch a starting/unresponsive
+    # daemon or an init supervisor (OpenRC, runit, s6, dinit) respawning buildqd between crashes.
+    _deadline=$(( $(date +%s) + 3 ))
+    while :; do
+      if daemon_lock_held; then
+        say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
+        say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+        exit 1
+      fi
+      [ "$(date +%s)" -ge "$_deadline" ] && break
+      sleep 0.2 2>/dev/null || sleep 1
+    done
+    # One final bounded socket probe (only when a socket path exists) followed by a final lock check.
+    _sock_present=no
+    for _sp in "${BUILDQ_SOCKET:-}" "$state_dir/run/buildq.sock" "/tmp/buildq-$(id -u)/buildq.sock"; do
+      [ -n "$_sp" ] && [ -S "$_sp" ] && { _sock_present=yes; break; }
+    done
+    if [ "$_sock_present" = yes ] && "$bindir/buildq" ping >/dev/null 2>&1; then
+      say "buildqd restarted after stop (it is likely managed by an init service such as OpenRC, runit, s6, or dinit)."
+      say "Disable and stop that service first, then re-run ./install.sh --uninstall."
       exit 1
     fi
-    if [ "$_had_live" = yes ]; then
-      _w=0
-      while [ "$_w" -lt 10 ]; do
-        sleep 0.2 2>/dev/null || { sleep 1; _w=$((_w + 4)); }
-        if daemon_lock_held || "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
-          say "buildqd restarted after stop (it is likely managed by an init service such as OpenRC, runit, s6, or dinit)."
-          say "Disable and stop that service first, then re-run ./install.sh --uninstall."
-          exit 1
-        fi
-        _w=$((_w + 1))
-      done
+    if daemon_lock_held; then
+      say "buildqd is still running or restarted (holding $state_dir/buildqd.lock); disable and stop its init service first, then re-run ./install.sh --uninstall."
+      exit 1
     fi
   elif daemon_lock_held; then
     say "buildqd is still running (holding $state_dir/buildqd.lock); stop it first, then re-run ./install.sh --uninstall."

@@ -890,7 +890,7 @@ class InstallScriptTests(unittest.TestCase):
                 tmp,
                 {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
                 copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
-                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep", "date"),
             )
             res = subprocess.run(
                 ["/bin/sh", self.INSTALL_SH, "--no-start"],
@@ -919,7 +919,7 @@ class InstallScriptTests(unittest.TestCase):
                 tmp,
                 {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
                 copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
-                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep"),
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep", "date"),
             )
             env = {
                 "PATH": bindir,
@@ -940,42 +940,55 @@ class InstallScriptTests(unittest.TestCase):
             guard_cfg = os.path.join(work, ".cargo", "config.toml")
             self.assertIn("buildq-rustc-guard", read_text(guard_cfg))
 
-            # Uninstall from a DIFFERENT directory (`tmp`) must still clean up the guard config.
+            # Uninstall from a DIFFERENT directory (`tmp`) must clean up the guard config quickly
+            # (within the ~2-3 s bounded respawn check, never stalling 40+ s on socket retries).
+            t0 = time.monotonic()
             uninst = subprocess.run(
                 ["/bin/sh", self.INSTALL_SH, "--uninstall"],
-                cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=15,
             )
+            elapsed = time.monotonic() - t0
             self.assertEqual(uninst.returncode, 0, uninst.stdout + uninst.stderr)
+            self.assertLess(elapsed, 8.0, f"clean uninstall took too long ({elapsed:.1f}s)")
             self.assertNotIn("buildq-rustc-guard", read_text(guard_cfg))
 
-            # If a supervised daemon respawns after stop, `--uninstall` MUST refuse to delete it.
+            # If an init supervisor respawns buildqd 0.3 s after `daemon stop` (even when `stop`
+            # saw "not running" between launches), `--uninstall` MUST catch buildqd.lock and refuse.
+            import fcntl
             os.makedirs(os.path.join(prefix, "bin"), exist_ok=True)
             fake_bq = os.path.join(prefix, "bin", "buildq")
-            with open(fake_bq, "w") as f:
-                f.write("#!/bin/sh\nexit 0\n")  # status/ping/stop all exit 0 -> looks respawned!
-            os.chmod(fake_bq, 0o755)
-            refused = subprocess.run(
-                ["/bin/sh", self.INSTALL_SH, "--uninstall"],
-                cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
-            )
-            self.assertNotEqual(refused.returncode, 0)
-            self.assertIn("restarted after stop", refused.stdout)
-            self.assertTrue(os.path.exists(fake_bq))
-
-            # If buildqd is starting/unresponsive (socket/status dead, but buildqd.lock is held),
-            # `--uninstall` MUST still refuse to delete binaries.
-            import fcntl
             with open(fake_bq, "w") as f:
                 f.write("#!/bin/sh\n[ \"$1\" = daemon ] && [ \"$2\" = stop ] && { echo 'buildqd is not running'; exit 0; }\nexit 3\n")
             os.chmod(fake_bq, 0o755)
             state_bq = os.path.join(tmp, "state", "buildq")
             os.makedirs(state_bq, exist_ok=True)
-            lock_f = open(os.path.join(state_bq, "buildqd.lock"), "w")
+            lock_path = os.path.join(state_bq, "buildqd.lock")
+            respawner = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl, sys, time; time.sleep(0.3); "
+                 "f = open(sys.argv[1], 'w'); fcntl.flock(f.fileno(), fcntl.LOCK_EX); time.sleep(5)",
+                 lock_path],
+            )
+            try:
+                refused = subprocess.run(
+                    ["/bin/sh", self.INSTALL_SH, "--uninstall"],
+                    cwd=tmp, env=env, capture_output=True, text=True, timeout=15,
+                )
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("buildqd.lock", refused.stdout)
+                self.assertTrue(os.path.exists(fake_bq))
+            finally:
+                respawner.kill()
+                respawner.wait()
+
+            # If buildqd is already starting/unresponsive (socket dead, buildqd.lock held),
+            # `--uninstall` MUST immediately refuse to delete binaries.
+            lock_f = open(lock_path, "w")
             try:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 refused_lock = subprocess.run(
                     ["/bin/sh", self.INSTALL_SH, "--uninstall"],
-                    cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+                    cwd=tmp, env=env, capture_output=True, text=True, timeout=15,
                 )
                 self.assertNotEqual(refused_lock.returncode, 0)
                 self.assertIn("buildqd.lock", refused_lock.stdout)
@@ -992,7 +1005,7 @@ class InstallScriptTests(unittest.TestCase):
                     "systemctl": "#!/bin/sh\nexit 0\n",
                 },
                 copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
-                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep", "date"),
             )
             # 1) Spaces and & are safely quoted without sed expansion.
             prefix1 = os.path.join(tmp, "my tools & builds")
@@ -1078,7 +1091,7 @@ class InstallScriptTests(unittest.TestCase):
                 tmp,
                 {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
                 copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
-                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep", "date"),
             )
             env = {
                 "PATH": bindir,
