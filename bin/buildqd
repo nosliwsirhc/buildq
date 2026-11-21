@@ -4651,6 +4651,15 @@ class Daemon:
                 if (post.get("order") or [0, ""]) >= (self.status_posted.get(where, {}).get("order") or [0, ""]):
                     self.status_posted.pop(where, None)
                     self.status_posted[where] = {"state": post["state"], "order": post.get("order") or [0, ""]}
+                if newer:
+                    # The commit is now on GitHub: give any queued replacement a fresh delivery
+                    # window instead of expiring or backing off under the old missing-commit state.
+                    for p in self.status_posts:
+                        if p.get("where") == post.get("where"):
+                            p.pop("missing", None)
+                            p.pop("tries", None)
+                            p["first"] = now
+                            p["next"] = min(p.get("next", now), now)
             else:
                 kind = self._status_failure(error)
                 if not newer and kind == "permanent":

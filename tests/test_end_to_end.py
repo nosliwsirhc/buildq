@@ -520,6 +520,12 @@ class Enforcement(Harness):
         dbuild2, drun2 = dotnet_app_flag.stdout.splitlines()
         self.assertRegex(dbuild2, r"^dotnet build app job=[0-9a-f-]{36}$")
         self.assertEqual(drun2, "dotnet run --project app --no-build -- --no-build job=none")
+        dotnet_watch_arg = subprocess.run(["dotnet", "run", "--project", "App.csproj", "--", "--watch"], env=env,
+                                          cwd=self.work, capture_output=True, text=True, timeout=60)
+        self.assertEqual(dotnet_watch_arg.returncode, 0, dotnet_watch_arg.stderr)
+        dbuild3, drun3 = dotnet_watch_arg.stdout.splitlines()
+        self.assertRegex(dbuild3, r"^dotnet build App\.csproj job=[0-9a-f-]{36}$")
+        self.assertEqual(drun3, "dotnet run --project App.csproj --no-build -- --watch job=none")
 
     def test_run_runs_cargo_commands_that_never_compile_at_once(self):
         """#72: `buildq run -- cargo fmt` (heavy-run cargo fmt) doesn't wait behind builds."""

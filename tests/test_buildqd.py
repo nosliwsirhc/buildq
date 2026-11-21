@@ -3083,22 +3083,45 @@ class GitHubStatuses(DaemonCase):
         t_start = p1["first"] + 10
         with mock.patch.object(buildqd.subprocess, "Popen", side_effect=fake_popen):
             self.daemon.send_status_posts(t_start)
-            self.assertEqual(len(launched), 1)
-            # Newer verdict arrives while p1 is still in flight.
-            self.now = t_start + 5
-            t2 = self.submit(("cargo", "test"), cwd=t1.cwd, source=SOURCE, again=True)
-            self.finish(t2, 1, after=5)
-            self.settle()
-            self.assertEqual(len(self.daemon.status_posts), 2)
-            # p1 finishes with missing-commit 422; replacement p2 inherits backoff and is NOT launched this tick.
-            proc.returncode = 1
-            t_done = t_start + 15
+        self.assertEqual(len(launched), 1)
+        # Newer verdict arrives while p1 is still in flight (outside Popen mock so source check runs).
+        self.now = t_start + 5
+        t2 = self.submit(("cargo", "test"), cwd=t1.cwd, source=SOURCE, again=True)
+        self.finish(t2, 1, after=5)
+        self.settle()
+        self.assertEqual(len(self.daemon.status_posts), 2)
+        # p1 finishes with missing-commit 422; replacement p2 inherits backoff and is NOT launched this tick.
+        proc.returncode = 1
+        t_done = t_start + 15
+        with mock.patch.object(buildqd.subprocess, "Popen", side_effect=fake_popen):
             self.daemon.send_status_posts(t_done)
         self.assertEqual(len(launched), 1)
         self.assertEqual(self.daemon.status_procs, [])
         (p2,) = self.daemon.status_posts
         self.assertEqual((p2["state"], p2["tries"], p2.get("missing"), p2["next"]),
                          ("failure", 1, True, t_done + 600))
+        # When an in-flight retry succeeds past the 6h missing-commit window, a queued replacement gets
+        # a fresh delivery window instead of expiring before its first send.
+        t_retry = t_done + 600
+        proc2 = FakeProc()
+        proc2.stderr = io.BytesIO(b"")
+        with mock.patch.object(buildqd.subprocess, "Popen", return_value=proc2):
+            self.daemon.send_status_posts(t_retry)
+        self.now = t_retry + 5
+        t3 = self.submit(("cargo", "test"), cwd=t1.cwd, source=SOURCE, again=True)
+        self.finish(t3, 0, after=5)
+        self.settle()
+        proc2.returncode = 0
+        t_ok = p2["first"] + buildqd.Daemon.STATUS_MISSING_MAX_AGE + 10
+        proc3 = FakeProc()
+        with mock.patch.object(buildqd.subprocess, "Popen", return_value=proc3):
+            self.daemon.send_status_posts(t_ok)
+        self.assertEqual(len(self.daemon.status_posts), 1)
+        (p3,) = self.daemon.status_posts
+        self.assertEqual((p3["state"], p3.get("missing"), p3.get("tries"), p3["first"]),
+                         ("success", None, None, t_ok))
+        self.assertEqual(len(self.daemon.status_procs), 1)
+        self.daemon.status_procs.clear()
 
     def test_in_flight_status_post_is_not_dropped_before_it_finishes(self):
         t = self.submit(("cargo", "test"), source=SOURCE)
@@ -4890,6 +4913,10 @@ class ShimRules(unittest.TestCase):
                          ["build", "app.csproj", "--no-restore"])
         self.assertFalse(self.shim.heavy("dotnet", ["run", "--no-build", "--", "--port", "8080"]))
         self.assertIsNone(self.shim.build_then_run("dotnet", ["run", "--no-build", "--", "--port", "8080"]))
+        self.assertFalse(self.shim.heavy("dotnet", ["watch", "run"]))
+        self.assertTrue(self.shim.heavy("dotnet", ["run", "--project", "App.csproj", "--", "--watch"]))
+        self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--project", "App.csproj", "--", "--watch"]),
+                         ["build", "App.csproj"])
         self.assertTrue(self.shim.heavy("dotnet", ["run", "--", "--no-build"]))
         self.assertEqual(self.shim.build_then_run("dotnet", ["run", "--", "--no-build"]), ["build"])
 

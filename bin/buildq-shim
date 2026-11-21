@@ -152,6 +152,14 @@ def heavy(tool: str, args: list[str]) -> bool:
                               and sub[1:] and sub[1] in ("watch", "dev", "serve")):
             return False  # cargo leptos watch, cargo tauri dev, ...: runs until stopped
         return sub[0] not in CARGO_LIGHT
+    if tool == "dotnet":
+        before = args[: args.index("--")] if "--" in args else args
+        if watching(before):
+            return False
+        pos = positionals(before)
+        if pos[:1] == ["run"] and "--no-build" in before:
+            return False  # caller explicitly asked to run without building
+        return pos[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
     if watching(args):
         return False
     if tool in ("npm", "pnpm", "yarn", "bun"):
@@ -177,12 +185,6 @@ def heavy(tool: str, args: list[str]) -> bool:
         targets = [a for a in positionals(args, {"-C", "-f", "-j", "-l", "-o", "-W", "--directory", "--file"})
                    if "=" not in a]
         return not targets or not all(MAKE_LIGHT_TARGET.search(t) for t in targets)
-    if tool == "dotnet":
-        before = args[: args.index("--")] if "--" in args else args
-        pos = positionals(before)
-        if pos[:1] == ["run"] and "--no-build" in before:
-            return False  # caller explicitly asked to run without building
-        return pos[:1] in (["build"], ["test"], ["publish"], ["pack"], ["msbuild"], ["run"])
     if tool in ("docker", "podman"):
         pos = positionals(args)
         return pos[:1] == ["build"] or pos[:2] in (["buildx", "build"], ["compose", "build"], ["image", "build"])
