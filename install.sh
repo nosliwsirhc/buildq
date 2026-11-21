@@ -3,9 +3,10 @@
 # Install buildq for the current user. No root needed.
 #
 #   ./install.sh                 install or upgrade, then enable and (re)start the daemon
-#   ./install.sh --shims         also put cargo, pnpm, npm, npx, yarn, make, ninja and dotnet shims
-#                                in ~/.local/share/buildq/shims, which send heavy commands through
-#                                the queue; put that directory first on PATH (it says how)
+#   ./install.sh --shims         also put cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet,
+#                                cmake, ctest, zig and gradle shims in ~/.local/share/buildq/shims,
+#                                which send heavy commands through the queue; put that directory
+#                                first on PATH (it says how)
 #   ./install.sh --rustc-guard=DIR[,DIR...]
 #                                also make buildq-rustc-guard cargo's rustc wrapper for everything
 #                                under each DIR (DIR/.cargo/config.toml), so Rust compiles there
@@ -50,7 +51,7 @@ cargo_config=${CARGO_HOME:-$HOME/.cargo}/config.toml
 src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # docker isn't among them: an image build's work runs in dockerd, outside the build's cgroup, so the
 # queue can't measure it (see the README).
-shim_tools=(cargo pnpm npm npx yarn make gmake ninja dotnet)
+shim_tools=(cargo pnpm npm npx yarn make gmake ninja dotnet cmake ctest zig gradle)
 guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
 skill_list=$confdir/skill-links    # every skill link made, for --uninstall
 # Where coding agents look for skills: each is used only if the agent's own directory exists.

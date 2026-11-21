@@ -1065,12 +1065,14 @@ def hashed(prefix: str, word: str) -> str:
 # everywhere, which the lane rules and restart_safe read. Anything else (a script, a package, a
 # test filter) is hashed.
 PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest install ci exec x lint eslint
-    vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t""".split())
+    vitest tsc typecheck unittest pytest discover buildx compose image make ninja all b c d r t
+    assemble compile ast-check build-exe build-lib build-obj mypy pyright basedpyright""".split())
 # Tools an anonymized trace names (a command's first word); any other first word is hashed.
 # (The daemon's shells and interpreters are among them: honors_grant and the lane rules read the tool.)
 PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
-    eslint playwright storybook python python3 pytest py.test uv dotnet msbuild make gmake ninja cmake docker
-    podman buildah bash sh zsh dash ksh fish ruby perl git go gradle mvn java""".split())
+    eslint playwright storybook python python3 pytest py.test mypy pyright basedpyright uv dotnet msbuild
+    make gmake ninja cmake ctest zig gcc g++ clang clang++ cc c++ docker podman buildah bash sh zsh dash
+    ksh fish ruby perl git go gradle gradlew mvn java""".split())
 PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?|(?:gcc|g\+\+|clang|clang\+\+)-\d+")  # versioned tools
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
@@ -1090,7 +1092,7 @@ PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches
     --workspace --all-features --no-default-features --features --package --no-run --no-fail-fast --locked
     --offline --frozen --jobs --load-average --test-threads --filter --recursive --noEmit --watch --run
     --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard
-    --doc""".split())
+    --doc --build --preset --config --clean-first --test-dir --max-workers --no-daemon --daemon --no-sync""".split())
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
 KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"})}
 TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test

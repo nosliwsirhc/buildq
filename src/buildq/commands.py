@@ -118,8 +118,8 @@ INTERPRETERS = {"python", "python3", "node", "deno", "ruby", "perl", "bun"}
 # push` restartable).
 NOT_SCRIPTS = (SHELLS | INTERPRETERS | WRAPPERS | tools.NOT_SCRIPT_TOOLS
                | {"env", "timeout", "rustc", "kubectl", "aws", "gh", "ssh", "scp", "rsync",
-                  "curl", "wget", "xargs", "parallel", "busybox", "uv", "uvx", "just", "mvn",
-                  "gradle", "gradlew", "terraform", "pytest", "jest", "sbt", "heavy-run", "buildq",
+                  "curl", "wget", "xargs", "parallel", "busybox", "uvx", "just", "mvn",
+                  "terraform", "jest", "sbt", "heavy-run", "buildq",
                   "flock", "systemd-run", "run0", "pkexec", "nix-shell", "firejail", "xvfb-run",
                   "strace", "valgrind", "tsx", "ts-node", "zx", "pwsh", "nodejs"})
 # (and any versioned interpreter or shell: python2, python3.12, pypy3, node22, bash5 …; the list can't
@@ -416,10 +416,11 @@ def restart_safe(argv: list[str], scripts: "frozenset[str] | tuple" = ()) -> boo
 
 # Options that move a command to another folder, or the folder its paths are read from: -C in any
 # spelling (env, make, cargo, git, ninja; grouped, -iC, or with its value run on); --chdir (env,
-# sudo) and --directory (make) with the prefixes GNU getopt takes for them (--ch, --dir); vitest's
-# --root and --dir, npm's --prefix, yarn's and bun's --cwd.
+# sudo) and --directory (make, uv) with the prefixes GNU getopt takes for them (--ch, --dir);
+# vitest's --root and --dir, pytest's --rootdir, npm's --prefix, yarn's and bun's --cwd, gradle's
+# --project-dir, and ctest's --test-dir.
 CHANGES_FOLDER = re.compile(r"-[A-Za-z0-9]*C.*|--c(h(d(i(r)?)?)?)?(=.*)?|--di(r(e(c(t(o(r(y)?)?)?)?)?)?)?(=.*)?"
-                            r"|--(root|prefix|cwd)(=.*)?")
+                            r"|--(root|rootdir|prefix|cwd|project-dir|test-dir)(=.*)?")
 OUTPUT_OPTIONS = ("--target-dir", "--cache-location")  # where a tool writes, not what it reads: not checked
 OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 # Variables that name tools, not source (where to find them, a compiler cache in front of rustc): a
@@ -430,7 +431,8 @@ OUTPUT_VARIABLES = ("CARGO_TARGET_DIR=",)
 TOOL_FOLDER = r"(/usr(/local)?/s?bin|/s?bin|/home/[^/]+/\.cargo/bin|/home/[^/]+/\.local/bin)"
 TOOL_VARIABLE = re.compile(rf"PATH={TOOL_FOLDER}(:{TOOL_FOLDER})*|RUSTUP_HOME=/home/[^/]+/\.rustup|"
                            r"(RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER)="
-                           r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)")
+                           r"(sccache|/usr(/local)?/bin/sccache|/home/[^/]+/\.cargo/bin/sccache)|"
+                           rf"(CC|CXX)=({TOOL_FOLDER}/)?(cc|c\+\+|gcc|g\+\+|clang|clang\+\+)(-\d+)?")
 # What a tool interprets rather than reads as it is: quoting, escapes (TOML's \u002f is a "/"),
 # expansion, structured values, URLs. A word with any of these can't be read for certain.
 UNREADABLE = re.compile(r"""[\x00-\x1f\\"'`$\[\]{}]|://""")  # (and control characters: cargo splits at \x1f)
@@ -528,6 +530,10 @@ def paths_inside(argv: list[str], cwd: str, top: str) -> bool:
         return False
     if "vitest" in (os.path.basename(a) for a in argv) and any(re.fullmatch(r"-[A-Za-z]*r(=.*)?", a) for a in words):
         return False  # vitest's short --root, grouped (-sr) or with its value (-r=..) too
+    if {"gradle", "gradlew"} & {os.path.basename(a) for a in argv} and any(re.fullmatch(r"-p.*", a) for a in words):
+        return False  # gradle's short --project-dir
+    if "uv" in (os.path.basename(a) for a in argv) and any(a == "--project" or a.startswith("--project=") for a in words):
+        return False  # uv's --project moves project discovery to another folder
     if any(os.path.basename(a) == "sudo" and b.startswith("-") for a, b in zip(argv, argv[1:])):
         return False  # sudo's options include -D, its own --chdir
     skip = operands = False

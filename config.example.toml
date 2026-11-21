@@ -154,7 +154,9 @@ max_finished = 1000
 # or --restartable), else fail it, saying why.
 shed_memory = true
 
-# A check (cargo check/clippy/test, dotnet test, tsc --noEmit, eslint, vitest run) that passed on
+# A check (cargo check/clippy/test, dotnet test, gradle test/check/lint, zig test/ast-check,
+# gcc/clang -fsyntax-only, pytest, python -m unittest/pytest/mypy/pyright, mypy, pyright,
+# tsc --noEmit, eslint, vitest run) that passed on
 # the same source, in the same directory, lane, environment and settings, with its tree unchanged
 # while it ran, answers the same submission again within this long instead of running ("0" turns
 # that off). `--again` always runs.

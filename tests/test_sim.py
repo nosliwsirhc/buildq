@@ -396,12 +396,16 @@ class Export(SimCase):
         for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
                      "--filter", "-p", "-F"):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
-        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS | {"python3.13", "python2", "py.test", "gcc-16", "clang++-22"}
+        tools = (bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS
+                 | {"python3.13", "python2", "py.test", "gcc", "g++", "clang", "clang++", "cc", "c++",
+                    "gcc-16", "clang++-22", "mypy", "pyright", "basedpyright"})
         self.assertTrue(sim.Simulation.GRANT_TOOLS <= bq_tools.HONORS_GRANT_TOOLS)
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)
-        for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):
-            self.assertEqual(sim.anonymous_argv(argv), argv)
+        for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"],
+                     ["cmake", "--build", "out"], ["zig", "build", "test"], ["gradlew", "test"], ["ctest"]):
+            if argv[0] != "cmake":
+                self.assertEqual(sim.anonymous_argv(argv), argv)
             self.assertEqual(bq_commands.restart_safe(sim.anonymous_argv(argv)), bq_commands.restart_safe(argv))
         key = lambda argv: bq_commands.command_words(sim.anonymous_argv(argv))  # noqa: E731
         self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
@@ -805,9 +809,11 @@ class LoadBuildqd(SimCase):
         os.makedirs(state)
         s = sim.Simulation(scenario([]), CONFIG, BUILDQD, state, name="buildqd_hg")
         t = type("T", (), {"argv": ["zig", "build"], "jobserver": None})()
-        self.assertFalse(s.honors_grant(t))
-        s.mod.patch("honors_grant_tool", lambda name: name == "zig")
-        self.assertTrue(s.honors_grant(t))
+        self.assertTrue(s.honors_grant(t))  # head's tools.py honors zig
+        t_other = type("T", (), {"argv": ["custom-cc", "build"], "jobserver": None})()
+        self.assertFalse(s.honors_grant(t_other))
+        s.mod.patch("honors_grant_tool", lambda name: name == "custom-cc")
+        self.assertTrue(s.honors_grant(t_other))
         s.mod = base_pkg
         self.assertFalse(s.honors_grant(t))  # pre-registry base uses frozen GRANT_TOOLS
         self.assertTrue(s.honors_grant(type("T", (), {"argv": ["cargo", "build"], "jobserver": None})()))
