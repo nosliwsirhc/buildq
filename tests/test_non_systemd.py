@@ -262,8 +262,10 @@ class CgroupRunnerUnit(unittest.TestCase):
         d.guard_slice()
         # held (4G) + (avail 10G - floor/2 2G) = 12G (< initial 16G)
         self.assertEqual(read_text(os.path.join(self.builds, "memory.max")).strip(), str(12 * GIB))
-        # Simulate SIGKILL crash before stopping=True: a restarted CgroupRunner must recover the
-        # original 16G baseline, NOT ratify the temporary lowered 12G cap!
+        # Simulate SIGKILL crash before stopping=True (even with 4 KiB kernel page rounding on live
+        # memory.max): a restarted CgroupRunner must recover the original 16G baseline, NOT 12G!
+        with open(os.path.join(self.builds, "memory.max"), "w") as f:
+            f.write(f"{12 * GIB + 4096}\n")
         r2 = self._make_runner()
         self.assertEqual(r2.initial_memory_max, str(16 * GIB))
         d.guard_slice(stopping=True)
@@ -429,16 +431,56 @@ class FallbacksUnit(unittest.TestCase):
             os.chmod(fake_make, 0o755)
             r_fd, w_fd = os.pipe()
             try:
-                env = {"PATH": tmp, "BUILDQ_CORES": "3", "MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/js"}
-                out_fd = supervisor._downgrade_old_make_fifo(["make", "all"], tmp, env, w_fd)
+                env = {"PATH": tmp, "BUILDQ_CORES": "99", "MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/js"}
+                out_fd = supervisor._downgrade_old_make_fifo(["make", "all"], tmp, env, w_fd,
+                                                              granted=3, directory=tmp)
                 self.assertIsNone(out_fd)
+                # Uses ticket grant (3), not caller-overridable BUILDQ_CORES (99), and marks make_fixed.json.
                 self.assertEqual(env["MAKEFLAGS"], "-j3")
+                self.assertTrue(os.path.isfile(os.path.join(tmp, "make_fixed.json")))
             finally:
                 os.close(r_fd)
                 try:
                     os.close(w_fd)
                 except OSError:
                     pass
+
+    def test_is_init_supervised_handles_openrc_15char_comm_and_dinit_pid1(self):
+        # OpenRC's `supervise-daemon` is truncated to 15 chars (`supervise-daemo`) in /proc/<pid>/comm.
+        with mock.patch.object(client.machine, "proc_ppid_comm", return_value=(42, "supervise-daemo")):
+            self.assertEqual(client._is_init_supervised(100, "external"), "supervise-daemo")
+        # dinit as PID 1 (ppid == 1) is recognized as supervised unless started by CLI.
+        with mock.patch.object(client.machine, "proc_ppid_comm", return_value=(1, "dinit")):
+            self.assertEqual(client._is_init_supervised(100, "external"), "dinit")
+            self.assertIsNone(client._is_init_supervised(100, "cli"))
+        # Plain init/systemd PID 1 is not mistaken for a non-systemd service supervisor.
+        with mock.patch.object(client.machine, "proc_ppid_comm", return_value=(1, "init")):
+            self.assertIsNone(client._is_init_supervised(100, "external"))
+
+    def test_direct_runner_thaw_waits_for_stopped_descendant_even_without_tracked_set(self):
+        # Even after a daemon restart (empty _frozen_procs), freeze_state must NOT declare thaw
+        # complete while any live descendant in the build's tree is still in stopped state.
+        t = types.SimpleNamespace(id="44444444-4444-4444-4444-444444444444", pid=100, pid_start=1234, _frozen_procs={})
+        with mock.patch.object(runners.machine, "proc_tree_info", return_value={
+            "sup_alive": True, "pids": [100, 101], "descendants": [101], "descendant_idents": {101: 5678},
+            "pgids": [101], "own_stopped": False, "all_stopped": False, "any_descendant_stopped": True,
+        }):
+            self.assertEqual(runners.DirectRunner().freeze_state(t), (True, False, False))
+
+    def test_read_daemon_pid_checks_socket_and_mandatory_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pf = os.path.join(tmp, "buildqd.pid")
+            cur_boot = machine.boot_id() or "boot-1"
+            with open(pf, "w") as f:
+                json.dump({"pid": 1234, "start": 5678, "boot_id": cur_boot, "socket": "/tmp/a.sock"}, f)
+            with mock.patch.object(client.machine, "pid_is_buildqd", return_value=True):
+                self.assertIsNone(client._read_daemon_pid(pf, expected_socket="/tmp/b.sock"))
+                self.assertEqual(client._read_daemon_pid(pf, expected_socket="/tmp/a.sock"), (1234, 5678, None))
+            # Missing start field in JSON record must be rejected.
+            with open(pf, "w") as f:
+                json.dump({"pid": 1234, "boot_id": cur_boot, "socket": "/tmp/a.sock"}, f)
+            with mock.patch.object(client.machine, "pid_is_buildqd", return_value=True):
+                self.assertIsNone(client._read_daemon_pid(pf, expected_socket="/tmp/a.sock"))
 
 
 class DirectRunnerEndToEnd(unittest.TestCase):

@@ -324,6 +324,7 @@ class CgroupRunner:
         self.mem_total = mem_total
         self.state_dir = state_dir
         self.initial_memory_max: str | None = None
+        self._last_guard_written: str | None = None
         self._ready = False
         if self.root:
             self._prepare_root()
@@ -331,9 +332,18 @@ class CgroupRunner:
     def _baseline_path(self) -> str | None:
         return os.path.join(self.state_dir, "cgroup-slice-baseline.json") if self.state_dir else None
 
+    @staticmethod
+    def _limits_match(live: str, written: str) -> bool:
+        if live == written:
+            return True
+        if live.isdigit() and written.isdigit():
+            page = os.sysconf("SC_PAGESIZE") if hasattr(os, "sysconf") else 4096
+            return abs(int(live) - int(written)) <= page
+        return False
+
     def _load_or_init_baseline(self) -> str:
         """Read `<builds>/memory.max` while preserving the original ceiling across daemon crashes
-        (SIGKILL / OOM while `slice_guard` held a lowered value)."""
+        (SIGKILL / OOM while `slice_guard` held a lowered value), tolerating kernel page rounding."""
         live = machine.cgroup_memory_max(self.builds_dir) or "max"
         bpath = self._baseline_path()
         bid = machine.boot_id() or ""
@@ -343,9 +353,7 @@ class CgroupRunner:
                 saved_base = rec.get("baseline")
                 last_written = rec.get("last_written")
                 if isinstance(saved_base, str) and (saved_base == "max" or saved_base.isdigit()):
-                    # If live still equals what our previous daemon wrote via slice_guard, the
-                    # previous daemon died before restoring: keep the original baseline!
-                    if last_written is not None and str(last_written) == live:
+                    if last_written is not None and self._limits_match(live, str(last_written)):
                         return saved_base
             try:
                 common.write_private_file_atomic(
@@ -356,10 +364,14 @@ class CgroupRunner:
                 pass
         return live
 
-    def note_slice_guard_write(self, value: str, *, stopping: bool = False) -> None:
-        """Record the value written by `slice_guard` so a crash doesn't ratify a lowered cap."""
+    def note_slice_guard_intent(self, value: str, *, stopping: bool = False) -> None:
+        """Persist `last_written` BEFORE writing `<builds>/memory.max` (skipping redundant disk
+        writes when the value is unchanged) so a crash mid-write never ratifies a lowered cap."""
+        if not stopping and getattr(self, "_last_guard_written", None) == str(value):
+            return
         bpath = self._baseline_path()
         if not bpath or not self.builds_dir:
+            self._last_guard_written = None if stopping else str(value)
             return
         bid = machine.boot_id() or ""
         base = self.initial_memory_max or "max"
@@ -368,8 +380,16 @@ class CgroupRunner:
                 bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
                                    "baseline": base, "last_written": None if stopping else str(value)})
             )
+            self._last_guard_written = None if stopping else str(value)
         except OSError:
             pass
+
+    def note_slice_guard_write(self, value: str, *, stopping: bool = False) -> None:
+        """Record the kernel's actual page-rounded readback after writing `<builds>/memory.max`."""
+        actual = machine.cgroup_memory_max(self.builds_dir) or str(value) if self.builds_dir else str(value)
+        if not stopping and getattr(self, "_last_guard_written", None) == actual:
+            return
+        self.note_slice_guard_intent(actual, stopping=stopping)
 
     @staticmethod
     def _enable_controllers(path: str) -> set[str]:
@@ -537,6 +557,18 @@ class CgroupRunner:
             self.builds_dir = os.path.join(self.root, "builds")
             self.initial_memory_max = self._load_or_init_baseline()
 
+    @staticmethod
+    def _rmdir_tree(path: str) -> None:
+        """Remove empty nested sub-cgroups bottom-up before removing `path`."""
+        try:
+            for dirpath, _dirnames, _filenames in os.walk(path, topdown=False):
+                try:
+                    os.rmdir(dirpath)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     def prune_stale(self, active_cgs: set[str]) -> None:
         """Remove empty stale build directories left by earlier crashes, AFTER ticket recovery so
         neither terminal OOM counters nor pre-join active build cgroups are deleted prematurely."""
@@ -550,10 +582,7 @@ class CgroupRunner:
                     if os.path.realpath(path) in keep:
                         continue
                     if os.path.isdir(path) and not machine.cgroup_populated(path):
-                        try:
-                            os.rmdir(path)
-                        except OSError:
-                            pass
+                        self._rmdir_tree(path)
         except OSError:
             pass
 
@@ -599,6 +628,14 @@ class CgroupRunner:
                     raise OSError(f"cgroup control {fname} is unavailable in {ticket.cg}")
                 with open(target, "w") as f:
                     f.write(f"{val}\n")
+            if str(lane.properties.get("CPUWeight", "")).strip().lower() == "idle":
+                idle_file = os.path.join(ticket.cg, "cpu.idle")
+                if os.path.exists(idle_file):
+                    try:
+                        with open(idle_file, "w") as f:
+                            f.write("1\n")
+                    except OSError:
+                        pass
         except Exception as e:
             try:
                 os.rmdir(ticket.cg)
@@ -634,10 +671,7 @@ class CgroupRunner:
 
     def cleanup(self, ticket):
         if ticket.cg:
-            try:
-                os.rmdir(ticket.cg)
-            except OSError:
-                pass
+            self._rmdir_tree(ticket.cg)
         return None
 
     def freeze(self, ticket, frozen: bool):
@@ -800,36 +834,40 @@ class DirectRunner:
         took = info["all_stopped"]
         if own is None:
             return None, None, False
-        # Verify every surviving process that buildq stopped has actually resumed before reporting
-        # thaw complete (own=False). Clean out exited tracked identities.
+        # Verify every surviving process in the tree (and every process buildq stopped, even if
+        # detached) has actually resumed before reporting thaw complete (own=False). This remains
+        # accurate across daemon restarts when `_frozen_procs` starts empty.
+        any_stopped = bool(info.get("any_descendant_stopped"))
         tracked = getattr(ticket, "_frozen_procs", None)
         if isinstance(tracked, dict) and tracked:
-            any_tracked_stopped = False
             for pid, start in list(tracked.items()):
                 st = machine.proc_stat(pid)
                 if st is None or st[0] != start or st[1] in ("Z", "X"):
                     tracked.pop(pid, None)
                 elif st[1] in ("T", "t"):
-                    any_tracked_stopped = True
-            if not own and any_tracked_stopped:
-                return True, False, False
-            if not own and not any_tracked_stopped:
+                    any_stopped = True
+            if not own and not any_stopped:
                 tracked.clear()
+        if not own and any_stopped:
+            return True, False, False
         return own, took, False
 
     def stop(self, ticket, force: bool = False):
         if force:
             # Keep the subreaper supervisor alive while killing descendants in a converging loop
-            # so a concurrent fork cannot reparent to PID 1 before we kill the supervisor.
+            # so a concurrent fork cannot reparent to PID 1. Only kill the supervisor once a clean
+            # scan confirms zero live descendants remain (otherwise the next daemon tick retries).
+            descendants_clear = False
             for _ in range(5):
                 info = machine.proc_tree_info(ticket.pid, ticket.pid_start, ticket.id)
                 idents = info["descendant_idents"]
                 if not idents:
+                    descendants_clear = True
                     break
                 for pid, start in idents.items():
                     machine.pidfd_signal(pid, start, signal.SIGKILL)
                 time.sleep(0.01)
-            if machine.proc_alive(ticket.pid, ticket.pid_start):
+            if descendants_clear and machine.proc_alive(ticket.pid, ticket.pid_start):
                 machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGKILL)
             for pid in machine.tagged_processes(ticket.id):
                 st = machine.proc_stat(pid)

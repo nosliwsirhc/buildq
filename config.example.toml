@@ -145,9 +145,9 @@ runner = "auto"
 # The slice the build services go in (systemd runner).
 slice = "buildq.slice"
 
-# Optional delegated cgroup v2 directory for the "cgroup" runner (e.g. "/sys/fs/cgroup/buildq-alice").
-# Empty (the default) auto-detects /sys/fs/cgroup/buildq-<user> or a writable delegated subtree.
-# cgroup_root = "/sys/fs/cgroup/buildq-alice"
+# Optional delegated cgroup v2 directory for the "cgroup" runner (e.g. "/sys/fs/cgroup/buildq-alice/user").
+# Empty (the default) auto-detects /sys/fs/cgroup/buildq-<user>/user or a writable delegated subtree.
+# cgroup_root = "/sys/fs/cgroup/buildq-alice/user"
 
 # A build's output log keeps at most this much; past it, only the end is kept.
 max_log = "64M"

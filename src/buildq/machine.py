@@ -489,42 +489,59 @@ def _scan_own_stats():
 
 def _collect_tree(root_pid: int | None, root_start: int | None, job: str, stats: dict, children: dict,
                   by_sid: dict) -> tuple[list[int], bool]:
-    """All PIDs in a build's process tree in BFS parent-before-child order (rooted at supervisor
-    `root_pid`, plus session members, falling back to BUILDQ_JOB-tagged processes if the supervisor
-    is gone). Returns `(ordered_pids, sup_alive)`."""
-    seen: set[int] = set()
-    ordered: list[int] = []
+    """All PIDs in a build's process tree in strict parent-before-child topological order (rooted
+    at supervisor `root_pid`, plus session members, falling back to BUILDQ_JOB-tagged processes if
+    the supervisor is gone). Returns `(ordered_pids, sup_alive)`."""
+    members: set[int] = set()
     sup_alive = False
     if root_pid and root_pid in stats and stats[root_pid][0] == root_start and stats[root_pid][1] not in ("Z", "X"):
         sup_alive = True
         queue_pids = collections.deque([root_pid])
-        seen.add(root_pid)
-        ordered.append(root_pid)
+        members.add(root_pid)
         for spid in by_sid.get(root_pid, ()):
-            if spid not in seen:
-                seen.add(spid)
-                ordered.append(spid)
+            if spid not in members:
+                members.add(spid)
                 queue_pids.append(spid)
         while queue_pids:
             cur = queue_pids.popleft()
             for ch in children.get(cur, ()):
-                if ch not in seen:
-                    seen.add(ch)
-                    ordered.append(ch)
+                if ch not in members:
+                    members.add(ch)
                     queue_pids.append(ch)
     else:
         for pid in tagged_processes(job):
-            if pid not in seen:
-                seen.add(pid)
-                ordered.append(pid)
+            if pid not in members:
+                members.add(pid)
                 queue_pids = collections.deque([pid])
                 while queue_pids:
                     cur = queue_pids.popleft()
                     for ch in children.get(cur, ()):
-                        if ch not in seen:
-                            seen.add(ch)
-                            ordered.append(ch)
+                        if ch not in members:
+                            members.add(ch)
                             queue_pids.append(ch)
+    if not members:
+        return [], sup_alive
+    # Topologically sort `members` strictly parent-before-child so a parent's stat is always read
+    # before its children's (preventing child-exit reap double-counting).
+    roots = [p for p in members if (stats[p][2] not in members if p in stats else True)]
+    if root_pid in roots:
+        roots.remove(root_pid)
+        roots.insert(0, root_pid)
+    ordered: list[int] = []
+    visited: set[int] = set()
+    q = collections.deque(roots)
+    while q:
+        cur = q.popleft()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        ordered.append(cur)
+        for ch in children.get(cur, ()):
+            if ch in members and ch not in visited:
+                q.append(ch)
+    for leftover in members:
+        if leftover not in visited:
+            ordered.append(leftover)
     return ordered, sup_alive
 
 
@@ -558,11 +575,13 @@ def proc_tree_info(root_pid: int | None, root_start: int | None, job: str) -> di
     pgids = sorted({stats[p][3] for p in descendants if stats[p][3] > 1 and stats[p][3] != root_pid})
     sup_state = stats[root_pid][1] if sup_alive and root_pid in stats else None
     own_stopped = (sup_state in ("T", "t")) if sup_state is not None else None
+    any_descendant_stopped = any(stats[p][1] in ("T", "t") for p in descendants)
     all_stopped = (bool(own_stopped) and all(stats[p][1] in ("T", "t") for p in descendants)) if own_stopped is not None else None
     return {
         "sup_alive": sup_alive, "pids": live, "descendants": descendants,
         "descendant_idents": descendant_idents, "pgids": pgids,
         "own_stopped": own_stopped, "all_stopped": all_stopped,
+        "any_descendant_stopped": any_descendant_stopped,
     }
 
 

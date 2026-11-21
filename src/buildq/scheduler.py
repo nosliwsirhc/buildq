@@ -1040,6 +1040,12 @@ class SchedulerMixin:
         usual cores, using all it has, takes cores from agents' builds above their minimum."""
         m, cfg = self.machine, self.cfg
         for t in self.active():
+            if t.js is not None and t.dir and os.path.exists(os.path.join(t.dir, "make_fixed.json")):
+                # GNU Make < 4.4 downgraded to fixed `-j<granted>` inside the supervisor: stop
+                # treating it as elastic so its cores aren't handed away while Make keeps using them.
+                t.elastic = False
+                self.close_jobserver(t)
+                continue
             if t.js is not None and not t.elastic:
                 if (t.cg and machine.fifo_in_use(t.cg, t.jobserver)) or (
                     not t.cg and t._pids and machine.fifo_in_use_pids(t._pids, t.jobserver)
@@ -1203,6 +1209,9 @@ class SchedulerMixin:
             self.guard_available = m.mem_available
             if self.slice_limit != "max":
                 value = min(value, int(self.slice_limit))
+        intent_fn = getattr(self.runner, "note_slice_guard_intent", None)
+        if intent_fn is not None:
+            intent_fn(str(value), stopping=stopping)
         try:
             with open(os.path.join(path, "memory.max"), "w") as f:
                 f.write(str(value))

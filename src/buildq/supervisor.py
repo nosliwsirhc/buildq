@@ -139,11 +139,45 @@ def _reap_all_children() -> None:
             break
 
 
-def _downgrade_old_make_fifo(argv: list[str], cwd: str, env: dict[str, str], jobserver_fd: int | None) -> int | None:
+def _effective_wrapper_cwd(argv: list[str], tool_at: int, base_cwd: str) -> str:
+    """Resolve effective working directory if an `env -C DIR` / `--chdir=DIR` wrapper precedes the tool."""
+    cwd = base_cwd
+    i = 0
+    while i < tool_at:
+        a = argv[i]
+        if a in ("-C", "--chdir") and i + 1 < tool_at:
+            nxt = argv[i + 1]
+            cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(cwd, nxt))
+            i += 2
+            continue
+        if a.startswith("--chdir="):
+            nxt = a.split("=", 1)[1]
+            cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(cwd, nxt))
+        i += 1
+    return cwd
+
+
+def _resolve_in_cwd(target: str, eff_cwd: str, eff_path: str | None) -> str | None:
+    """Resolve executable `target` relative to `eff_cwd` and `eff_path` (never supervisor's cwd/PATH)."""
+    if "/" in target:
+        cand = target if os.path.isabs(target) else os.path.normpath(os.path.join(eff_cwd, target))
+        return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+    search_path = os.defpath if eff_path is None else eff_path
+    for entry in search_path.split(os.pathsep):
+        base = eff_cwd if not entry else (entry if os.path.isabs(entry) else os.path.normpath(os.path.join(eff_cwd, entry)))
+        cand = os.path.join(base, target)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _downgrade_old_make_fifo(argv: list[str], cwd: str, env: dict[str, str], jobserver_fd: int | None,
+                             granted: int | None = None, directory: str | None = None,
+                             cancel_flag: list[int] | None = None) -> int | None:
     """Inside the confined build, detect GNU Make < 4.4 which aborts on `--jobserver-auth=fifo:`.
-    If detected, replace the fifo jobserver flags in MAKEFLAGS with `-j<granted>` (the caller's
-    CLI `-j` was already stripped by the scheduler, so GNU Make 4.3 honors the exact core grant)
-    and close the supervisor's jobserver fd."""
+    Uses the build's effective cwd (`env -C`) and PATH, runs in its own process group honoring
+    cancellation, replaces fifo flags with `-j<granted>` from the ticket (not caller-overridable
+    BUILDQ_CORES), writes `make_fixed.json` so the daemon stops rebalancing it, and closes the fd."""
     if jobserver_fd is None or "--jobserver-auth=fifo:" not in env.get("MAKEFLAGS", ""):
         return jobserver_fd
     stripped = commands.strip_wrappers(argv)
@@ -153,38 +187,57 @@ def _downgrade_old_make_fifo(argv: list[str], cwd: str, env: dict[str, str], job
     if tool not in ("make", "gmake"):
         return jobserver_fd
     tool_at = len(argv) - len(stripped)
+    eff_cwd = _effective_wrapper_cwd(argv, tool_at, cwd)
     inline_idx, reset_at, unset_at = commands.wrapper_env_sites(argv, tool_at)
     if reset_at is not None:
         eff_path = argv[inline_idx["PATH"]].split("=", 1)[1] if "PATH" in inline_idx else None
-    elif "PATH" in inline_idx:
-        eff_path = argv[inline_idx["PATH"]].split("=", 1)[1]
-    elif "PATH" in unset_at:
-        eff_path = None
+        probe_env = {k: argv[idx].split("=", 1)[1] for k, idx in inline_idx.items()}
     else:
-        eff_path = env.get("PATH")
-    target = stripped[0]
-    if "/" in target:
-        exe = target if os.path.isabs(target) else os.path.join(cwd, target)
-    else:
-        exe = shutil.which(target, path=eff_path)
-    if not exe or not os.path.isfile(exe):
+        probe_env = dict(env)
+        for k in unset_at:
+            probe_env.pop(k, None)
+        for k, idx in inline_idx.items():
+            probe_env[k] = argv[idx].split("=", 1)[1]
+        eff_path = probe_env.get("PATH")
+    exe = _resolve_in_cwd(stripped[0], eff_cwd, eff_path)
+    if not exe:
         return jobserver_fd
+    out_text = ""
     try:
-        res = subprocess.run([exe, "--version"], cwd=cwd, env=env, stdin=DEVNULL,
-                             capture_output=True, text=True, timeout=2)
+        proc = subprocess.Popen([exe, "--version"], cwd=eff_cwd, env=probe_env, stdin=DEVNULL,
+                                stdout=subprocess.PIPE, stderr=DEVNULL, text=True, process_group=0)
+        deadline = time.monotonic() + 2.0
+        while proc.poll() is None:
+            if cancel_flag:
+                signal_group(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=1)
+                return jobserver_fd
+            if time.monotonic() >= deadline:
+                signal_group(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=1)
+                return jobserver_fd
+            time.sleep(0.02)
+        out_text = proc.stdout.read() if proc.stdout else ""
+        if proc.stdout:
+            proc.stdout.close()
     except (OSError, subprocess.SubprocessError):
         return jobserver_fd
-    m = re.search(r"GNU Make\s+(\d+)\.(\d+)", res.stdout or "")
+    m = re.search(r"GNU Make\s+(\d+)\.(\d+)", out_text or "")
     if not m or (int(m.group(1)), int(m.group(2))) >= (4, 4):
         return jobserver_fd
-    granted = env.get("BUILDQ_CORES") or "1"
+    fixed_j = str(max(1, int(granted))) if granted else (env.get("BUILDQ_CORES") or "1")
     for var in ("MAKEFLAGS", "MFLAGS"):
         val = env.get(var)
         if not val or "--jobserver-auth=fifo:" not in val:
             continue
-        cleaned = re.sub(r"(?:^|\s)-j\d+\s+--jobserver-auth=fifo:\S+", f" -j{granted}", val)
+        cleaned = re.sub(r"(?:^|\s)-j\d+\s+--jobserver-auth=fifo:\S+", f" -j{fixed_j}", val)
         cleaned = re.sub(r"(?:^|\s)--jobserver-auth=fifo:\S+", "", cleaned).strip()
         env[var] = cleaned
+    if directory:
+        try:
+            common.write_json(os.path.join(directory, "make_fixed.json"), {"granted": int(fixed_j)})
+        except OSError:
+            pass
     try:
         os.close(jobserver_fd)
     except OSError:
@@ -211,10 +264,11 @@ def supervise(directory: str) -> int:
         me = machine.proc_identity(os.getpid())
         common.write_json(os.path.join(directory, "supervisor.json"), {"pid": os.getpid(), "start": me[0] if me else None})
         spec = common.read_json(os.path.join(directory, "ticket.json")) or {}
+        subreaper_ok = False
         if spec.get("runner") in ("direct", "cgroup"):
-            # Become a subreaper only on non-systemd runners (under systemd, systemd --user already
-            # owns cgroup teardown and subreaping).
-            machine.set_child_subreaper()
+            # Become a subreaper on non-systemd runners (under systemd, systemd --user already
+            # owns cgroup teardown and subreaping). DirectRunner requires it for orphan cleanup.
+            subreaper_ok = machine.set_child_subreaper()
         job = str(spec.get("id") or os.path.basename(directory))
         env = common.read_json(claimed)
         try:
@@ -249,6 +303,10 @@ def supervise(directory: str) -> int:
         def note(text: str) -> None:
             for output in (combined, streams[2]):
                 output.write(text.encode())
+
+        if spec.get("runner") == "direct" and not subreaper_ok:
+            note("buildq: couldn't enable PR_SET_CHILD_SUBREAPER; refusing direct build without orphan cleanup\n")
+            return code
 
         # Direct cgroup v2 runner: move this supervisor into the build's cgroup BEFORE spawning
         # the child so every process of the build is born under the cgroup's limits.
@@ -288,9 +346,22 @@ def supervise(directory: str) -> int:
         if not isinstance(env, dict) or not argv:
             note("buildq: this build's command or environment is missing; it can't run.\n")
             return code
+        # Install cancellation signal handler BEFORE any pre-launch probe so a cancel arriving
+        # during the Make version probe aborts cleanly without leaking the probe child.
+        pre_cancel: list[int] = []
+
+        def _pre_cancel_handler(signum, _frame):
+            pre_cancel.append(signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+            signal.signal(sig, _pre_cancel_handler)
         # Check GNU Make < 4.4 inside build confinement (with build's exact cwd/env/limits) so old
         # make falls back cleanly to `-j<granted>` instead of aborting on `--jobserver-auth=fifo:`.
-        jobserver = _downgrade_old_make_fifo(argv, cwd, env, jobserver)
+        jobserver = _downgrade_old_make_fifo(argv, cwd, env, jobserver, granted=spec.get("granted"),
+                                             directory=directory, cancel_flag=pre_cancel)
+        if pre_cancel:
+            code = 128 + pre_cancel[-1]
+            return code
         pipes = {1: os.pipe(), 2: os.pipe()}
         try:
             umask = spec.get("umask")

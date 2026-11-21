@@ -218,6 +218,11 @@ class Daemon(GitHubMixin, SchedulerMixin):
         if os.environ.get("INVOCATION_ID") and wanted != "systemd":
             # Running as a systemd service: the direct runner would put every build inside the
             # daemon's own small cgroup. A slow probe under load mustn't pick it.
+            if wanted == "cgroup":
+                raise RunnerUnavailableError(
+                    "runner = \"cgroup\" can't be used while buildqd runs as a systemd service "
+                    "(use runner = \"systemd\" or \"auto\")"
+                )
             if wanted != "auto":
                 common.log(f"runner = {wanted!r} can't be used while buildqd runs as a systemd service; using systemd")
             wanted = "systemd"
@@ -282,6 +287,8 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 raise  # fail startup explicitly rather than silently switching runners
             problem = f"config {self.config_path}: requested runner is unavailable"
         except Exception as e:
+            if self.cfg is None and os.environ.get("BUILDQ_RUNNER") == "cgroup":
+                raise RunnerUnavailableError(f"config {self.config_path}: {e}") from e
             problem = f"config {self.config_path}: {e}"
         if self.cfg is not None:
             common.log(f"{problem}; keeping the configuration in force")
@@ -1002,9 +1009,11 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 res_usec = int(float(res_cpu) * 1_000_000)
                 if res_usec > used:
                     used = res_usec
-                    if res_usec > 0:
-                        t.measured = True
-        t.avg_cores = used / 1e6 / wall if wall > 0 and t.measured else 0.0
+                    # Keep t.cpu_usec in sync so outcomes.jsonl and metrics.db see the exact same
+                    # authoritative terminal CPU, without setting t.measured on CPU-only runs (so
+                    # an unsampled memory peak is never mistaken for an observed 0 bytes).
+                    t.cpu_usec = (t.cpu_usec_base or 0) + used
+        t.avg_cores = used / 1e6 / wall if wall > 0 and (t.measured or used > 0) else 0.0
         t.peak_cores = max(t.peak_cores, t.avg_cores)
         if t.flock:
             self.tickets.pop(t.id, None)
@@ -1710,8 +1719,18 @@ def listening_socket(path: str, state_dir: str | None = None):
         common.ensure_private_dir(parent)
     else:
         os.makedirs(parent, mode=0o700, exist_ok=True)
-        if not os.path.isdir(parent):
-            sys.exit(f"buildqd: socket directory {parent} is not a directory")
+        try:
+            dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as e:
+            sys.exit(f"buildqd: socket directory {parent} isn't a real directory: {e}")
+        try:
+            pst = os.fstat(dfd)
+            if not stat.S_ISDIR(pst.st_mode):
+                sys.exit(f"buildqd: socket directory {parent} is not a directory")
+            if pst.st_uid != UID and not (pst.st_mode & stat.S_ISVTX):
+                sys.exit(f"buildqd: socket directory {parent} belongs to uid {pst.st_uid}, not {UID}")
+        finally:
+            os.close(dfd)
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -1770,9 +1789,14 @@ async def serve(args) -> None:
     my_ident = machine.proc_identity(os.getpid())
     my_start = my_ident[0] if my_ident else None
     my_boot = machine.boot_id()
+    started_by = os.environ.get("BUILDQ_DAEMON_STARTED_BY") or "external"
+    pid_in_state = False
     if pid_file:
-        rec = json.dumps({"pid": os.getpid(), "start": my_start, "boot_id": my_boot, "socket": args.socket}) + "\n"
-        common.write_private_file_atomic(pid_file, rec)
+        pid_parent = os.path.normpath(os.path.dirname(os.path.abspath(pid_file)) or ".")
+        pid_in_state = pid_parent == os.path.normpath(os.path.abspath(args.state_dir))
+        rec = json.dumps({"pid": os.getpid(), "start": my_start, "boot_id": my_boot,
+                          "socket": os.path.abspath(args.socket), "started_by": started_by}) + "\n"
+        common.write_private_file_atomic(pid_file, rec, enforce_parent_mode=pid_in_state)
     # Python 3.13+ removes a Unix server's socket file when the server closes. A socket systemd
     # passed us belongs to systemd and must outlive this process; ours we remove ourselves.
     keep = {"cleanup_socket": False} if sys.version_info >= (3, 13) else {}

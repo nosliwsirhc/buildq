@@ -33,13 +33,17 @@ case "$raw_pct" in
     exit 2
     ;;
 esac
-# Strip leading zeros in POSIX sh so values like "08" don't fail octal arithmetic.
+# Strip leading zeros in POSIX sh and reject >2 digits before arithmetic (prevents 64-bit wrap).
 while [ "${#raw_pct}" -gt 1 ]; do
   case "$raw_pct" in
     0*) raw_pct=${raw_pct#0} ;;
     *) break ;;
   esac
 done
+if [ "${#raw_pct}" -gt 2 ]; then
+  printf 'cgroup-setup.sh: memory_max_percent must be between 0 and 99, got %s\n' "$raw_pct" >&2
+  exit 2
+fi
 max_pct=$((raw_pct))
 if [ "$max_pct" -lt 0 ] || [ "$max_pct" -ge 100 ]; then
   printf 'cgroup-setup.sh: memory_max_percent must be between 0 and 99, got %s\n' "$max_pct" >&2
@@ -90,16 +94,30 @@ builds="$root/builds"
 mkdir -p "$outer"
 chown root:root "$outer"
 chmod 0755 "$outer"
+# Ensure outer control files stay root-owned (including when upgrading from an earlier recursive chown).
+for f in cgroup.procs cgroup.threads cgroup.subtree_control memory.high memory.max; do
+  [ -e "$outer/$f" ] && chown root:root "$outer/$f" 2>/dev/null || true
+done
 enable_ctrls "$outer"
 
 # Host-wide aggregate memory ceiling stays root-owned on `buildq-<user>` so workloads under
-# `$user` cannot raise their own ceiling above `max_pct`% of RAM.
+# `$user` cannot raise their own ceiling above `max_pct`% of RAM. Fail closed if writing fails.
 mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "${mem_kb:-0}" -gt 0 ] && [ "$max_pct" -gt 0 ]; then
   high_bytes=$((mem_kb * 1024 * high_pct / 100))
   max_bytes=$((mem_kb * 1024 * max_pct / 100))
-  [ -w "$outer/memory.high" ] && printf '%s\n' "$high_bytes" >"$outer/memory.high" 2>/dev/null || true
-  [ -w "$outer/memory.max" ] && printf '%s\n' "$max_bytes" >"$outer/memory.max" 2>/dev/null || true
+  if [ ! -w "$outer/memory.high" ] || [ ! -w "$outer/memory.max" ]; then
+    printf 'cgroup-setup.sh: memory controller files missing under %s\n' "$outer" >&2
+    exit 1
+  fi
+  printf '%s\n' "$high_bytes" >"$outer/memory.high" || {
+    printf 'cgroup-setup.sh: failed to write %s/memory.high\n' "$outer" >&2
+    exit 1
+  }
+  printf '%s\n' "$max_bytes" >"$outer/memory.max" || {
+    printf 'cgroup-setup.sh: failed to write %s/memory.max\n' "$outer" >&2
+    exit 1
+  }
 fi
 
 mkdir -p "$root"

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import fcntl
 import glob
 import hashlib
 import json
@@ -1637,11 +1638,13 @@ def _use_systemd_unit() -> bool:
         return False
 
 
-_SUPERVISOR_COMMS = frozenset({"runsv", "s6-supervise", "supervise-daemon", "dinit", "supervisord"})
+# Linux /proc/<pid>/comm truncates process names to 15 characters (TASK_COMM_LEN - 1), so
+# OpenRC's `supervise-daemon` appears as `supervise-daemo`.
+_SUPERVISOR_COMMS = frozenset(name[:15] for name in ("runsv", "s6-supervise", "supervise-daemon", "dinit", "supervisord"))
 
 
-def _socket_peer_daemon(sock_path: str) -> tuple[int, int | None] | None:
-    """Ask the kernel (`SO_PEERCRED`) for the PID of the same-UID buildqd listening on `sock_path`."""
+def _socket_peer_daemon(sock_path: str) -> tuple[int, int] | None:
+    """Ask the kernel (`SO_PEERCRED`) for `(pid, start)` of the same-UID buildqd on `sock_path`."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(1.0)
     try:
@@ -1655,12 +1658,14 @@ def _socket_peer_daemon(sock_path: str) -> tuple[int, int | None] | None:
     if uid != os.getuid() or not machine.pid_is_buildqd(pid):
         return None
     ident = machine.proc_identity(pid)
-    return (pid, ident[0] if ident else None)
+    if ident is None:
+        return None
+    return (pid, ident[0])
 
 
-def _read_daemon_pid(pid_file: str) -> tuple[int, int | None] | None:
-    """Read `(pid, start_ticks)` from `pid_file` (JSON record or legacy int) and verify boot ID
-    and daemon identity."""
+def _read_daemon_pid(pid_file: str, expected_socket: str | None = None) -> tuple[int, int, str | None] | None:
+    """Read `(pid, start_ticks, started_by)` from `pid_file` (JSON record or legacy int),
+    verifying boot ID, socket match, and daemon identity."""
     try:
         with open(pid_file) as f:
             raw = f.read().strip()
@@ -1670,6 +1675,7 @@ def _read_daemon_pid(pid_file: str) -> tuple[int, int | None] | None:
         return None
     pid: int | None = None
     start: int | None = None
+    started_by: str | None = None
     if raw.startswith("{"):
         try:
             rec = json.loads(raw)
@@ -1679,10 +1685,17 @@ def _read_daemon_pid(pid_file: str) -> tuple[int, int | None] | None:
             return None
         rec_boot = rec.get("boot_id")
         cur_boot = machine.boot_id()
-        if rec_boot and cur_boot and rec_boot != cur_boot:
+        if not rec_boot or (cur_boot and rec_boot != cur_boot):
             return None
+        rec_sock = rec.get("socket")
+        if expected_socket and rec_sock:
+            if os.path.normpath(os.path.abspath(str(rec_sock))) != os.path.normpath(os.path.abspath(expected_socket)):
+                return None
         pid = rec.get("pid") if isinstance(rec.get("pid"), int) else None
         start = rec.get("start") if isinstance(rec.get("start"), int) else None
+        started_by = rec.get("started_by") if isinstance(rec.get("started_by"), str) else None
+        if pid is None or start is None:
+            return None
     else:
         try:
             pid = int(raw)
@@ -1692,38 +1705,68 @@ def _read_daemon_pid(pid_file: str) -> tuple[int, int | None] | None:
         return None
     if start is None:
         ident = machine.proc_identity(pid)
-        start = ident[0] if ident else None
-    return (pid, start)
+        if ident is None:
+            return None
+        start = ident[0]
+    return (pid, start, started_by)
 
 
-def _live_daemon_target(sock: str, pid_file: str) -> tuple[int, int | None] | None:
-    """Identify the running buildqd via kernel SO_PEERCRED first, falling back to verified pid_file."""
-    return _socket_peer_daemon(sock) or _read_daemon_pid(pid_file)
+def _live_daemon_target(sock: str, pid_file: str) -> tuple[int, int, str | None] | None:
+    """Identify the running buildqd via kernel SO_PEERCRED first, enriching with pid_file metadata."""
+    rec = _read_daemon_pid(pid_file, expected_socket=sock)
+    peer = _socket_peer_daemon(sock)
+    if peer is not None:
+        started_by = rec[2] if (rec is not None and rec[0] == peer[0] and rec[1] == peer[1]) else None
+        return (peer[0], peer[1], started_by)
+    return rec
 
 
-def _remove_pid_file_if_matches(pid_file: str, pid: int, start: int | None) -> None:
-    """Unlink `pid_file` only if it still describes the same `(pid, start)` (never a replacement)."""
+def _remove_pid_file_if_matches(sdir: str, pid_file: str, pid: int, start: int) -> None:
+    """Unlink `pid_file` under a non-blocking `buildqd.lock` only if it still describes the same
+    `(pid, start)`, so a concurrent replacement daemon's PID record is never deleted."""
+    lock_path = os.path.join(sdir, "buildqd.lock")
+    lfd = -1
     try:
-        with open(pid_file) as f:
-            raw = f.read().strip()
+        lfd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return
+        if lfd >= 0:
+            os.close(lfd)
+        return  # another daemon holds the lock; leave its PID file alone
     try:
-        if raw.startswith("{"):
-            rec = json.loads(raw)
-            if not (isinstance(rec, dict) and rec.get("pid") == pid and (start is None or rec.get("start") == start)):
+        abs_pid = os.path.abspath(pid_file)
+        parent = os.path.dirname(abs_pid) or "/"
+        base = os.path.basename(abs_pid)
+        dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            fd = os.open(base, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+            try:
+                raw = os.read(fd, 4096).decode("utf-8", errors="replace").strip()
+            finally:
+                os.close(fd)
+            if raw.startswith("{"):
+                rec = json.loads(raw)
+                if not (isinstance(rec, dict) and rec.get("pid") == pid and rec.get("start") == start):
+                    return
+            elif int(raw) != pid:
                 return
-        elif int(raw) != pid:
-            return
-        os.unlink(pid_file)
+            os.unlink(base, dir_fd=dfd)
+        finally:
+            os.close(dfd)
     except (OSError, ValueError):
         pass
+    finally:
+        os.close(lfd)
 
 
-def _is_init_supervised(pid: int) -> str | None:
-    """Return the supervisor process name if `pid` runs under runit/s6/OpenRC/dinit, else None."""
+def _is_init_supervised(pid: int, started_by: str | None = None) -> str | None:
+    """Return the supervisor process name if `pid` runs under runit/s6/OpenRC/dinit, else None.
+    Daemons launched by `buildq daemon start` carry `started_by == 'cli'` so an orphaned CLI
+    daemon reparented to PID 1 (`dinit`) is never mistaken for a system dinit service."""
+    if started_by == "cli":
+        return None
     ppid, pcomm = machine.proc_ppid_comm(pid)
-    if ppid and ppid > 1 and pcomm in _SUPERVISOR_COMMS:
+    if ppid and ppid >= 1 and pcomm and pcomm[:15] in _SUPERVISOR_COMMS:
         return pcomm
     return None
 
@@ -1737,6 +1780,7 @@ def _daemon_start_local(sdir: str, sock: str, cfg: str, pid_file: str, log_file:
     cmd = [*_buildqd_command(), "--socket", sock, "--state-dir", sdir, "--config", cfg,
            "--pid-file", pid_file, "--log-file", log_file]
     env = dict(os.environ)
+    env["BUILDQ_DAEMON_STARTED_BY"] = "cli"
     if len(cmd) >= 3 and cmd[1:3] == ["-m", "buildq.daemon"]:
         pypath = common.module_pythonpath(env.get("PYTHONPATH"), always=True)
         if pypath:
@@ -1771,7 +1815,7 @@ def _daemon_start_local(sdir: str, sock: str, cfg: str, pid_file: str, log_file:
     return 1
 
 
-def _daemon_stop_local(sock: str, pid_file: str) -> int:
+def _daemon_stop_local(sdir: str, sock: str, pid_file: str) -> int:
     target = _live_daemon_target(sock, pid_file)
     if target is None:
         reply = request({"op": "ping"}, timeout=1.0)
@@ -1780,10 +1824,10 @@ def _daemon_stop_local(sock: str, pid_file: str) -> int:
             return 1
         print("buildqd is not running")
         return 0
-    pid, start = target
+    pid, start, _ = target
     if not machine.pidfd_signal(pid, start, signal.SIGTERM):
         if not machine.pid_is_buildqd(pid, start):
-            _remove_pid_file_if_matches(pid_file, pid, start)
+            _remove_pid_file_if_matches(sdir, pid_file, pid, start)
             print(f"buildqd (pid {pid}) stopped")
             return 0
         note(f"can't stop buildqd (pid {pid})")
@@ -1791,7 +1835,7 @@ def _daemon_stop_local(sock: str, pid_file: str) -> int:
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         if not machine.pid_is_buildqd(pid, start):
-            _remove_pid_file_if_matches(pid_file, pid, start)
+            _remove_pid_file_if_matches(sdir, pid_file, pid, start)
             print(f"buildqd (pid {pid}) stopped")
             return 0
         time.sleep(0.1)
@@ -1822,12 +1866,12 @@ def cmd_daemon(args) -> int:
     if action == "start":
         return _daemon_start_local(sdir, sock, cfg, pid_file, log_file)
     if action == "stop":
-        return _daemon_stop_local(sock, pid_file)
+        return _daemon_stop_local(sdir, sock, pid_file)
     if action == "restart":
         target = _live_daemon_target(sock, pid_file)
         if target is not None:
-            pid, start = target
-            sup_name = _is_init_supervised(pid)
+            pid, start, started_by = target
+            sup_name = _is_init_supervised(pid, started_by)
             if sup_name:
                 # Under runit/s6/OpenRC/dinit, signal the supervised daemon and wait for the
                 # service supervisor to respawn it rather than launching a competing copy.
@@ -1847,7 +1891,7 @@ def cmd_daemon(args) -> int:
                     time.sleep(0.15)
                 note(f"buildqd (pid {pid}) under {sup_name} didn't respawn within 15s")
                 return 1
-            code = _daemon_stop_local(sock, pid_file)
+            code = _daemon_stop_local(sdir, sock, pid_file)
             if code != 0:
                 return code
         return _daemon_start_local(sdir, sock, cfg, pid_file, log_file)
@@ -1856,7 +1900,7 @@ def cmd_daemon(args) -> int:
         if target is None:
             note(f"buildqd isn't running (no live daemon at {sock} or {pid_file})")
             return 1
-        pid, start = target
+        pid, start, _ = target
         if not machine.pidfd_signal(pid, start, signal.SIGHUP):
             note(f"can't reload buildqd (pid {pid})")
             return 1
@@ -1903,11 +1947,19 @@ def cmd_daemon(args) -> int:
                 try:
                     nst = os.stat(log_file)
                     if (nst.st_dev, nst.st_ino) != cur_id or nst.st_size < f.tell():
-                        f.close()
-                        f = open(log_file, errors="replace")
-                        st = os.fstat(f.fileno())
-                        cur_id = (st.st_dev, st.st_ino)
-                        continue
+                        # Open and verify replacement BEFORE closing current stream so a brief
+                        # disappearance during rotation never leaves a closed handle.
+                        nf = open(log_file, errors="replace")
+                        try:
+                            nf_st = os.fstat(nf.fileno())
+                            if stat.S_ISREG(nf_st.st_mode):
+                                f.close()
+                                f = nf
+                                cur_id = (nf_st.st_dev, nf_st.st_ino)
+                                continue
+                            nf.close()
+                        except OSError:
+                            nf.close()
                 except OSError:
                     pass
                 time.sleep(0.2)

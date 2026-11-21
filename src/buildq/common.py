@@ -194,12 +194,22 @@ def ensure_private_dir(path: str) -> None:
 
 
 def open_private_log(path: str) -> int:
-    """Open `path` for append without following symlinks, verifying it is a regular file owned by
-    UID and clamping permissions via fchmod."""
-    parent = os.path.dirname(path) or "."
+    """Open `path` for append relative to a verified parent dirfd without following symlinks and
+    with O_NONBLOCK (so an existing FIFO never hangs open() before S_ISREG is checked), verifying
+    it is a regular file owned by UID and clamping mode via fchmod."""
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(abs_path) or "/"
+    base = os.path.basename(abs_path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o600)
+    dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        pst = os.fstat(dfd)
+        if not stat.S_ISDIR(pst.st_mode):
+            raise PermissionError(f"{parent} is not a directory")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(base, flags, 0o600, dir_fd=dfd)
+    finally:
+        os.close(dfd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -208,18 +218,24 @@ def open_private_log(path: str) -> int:
             raise PermissionError(f"{path} belongs to uid {st.st_uid}, not {UID}")
         if stat.S_IMODE(st.st_mode) & 0o077:
             os.fchmod(fd, 0o600)
+        os.set_blocking(fd, True)
     except Exception:
         os.close(fd)
         raise
     return fd
 
 
-def write_private_file_atomic(path: str, text: str) -> None:
-    """Atomically write a private 0600 regular file inside a validated directory without following
-    symlinks or using predictable temporary filenames."""
-    parent = os.path.dirname(os.path.abspath(path)) or "."
-    base = os.path.basename(path)
-    ensure_private_dir(parent)
+def write_private_file_atomic(path: str, text: str, *, enforce_parent_mode: bool = True) -> None:
+    """Atomically write a private 0600 regular file inside a verified dirfd without following
+    symlinks or using predictable temporary filenames. Only hardens the parent directory mode when
+    `enforce_parent_mode` is True (e.g. inside buildq's own state_dir)."""
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    parent = os.path.dirname(abs_path) or "/"
+    base = os.path.basename(abs_path)
+    if enforce_parent_mode:
+        ensure_private_dir(parent)
+    else:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
     dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
     tmp_name = f".{base}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
     fd = -1
@@ -285,13 +301,14 @@ def configure_log_file(path: str | None, max_bytes: int = 4 << 20, *, dup_stderr
     """Route `log()` to a timestamped rotating file (for non-systemd background daemons)."""
     global _log_file, _log_max_bytes, _log_dup_stderr
     with _log_lock:
-        _log_file = os.path.expanduser(path) if path else None
+        _log_file = os.path.abspath(os.path.expanduser(path)) if path else None
         _log_max_bytes = max(64 << 10, int(max_bytes))
         _log_dup_stderr = bool(dup_stderr and _log_file)
         if _log_dup_stderr and _log_file:
             try:
                 fd = open_private_log(_log_file)
                 try:
+                    os.dup2(fd, 1)
                     os.dup2(fd, 2)
                 finally:
                     os.close(fd)
@@ -318,29 +335,44 @@ def log(message: str, level: int | None = None) -> None:
             stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             payload = "".join(f"{stamp} {line}\n" for line in message.split("\n"))
             try:
+                parent = os.path.dirname(_log_file) or "/"
+                base = os.path.basename(_log_file)
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+                dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
                 rotated = False
                 try:
-                    st = os.lstat(_log_file)
-                    if stat.S_ISREG(st.st_mode) and st.st_uid == UID and st.st_size > _log_max_bytes:
-                        bak = _log_file + ".1"
-                        try:
-                            bst = os.lstat(bak)
-                            if stat.S_ISLNK(bst.st_mode) or bst.st_uid != UID:
-                                bak = ""
-                        except FileNotFoundError:
-                            pass
-                        if bak:
-                            os.replace(_log_file, bak)
-                            rotated = True
-                except OSError:
-                    pass
-                fd = open_private_log(_log_file)
+                    try:
+                        st = os.lstat(base, dir_fd=dfd)
+                        if stat.S_ISREG(st.st_mode) and st.st_uid == UID and st.st_size > _log_max_bytes:
+                            bak = base + ".1"
+                            try:
+                                bst = os.lstat(bak, dir_fd=dfd)
+                                if stat.S_ISLNK(bst.st_mode) or bst.st_uid != UID:
+                                    bak = ""
+                            except FileNotFoundError:
+                                pass
+                            if bak:
+                                os.replace(base, bak, src_dir_fd=dfd, dst_dir_fd=dfd)
+                                rotated = True
+                    except OSError:
+                        pass
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+                    fd = os.open(base, flags, 0o600, dir_fd=dfd)
+                finally:
+                    os.close(dfd)
                 try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
+                        raise PermissionError(f"{_log_file} is not a private regular file")
+                    if stat.S_IMODE(st.st_mode) & 0o077:
+                        os.fchmod(fd, 0o600)
+                    os.set_blocking(fd, True)
                     data = payload.encode(errors="backslashreplace")
                     while data:
                         data = data[os.write(fd, data):]
                     if rotated and _log_dup_stderr:
                         try:
+                            os.dup2(fd, 1)
                             os.dup2(fd, 2)
                         except OSError:
                             pass
