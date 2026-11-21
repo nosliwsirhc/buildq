@@ -634,8 +634,9 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 env = {"LC_ALL": "C", **t.git_env}
                 if pypath:
                     env["PYTHONPATH"] = pypath
+                    env["PYTHONSAFEPATH"] = "1"
             elif pypath:
-                env = {**os.environ, "PYTHONPATH": pypath}
+                env = {**os.environ, "PYTHONPATH": pypath, "PYTHONSAFEPATH": "1"}
             else:
                 env = None
             try:

@@ -102,7 +102,7 @@ class SystemdRunner:
         properties = [f"--property={k}={v}" for k, v in lane.properties.items()]
         cmd = common.daemon_command()
         pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"), always=True) if len(cmd) >= 2 and cmd[1] == "-m" else None
-        setenv = [f"--setenv=PYTHONPATH={pypath}"] if pypath else []
+        setenv = [f"--setenv=PYTHONPATH={pypath}", "--setenv=PYTHONSAFEPATH=1"] if pypath else []
         with open(os.path.join(ticket.dir, "launch.err"), "wb") as err:
             proc = subprocess.Popen(
                 ["systemd-run", "--user", "--quiet", f"--unit={unit}", f"--slice={slice_name}",
@@ -228,7 +228,7 @@ class DirectRunner:
     def launch(self, ticket, lane: Lane, slice_name: str):
         cmd = common.daemon_command()
         pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"), always=True) if len(cmd) >= 2 and cmd[1] == "-m" else None
-        env = {**os.environ, "PYTHONPATH": pypath} if pypath else None
+        env = {**os.environ, "PYTHONPATH": pypath, "PYTHONSAFEPATH": "1"} if pypath else None
         proc = subprocess.Popen([*cmd, "--supervise", ticket.dir], stdin=DEVNULL, stdout=DEVNULL,
                                 stderr=DEVNULL, start_new_session=True, env=env)
         ticket.pid = proc.pid

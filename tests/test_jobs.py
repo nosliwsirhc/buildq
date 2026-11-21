@@ -1219,12 +1219,14 @@ class ClientAndGuardHelpers(unittest.TestCase):
 class PackagePlumbing(unittest.TestCase):
     """Package split plumbing: module PYTHONPATH, symlinked entrypoints, and launcher dispatch."""
 
-    def test_module_pythonpath_prepends_absolute_root_over_relative_entries(self):
+    def test_module_pythonpath_prepends_absolute_root_over_relative_and_empty_entries(self):
         root = common.package_root()
         with mock.patch.object(common, "_DAEMON_ENTRYPOINT", None):
             self.assertEqual(common.module_pythonpath(None), root)
             # Relative `PYTHONPATH=src` must become absolute-first so systemd units in $HOME find buildq.
             self.assertEqual(common.module_pythonpath("src"), f"{root}{os.pathsep}src")
+            # A leading empty entry (`:root`) means CWD first and must not survive ahead of `root`.
+            self.assertEqual(common.module_pythonpath(f"{os.pathsep}{root}"), root)
             self.assertEqual(common.module_pythonpath(f"{root}{os.pathsep}/other"), f"{root}{os.pathsep}/other")
             self.assertEqual(common.module_pythonpath(f"/other{os.pathsep}{root}"), f"{root}{os.pathsep}/other")
         with mock.patch.object(common, "_DAEMON_ENTRYPOINT", BUILDQD):
@@ -1245,18 +1247,39 @@ class PackagePlumbing(unittest.TestCase):
             os.symlink(os.path.join(checkout, "buildqd"), ext_daemon)
             ext_client = os.path.join(stable, "my-buildq")
             os.symlink(os.path.join(checkout, "buildq"), ext_client)
+            real_checkout = os.path.realpath(checkout)
             with mock.patch.object(common, "_DAEMON_ENTRYPOINT", None), \
                  mock.patch.object(common, "_CLIENT_ENTRYPOINT", None):
                 common.set_daemon_entrypoint(ext_daemon)
                 self.assertEqual(common.daemon_command(), [sys.executable, os.path.abspath(ext_daemon)])
-                self.assertEqual(common.client_command(), [sys.executable, os.path.join(checkout, "buildq")])
+                self.assertEqual(common.client_command(), [sys.executable, os.path.join(real_checkout, "buildq")])
                 common.set_client_entrypoint(ext_client)
-                self.assertEqual(common.client_bin_dir(), checkout)
+                self.assertEqual(common.client_bin_dir(), real_checkout)
 
-    def test_module_mode_client_bin_dir_finds_checkout_shim(self):
+    def test_module_mode_client_bin_dir_matches_checkout_and_user_scheme(self):
         with mock.patch.object(common, "_CLIENT_ENTRYPOINT", None), \
              mock.patch.object(sys, "argv", [client.__file__]):
-            self.assertEqual(common.client_bin_dir(), os.path.join(ROOT, "bin"))
+            self.assertEqual(common.client_bin_dir(), os.path.realpath(os.path.join(ROOT, "bin")))
+        with tempfile.TemporaryDirectory() as tmp:
+            user_lib = os.path.join(tmp, "user", "lib")
+            user_bin = os.path.join(tmp, "user", "bin")
+            sys_lib = os.path.join(tmp, "sys", "lib")
+            sys_bin = os.path.join(tmp, "sys", "bin")
+            for d in (user_lib, user_bin, sys_lib, sys_bin):
+                os.makedirs(d)
+            for d in (user_bin, sys_bin):
+                open(os.path.join(d, "buildq-shim"), "w").close()
+            schemes = {"posix_prefix": {"purelib": sys_lib, "platlib": sys_lib, "scripts": sys_bin},
+                       "posix_user": {"purelib": user_lib, "platlib": user_lib, "scripts": user_bin}}
+            import sysconfig
+            with mock.patch.object(common, "_CLIENT_ENTRYPOINT", None), \
+                 mock.patch.object(common, "package_root", return_value=os.path.realpath(user_lib)), \
+                 mock.patch.object(sys, "argv", [os.path.join(user_lib, "buildq", "client.py")]), \
+                 mock.patch.object(sysconfig, "get_default_scheme", return_value="posix_prefix"), \
+                 mock.patch.object(sysconfig, "get_preferred_scheme", return_value="posix_user"), \
+                 mock.patch.object(sysconfig, "get_scheme_names", return_value=("posix_prefix", "posix_user")), \
+                 mock.patch.object(sysconfig, "get_paths", side_effect=lambda s: schemes[s]):
+                self.assertEqual(common.client_bin_dir(), os.path.realpath(user_bin))
 
     def test_renamed_daemon_symlink_and_pythonpath_precedence(self):
         with tempfile.TemporaryDirectory() as tmp:

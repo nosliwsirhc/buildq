@@ -60,6 +60,38 @@ def package_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
+def _scheme_scripts_dirs(pkg_root: str) -> tuple[list[str], list[str]]:
+    """Return `(matched, fallback)` scripts dirs for sysconfig schemes owning `pkg_root`."""
+    import sysconfig
+    default_scheme = sysconfig.get_default_scheme()
+    user_scheme = sysconfig.get_preferred_scheme("user")
+    seen: set[str] = set()
+    schemes: list[str] = []
+    for name in (default_scheme, user_scheme, *sysconfig.get_scheme_names()):
+        if name and name not in seen:
+            seen.add(name)
+            schemes.append(name)
+    matched: list[str] = []
+    fallback: list[str] = []
+    for scheme in schemes:
+        try:
+            paths = sysconfig.get_paths(scheme)
+        except KeyError:
+            continue
+        scripts = paths.get("scripts")
+        if not scripts:
+            continue
+        libs = {os.path.realpath(paths[k]) for k in ("purelib", "platlib") if paths.get(k)}
+        real_scripts = os.path.realpath(scripts)
+        if pkg_root in libs:
+            if real_scripts not in matched:
+                matched.append(real_scripts)
+        elif scheme in (default_scheme, user_scheme):
+            if real_scripts not in fallback:
+                fallback.append(real_scripts)
+    return matched, fallback
+
+
 def client_bin_dir() -> str:
     """Directory holding the running `buildq` executable (for finding sibling buildq-shim)."""
     candidates: list[str] = []
@@ -68,12 +100,14 @@ def client_bin_dir() -> str:
     else:
         if sys.argv and sys.argv[0] and os.path.isfile(sys.argv[0]):
             candidates.extend([os.path.dirname(os.path.realpath(sys.argv[0])), os.path.dirname(os.path.abspath(sys.argv[0]))])
-        # Module-mode (`python -m buildq.client`) fallbacks: checkout bin/ and matching scripts dir.
-        import sysconfig
-        candidates.append(os.path.normpath(os.path.join(package_root(), "..", "bin")))
-        scripts = sysconfig.get_path("scripts")
-        if scripts:
-            candidates.append(os.path.realpath(scripts))
+        # Module-mode (`python -m buildq.client`) fallbacks: prefer the sysconfig scheme that owns
+        # this package (e.g. user scripts for `pip install --user`, venv bin for a venv), then the
+        # checkout's sibling `bin/`, then default/user fallbacks.
+        root = package_root()
+        matched, fallback = _scheme_scripts_dirs(root)
+        candidates.extend(matched)
+        candidates.append(os.path.normpath(os.path.join(root, "..", "bin")))
+        candidates.extend(fallback)
         candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
     for directory in candidates:
         if os.path.isfile(os.path.join(directory, "buildq-shim")):
@@ -82,17 +116,17 @@ def client_bin_dir() -> str:
 
 
 def module_pythonpath(existing: str | None = None, *, always: bool = False) -> str | None:
-    """PYTHONPATH placing the running package root first for `-m buildq.*` child processes.
-    Needed when running via `-m` (no entrypoint script) or when a stripped child env could drop
-    user site-packages (`always=True`)."""
+    """PYTHONPATH placing the running package root in the literal first entry for `-m buildq.*`
+    child processes. Needed when running via `-m` (no entrypoint script) or when a stripped child
+    env could drop user site-packages (`always=True`)."""
     if not always and _DAEMON_ENTRYPOINT is not None:
         return None
     root = package_root()
     if existing:
-        parts = [p for p in existing.split(os.pathsep) if p]
-        if parts and os.path.isabs(parts[0]) and os.path.realpath(parts[0]) == root:
+        raw = existing.split(os.pathsep)
+        if raw[0] and os.path.isabs(raw[0]) and os.path.realpath(raw[0]) == root:
             return existing
-        kept = [p for p in parts if not (os.path.isabs(p) and os.path.realpath(p) == root)]
+        kept = [p for p in raw if p and not (os.path.isabs(p) and os.path.realpath(p) == root)]
         return os.pathsep.join([root, *kept])
     return root
 

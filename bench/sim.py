@@ -99,8 +99,20 @@ class _BuildqdPackage:
                 setattr(mod, attr, value)
 
 
-def _wrapper_interpreter(source: str) -> str | None:
-    """Absolute Python executable named by a script's shebang (including pip's `/bin/sh` wrapper)."""
+def _shebang_isolation_flags(tokens: list[str]) -> list[str]:
+    """Forward safe Python path-isolation flags (`-s`, `-S`, `-E`, `-I`) present on a shebang."""
+    flags: list[str] = []
+    for tok in tokens:
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            for ch in tok[1:]:
+                if ch in ("s", "S", "E", "I") and f"-{ch}" not in flags:
+                    flags.append(f"-{ch}")
+    return flags
+
+
+def _wrapper_interpreter(source: str) -> tuple[str, list[str]] | None:
+    """Absolute Python executable and safe isolation flags named by a script's shebang
+    (including pip's `/bin/sh` multiline `'''exec'` wrapper)."""
     lines = source.splitlines()
     if not lines or not lines[0].startswith("#!"):
         return None
@@ -117,10 +129,14 @@ def _wrapper_interpreter(source: str) -> str | None:
         except ValueError:
             return None
         cand = args[0] if args else ""
-        return cand if os.path.isabs(cand) and os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+        if os.path.isabs(cand) and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand, _shebang_isolation_flags(args[1:])
+        return None
     if os.path.basename(first) == "env":
         return None
-    return first if os.path.isabs(first) and os.path.isfile(first) and os.access(first, os.X_OK) else None
+    if os.path.isabs(first) and os.path.isfile(first) and os.access(first, os.X_OK):
+        return first, _shebang_isolation_flags(tokens[1:])
+    return None
 
 
 def _launcher_pkg_dir(real_path: str) -> str | None:
@@ -157,26 +173,39 @@ def _launcher_pkg_dir(real_path: str) -> str | None:
     for pkg_dir in candidates:
         if is_pkg(pkg_dir):
             return pkg_dir
-    # Pip/uv console script: ask the wrapper's own interpreter where its `buildq` package lives
-    # (handles virtualenvs, editable installs, and multi-Python prefixes accurately).
-    interp = _wrapper_interpreter(source)
-    if interp:
+    # Pip/uv console script: ask the wrapper's own interpreter where its `buildq` package lives,
+    # stripped of PYTHONPATH and CWD so the simulator's checkout never shadows the target venv.
+    wrapper = _wrapper_interpreter(source)
+    if wrapper:
+        interp, flags = wrapper
+        probe_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        probe_env["PYTHONSAFEPATH"] = "1"
         try:
             probe = subprocess.run(
-                [interp, "-c",
-                 "import importlib.util, os; s = importlib.util.find_spec('buildq'); "
+                [interp, *flags, "-c",
+                 "import importlib.util, os, sys; "
+                 "sys.path = [p for p in sys.path if p]; "
+                 "s = importlib.util.find_spec('buildq'); "
                  "print(os.path.dirname(os.path.realpath(s.origin)) if s and s.origin else '')"],
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, env=probe_env)
             found = probe.stdout.strip()
             if probe.returncode == 0 and found and is_pkg(found):
                 return found
         except (OSError, subprocess.SubprocessError):
             pass
-    # Fallback: site-packages / dist-packages relative to the script's prefix.
+    # Fallback: unique site-packages / dist-packages relative to the script's prefix.
     prefix = os.path.normpath(os.path.join(os.path.dirname(real_path), ".."))
-    for pkg_dir in sorted(glob.glob(os.path.join(prefix, "lib*", "python*", "*-packages", "buildq"))):
-        if is_pkg(pkg_dir):
-            return pkg_dir
+    found_dirs: list[str] = []
+    seen_real: set[str] = set()
+    for pkg_dir in sorted(glob.glob(os.path.join(glob.escape(prefix), "lib*", "python*", "*-packages", "buildq"))):
+        real_dir = os.path.realpath(pkg_dir)
+        if real_dir not in seen_real and is_pkg(real_dir):
+            seen_real.add(real_dir)
+            found_dirs.append(real_dir)
+    if len(found_dirs) == 1:
+        return found_dirs[0]
+    if len(found_dirs) > 1:
+        raise RuntimeError(f"ambiguous buildq packages under {prefix}: {', '.join(found_dirs)}")
     raise FileNotFoundError(f"buildq package not found for launcher {real_path}")
 
 

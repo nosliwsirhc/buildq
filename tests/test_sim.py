@@ -709,17 +709,72 @@ class LoadBuildqd(SimCase):
         finally:
             sys.modules.pop("buildqd_iso_test", None)
 
-        # 2. Wheel-style console script in a prefix's bin/ with site-packages beside it.
-        venv = os.path.join(self.tmp.name, "venv")
-        os.makedirs(os.path.join(venv, "bin"))
-        site_pkg = os.path.join(venv, "lib", "python3.11", "site-packages", "buildq")
-        shutil.copytree(os.path.join(ROOT, "src", "buildq"), site_pkg)
-        console = os.path.join(venv, "bin", "buildqd")
-        with open(console, "w") as f:
-            f.write("#!/usr/bin/env python3\nfrom buildq.daemon import main\nif __name__ == '__main__':\n    main()\n")
-        wheel_pkg = sim.load_buildqd(console, "buildqd_wheel_test")
-        self.assertTrue(hasattr(wheel_pkg, "Daemon"))
-        self.assertNotIn("buildqd_wheel_test", sys.modules)
+        # 2. Wheel-style console scripts: both absolute shebang (venv site-packages) and pip's
+        # `#!/bin/sh` multiline `'''exec'` wrapper (editable `.pth` install), verified while
+        # PYTHONPATH and CWD point at competing `buildq` trees.
+        pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+
+        def make_venv(name, marker, *, editable=False, sh_wrapper=False):
+            venv = os.path.join(self.tmp.name, name)
+            os.makedirs(os.path.join(venv, "bin"))
+            site_dir = os.path.join(venv, "lib", pyver, "site-packages")
+            os.makedirs(site_dir)
+            with open(os.path.join(venv, "pyvenv.cfg"), "w") as f:
+                f.write("include-system-site-packages = false\n")
+            vpy = os.path.join(venv, "bin", "python")
+            os.symlink(sys.executable, vpy)
+            if editable:
+                pkg_parent = os.path.join(venv, "editable_src")
+                pkg_dir = os.path.join(pkg_parent, "buildq")
+                shutil.copytree(os.path.join(ROOT, "src", "buildq"), pkg_dir)
+                with open(os.path.join(site_dir, "buildq_editable.pth"), "w") as f:
+                    f.write(pkg_parent + "\n")
+            else:
+                pkg_dir = os.path.join(site_dir, "buildq")
+                shutil.copytree(os.path.join(ROOT, "src", "buildq"), pkg_dir)
+            with open(os.path.join(pkg_dir, "daemon.py"), "a") as f:
+                f.write(f"\nSIM_MARKER = {marker!r}\n")
+            console = os.path.join(venv, "bin", "buildqd")
+            if sh_wrapper:
+                header = f"#!/bin/sh\n'''exec' '{vpy}' \"$0\" \"$@\"\n' '''\n"
+            else:
+                header = f"#!{vpy}\n"
+            with open(console, "w") as f:
+                f.write(f"{header}from buildq.daemon import main\nif __name__ == '__main__':\n    main()\n")
+            return console, os.path.realpath(pkg_dir)
+
+        console_abs, pkg_abs = make_venv("venv-abs", "from-venv-abs")
+        console_sh, pkg_sh = make_venv("venv-sh [1]", "from-venv-sh", editable=True, sh_wrapper=True)
+        competing = os.path.join(self.tmp.name, "competing")
+        shutil.copytree(os.path.join(ROOT, "src", "buildq"), os.path.join(competing, "buildq"))
+        with open(os.path.join(competing, "buildq", "daemon.py"), "a") as f:
+            f.write("\nSIM_MARKER = 'from-competing'\n")
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(os.path.join(ROOT, "src"))
+            with unittest.mock.patch.dict(os.environ, {"PYTHONPATH": competing}):
+                p_abs = sim.load_buildqd(console_abs, "buildqd_wheel_abs")
+                p_sh = sim.load_buildqd(console_sh, "buildqd_wheel_sh")
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual(p_abs.SIM_MARKER, "from-venv-abs")
+        self.assertEqual(os.path.dirname(os.path.realpath(p_abs._mods["daemon"].__file__)), pkg_abs)
+        self.assertEqual(p_sh.SIM_MARKER, "from-venv-sh")
+        self.assertEqual(os.path.dirname(os.path.realpath(p_sh._mods["daemon"].__file__)), pkg_sh)
+        self.assertNotIn("buildqd_wheel_abs", sys.modules)
+        self.assertNotIn("buildqd_wheel_sh", sys.modules)
+
+        # 3. Prefix fallback rejects ambiguous multi-version site-packages and escapes glob chars.
+        ambig = os.path.join(self.tmp.name, "ambig [2]")
+        os.makedirs(os.path.join(ambig, "bin"))
+        for ver in ("python3.11", "python3.12"):
+            shutil.copytree(os.path.join(ROOT, "src", "buildq"),
+                            os.path.join(ambig, "lib", ver, "site-packages", "buildq"))
+        ambig_console = os.path.join(ambig, "bin", "buildqd")
+        with open(ambig_console, "w") as f:
+            f.write("#!/usr/bin/env python3\nfrom buildq.daemon import main\n")
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            sim.load_buildqd(ambig_console, "buildqd_ambig")
 
 
 if __name__ == "__main__":
