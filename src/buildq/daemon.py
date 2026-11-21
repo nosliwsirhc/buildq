@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import fcntl
 import glob
 import json
 import os
@@ -13,6 +14,7 @@ import queue
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -33,6 +35,10 @@ from .metrics import Metrics, WAIT_COLUMN, WAIT_COLUMNS
 from .runners import CgroupRunner, DirectRunner, Jobserver, SystemdRunner
 from .scheduler import SchedulerMixin
 from .ticket import Conn, Ticket
+
+class RunnerUnavailableError(RuntimeError):
+    """Raised when an explicitly requested runner (e.g. runner = 'cgroup') cannot start."""
+
 
 class Daemon(GitHubMixin, SchedulerMixin):
     VACATED_SECONDS = 600.0  # how long a cancelled `run` build's place is kept for its retry
@@ -194,7 +200,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         existing = self.runners.get("cgroup")
         if isinstance(existing, CgroupRunner) and existing.root == root and existing._ready:
             return existing
-        runner = CgroupRunner(root, self.machine.mem_total)
+        runner = CgroupRunner(root, self.machine.mem_total, state_dir=self.state_dir)
         if not runner._ready:
             self._cgroup_probed = (key, None)
             return None
@@ -215,6 +221,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
             if wanted != "auto":
                 common.log(f"runner = {wanted!r} can't be used while buildqd runs as a systemd service; using systemd")
             wanted = "systemd"
+        explicit_cg_root = bool(os.environ.get("BUILDQ_CGROUP_ROOT", "").strip() or cfg.cgroup_root.strip())
         if wanted == "auto":
             if self._systemd_ok is None:
                 self._systemd_ok = SystemdRunner.available()
@@ -223,21 +230,42 @@ class Daemon(GitHubMixin, SchedulerMixin):
             elif self._cgroup_runner(cfg.cgroup_root) is not None:
                 wanted = "cgroup"
             else:
+                if explicit_cg_root:
+                    common.log(f"cgroup_root {os.environ.get('BUILDQ_CGROUP_ROOT') or cfg.cgroup_root!r} "
+                               "isn't usable for cgroup runner; falling back to direct runner", level=4)
                 wanted = "direct"
         if wanted == "cgroup":
             cg_runner = self._cgroup_runner(cfg.cgroup_root)
             if cg_runner is not None:
                 return cg_runner
-            raise ValueError("runner = \"cgroup\" needs a writable cgroup v2 directory with cpu and memory "
-                             "controllers (set cgroup_root, run init/cgroup-setup.sh, or use runner = \"auto\")")
+            raise RunnerUnavailableError(
+                "runner = \"cgroup\" needs a writable delegated cgroup v2 directory with cpu and memory "
+                "controllers, and buildqd must run inside that delegated subtree (run init/cgroup-setup.sh "
+                "and start buildqd via an init service, set cgroup_root, or use runner = \"auto\")"
+            )
         return self.runners[wanted]
 
     def runner_of(self, t: "Ticket"):
-        return self.runners.get(t.runner) or self.runner
+        found = self.runners.get(t.runner)
+        if found is not None:
+            return found
+        # Backend-preserving recovery: if a restarted daemon switched to `direct` while a `cgroup`
+        # build is still active or pending cleanup, return a read/control handle for its cgroup.
+        if t.runner == "cgroup" and t.cg and t.cg.startswith("/sys/fs/cgroup/"):
+            handle = CgroupRunner.__new__(CgroupRunner)
+            handle.root = os.path.dirname(os.path.dirname(t.cg))
+            handle.builds_dir = os.path.dirname(t.cg)
+            handle.mem_total = self.machine.mem_total
+            handle.state_dir = self.state_dir
+            handle.initial_memory_max = None
+            handle._ready = False
+            return handle
+        return self.runner
 
     def load_config(self) -> Config:
-        """The configuration file if it loads and systemd accepts its lanes; else the last one that
-        did; else the defaults. A typo never leaves the queue without its limits."""
+        """The configuration file if it loads and the runner accepts its lanes; else the last one
+        that did; else the defaults. An explicit unavailable runner fails startup cleanly rather
+        than silently dropping back to another backend."""
         m = self.machine
         try:
             cfg = config.load_config_file(self.config_path, m.mem_total, m.ncpu)
@@ -249,6 +277,10 @@ class Daemon(GitHubMixin, SchedulerMixin):
             if os.path.exists(self.config_path):
                 shutil.copyfile(self.config_path, self.last_good)
             return cfg
+        except RunnerUnavailableError:
+            if self.cfg is None:
+                raise  # fail startup explicitly rather than silently switching runners
+            problem = f"config {self.config_path}: requested runner is unavailable"
         except Exception as e:
             problem = f"config {self.config_path}: {e}"
         if self.cfg is not None:
@@ -747,9 +779,10 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 else:
                     self.requeue(t, now)
                 continue
-            # Non-cgroup runner MemoryMax watchdog: kill a build whose measured process-tree memory
-            # exceeds its lane's MemoryMax, marking it killed for memory so history learns its cap.
-            if not self._runner_has_cgroup(self.runner_of(t)) and t.measured and not t.cancel_requested and not t.cap_killed:
+            # Non-cgroup runner MemoryMax watchdog: kill a build whose complete measured process-tree
+            # memory exceeds its lane's MemoryMax, marking it killed for memory so history learns its cap.
+            if (not self._runner_has_cgroup(self.runner_of(t)) and t.measured and t._mem_sample_ok
+                    and not t.cancel_requested and not t.cap_killed):
                 lane = self.lane(t.lane)
                 if lane.mem_cap and t.mem_now > lane.mem_cap:
                     t.cap_killed = True
@@ -963,6 +996,14 @@ class Daemon(GitHubMixin, SchedulerMixin):
         t.frozen_total += t.frozen_attempt
         t.frozen_attempt = 0.0
         used = t.cpu_usec - (t.cpu_usec_base or 0)
+        if not t.cg and isinstance(result, dict):
+            res_cpu = result.get("cpu_s")
+            if isinstance(res_cpu, (int, float)) and not isinstance(res_cpu, bool) and res_cpu >= 0:
+                res_usec = int(float(res_cpu) * 1_000_000)
+                if res_usec > used:
+                    used = res_usec
+                    if res_usec > 0:
+                        t.measured = True
         t.avg_cores = used / 1e6 / wall if wall > 0 and t.measured else 0.0
         t.peak_cores = max(t.peak_cores, t.avg_cores)
         if t.flock:
@@ -1291,6 +1332,12 @@ class Daemon(GitHubMixin, SchedulerMixin):
             if t.cancel_requested:
                 self.stop(t, now, force=t.frozen)  # a cancel in progress when the daemon stopped goes on
             common.log(f"picked up {t.id} [{t.lane}] ({t.state}) from before the restart: {t.label}")
+        # Prune stale empty build cgroups ONLY after every saved ticket is loaded so neither
+        # terminal OOM counters nor pre-join active build cgroups are deleted prematurely.
+        cg_runner = self.runners.get("cgroup")
+        if cg_runner is not None and hasattr(cg_runner, "prune_stale"):
+            active_cgs = {t.cg for t in self.tickets.values() if t.state in ("starting", "running") and t.cg}
+            cg_runner.prune_stale(active_cgs)
 
     def prune(self, now: float) -> None:
         finished = sorted((t for t in self.tickets.values() if t.state in FINISHED and t.dir),
@@ -1625,7 +1672,32 @@ class Daemon(GitHubMixin, SchedulerMixin):
 # Serving
 
 
-def listening_socket(path: str):
+def acquire_instance_lock(state_dir: str) -> int:
+    """Acquire an exclusive non-blocking flock on `<state_dir>/buildqd.lock` before state recovery
+    or socket binding so concurrent daemon starts never race on tickets, cgroups, or sockets."""
+    common.ensure_private_dir(state_dir)
+    dfd = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open("buildqd.lock", flags, 0o600, dir_fd=dfd)
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != UID:
+            os.close(fd)
+            sys.exit(f"buildqd: {state_dir}/buildqd.lock is not a private regular file")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        sys.exit(f"buildqd: another daemon already holds {state_dir}/buildqd.lock")
+    except OSError as e:
+        os.close(fd)
+        sys.exit(f"buildqd: can't lock {state_dir}/buildqd.lock: {e}")
+    return fd
+
+
+def listening_socket(path: str, state_dir: str | None = None):
     """The socket systemd passed us (socket activation), or one we bind at `path`."""
     if os.environ.get("LISTEN_PID") == str(os.getpid()) and int(os.environ.get("LISTEN_FDS") or 0) >= 1:
         for name in ("LISTEN_PID", "LISTEN_FDS", "LISTEN_FDNAMES"):
@@ -1633,20 +1705,37 @@ def listening_socket(path: str):
         sock = socket.socket(fileno=3)
         sock.setblocking(False)
         return sock, False
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    parent = os.path.normpath(os.path.dirname(os.path.abspath(path)) or ".")
+    if parent in common.fallback_runtime_dirs(state_dir):
+        common.ensure_private_dir(parent)
+    else:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        if not os.path.isdir(parent):
+            sys.exit(f"buildqd: socket directory {parent} is not a directory")
     try:
-        probe.connect(path)
-        sys.exit(f"buildqd: something is already listening on {path}")
-    except (FileNotFoundError, ConnectionRefusedError):
-        pass
-    finally:
-        probe.close()
-    try:
-        os.unlink(path)
+        st = os.lstat(path)
     except FileNotFoundError:
-        pass
-    parent = os.path.dirname(path) or "."
-    common.ensure_private_dir(parent)
+        st = None
+    if st is not None:
+        if not stat.S_ISSOCK(st.st_mode):
+            sys.exit(f"buildqd: refusing to replace non-socket {path}")
+        if st.st_uid != UID:
+            sys.exit(f"buildqd: refusing to replace socket {path} owned by uid {st.st_uid}")
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(path)
+            sys.exit(f"buildqd: something is already listening on {path}")
+        except ConnectionRefusedError:
+            pass
+        except FileNotFoundError:
+            st = None
+        finally:
+            probe.close()
+        if st is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(path)  # mode 0600: the daemon runs with umask 077
     sock.listen(128)
@@ -1655,6 +1744,7 @@ def listening_socket(path: str):
 
 
 async def serve(args) -> None:
+    lock_fd = acquire_instance_lock(args.state_dir)
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     holder: dict = {}
@@ -1662,7 +1752,12 @@ async def serve(args) -> None:
         loop.add_signal_handler(sig, stop.set)
     loop.add_signal_handler(signal.SIGHUP, lambda: asyncio.ensure_future(holder["daemon"].reload_async())
                             if "daemon" in holder else None)
-    daemon = Daemon(args.config, args.state_dir)
+    try:
+        daemon = Daemon(args.config, args.state_dir)
+    except RunnerUnavailableError as e:
+        common.log(f"buildqd: {e}", level=3)
+        os.close(lock_fd)
+        sys.exit(f"buildqd: {e}")
     holder["daemon"] = daemon
     await asyncio.sleep(0.5)
     daemon.machine.sample(time.monotonic())  # a first CPU reading before the first decision
@@ -1670,14 +1765,14 @@ async def serve(args) -> None:
     daemon.load_tickets(now)
     daemon.prune(now)
     daemon.scan_flock_slots(now)
-    sock, owned = listening_socket(args.socket)
+    sock, owned = listening_socket(args.socket, args.state_dir)
     pid_file = os.path.expanduser(args.pid_file) if getattr(args, "pid_file", None) else None
+    my_ident = machine.proc_identity(os.getpid())
+    my_start = my_ident[0] if my_ident else None
+    my_boot = machine.boot_id()
     if pid_file:
-        os.makedirs(os.path.dirname(pid_file) or ".", mode=0o700, exist_ok=True)
-        tmp_pid = f"{pid_file}.tmp.{os.getpid()}"
-        with open(tmp_pid, "w") as f:
-            f.write(f"{os.getpid()}\n")
-        os.replace(tmp_pid, pid_file)
+        rec = json.dumps({"pid": os.getpid(), "start": my_start, "boot_id": my_boot, "socket": args.socket}) + "\n"
+        common.write_private_file_atomic(pid_file, rec)
     # Python 3.13+ removes a Unix server's socket file when the server closes. A socket systemd
     # passed us belongs to systemd and must outlive this process; ours we remove ourselves.
     keep = {"cleanup_socket": False} if sys.version_info >= (3, 13) else {}
@@ -1686,28 +1781,34 @@ async def serve(args) -> None:
     m = daemon.machine
     common.log(f"buildqd {VERSION} on {args.socket}: {m.ncpu} cores, {common.fmt_size(m.mem_total)} memory, "
         f"{daemon.runner.name} runner; configuration {json.dumps(daemon.cfg.summary())}")
-    await stop.wait()
-    daemon.stopping = True  # from here on nothing new starts
-    daemon.thaw_all(time.time())
-    daemon.save_queued(time.time())
-    daemon.guard_slice(stopping=True)
-    ticker.cancel()
-    daemon.stop_memory_watch()
-    daemon.queries.shutdown(wait=False, cancel_futures=True)
-    server.close()
-    if owned:
-        try:
-            os.unlink(args.socket)
-        except OSError:
-            pass
-    if pid_file:
-        try:
-            with open(pid_file) as f:
-                if f.read().strip() == str(os.getpid()):
+    try:
+        await stop.wait()
+        daemon.stopping = True  # from here on nothing new starts
+        daemon.thaw_all(time.time())
+        daemon.save_queued(time.time())
+        daemon.guard_slice(stopping=True)
+        ticker.cancel()
+        daemon.stop_memory_watch()
+        daemon.queries.shutdown(wait=False, cancel_futures=True)
+        server.close()
+        if owned:
+            try:
+                os.unlink(args.socket)
+            except OSError:
+                pass
+        if pid_file:
+            try:
+                cur = common.read_json(pid_file)
+                if isinstance(cur, dict) and cur.get("pid") == os.getpid() and cur.get("start") == my_start:
                     os.unlink(pid_file)
+            except OSError:
+                pass
+        common.log(f"stopping; {len(daemon.active())} running build(s) carry on, and the next daemon picks them up")
+    finally:
+        try:
+            os.close(lock_fd)
         except OSError:
             pass
-    common.log(f"stopping; {len(daemon.active())} running build(s) carry on, and the next daemon picks them up")
 
 
 def main(argv=None) -> None:
@@ -1726,8 +1827,8 @@ def main(argv=None) -> None:
     os.umask(0o077)  # tickets, logs, history and the socket are private to this user
     if args.supervise:
         sys.exit(supervisor.supervise(args.supervise))
-    if args.log_file:
-        common.configure_log_file(args.log_file)
+    if args.log_file and not args.check_config:
+        common.configure_log_file(args.log_file, dup_stderr=True)
     try:
         sys.stdout.reconfigure(errors="backslashreplace")
     except (AttributeError, ValueError):
@@ -1742,7 +1843,9 @@ def main(argv=None) -> None:
                 if problem:
                     sys.exit(f"systemd refuses lanes.{lane.name}.properties: {problem}")
         else:
-            if wanted == "cgroup" and not CgroupRunner.discover(cfg.cgroup_root):
+            # Read-only validation (no cgroup writes, no migration-ancestry check so `install.sh`
+            # run from an interactive shell can validate `runner = "cgroup"` cleanly).
+            if wanted == "cgroup" and not CgroupRunner.discover(cfg.cgroup_root, read_only=True, check_migration=False):
                 sys.exit("cgroup runner needs a writable cgroup v2 directory with cpu and memory controllers "
                          "(set cgroup_root, run init/cgroup-setup.sh, or use runner = \"auto\")")
             for lane in cfg.lanes.values():

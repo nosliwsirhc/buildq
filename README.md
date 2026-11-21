@@ -49,8 +49,8 @@ Every build runs under a supervisor so it can be capped, paused, measured and cl
 By default (`runner = "auto"`), buildq picks the strongest isolation available on your Linux host:
 1. **`systemd`**: each build runs as a transient systemd user service inside `buildq.slice`.
 2. **`cgroup`**: pure Linux cgroup v2 without systemd, using a delegated subtree (e.g. via
-   [`init/cgroup-setup.sh`](init/cgroup-setup.sh)) with full kernel `memory.high`/`memory.max`,
-   `cpu.weight`/`io.weight`/`pids.max`, `cgroup.freeze`, `cgroup.kill` and `slice_guard` parity.
+   [`init/cgroup-setup.sh`](init/cgroup-setup.sh)) with kernel `memory.high`/`memory.max`,
+   `cpu.weight`/`io.weight`/`pids.max`/`cpu.max`, `cgroup.freeze`, `cgroup.kill` and `slice_guard`.
 3. **`direct`**: works on any Linux box, WSL2, or container with zero systemd and zero cgroup
    delegation — measuring each build's process tree via `/proc` (`smaps_rollup` PSS and
    `PR_SET_CHILD_SUBREAPER`), pausing via `SIGSTOP`/`SIGCONT`, enforcing `MemoryMax` via a 1 s
@@ -79,8 +79,9 @@ a build arrives or ends.
 
 ## Quick start
 
-You need Linux and Python 3.11 or newer — works with systemd **or** without it (Alpine/OpenRC,
-Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2, Docker/Podman containers).
+You need Linux, `bash` (for `install.sh`; e.g. `apk add bash` on minimal Alpine), and Python 3.11
+or newer — works with systemd **or** without it (Alpine/OpenRC, Void/runit, Gentoo, Artix/s6/dinit,
+Devuan/SysVinit, WSL2, Docker/Podman containers).
 
 ```sh
 git clone https://github.com/nosliwsirhc/buildq.git
@@ -173,7 +174,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | --- | --- |
 | **One machine and one user** | The socket is private to the user who runs the daemon. Several users each need their own daemon, and those daemons don't coordinate, though each sees the others' load in the machine-wide numbers. |
 | **The user is the trust boundary** | Every process of that user can submit, list, watch and cancel every build, and pause or resume the queue, CI jobs under the same user included, and can read a build's environment while it is queued or running. Where a CI runner runs code you don't trust, run it as a separate user (with its own daemon) rather than through this one. [Design, Security](docs/design.md#security) |
-| **Estimates, not guarantees** | A command that suddenly needs far more than before is planned by its history. Per-build `MemoryMax` and the slice backstop are what keep that from hurting the machine. |
+| **Estimates, not guarantees** | A command that suddenly needs far more than before is planned by its history. Per-build `MemoryMax` (plus the aggregate builds memory ceiling under `systemd` and `cgroup`) is what keeps that from hurting the machine. |
 | **Sampling** | Memory is sampled once a second from the build's cgroup (under `systemd`/`cgroup`: anonymous, shared and unreclaimable kernel memory, leaving out page cache) or its `/proc` process tree (under `direct`: `smaps_rollup` anonymous + shared PSS). A spike shorter than a second can be missed. |
 | **Work outside the build's cgroup** | Anything a build hands to a daemon runs in that daemon's cgroup: a test database in Docker, and above all `docker build`, whose compile runs in dockerd. It counts as machine load but not in the build's history, so give such commands a lane whose `min_mem` is what they really need, and route them there with a lane rule. (That is why the shims leave `docker` alone.) |
 | **Fair shares count builds, not their size** | A caller with one 16-core build running goes before one with two 1-core builds. Priorities still come first. |

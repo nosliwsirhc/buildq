@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import pwd
 import re
@@ -92,8 +93,11 @@ def translate_cgroup_properties(lane: Lane, mem_total: int) -> tuple[dict[str, s
                       "MemorySwapMax": "memory.swap.max"}[key]
             files[target] = "max" if val.lower() in ("infinity", "max") else str(common.parse_size(val, mem_total))
         elif key == "CPUWeight":
-            w = common.number(int(val), f"lanes.{lane.name}.properties.CPUWeight", 1, 10000, integer=True)
-            files["cpu.weight"] = str(w)
+            if val.lower() == "idle":
+                files["cpu.weight"] = "1"
+            else:
+                w = common.number(int(val), f"lanes.{lane.name}.properties.CPUWeight", 1, 10000, integer=True)
+                files["cpu.weight"] = str(w)
         elif key == "IOWeight":
             w = common.number(int(val), f"lanes.{lane.name}.properties.IOWeight", 1, 10000, integer=True)
             files["io.weight"] = f"default {w}"
@@ -123,7 +127,7 @@ def translate_cgroup_properties(lane: Lane, mem_total: int) -> tuple[dict[str, s
 
 
 def lane_nice(lane: Lane) -> int | None:
-    """Optional positive nice value for non-cgroup runners from Nice or CPUWeight < 100."""
+    """Optional positive nice value for non-cgroup runners from Nice or CPUWeight < 100 / idle."""
     if "Nice" in lane.properties:
         try:
             n = int(str(lane.properties["Nice"]).strip())
@@ -131,8 +135,11 @@ def lane_nice(lane: Lane) -> int | None:
         except ValueError:
             return None
     if "CPUWeight" in lane.properties:
+        raw = str(lane.properties["CPUWeight"]).strip()
+        if raw.lower() == "idle":
+            return 19
         try:
-            w = int(str(lane.properties["CPUWeight"]).strip())
+            w = int(raw)
             if 1 <= w < 100:
                 # Map weight 1..99 onto nice 1..19 smoothly (lower weight -> nicer).
                 return max(1, min(19, round((100 - w) / 99 * 19)))
@@ -311,14 +318,58 @@ class CgroupRunner:
     has_cgroup = True
     enforces_mem_cap = True
 
-    def __init__(self, root: str | None = None, mem_total: int = 0):
+    def __init__(self, root: str | None = None, mem_total: int = 0, state_dir: str | None = None):
         self.root = root or ""
         self.builds_dir = os.path.join(self.root, "builds") if self.root else ""
         self.mem_total = mem_total
+        self.state_dir = state_dir
         self.initial_memory_max: str | None = None
         self._ready = False
         if self.root:
             self._prepare_root()
+
+    def _baseline_path(self) -> str | None:
+        return os.path.join(self.state_dir, "cgroup-slice-baseline.json") if self.state_dir else None
+
+    def _load_or_init_baseline(self) -> str:
+        """Read `<builds>/memory.max` while preserving the original ceiling across daemon crashes
+        (SIGKILL / OOM while `slice_guard` held a lowered value)."""
+        live = machine.cgroup_memory_max(self.builds_dir) or "max"
+        bpath = self._baseline_path()
+        bid = machine.boot_id() or ""
+        if bpath:
+            rec = common.read_json(bpath)
+            if isinstance(rec, dict) and rec.get("builds_dir") == self.builds_dir and rec.get("boot_id") == bid:
+                saved_base = rec.get("baseline")
+                last_written = rec.get("last_written")
+                if isinstance(saved_base, str) and (saved_base == "max" or saved_base.isdigit()):
+                    # If live still equals what our previous daemon wrote via slice_guard, the
+                    # previous daemon died before restoring: keep the original baseline!
+                    if last_written is not None and str(last_written) == live:
+                        return saved_base
+            try:
+                common.write_private_file_atomic(
+                    bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
+                                       "baseline": live, "last_written": None})
+                )
+            except OSError:
+                pass
+        return live
+
+    def note_slice_guard_write(self, value: str, *, stopping: bool = False) -> None:
+        """Record the value written by `slice_guard` so a crash doesn't ratify a lowered cap."""
+        bpath = self._baseline_path()
+        if not bpath or not self.builds_dir:
+            return
+        bid = machine.boot_id() or ""
+        base = self.initial_memory_max or "max"
+        try:
+            common.write_private_file_atomic(
+                bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
+                                   "baseline": base, "last_written": None if stopping else str(value)})
+            )
+        except OSError:
+            pass
 
     @staticmethod
     def _enable_controllers(path: str) -> set[str]:
@@ -332,6 +383,37 @@ class CgroupRunner:
             except OSError:
                 continue
         return machine.cgroup_subtree_controllers(path)
+
+    @classmethod
+    def validate_root(cls, root: str, *, check_migration: bool = True) -> bool:
+        """Pure read-only validation of a candidate cgroup v2 root (safe for `--check-config`)."""
+        if not root or not machine.is_cgroup_v2():
+            return False
+        real = os.path.realpath(root)
+        if not (real == "/sys/fs/cgroup" or real.startswith("/sys/fs/cgroup/")):
+            return False
+        if not os.path.isdir(real) or not os.access(real, os.W_OK | os.X_OK):
+            return False
+        builds = os.path.join(real, "builds")
+        if os.path.isdir(builds):
+            if not os.access(builds, os.W_OK | os.X_OK):
+                return False
+            avail = machine.cgroup_controllers(builds) | machine.cgroup_subtree_controllers(builds)
+            if not ({"memory", "cpu"} <= avail):
+                return False
+        else:
+            avail = machine.cgroup_controllers(real) | machine.cgroup_subtree_controllers(real)
+            if not ({"memory", "cpu"} <= avail):
+                return False
+        if check_migration and os.geteuid() != 0:
+            own = machine.proc_cgroup(os.getpid())
+            if not own:
+                return False
+            target = os.path.realpath(builds) if os.path.isdir(builds) else real
+            common_anc = os.path.commonpath([os.path.realpath(own), target])
+            if not os.access(os.path.join(common_anc, "cgroup.procs"), os.W_OK):
+                return False
+        return True
 
     @classmethod
     def _probe_root(cls, root: str, *, allow_move_self: bool = False) -> bool:
@@ -401,22 +483,30 @@ class CgroupRunner:
         return ok
 
     @classmethod
-    def discover(cls, configured_root: str = "") -> str | None:
-        """Find a usable delegated cgroup v2 root, or None if unavailable."""
+    def discover(cls, configured_root: str = "", *, read_only: bool = False,
+                 check_migration: bool = True) -> str | None:
+        """Find a usable delegated cgroup v2 root, or None if unavailable.
+
+        When an explicit root (`BUILDQ_CGROUP_ROOT` or `configured_root`) is given, only that root
+        is checked — never silently falling through to another cgroup subtree.
+        """
         if not machine.is_cgroup_v2():
             return None
+        explicit = os.environ.get("BUILDQ_CGROUP_ROOT", "").strip() or configured_root.strip()
+        if explicit:
+            norm = os.path.normpath(explicit)
+            ok = (cls.validate_root(norm, check_migration=check_migration) if read_only
+                  else cls._probe_root(norm, allow_move_self=True))
+            return os.path.realpath(norm) if ok else None
         candidates: list[tuple[str, bool]] = []
-        env_root = os.environ.get("BUILDQ_CGROUP_ROOT", "").strip()
-        if env_root:
-            candidates.append((env_root, True))
-        if configured_root:
-            candidates.append((configured_root, True))
         try:
             user = pwd.getpwuid(UID).pw_name
         except KeyError:
             user = ""
         if user:
+            candidates.append((f"/sys/fs/cgroup/buildq-{user}/user", True))
             candidates.append((f"/sys/fs/cgroup/buildq-{user}", True))
+        candidates.append((f"/sys/fs/cgroup/buildq-uid-{UID}/user", True))
         candidates.append((f"/sys/fs/cgroup/buildq-uid-{UID}", True))
         own = machine.proc_cgroup(os.getpid())
         if own and own != "/sys/fs/cgroup":
@@ -425,13 +515,18 @@ class CgroupRunner:
                 candidates.append((parent, False))
             candidates.append((os.path.join(own, "buildq"), False))
             candidates.append((own, False))
+        elif own == "/sys/fs/cgroup" and os.geteuid() == 0:
+            # Private container cgroup namespace running as root (PID 1 / rootless containerns).
+            candidates.append(("/sys/fs/cgroup", False))
         seen: set[str] = set()
         for cand, allow_move in candidates:
             norm = os.path.normpath(cand)
             if norm in seen:
                 continue
             seen.add(norm)
-            if cls._probe_root(norm, allow_move_self=allow_move):
+            ok = (cls.validate_root(norm, check_migration=check_migration) if read_only
+                  else cls._probe_root(norm, allow_move_self=allow_move))
+            if ok:
                 return os.path.realpath(norm)
         return None
 
@@ -440,19 +535,27 @@ class CgroupRunner:
         if self._ready:
             self.root = os.path.realpath(self.root)
             self.builds_dir = os.path.join(self.root, "builds")
-            self.initial_memory_max = machine.cgroup_memory_max(self.builds_dir) or "max"
-            # Remove any stale empty build directories left behind by an earlier crash.
-            try:
-                for name in os.listdir(self.builds_dir):
-                    if name.startswith("buildq-"):
-                        path = os.path.join(self.builds_dir, name)
-                        if os.path.isdir(path) and not machine.cgroup_populated(path):
-                            try:
-                                os.rmdir(path)
-                            except OSError:
-                                pass
-            except OSError:
-                pass
+            self.initial_memory_max = self._load_or_init_baseline()
+
+    def prune_stale(self, active_cgs: set[str]) -> None:
+        """Remove empty stale build directories left by earlier crashes, AFTER ticket recovery so
+        neither terminal OOM counters nor pre-join active build cgroups are deleted prematurely."""
+        if not self._ready or not self.builds_dir:
+            return
+        keep = {os.path.realpath(p) for p in active_cgs if p}
+        try:
+            for name in os.listdir(self.builds_dir):
+                if name.startswith("buildq-"):
+                    path = os.path.join(self.builds_dir, name)
+                    if os.path.realpath(path) in keep:
+                        continue
+                    if os.path.isdir(path) and not machine.cgroup_populated(path):
+                        try:
+                            os.rmdir(path)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
 
     def builds_cgroup(self, slice_name: str) -> str | None:
         return self.builds_dir if self._ready else None
@@ -471,28 +574,37 @@ class CgroupRunner:
         if machine.proc_alive(sup.get("pid"), sup.get("start")):
             ticket.pid, ticket.pid_start = sup["pid"], sup["start"]
             return "pending"
+        if machine.proc_alive(ticket.pid, ticket.pid_start):
+            return "pending"
         return "gone"
 
     def launch(self, ticket, lane: Lane, slice_name: str):
         self.prepare(ticket, slice_name)
         os.makedirs(ticket.cg, exist_ok=True)
-        # Keep OOM kills per-process (like systemd OOMPolicy=continue) so the supervisor survives to
-        # write result.json with memory.events.local counters.
         try:
-            with open(os.path.join(ticket.cg, "memory.oom.group"), "w") as f:
-                f.write("0\n")
-        except OSError:
-            pass
-        files, hints = translate_cgroup_properties(lane, self.mem_total or 1)
-        for fname, val in files.items():
-            target = os.path.join(ticket.cg, fname)
-            if not os.path.exists(target):
-                continue
-            try:
+            # Keep OOM kills per-process (like systemd OOMPolicy=continue) so the supervisor survives
+            # to write result.json with memory.events.local counters.
+            oom_group = os.path.join(ticket.cg, "memory.oom.group")
+            if os.path.exists(oom_group):
+                try:
+                    with open(oom_group, "w") as f:
+                        f.write("0\n")
+                except OSError:
+                    pass
+            # Fail closed: every configured lane control MUST exist and apply cleanly before launch.
+            files, hints = translate_cgroup_properties(lane, self.mem_total or 1)
+            for fname, val in files.items():
+                target = os.path.join(ticket.cg, fname)
+                if not os.path.exists(target):
+                    raise OSError(f"cgroup control {fname} is unavailable in {ticket.cg}")
                 with open(target, "w") as f:
                     f.write(f"{val}\n")
-            except OSError as e:
-                common.log(f"{ticket.id}: can't write {fname}={val} in {ticket.cg}: {e}")
+        except Exception as e:
+            try:
+                os.rmdir(ticket.cg)
+            except OSError:
+                pass
+            raise OSError(f"couldn't apply cgroup limits in {ticket.cg}: {e}") from e
         if "nice" in hints:
             ticket.nice = hints["nice"]
         cmd = common.daemon_command()
@@ -541,29 +653,44 @@ class CgroupRunner:
                 machine.parent_freeze_set(ticket.cg))
 
     def stop(self, ticket, force: bool = False):
-        if force and ticket.cg:
-            try:
-                with open(os.path.join(ticket.cg, "cgroup.kill"), "w") as f:
-                    f.write("1")
-                return None
-            except OSError:
-                pass
-            # Fallback for Linux < 5.14 without cgroup.kill: kill every PID in cgroup.procs.
-            for _ in range(3):
-                pids = machine.cgroup_pids(ticket.cg)
-                if not pids:
-                    break
-                for pid in pids:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except OSError:
-                        pass
+        if force:
+            # Handle the pre-migration window: if the supervisor hasn't joined ticket.cg yet,
+            # kill it directly via verified pidfd before/alongside cgroup teardown.
+            if ticket.pid and machine.proc_alive(ticket.pid, ticket.pid_start):
+                sup_cg = machine.proc_cgroup(ticket.pid)
+                if not ticket.cg or not sup_cg or os.path.realpath(sup_cg) != os.path.realpath(ticket.cg):
+                    machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGKILL)
+            if ticket.cg:
+                kill_file = os.path.join(ticket.cg, "cgroup.kill")
+                used_cg_kill = False
+                if os.path.exists(kill_file):
+                    for _ in range(3):
+                        try:
+                            with open(kill_file, "w") as f:
+                                f.write("1")
+                            used_cg_kill = True
+                        except OSError:
+                            break
+                        if not machine.cgroup_populated(ticket.cg):
+                            break
+                        time.sleep(0.02)
+                if not used_cg_kill:
+                    # Legacy Linux < 5.14 fallback: recursively kill all PIDs across ticket.cg and
+                    # any nested sub-cgroups using verified process identities.
+                    for _ in range(5):
+                        pids = machine.cgroup_all_pids(ticket.cg)
+                        if not pids:
+                            break
+                        for pid in pids:
+                            st = machine.proc_stat(pid)
+                            if st is not None:
+                                machine.pidfd_signal(pid, st[0], signal.SIGKILL)
+                        if not machine.cgroup_populated(ticket.cg):
+                            break
+                        time.sleep(0.02)
             return None
         if machine.proc_alive(ticket.pid, ticket.pid_start):
-            try:
-                os.kill(ticket.pid, signal.SIGTERM)
-            except OSError:
-                pass
+            machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGTERM)
         return None
 
     @staticmethod
@@ -632,94 +759,90 @@ class DirectRunner:
         return bool(machine.tagged_processes(ticket.id))  # the supervisor is gone; is anything of the build left?
 
     def freeze(self, ticket, frozen: bool):
-        """Pause or resume the build's process tree via SIGSTOP/SIGCONT.
+        """Pause or resume the build's process tree via pidfd-verified SIGSTOP/SIGCONT.
 
-        On freeze: stop descendant process groups and PIDs first (re-checking briefly so children
-        forked mid-stop are caught), then stop the supervisor so its timeout clock pauses too.
-        On thaw: resume the supervisor first, then every descendant process group and PID."""
+        On freeze: stop every descendant (verified by pid+start_time) first, repeating briefly to
+        catch forks, recording all stopped identities on the ticket, then stop the supervisor.
+        On thaw: resume the supervisor and every tracked stopped identity plus any current tree
+        descendants."""
+        tracked = getattr(ticket, "_frozen_procs", None)
+        if not isinstance(tracked, dict):
+            tracked = {}
+            ticket._frozen_procs = tracked
         if frozen:
             for _ in range(3):
                 info = machine.proc_tree_info(ticket.pid, ticket.pid_start, ticket.id)
-                for pgid in info["pgids"]:
-                    try:
-                        os.killpg(pgid, signal.SIGSTOP)
-                    except OSError:
-                        pass
-                for pid in info["descendants"]:
-                    try:
-                        os.kill(pid, signal.SIGSTOP)
-                    except OSError:
-                        pass
-                if not info["descendants"]:
+                idents = info["descendant_idents"]
+                new_seen = False
+                for pid, start in idents.items():
+                    if tracked.get(pid) != start:
+                        new_seen = True
+                    if machine.pidfd_signal(pid, start, signal.SIGSTOP):
+                        tracked[pid] = start
+                if not idents or not new_seen:
                     break
                 time.sleep(0.01)
             if machine.proc_alive(ticket.pid, ticket.pid_start):
-                try:
-                    os.kill(ticket.pid, signal.SIGSTOP)
-                except OSError:
-                    pass
+                machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGSTOP)
         else:
             if machine.proc_alive(ticket.pid, ticket.pid_start):
-                try:
-                    os.kill(ticket.pid, signal.SIGCONT)
-                except OSError:
-                    pass
+                machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGCONT)
             info = machine.proc_tree_info(ticket.pid, ticket.pid_start, ticket.id)
-            for pgid in info["pgids"]:
-                try:
-                    os.killpg(pgid, signal.SIGCONT)
-                except OSError:
-                    pass
-            for pid in info["descendants"]:
-                try:
-                    os.kill(pid, signal.SIGCONT)
-                except OSError:
-                    pass
+            targets = dict(tracked)
+            targets.update(info["descendant_idents"])
+            for pid, start in targets.items():
+                machine.pidfd_signal(pid, start, signal.SIGCONT)
         return None
 
     def freeze_state(self, ticket) -> tuple[bool | None, bool | None, bool]:
-        if hasattr(ticket, "_own_stopped") and ticket._own_stopped is not None:
-            return ticket._own_stopped, ticket._all_stopped, False
         info = machine.proc_tree_info(ticket.pid, ticket.pid_start, ticket.id)
-        return info["own_stopped"], info["all_stopped"], False
+        own = info["own_stopped"]
+        took = info["all_stopped"]
+        if own is None:
+            return None, None, False
+        # Verify every surviving process that buildq stopped has actually resumed before reporting
+        # thaw complete (own=False). Clean out exited tracked identities.
+        tracked = getattr(ticket, "_frozen_procs", None)
+        if isinstance(tracked, dict) and tracked:
+            any_tracked_stopped = False
+            for pid, start in list(tracked.items()):
+                st = machine.proc_stat(pid)
+                if st is None or st[0] != start or st[1] in ("Z", "X"):
+                    tracked.pop(pid, None)
+                elif st[1] in ("T", "t"):
+                    any_tracked_stopped = True
+            if not own and any_tracked_stopped:
+                return True, False, False
+            if not own and not any_tracked_stopped:
+                tracked.clear()
+        return own, took, False
 
     def stop(self, ticket, force: bool = False):
         if force:
-            # Capture the full process tree BEFORE killing the supervisor so children that cleared
-            # BUILDQ_JOB (e.g. `env -i`) are still terminated cleanly.
-            info = machine.proc_tree_info(ticket.pid, ticket.pid_start, ticket.id)
-            for pgid in info["pgids"]:
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except OSError:
-                    pass
-            for pid in info["descendants"]:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+            # Keep the subreaper supervisor alive while killing descendants in a converging loop
+            # so a concurrent fork cannot reparent to PID 1 before we kill the supervisor.
+            for _ in range(5):
+                info = machine.proc_tree_info(ticket.pid, ticket.pid_start, ticket.id)
+                idents = info["descendant_idents"]
+                if not idents:
+                    break
+                for pid, start in idents.items():
+                    machine.pidfd_signal(pid, start, signal.SIGKILL)
+                time.sleep(0.01)
             if machine.proc_alive(ticket.pid, ticket.pid_start):
-                try:
-                    os.kill(ticket.pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGKILL)
             for pid in machine.tagged_processes(ticket.id):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                st = machine.proc_stat(pid)
+                if st is not None:
+                    machine.pidfd_signal(pid, st[0], signal.SIGKILL)
             return None
         if machine.proc_alive(ticket.pid, ticket.pid_start):
-            try:
-                os.kill(ticket.pid, signal.SIGTERM)
-            except OSError:
-                pass
+            machine.pidfd_signal(ticket.pid, ticket.pid_start, signal.SIGTERM)
         else:
             for pid in machine.tagged_processes(ticket.id):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                st = machine.proc_stat(pid)
+                if st is not None:
+                    machine.pidfd_signal(pid, st[0], signal.SIGKILL)
         return None
 
     @staticmethod

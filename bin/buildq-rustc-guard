@@ -36,9 +36,11 @@ shift
 pass() { exec "$rustc" "$@"; }
 
 # Inside a buildq build: the common case, so it is checked first and costs one read.
+# Matches systemd (`.../buildq.slice/buildq-<hex>*.service`) and direct cgroup v2
+# (`.../builds/buildq-<hex>*`) build cgroups specifically, never an unrelated user/daemon cgroup.
 cgroup=$(cat /proc/self/cgroup 2>/dev/null)
 case $cgroup in
-  */buildq.slice/*|*/buildq-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) pass "$@" ;;
+  */buildq.slice/*|*/builds/buildq-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*) pass "$@" ;;
 esac
 
 # Not a compile: version and target queries.
@@ -81,14 +83,35 @@ if [ -n "$slice" ]; then
   esac
 fi
 
-# A build of the direct (or cgroup) runner: its ticket says it is running.
+# A build of the direct runner (no build cgroup): verify that BUILDQ_JOB names a live direct
+# ticket AND that this process actually descends from that ticket's recorded supervisor PID.
+# (cgroup and systemd builds must match /proc/self/cgroup above and cannot be spoofed by env.)
 if [ -n "${BUILDQ_JOB:-}" ]; then
   state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
   case $BUILDQ_JOB in
     */*|.*) ;;
     *) ticket=$state_dir/tickets/$BUILDQ_JOB/ticket.json
-       if grep -Eq '"state":"(starting|running)"' "$ticket" 2>/dev/null && grep -Eq '"runner":"(direct|cgroup)"' "$ticket" 2>/dev/null; then
-         pass "$@"
+       sup_json=$state_dir/tickets/$BUILDQ_JOB/supervisor.json
+       if grep -Eq '"state"[[:space:]]*:[[:space:]]*"(starting|running)"' "$ticket" 2>/dev/null \
+          && grep -Eq '"runner"[[:space:]]*:[[:space:]]*"direct"' "$ticket" 2>/dev/null; then
+         sup_pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$sup_json" "$ticket" 2>/dev/null | head -n 1)
+         sup_start=$(sed -n 's/.*"start"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$sup_json" 2>/dev/null | head -n 1)
+         if [ -n "$sup_pid" ] && [ "$sup_pid" -gt 1 ] 2>/dev/null; then
+           walk=$PPID
+           wdepth=0
+           while [ "${walk:-0}" -gt 1 ] 2>/dev/null && [ "$wdepth" -lt 64 ]; do
+             if [ "$walk" -eq "$sup_pid" ] 2>/dev/null; then
+               if [ -z "$sup_start" ]; then
+                 pass "$@"
+               fi
+               act_start=$(awk '{s = s (NR > 1 ? " " : "") $0} END {if (sub(/.*\) /, "", s)) {split(s, f); print f[20]}}' "/proc/$walk/stat" 2>/dev/null)
+               [ "$act_start" = "$sup_start" ] && pass "$@"
+               break
+             fi
+             walk=$(awk '{s = s (NR > 1 ? " " : "") $0} END {if (sub(/.*\) /, "", s)) {split(s, f); print f[2]}}' "/proc/$walk/stat" 2>/dev/null)
+             wdepth=$((wdepth + 1))
+           done
+         fi
        fi ;;
   esac
 fi

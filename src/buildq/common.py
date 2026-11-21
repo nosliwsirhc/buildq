@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import socket
 import stat
@@ -137,41 +138,114 @@ def module_pythonpath(existing: str | None = None, *, always: bool = False) -> s
 def runtime_dir(state_dir: str | None = None) -> str:
     """User-private directory for the daemon socket.
 
-    Prefers $XDG_RUNTIME_DIR, then /run/user/<uid> when it already exists and is owned/writable by
-    this user (systemd / elogind / pam_rundir), and otherwise falls back to <state_dir>/run (or
-    /tmp/buildq-<uid> if <state_dir>/run/buildq.sock would approach Linux's 108-byte AF_UNIX limit).
+    On systemd hosts, prefers $XDG_RUNTIME_DIR then /run/user/<uid> (matching buildq.socket).
+    On non-systemd hosts, always uses the session-independent <state_dir>/run (or /tmp/buildq-<uid>
+    if <state_dir>/run/buildq.sock would exceed Linux's 108-byte AF_UNIX limit) so boot-time init
+    services and interactive login shells (including elogind/pam_rundir sessions) always agree on
+    the same socket path and never lose it on logout.
     """
-    xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg:
-        return xdg
-    run_user = f"/run/user/{UID}"
-    try:
-        st = os.lstat(run_user)
-        if stat.S_ISDIR(st.st_mode) and st.st_uid == UID and os.access(run_user, os.W_OK | os.X_OK):
-            return run_user
-    except OSError:
-        pass
+    if has_systemd_user():
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg:
+            return xdg
+        run_user = f"/run/user/{UID}"
+        try:
+            st = os.lstat(run_user)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == UID and os.access(run_user, os.W_OK | os.X_OK):
+                return run_user
+        except OSError:
+            pass
     cand = os.path.join(os.path.expanduser(state_dir) if state_dir else default_state_dir(), "run")
     if len(os.path.join(cand, "buildq.sock").encode("utf-8", errors="surrogateescape")) <= 100:
         return cand
     return f"/tmp/buildq-{UID}"
 
 
+def fallback_runtime_dirs(state_dir: str | None = None) -> set[str]:
+    """Directories owned and managed by buildq itself when no systemd runtime dir is used."""
+    sdir = os.path.expanduser(state_dir) if state_dir else default_state_dir()
+    return {os.path.normpath(os.path.join(sdir, "run")), f"/tmp/buildq-{UID}"}
+
+
 def ensure_private_dir(path: str) -> None:
-    """Create `path` (0700) if missing and verify it is a real directory owned by UID (no symlinks)."""
+    """Create `path` (0700) if missing and verify it is a real directory owned by UID (no symlinks),
+    hardening its mode via an open directory descriptor."""
     if not path:
         return
     try:
-        st = os.lstat(path)
-    except FileNotFoundError:
         os.makedirs(path, mode=0o700, exist_ok=True)
-        st = os.lstat(path)
-    if not stat.S_ISDIR(st.st_mode):
-        raise PermissionError(f"{path} exists and is not a directory")
-    if st.st_uid != UID:
-        raise PermissionError(f"{path} belongs to uid {st.st_uid}, not {UID}")
-    if stat.S_IMODE(st.st_mode) & 0o077:
-        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        dfd = os.open(path, flags)
+    except OSError as e:
+        raise PermissionError(f"{path} is not an accessible private directory: {e}") from e
+    try:
+        st = os.fstat(dfd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise PermissionError(f"{path} exists and is not a directory")
+        if st.st_uid != UID:
+            raise PermissionError(f"{path} belongs to uid {st.st_uid}, not {UID}")
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            os.fchmod(dfd, 0o700)
+    finally:
+        os.close(dfd)
+
+
+def open_private_log(path: str) -> int:
+    """Open `path` for append without following symlinks, verifying it is a regular file owned by
+    UID and clamping permissions via fchmod."""
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise PermissionError(f"{path} is not a regular file")
+        if st.st_uid != UID:
+            raise PermissionError(f"{path} belongs to uid {st.st_uid}, not {UID}")
+        if stat.S_IMODE(st.st_mode) & 0o077:
+            os.fchmod(fd, 0o600)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def write_private_file_atomic(path: str, text: str) -> None:
+    """Atomically write a private 0600 regular file inside a validated directory without following
+    symlinks or using predictable temporary filenames."""
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    base = os.path.basename(path)
+    ensure_private_dir(parent)
+    dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    tmp_name = f".{base}.{os.getpid()}.{secrets.token_hex(6)}.tmp"
+    fd = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(tmp_name, flags, 0o600, dir_fd=dfd)
+        os.fchmod(fd, 0o600)
+        data = text.encode("utf-8")
+        while data:
+            data = data[os.write(fd, data):]
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_name, base, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(tmp_name, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(dfd)
 
 
 def default_socket(state_dir: str | None = None) -> str:
@@ -204,14 +278,25 @@ def has_systemd_user() -> bool:
 _log_lock = threading.Lock()
 _log_file: str | None = None
 _log_max_bytes: int = 4 << 20
+_log_dup_stderr: bool = False
 
 
-def configure_log_file(path: str | None, max_bytes: int = 4 << 20) -> None:
+def configure_log_file(path: str | None, max_bytes: int = 4 << 20, *, dup_stderr: bool = False) -> None:
     """Route `log()` to a timestamped rotating file (for non-systemd background daemons)."""
-    global _log_file, _log_max_bytes
+    global _log_file, _log_max_bytes, _log_dup_stderr
     with _log_lock:
         _log_file = os.path.expanduser(path) if path else None
         _log_max_bytes = max(64 << 10, int(max_bytes))
+        _log_dup_stderr = bool(dup_stderr and _log_file)
+        if _log_dup_stderr and _log_file:
+            try:
+                fd = open_private_log(_log_file)
+                try:
+                    os.dup2(fd, 2)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
 
 
 def to_journal() -> bool:
@@ -233,17 +318,32 @@ def log(message: str, level: int | None = None) -> None:
             stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             payload = "".join(f"{stamp} {line}\n" for line in message.split("\n"))
             try:
-                os.makedirs(os.path.dirname(_log_file) or ".", mode=0o700, exist_ok=True)
+                rotated = False
                 try:
-                    if os.path.getsize(_log_file) > _log_max_bytes:
-                        os.replace(_log_file, _log_file + ".1")
+                    st = os.lstat(_log_file)
+                    if stat.S_ISREG(st.st_mode) and st.st_uid == UID and st.st_size > _log_max_bytes:
+                        bak = _log_file + ".1"
+                        try:
+                            bst = os.lstat(bak)
+                            if stat.S_ISLNK(bst.st_mode) or bst.st_uid != UID:
+                                bak = ""
+                        except FileNotFoundError:
+                            pass
+                        if bak:
+                            os.replace(_log_file, bak)
+                            rotated = True
                 except OSError:
                     pass
-                fd = os.open(_log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                fd = open_private_log(_log_file)
                 try:
                     data = payload.encode(errors="backslashreplace")
                     while data:
                         data = data[os.write(fd, data):]
+                    if rotated and _log_dup_stderr:
+                        try:
+                            os.dup2(fd, 2)
+                        except OSError:
+                            pass
                 finally:
                     os.close(fd)
                 return

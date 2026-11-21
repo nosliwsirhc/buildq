@@ -224,6 +224,9 @@ class Metrics:
         self.extremes: dict[str, float] = {}
         self.builds_cgroup: str | None = ""
         self.builds_fallback: tuple[int, float] | None = None
+        self._fb_mem_sum = 0.0
+        self._fb_cpu_sum = 0.0
+        self._fb_weight = 0.0
 
     def trouble(self, message: str) -> None:
         """Log a problem with the analytics, at most once an hour."""
@@ -234,23 +237,33 @@ class Metrics:
 
     # ---- on the daemon's loop
 
+    def _current_fallback(self) -> tuple[int, float] | None:
+        if self._fb_weight > 0:
+            return (int(self._fb_mem_sum / self._fb_weight), self._fb_cpu_sum / self._fb_weight)
+        return self.builds_fallback
+
     def observe(self, now: float, values: dict, builds_cgroup: str | None,
                 builds_fallback: tuple[int, float] | None = None) -> None:
         """Add one tick's numbers to the minute; a new minute sends the last one to be written."""
         minute = int(now // 60) * 60
+        if self.minute is not None and minute != self.minute:
+            self.emit(self.builds_cgroup, self._current_fallback())
         self.builds_cgroup = builds_cgroup
         self.builds_fallback = builds_fallback
-        if self.minute is not None and minute != self.minute:
-            self.emit(builds_cgroup, builds_fallback)
         if minute != self.minute:
             self.minute, self.last, self.seconds = minute, None, 0.0
             self.sums.clear()
             self.extremes.clear()
+            self._fb_mem_sum = self._fb_cpu_sum = self._fb_weight = 0.0
         weight = 1.0 if self.last is None else min(max(now - self.last, 0.0), 5.0)
         self.last = now
         if weight <= 0:
             return
         self.seconds += weight
+        if builds_fallback is not None:
+            self._fb_mem_sum += float(builds_fallback[0]) * weight
+            self._fb_cpu_sum += float(builds_fallback[1]) * weight
+            self._fb_weight += weight
         for name, value in values.items():
             self.sums[name] += float(value) * weight
             if name in EXTREMES:
@@ -311,7 +324,7 @@ class Metrics:
 
     def stop(self, timeout: float = 2.0) -> None:
         if not self.stopping and self.minute is not None and self.seconds > 0:
-            self.emit(self.builds_cgroup, self.builds_fallback)  # the minute so far
+            self.emit(self.builds_cgroup, self._current_fallback())  # the minute so far
             self.minute = None
         with self.lock:
             self.stopping = True

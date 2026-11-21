@@ -26,7 +26,7 @@ for p in (TESTS_DIR, SRC):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from buildq import client, common, config, daemon, machine, runners, scheduler, top  # noqa: E402
+from buildq import client, common, config, daemon, machine, metrics, runners, scheduler, supervisor, ticket, top  # noqa: E402
 from buildq.common import GIB, MIB  # noqa: E402
 from helpers import BUILDQ, BUILDQD, DaemonCase, FakeMachine, FakeRunner  # noqa: E402
 
@@ -45,13 +45,22 @@ def read_text(path: str) -> str:
 
 
 class RuntimeDirAndLogs(unittest.TestCase):
-    def test_runtime_dir_prefers_xdg_then_run_user_then_state_dir(self):
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/custom/run"}, clear=False):
-            self.assertEqual(common.runtime_dir(), "/custom/run")
+    def test_runtime_dir_systemd_vs_non_systemd_elogind_consistency(self):
         state = "/var/tmp/bq-st"
+        # On systemd hosts: XDG_RUNTIME_DIR wins (matching buildq.socket).
+        with mock.patch.object(common, "has_systemd_user", return_value=True), \
+                mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/custom/run", "BUILDQ_STATE_DIR": state}, clear=False):
+            self.assertEqual(common.runtime_dir(), "/custom/run")
+        # On non-systemd hosts: ALWAYS session-independent <state_dir>/run even when elogind /
+        # pam_rundir sets XDG_RUNTIME_DIR in interactive login shells!
+        with mock.patch.object(common, "has_systemd_user", return_value=False), \
+                mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000", "BUILDQ_STATE_DIR": state}, clear=False):
+            self.assertEqual(common.runtime_dir(), os.path.join(state, "run"))
+        # Without XDG_RUNTIME_DIR or /run/user on systemd: falls back to <state_dir>/run.
         env = {k: v for k, v in os.environ.items() if k != "XDG_RUNTIME_DIR"}
         env["BUILDQ_STATE_DIR"] = state
-        with mock.patch.dict(os.environ, env, clear=True), \
+        with mock.patch.object(common, "has_systemd_user", return_value=True), \
+                mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(common.os, "lstat", side_effect=FileNotFoundError):
             self.assertEqual(common.runtime_dir(), os.path.join(state, "run"))
 
@@ -153,11 +162,14 @@ class ConfigAndProperties(unittest.TestCase):
             with self.assertRaises(ValueError, msg=prop):
                 runners.translate_cgroup_properties(cfg.lanes["a"], 64 * GIB)
 
-    def test_lane_nice_maps_low_cpu_weight_and_explicit_nice(self):
+    def test_lane_nice_maps_low_cpu_weight_idle_and_explicit_nice(self):
         low = self.make('default_lane = "a"\n[lanes.a]\nproperties = { CPUWeight = 10 }\n').lanes["a"]
+        idle = self.make('default_lane = "a"\n[lanes.a]\nproperties = { CPUWeight = "idle" }\n').lanes["a"]
         normal = self.make('default_lane = "a"\n[lanes.a]\nproperties = { CPUWeight = 100 }\n').lanes["a"]
         explicit = self.make('default_lane = "a"\n[lanes.a]\nproperties = { Nice = 7 }\n').lanes["a"]
         self.assertGreater(runners.lane_nice(low), 10)
+        self.assertEqual(runners.lane_nice(idle), 19)
+        self.assertEqual(runners.translate_cgroup_properties(idle, 64 * GIB)[0]["cpu.weight"], "1")
         self.assertIsNone(runners.lane_nice(normal))
         self.assertEqual(runners.lane_nice(explicit), 7)
 
@@ -189,7 +201,9 @@ class CgroupRunnerUnit(unittest.TestCase):
         r.root = self.root
         r.builds_dir = self.builds
         r.mem_total = 64 * GIB
-        r.initial_memory_max = str(16 * GIB)
+        r.state_dir = os.path.join(self.tmp.name, "state")
+        os.makedirs(r.state_dir, mode=0o700, exist_ok=True)
+        r.initial_memory_max = r._load_or_init_baseline()
         r._ready = True
         return r
 
@@ -248,8 +262,55 @@ class CgroupRunnerUnit(unittest.TestCase):
         d.guard_slice()
         # held (4G) + (avail 10G - floor/2 2G) = 12G (< initial 16G)
         self.assertEqual(read_text(os.path.join(self.builds, "memory.max")).strip(), str(12 * GIB))
+        # Simulate SIGKILL crash before stopping=True: a restarted CgroupRunner must recover the
+        # original 16G baseline, NOT ratify the temporary lowered 12G cap!
+        r2 = self._make_runner()
+        self.assertEqual(r2.initial_memory_max, str(16 * GIB))
         d.guard_slice(stopping=True)
         self.assertEqual(read_text(os.path.join(self.builds, "memory.max")).strip(), str(16 * GIB))
+
+    def test_cgroup_launch_fails_closed_when_control_file_missing(self):
+        r = self._make_runner()
+        lane = config.Config(
+            config.tomllib.loads('default_lane = "a"\n[lanes.a]\nproperties = { MemoryMax = "4G" }\n'),
+            64 * GIB, 16
+        ).lanes["a"]
+        t = types.SimpleNamespace(id="22222222-2222-2222-2222-222222222222", requeues=0, unit=None, cg=None,
+                                  dir=self.tmp.name, pid=None, pid_start=None, nice=None)
+        # builds/<unit> is a plain temp dir with no kernel memory.max file -> launch MUST fail closed
+        # and remove the unused cgroup directory rather than starting an uncapped build.
+        with self.assertRaises(OSError):
+            r.launch(t, lane, "buildq.slice")
+        self.assertFalse(os.path.exists(t.cg))
+
+    def test_discover_explicit_root_never_falls_through_and_validate_is_readonly(self):
+        with mock.patch.object(runners.machine, "is_cgroup_v2", return_value=True), \
+                mock.patch.object(runners.CgroupRunner, "_probe_root", side_effect=lambda p, **kw: p == "/sys/fs/cgroup/buildq-other"):
+            # Explicit bad root MUST return None, never fall through to buildq-other.
+            self.assertIsNone(runners.CgroupRunner.discover("/sys/fs/cgroup/nonexistent"))
+        # validate_root(..., check_migration=False) never writes and succeeds from outside subtree.
+        root = "/sys/fs/cgroup/buildq-alice/user"
+        with mock.patch.object(runners.machine, "is_cgroup_v2", return_value=True), \
+                mock.patch.object(runners.os.path, "realpath", side_effect=lambda p: p), \
+                mock.patch.object(runners.os.path, "isdir", return_value=True), \
+                mock.patch.object(runners.os, "access", return_value=True), \
+                mock.patch.object(runners.machine, "cgroup_controllers", return_value={"cpu", "memory"}), \
+                mock.patch.object(runners.machine, "cgroup_subtree_controllers", return_value={"cpu", "memory"}), \
+                mock.patch.object(runners.machine, "proc_cgroup", return_value="/sys/fs/cgroup"), \
+                mock.patch.object(runners.os, "geteuid", return_value=1000):
+            self.assertTrue(runners.CgroupRunner.validate_root(root, check_migration=False))
+            with mock.patch.object(runners.os, "access", side_effect=lambda p, m: not p.startswith("/sys/fs/cgroup/cgroup.procs")):
+                self.assertFalse(runners.CgroupRunner.validate_root(root, check_migration=True))
+
+    def test_prune_stale_preserves_active_cgroups_and_removes_idle_ones(self):
+        r = self._make_runner()
+        active_cg = os.path.join(self.builds, "buildq-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        stale_cg = os.path.join(self.builds, "buildq-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        os.makedirs(active_cg)
+        os.makedirs(stale_cg)
+        r.prune_stale({active_cg})
+        self.assertTrue(os.path.isdir(active_cg))
+        self.assertFalse(os.path.exists(stale_cg))
 
     def test_probe_root_enforces_cgroup_v2_common_ancestor_rule(self):
         root = "/sys/fs/cgroup/buildq-alice"
@@ -298,6 +359,10 @@ class FallbacksUnit(unittest.TestCase):
         with mock.patch.dict(os.environ, {**env, "TMUX_PANE": "%7"}, clear=True), \
                 mock.patch("builtins.open", mock.mock_open(read_data="0::/\n")):
             self.assertEqual(client.caller(), "tmux:%7")
+        # OpenRC shared login service cgroup (openrc.sshd) falls back so SSH sessions stay distinct.
+        with mock.patch.dict(os.environ, {**env, "TMUX_PANE": "%9"}, clear=True), \
+                mock.patch("builtins.open", mock.mock_open(read_data="0::/openrc.sshd\n")):
+            self.assertEqual(client.caller(), "tmux:%9")
 
     def test_biggest_processes_returns_sorted_entries(self):
         top_procs, complete = machine.biggest_processes(count=3, at_least=1)
@@ -306,32 +371,74 @@ class FallbacksUnit(unittest.TestCase):
         self.assertTrue(top_procs[0][2].startswith("pid "))
         self.assertGreater(top_procs[0][0] + top_procs[0][1], 0)
 
-    def test_pid_is_buildqd_rejects_unrelated_process(self):
+    def test_pid_is_buildqd_rejects_unrelated_and_spoofed_cmdline(self):
         self.assertFalse(machine.pid_is_buildqd(os.getpid()))
         self.assertFalse(machine.pid_is_buildqd(1))
         self.assertFalse(machine.pid_is_buildqd(-1))
+        self.assertFalse(machine._cmdline_is_buildqd(["grep", "buildqd"]))
+        self.assertFalse(machine._cmdline_is_buildqd(["python3", "-c", "print('buildq.daemon')"]))
+        self.assertFalse(machine._cmdline_is_buildqd(["python3", "/usr/bin/buildqd", "--supervise", "/tmp/x"]))
+        self.assertTrue(machine._cmdline_is_buildqd(["python3", "-B", "/home/u/.local/bin/buildqd", "--state-dir", "/x"]))
+        self.assertTrue(machine._cmdline_is_buildqd(["python3", "-m", "buildq.daemon"]))
 
     def test_default_socket_uses_explicit_state_dir(self):
         env = {k: v for k, v in os.environ.items() if k not in ("XDG_RUNTIME_DIR", "BUILDQ_SOCKET", "BUILDQ_STATE_DIR")}
-        with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(common.os, "lstat", side_effect=FileNotFoundError):
+        with mock.patch.object(common, "has_systemd_user", return_value=False), \
+                mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(common.default_socket("/var/tmp/bq-explicit"), "/var/tmp/bq-explicit/run/buildq.sock")
 
-    def test_make_supports_fifo_detects_gnu_make_4_3_vs_4_4(self):
-        scheduler._MAKE_FIFO_CACHE.clear()
+    def test_cap_killed_persists_across_ticket_reload(self):
+        t = ticket.Ticket("33333333-3333-3333-3333-333333333333", ["true"], "/", "default", "true", 1.0, None)
+        t.cap_killed = True
+        t2 = ticket.Ticket.from_record(t.record(), "/tmp/fake")
+        self.assertTrue(t2.cap_killed)
+
+    def test_inside_a_build_matches_custom_slice_and_cgroup_builds_and_rejects_spoof(self):
+        job = "12345678-1234-1234-1234-123456789abc"
+        env = {"BUILDQ_JOB": job, "BUILDQ_STATE_DIR": "/nonexistent-state"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            # Custom systemd slice
+            with mock.patch("builtins.open", mock.mock_open(read_data=f"0::/user.slice/custom.slice/buildq-{job}.service\n")):
+                self.assertTrue(client.inside_a_build())
+            # CgroupRunner builds dir
+            with mock.patch("builtins.open", mock.mock_open(read_data=f"0::/buildq-alice/user/builds/buildq-{job}\n")):
+                self.assertTrue(client.inside_a_build())
+            # Unrelated daemon cgroup with hex-like username must NOT match
+            with mock.patch("builtins.open", mock.mock_open(read_data=f"0::/buildq-{job}/daemon\n")):
+                self.assertFalse(client.inside_a_build())
+
+    def test_metrics_fallback_weighted_in_its_own_minute(self):
+        m = metrics.Metrics("/tmp/unused.db")
+        emitted = []
+        m.put = emitted.append
+        base = {"cpu_busy": 1.0, "cpu_target": 4.0, "mem_available": 1000, "mem_floor": 100, "growth": 0}
+        m.observe(60.0, base, None, builds_fallback=(1000, 1.0))
+        m.observe(65.0, base, None, builds_fallback=(2000, 3.0))
+        # Crossing into minute 120 must emit minute 60 using minute 60's fallback, NOT minute 120's!
+        m.observe(120.0, base, None, builds_fallback=(999999, 99.0))
+        self.assertEqual(len(emitted), 1)
+        fb_mem, fb_cpu = emitted[0]["_builds_fallback"]
+        self.assertLess(fb_mem, 3000)
+        self.assertLess(fb_cpu, 4.0)
+
+    def test_supervisor_downgrades_gnu_make_4_3_fifo_inside_confinement(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_make = os.path.join(tmp, "make")
             with open(fake_make, "w") as f:
-                f.write("#!/bin/sh\n")
+                f.write("#!/bin/sh\necho 'GNU Make 4.3'\n")
             os.chmod(fake_make, 0o755)
-            with mock.patch.object(scheduler.subprocess, "run",
-                                   return_value=types.SimpleNamespace(stdout="GNU Make 4.3\nBuilt for x86_64")):
-                self.assertFalse(scheduler._make_supports_fifo(fake_make, None))
-            scheduler._MAKE_FIFO_CACHE.clear()
-            with mock.patch.object(scheduler.subprocess, "run",
-                                   return_value=types.SimpleNamespace(stdout="GNU Make 4.4.1\nBuilt for x86_64")):
-                self.assertTrue(scheduler._make_supports_fifo(fake_make, None))
-        scheduler._MAKE_FIFO_CACHE.clear()
+            r_fd, w_fd = os.pipe()
+            try:
+                env = {"PATH": tmp, "BUILDQ_CORES": "3", "MAKEFLAGS": "-j8 --jobserver-auth=fifo:/tmp/js"}
+                out_fd = supervisor._downgrade_old_make_fifo(["make", "all"], tmp, env, w_fd)
+                self.assertIsNone(out_fd)
+                self.assertEqual(env["MAKEFLAGS"], "-j3")
+            finally:
+                os.close(r_fd)
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
 
 
 class DirectRunnerEndToEnd(unittest.TestCase):
@@ -517,6 +624,41 @@ properties = { MemoryMax = "48M" }
         while time.time() < deadline and machine.proc_stat(orphan_pid) is not None:
             time.sleep(0.05)
         self.assertIsNone(machine.proc_stat(orphan_pid), "env-cleared detached grandchild leaked")
+
+    def test_direct_runner_normal_exit_fast_and_kills_adopted_detached_grandchild(self):
+        # Regression for BOTH: (a) 10s zombie stall when background child exits on SIGTERM, and
+        # (b) adopted detached env-cleared grandchild surviving normal exit of the main command.
+        self.assertEqual(self.q("daemon", "start").returncode, 0)
+        pid_out = os.path.join(self.tmp.name, "detached.pid")
+        code = (
+            "import subprocess, sys\n"
+            "p1 = subprocess.Popen(['/bin/sleep', '60'])\n"
+            "p2 = subprocess.Popen(['/bin/sleep', '60'], env={}, start_new_session=True)\n"
+            "with open(sys.argv[1], 'w') as f: f.write(f'{p1.pid} {p2.pid}')\n"
+        )
+        t0 = time.monotonic()
+        res = self.q("run", "--", sys.executable, "-c", code, pid_out)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertLess(elapsed, 6.0, f"subreaper zombie wait stalled for {elapsed:.1f}s")
+        p1, p2 = (int(x) for x in read_text(pid_out).split())
+        self.assertIsNone(machine.proc_stat(p1), "background process-group child leaked")
+        self.assertIsNone(machine.proc_stat(p2), "adopted env-cleared detached grandchild leaked")
+
+    def test_daemon_single_instance_flock_and_logs_tail_zero(self):
+        self.assertEqual(self.q("daemon", "start").returncode, 0)
+        # Launching a second buildqd against the same state_dir MUST fail immediately on flock.
+        dup = subprocess.run(
+            [sys.executable, BUILDQD, "--socket", os.path.join(self.tmp.name, "other.sock"),
+             "--state-dir", self.state, "--config", self.cfg],
+            env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(dup.returncode, 0)
+        self.assertIn("buildqd.lock", dup.stderr)
+        # `--tail 0` must print zero lines, not the entire log.
+        zero = self.q("daemon", "logs", "--tail", "0")
+        self.assertEqual(zero.returncode, 0, zero.stderr)
+        self.assertEqual(zero.stdout, "")
 
 
 if __name__ == "__main__":

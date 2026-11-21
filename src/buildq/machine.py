@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import errno
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 
@@ -412,13 +414,13 @@ def proc_stat_full(pid: int):
         return None
 
 
-def proc_memory(pid: int) -> tuple[int, int]:
+def proc_memory(pid: int) -> tuple[int, int] | None:
     """(unreclaimable anon+shmem bytes, swap bytes) of one process.
 
     Reads /proc/<pid>/smaps_rollup (Pss_Anon + Pss_Shmem, SwapPss) so shared CoW pages aren't
     double-counted across forked workers and file-backed page cache is excluded (matching cgroup
     memory.stat). Falls back to /proc/<pid>/status (RssAnon + RssShmem, VmSwap) where smaps_rollup
-    isn't available."""
+    isn't available. Returns None if neither file could be read."""
     try:
         with open(f"/proc/{pid}/smaps_rollup") as f:
             vals: dict[str, int] = {}
@@ -447,9 +449,11 @@ def proc_memory(pid: int) -> tuple[int, int]:
                         vals[name] = int(parts[0]) * KIB
         if "RssAnon" in vals or "RssShmem" in vals:
             return vals.get("RssAnon", 0) + vals.get("RssShmem", 0), vals.get("VmSwap", 0)
-        return vals.get("VmRSS", 0), vals.get("VmSwap", 0)
-    except OSError:
+        if "VmRSS" in vals or "VmSwap" in vals:
+            return vals.get("VmRSS", 0), vals.get("VmSwap", 0)
         return 0, 0
+    except OSError:
+        return None
 
 
 def proc_io(pid: int) -> tuple[int, int] | None:
@@ -484,36 +488,64 @@ def _scan_own_stats():
 
 
 def _collect_tree(root_pid: int | None, root_start: int | None, job: str, stats: dict, children: dict,
-                  by_sid: dict) -> tuple[set[int], bool]:
-    """All PIDs in a build's process tree (rooted at supervisor `root_pid`, plus session members,
-    falling back to BUILDQ_JOB-tagged processes if the supervisor is gone). Returns `(pids, sup_alive)`."""
-    tree: set[int] = set()
+                  by_sid: dict) -> tuple[list[int], bool]:
+    """All PIDs in a build's process tree in BFS parent-before-child order (rooted at supervisor
+    `root_pid`, plus session members, falling back to BUILDQ_JOB-tagged processes if the supervisor
+    is gone). Returns `(ordered_pids, sup_alive)`."""
+    seen: set[int] = set()
+    ordered: list[int] = []
     sup_alive = False
     if root_pid and root_pid in stats and stats[root_pid][0] == root_start and stats[root_pid][1] not in ("Z", "X"):
         sup_alive = True
         queue_pids = collections.deque([root_pid])
-        tree.add(root_pid)
+        seen.add(root_pid)
+        ordered.append(root_pid)
         for spid in by_sid.get(root_pid, ()):
-            if spid not in tree:
-                tree.add(spid)
+            if spid not in seen:
+                seen.add(spid)
+                ordered.append(spid)
                 queue_pids.append(spid)
         while queue_pids:
             cur = queue_pids.popleft()
             for ch in children.get(cur, ()):
-                if ch not in tree:
-                    tree.add(ch)
+                if ch not in seen:
+                    seen.add(ch)
+                    ordered.append(ch)
                     queue_pids.append(ch)
     else:
         for pid in tagged_processes(job):
-            tree.add(pid)
-            queue_pids = collections.deque([pid])
-            while queue_pids:
-                cur = queue_pids.popleft()
-                for ch in children.get(cur, ()):
-                    if ch not in tree:
-                        tree.add(ch)
-                        queue_pids.append(ch)
-    return tree, sup_alive
+            if pid not in seen:
+                seen.add(pid)
+                ordered.append(pid)
+                queue_pids = collections.deque([pid])
+                while queue_pids:
+                    cur = queue_pids.popleft()
+                    for ch in children.get(cur, ()):
+                        if ch not in seen:
+                            seen.add(ch)
+                            ordered.append(ch)
+                            queue_pids.append(ch)
+    return ordered, sup_alive
+
+
+def proc_tree_descendants(root_pid: int) -> list[tuple[int, int]]:
+    """All live descendant `(pid, start_time)` pairs of `root_pid` (excluding `root_pid`)."""
+    stats, children, _ = _scan_own_stats()
+    if root_pid not in stats:
+        return []
+    seen = {root_pid}
+    queue_pids = collections.deque([root_pid])
+    out: list[tuple[int, int]] = []
+    while queue_pids:
+        cur = queue_pids.popleft()
+        for ch in children.get(cur, ()):
+            if ch not in seen:
+                seen.add(ch)
+                queue_pids.append(ch)
+                s = stats.get(ch)
+                if s is not None and s[1] not in ("Z", "X"):
+                    out.append((ch, s[0]))
+    return out
 
 
 def proc_tree_info(root_pid: int | None, root_start: int | None, job: str) -> dict:
@@ -522,19 +554,22 @@ def proc_tree_info(root_pid: int | None, root_start: int | None, job: str) -> di
     tree, sup_alive = _collect_tree(root_pid, root_start, job, stats, children, by_sid)
     live = [p for p in tree if p in stats and stats[p][1] not in ("Z", "X")]
     descendants = [p for p in live if p != root_pid]
+    descendant_idents = {p: stats[p][0] for p in descendants}
     pgids = sorted({stats[p][3] for p in descendants if stats[p][3] > 1 and stats[p][3] != root_pid})
     sup_state = stats[root_pid][1] if sup_alive and root_pid in stats else None
     own_stopped = (sup_state in ("T", "t")) if sup_state is not None else None
     all_stopped = (bool(own_stopped) and all(stats[p][1] in ("T", "t") for p in descendants)) if own_stopped is not None else None
     return {
-        "sup_alive": sup_alive, "pids": live, "descendants": descendants, "pgids": pgids,
+        "sup_alive": sup_alive, "pids": live, "descendants": descendants,
+        "descendant_idents": descendant_idents, "pgids": pgids,
         "own_stopped": own_stopped, "all_stopped": all_stopped,
     }
 
 
 def proc_trees_snapshot(jobs: dict[str, tuple[int | None, int | None]]) -> dict[str, dict]:
     """Single-pass /proc CPU, memory, swap, PID-list, and stop-state measurement for all active
-    non-cgroup builds at once."""
+    non-cgroup builds at once. Reads stat in top-down parent-before-child BFS order so a child
+    reaped mid-scan is never double-counted in both its own utime and its parent's cutime."""
     if not jobs:
         return {}
     stats, children, by_sid = _scan_own_stats()
@@ -546,32 +581,49 @@ def proc_trees_snapshot(jobs: dict[str, tuple[int | None, int | None]]) -> dict[
             continue
         ticks = 0
         mem = swap = 0
+        mem_failed = 0
         live: list[int] = []
         descendants: list[int] = []
+        descendant_idents: dict[int, int] = {}
+        # Re-read stat strictly top-down (parent before child) so a concurrent child exit + reap
+        # cannot be counted in both the child's utime/stime and the parent's cutime/cstime.
+        fresh_states: dict[int, str] = {}
         for pid in tree:
-            s = stats.get(pid)
-            if s is None:
+            orig = stats.get(pid)
+            if orig is None:
                 continue
-            # Include utime + stime + cutime + cstime across the tree (including supervisor's
-            # cutime/cstime) so CPU time from short-lived exited compilers is never lost.
+            s = proc_stat_full(pid)
+            if s is None or s[0] != orig[0]:
+                continue
+            fresh_states[pid] = s[1]
             ticks += s[5] + s[6] + s[7] + s[8]
             if s[1] in ("Z", "X"):
                 continue
             live.append(pid)
             if pid != root_pid:
                 descendants.append(pid)
-                pm, ps = proc_memory(pid)
-                mem += pm
-                swap += ps
-        sup_state = stats[root_pid][1] if sup_alive and root_pid in stats else None
+                descendant_idents[pid] = s[0]
+                pm_ps = proc_memory(pid)
+                if pm_ps is None:
+                    # Process may have exited right between stat and smaps_rollup; only flag
+                    # sample invalid if the exact same process is still alive.
+                    after = proc_stat(pid)
+                    if after is not None and after[0] == s[0] and after[1] not in ("Z", "X"):
+                        mem_failed += 1
+                else:
+                    mem += pm_ps[0]
+                    swap += pm_ps[1]
+        sup_state = fresh_states.get(root_pid) if sup_alive and root_pid is not None else None
         own_stopped = (sup_state in ("T", "t")) if sup_state is not None else None
-        all_stopped = (bool(own_stopped) and all(stats[p][1] in ("T", "t") for p in descendants)) if own_stopped is not None else None
+        all_stopped = (bool(own_stopped) and all(fresh_states.get(p) in ("T", "t") for p in descendants)) if own_stopped is not None else None
         out[job_id] = {
             "cpu_usec": int(ticks * 1_000_000 // clk),
             "mem": mem,
             "swap": swap,
+            "mem_ok": mem_failed == 0,
             "pids": live,
             "descendants": descendants,
+            "descendant_idents": descendant_idents,
             "own_stopped": own_stopped,
             "all_stopped": all_stopped,
         }
@@ -644,6 +696,21 @@ def cgroup_pids(path: str) -> list[int]:
         return []
 
 
+def cgroup_all_pids(path: str) -> list[int]:
+    """All PIDs in `path` and every nested child cgroup beneath it (for legacy < 5.14 shutdown)."""
+    found: list[int] = []
+    seen: set[int] = set()
+    try:
+        for dirpath, _dirnames, _filenames in os.walk(path):
+            for pid in cgroup_pids(dirpath):
+                if pid not in seen:
+                    seen.add(pid)
+                    found.append(pid)
+    except OSError:
+        pass
+    return found
+
+
 def cgroup_memory_max(path: str) -> str | None:
     try:
         with open(os.path.join(path, "memory.max")) as f:
@@ -653,8 +720,113 @@ def cgroup_memory_max(path: str) -> str | None:
         return None
 
 
-def pid_is_buildqd(pid: int) -> bool:
-    """Whether `pid` is a running buildqd daemon belonging to UID (and not a `--supervise` child)."""
+def boot_id() -> str | None:
+    """Kernel boot UUID from /proc/sys/kernel/random/boot_id."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def pidfd_signal(pid: int, start: int | None, sig: int) -> bool:
+    """Send `sig` to `(pid, start)` pinned via Linux pidfd_open + pidfd_send_signal (immune to PID
+    reuse). Falls back to re-verified os.kill if the kernel lacks pidfd support."""
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is not None and pidfd_send is not None:
+        fd = -1
+        try:
+            fd = pidfd_open(pid, 0)
+            if start is not None:
+                st = proc_stat(pid)
+                if st is None or st[0] != start:
+                    return False
+            pidfd_send(fd, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError as e:
+            if getattr(e, "errno", None) not in (errno.ENOSYS, errno.EPERM):
+                return False
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    if start is not None:
+        st = proc_stat(pid)
+        if st is None or st[0] != start:
+            return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def proc_ppid_comm(pid: int) -> tuple[int | None, str | None]:
+    """(ppid, parent_comm) for `pid`, or (None, None)."""
+    s = proc_stat_full(pid)
+    if s is None or s[2] <= 0:
+        return None, None
+    ppid = s[2]
+    try:
+        with open(f"/proc/{ppid}/comm", errors="replace") as f:
+            return ppid, f.read().strip()
+    except OSError:
+        return ppid, None
+
+
+def is_descendant_of(pid: int, ancestor_pid: int, ancestor_start: int | None = None) -> bool:
+    """Whether `pid` descends from `(ancestor_pid, ancestor_start)` via /proc/<p>/stat PPID chain."""
+    if not isinstance(pid, int) or not isinstance(ancestor_pid, int) or ancestor_pid <= 1:
+        return False
+    cur = pid
+    seen: set[int] = set()
+    for _ in range(64):
+        if cur <= 1 or cur in seen:
+            return False
+        seen.add(cur)
+        s = proc_stat_full(cur)
+        if s is None:
+            return False
+        if cur == ancestor_pid:
+            return ancestor_start is None or s[0] == ancestor_start
+        cur = s[2]
+    return False
+
+
+def _cmdline_is_buildqd(cmd: list[str]) -> bool:
+    if not cmd or "--supervise" in cmd:
+        return False
+    base0 = os.path.basename(cmd[0])
+    if base0 == "buildqd":
+        return True
+    if not re.fullmatch(r"python(\d+(\.\d+)*)?", base0):
+        return False
+    i = 1
+    while i < len(cmd):
+        arg = cmd[i]
+        if arg == "-m":
+            return i + 1 < len(cmd) and cmd[i + 1] == "buildq.daemon"
+        if arg in ("-c", "-W", "-X"):
+            if arg == "-c":
+                return False
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return os.path.basename(arg) == "buildqd"
+    return False
+
+
+def pid_is_buildqd(pid: int, start: int | None = None) -> bool:
+    """Whether `pid` (optionally pinned to `start`) is a running buildqd daemon owned by UID."""
     if not isinstance(pid, int) or pid <= 1:
         return False
     try:
@@ -665,10 +837,9 @@ def pid_is_buildqd(pid: int) -> bool:
     stat_info = proc_stat(pid)
     if stat_info is None or stat_info[1] in ("Z", "X"):
         return False
-    cmd = proc_cmdline(pid)
-    if not cmd or "--supervise" in cmd:
+    if start is not None and stat_info[0] != start:
         return False
-    return any(os.path.basename(arg) == "buildqd" or arg == "buildq.daemon" for arg in cmd)
+    return _cmdline_is_buildqd(proc_cmdline(pid))
 
 
 def proc_identity(pid):

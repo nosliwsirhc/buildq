@@ -39,7 +39,7 @@ class Conn:
 class Ticket:
     PERSIST = ("id", "name", "argv", "cwd", "lane", "key", "label", "notify", "submitted", "priority", "timeout",
                "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
-               "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "nice", "cancel_requested", "want",
+               "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "nice", "cap_killed", "cancel_requested", "want",
                "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "ended_rule", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
                "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
@@ -110,6 +110,8 @@ class Ticket:
         self._pids: list[int] = []
         self._own_stopped: bool | None = None
         self._all_stopped: bool | None = None
+        self._frozen_procs: dict[int, int] = {}
+        self._mem_sample_ok: bool = True
         self.cap_killed = False
         self.cancel_requested = False
         self.want = 1
@@ -280,6 +282,7 @@ class Ticket:
         t.group_lane = t.group_lane if isinstance(t.group_lane, str) else None
         t.workspace_group = t.workspace_group if isinstance(t.workspace_group, str) else None
         t.observed_gap = t.observed_gap is True
+        t.cap_killed = t.cap_killed is True
         t.write_dirs = [r for r in (commands.within_home(d) for d in t.write_dirs if isinstance(d, str))
                         if r][:4] if isinstance(t.write_dirs, list) else []
         t.release_end = common.sane_count(t.release_end)
@@ -296,6 +299,7 @@ class Ticket:
             self.js.observe()
             if self.js.used and not self.elastic:
                 self.elastic = True
+        mem_ok = True
         if self.cg:
             stats = machine.cgroup_stats(self.cg)
             if stats is None:
@@ -307,6 +311,7 @@ class Ticket:
             usage = proc_sample["cpu_usec"]
             if self.measured and usage < self.cpu_usec:
                 usage = self.cpu_usec  # keep monotonic across brief process-reap gaps
+            mem_ok = bool(proc_sample.get("mem_ok", True))
             need = proc_sample["mem"]
             swap = proc_sample["swap"]
             oom = (self.oom_base or 0) + self.oom_kills
@@ -316,9 +321,11 @@ class Ticket:
             waits = None
         else:
             return
+        self._mem_sample_ok = mem_ok
         if self.cpu_usec_base is None:
             self.cpu_usec_base = usage if self.measured else 0  # picked up after a restart: count from here
-        self.measured = True
+        if mem_ok:
+            self.measured = True
         self.samples.append((now, usage))
         # Keep about five seconds of samples, so cores_now is a five-second average.
         while len(self.samples) > 2 and now - self.samples[1][0] >= 5.0:
@@ -329,32 +336,33 @@ class Ticket:
             if now - t0 >= 3.0:
                 self.peak_cores = max(self.peak_cores, self.cores_now)
         self.cpu_usec = usage
-        self.mem_now = need
-        self.swap_now = swap
         pausing = max(0.0, now - self.frozen_at) if self.frozen and self.frozen_at else 0.0
         elapsed = max(0.0, now - (self.started or now) - self.frozen_attempt - pausing)
-        if need > self.mem_peak:
-            self.mem_peak = need
-            self.peak_mem_cores = self.granted
-            self.peak_at, self.tail, self.tail_used = elapsed, 0, 0
-            self.peak_swap = self.swap_now
-            self.peak_cpu = max(0, usage - (self.cpu_usec_base or 0)) / 1e6
-        elif elapsed - self.peak_at >= 30 and not self.frozen:
-            self.tail = max(self.tail, need)
-            self.tail_used = max(self.tail_used, need + self.swap_now)  # (what it held, swap included: #56)
-        if not self.frozen:
-            self.note_trace(elapsed, need)
-        if self.release_at is not None and (not self.release_revoked or self.release_breach):
-            # Past its peak: did it need more, and how much more? After a breach it is still
-            # followed: the room let go may already be another build's, so all of it counts.
-            used = need + self.swap_now
-            self.after_release_peak = max(self.after_release_peak, used)
-            if used > self.release_hold and not self.release_revoked:
-                self.release_revoked = self.release_breach = self.release_dirty = True
-                self.release_end = round(elapsed, 1)
-                if self.released:
-                    common.log(f"{self.id} grew past what was kept for it after its peak ({common.fmt_size(used)} > "
-                        f"{common.fmt_size(self.release_hold)}); holding its full {common.fmt_size(self.est_mem)} again", level=4)
+        if mem_ok:
+            self.mem_now = need
+            self.swap_now = swap
+            if need > self.mem_peak:
+                self.mem_peak = need
+                self.peak_mem_cores = self.granted
+                self.peak_at, self.tail, self.tail_used = elapsed, 0, 0
+                self.peak_swap = self.swap_now
+                self.peak_cpu = max(0, usage - (self.cpu_usec_base or 0)) / 1e6
+            elif elapsed - self.peak_at >= 30 and not self.frozen:
+                self.tail = max(self.tail, need)
+                self.tail_used = max(self.tail_used, need + self.swap_now)  # (what it held, swap included: #56)
+            if not self.frozen:
+                self.note_trace(elapsed, need)
+            if self.release_at is not None and (not self.release_revoked or self.release_breach):
+                # Past its peak: did it need more, and how much more? After a breach it is still
+                # followed: the room let go may already be another build's, so all of it counts.
+                used = need + self.swap_now
+                self.after_release_peak = max(self.after_release_peak, used)
+                if used > self.release_hold and not self.release_revoked:
+                    self.release_revoked = self.release_breach = self.release_dirty = True
+                    self.release_end = round(elapsed, 1)
+                    if self.released:
+                        common.log(f"{self.id} grew past what was kept for it after its peak ({common.fmt_size(used)} > "
+                            f"{common.fmt_size(self.release_hold)}); holding its full {common.fmt_size(self.est_mem)} again", level=4)
         self.oom_kills = max(0, oom - (self.oom_base or 0))
         if self.release_at is not None and not self.release_revoked and self.oom_kills > self.release_oom_base:
             self.release_revoked = self.release_breach = self.release_dirty = True  # something in it was killed for memory

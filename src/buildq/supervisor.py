@@ -6,13 +6,15 @@ from __future__ import annotations
 import collections
 import os
 import re
+import resource
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
 import time
 
-from . import common, machine
+from . import commands, common, machine
 from .common import DEVNULL
 
 class CappedOutput:
@@ -99,12 +101,102 @@ def apply_rlimits(limits) -> None:
             continue
 
 
+def _reap_other_children(main_pid: int) -> None:
+    """Reap exited reparented children without touching `main_pid`. Uses POSIX waitid(P_ALL,
+    WNOWAIT) so it works on all Linux kernels even without CONFIG_PROC_CHILDREN."""
+    waitid = getattr(os, "waitid", None)
+    if waitid is not None and hasattr(os, "WNOWAIT"):
+        for _ in range(64):
+            try:
+                si = waitid(os.P_ALL, 0, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError:
+                return
+            except OSError:
+                break
+            if si is None or si.si_pid <= 0 or si.si_pid == main_pid:
+                return
+            try:
+                os.waitpid(si.si_pid, os.WNOHANG)
+            except OSError:
+                return
+        return
+    for orphan in machine.proc_children(os.getpid()):
+        if orphan != main_pid:
+            try:
+                os.waitpid(orphan, os.WNOHANG)
+            except OSError:
+                pass
+
+
+def _reap_all_children() -> None:
+    """Reap all currently exited child processes (used after the main child has already exited)."""
+    while True:
+        try:
+            reaped, _ = os.waitpid(-1, os.WNOHANG)
+            if reaped <= 0:
+                break
+        except OSError:
+            break
+
+
+def _downgrade_old_make_fifo(argv: list[str], cwd: str, env: dict[str, str], jobserver_fd: int | None) -> int | None:
+    """Inside the confined build, detect GNU Make < 4.4 which aborts on `--jobserver-auth=fifo:`.
+    If detected, replace the fifo jobserver flags in MAKEFLAGS with `-j<granted>` (the caller's
+    CLI `-j` was already stripped by the scheduler, so GNU Make 4.3 honors the exact core grant)
+    and close the supervisor's jobserver fd."""
+    if jobserver_fd is None or "--jobserver-auth=fifo:" not in env.get("MAKEFLAGS", ""):
+        return jobserver_fd
+    stripped = commands.strip_wrappers(argv)
+    if not stripped:
+        return jobserver_fd
+    tool = os.path.basename(stripped[0])
+    if tool not in ("make", "gmake"):
+        return jobserver_fd
+    tool_at = len(argv) - len(stripped)
+    inline_idx, reset_at, unset_at = commands.wrapper_env_sites(argv, tool_at)
+    if reset_at is not None:
+        eff_path = argv[inline_idx["PATH"]].split("=", 1)[1] if "PATH" in inline_idx else None
+    elif "PATH" in inline_idx:
+        eff_path = argv[inline_idx["PATH"]].split("=", 1)[1]
+    elif "PATH" in unset_at:
+        eff_path = None
+    else:
+        eff_path = env.get("PATH")
+    target = stripped[0]
+    if "/" in target:
+        exe = target if os.path.isabs(target) else os.path.join(cwd, target)
+    else:
+        exe = shutil.which(target, path=eff_path)
+    if not exe or not os.path.isfile(exe):
+        return jobserver_fd
+    try:
+        res = subprocess.run([exe, "--version"], cwd=cwd, env=env, stdin=DEVNULL,
+                             capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return jobserver_fd
+    m = re.search(r"GNU Make\s+(\d+)\.(\d+)", res.stdout or "")
+    if not m or (int(m.group(1)), int(m.group(2))) >= (4, 4):
+        return jobserver_fd
+    granted = env.get("BUILDQ_CORES") or "1"
+    for var in ("MAKEFLAGS", "MFLAGS"):
+        val = env.get(var)
+        if not val or "--jobserver-auth=fifo:" not in val:
+            continue
+        cleaned = re.sub(r"(?:^|\s)-j\d+\s+--jobserver-auth=fifo:\S+", f" -j{granted}", val)
+        cleaned = re.sub(r"(?:^|\s)--jobserver-auth=fifo:\S+", "", cleaned).strip()
+        env[var] = cleaned
+    try:
+        os.close(jobserver_fd)
+    except OSError:
+        pass
+    return None
+
+
 def supervise(directory: str) -> int:
     """Run one build: its command, with its submitter's environment, directory and limits; its
     output into output.log (both streams) and stdout.log / stderr.log (each); and, whatever
     happens, its exit status into result.json."""
     os.umask(0o077)
-    machine.set_child_subreaper()
     code, timed_out = 126, False
     outputs = []
     jobserver = None
@@ -119,6 +211,10 @@ def supervise(directory: str) -> int:
         me = machine.proc_identity(os.getpid())
         common.write_json(os.path.join(directory, "supervisor.json"), {"pid": os.getpid(), "start": me[0] if me else None})
         spec = common.read_json(os.path.join(directory, "ticket.json")) or {}
+        if spec.get("runner") in ("direct", "cgroup"):
+            # Become a subreaper only on non-systemd runners (under systemd, systemd --user already
+            # owns cgroup teardown and subreaping).
+            machine.set_child_subreaper()
         job = str(spec.get("id") or os.path.basename(directory))
         env = common.read_json(claimed)
         try:
@@ -133,6 +229,12 @@ def supervise(directory: str) -> int:
             pass
         if isinstance(env, dict) and isinstance(parallel, dict):
             env.update({str(k): str(v) for k, v in parallel.items()})
+        # Propagate the daemon's real state directory so buildq-rustc-guard and nested `buildq`
+        # calls find `tickets/<job>/ticket.json` even when buildqd runs with custom `--state-dir`.
+        if isinstance(env, dict):
+            tickets_parent = os.path.dirname(os.path.abspath(directory))
+            if os.path.basename(tickets_parent) == "tickets":
+                env["BUILDQ_STATE_DIR"] = os.path.dirname(tickets_parent)
         limit = int(spec.get("max_log") or 0)
 
         def log_file(name: str, size: int, note: bool = True) -> CappedOutput:
@@ -186,6 +288,9 @@ def supervise(directory: str) -> int:
         if not isinstance(env, dict) or not argv:
             note("buildq: this build's command or environment is missing; it can't run.\n")
             return code
+        # Check GNU Make < 4.4 inside build confinement (with build's exact cwd/env/limits) so old
+        # make falls back cleanly to `-j<granted>` instead of aborting on `--jobserver-auth=fifo:`.
+        jobserver = _downgrade_old_make_fifo(argv, cwd, env, jobserver)
         pipes = {1: os.pipe(), 2: os.pipe()}
         try:
             umask = spec.get("umask")
@@ -202,8 +307,12 @@ def supervise(directory: str) -> int:
             os.close(w)
         common.write_json(os.path.join(directory, "child.json"), {"pid": child.pid, "pgid": child.pid})
 
+        cancel_signal: list[int] = []
+
         def forward(signum, _frame):
             signal_group(child.pid, signum)
+            if signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+                cancel_signal.append(signum)
 
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT, signal.SIGUSR1, signal.SIGUSR2):
             signal.signal(sig, forward)
@@ -237,16 +346,18 @@ def supervise(directory: str) -> int:
 
         last = time.monotonic()
         my_pid = os.getpid()
+        subreaper_active = spec.get("runner") in ("direct", "cgroup")
+        forwarded_descendants = False
         while child.poll() is None:
             pump(0.5)
-            # Reap any orphaned grandchildren reparented here via PR_SET_CHILD_SUBREAPER (never
-            # touching child.pid) so zombies don't accumulate and their CPU rolls into cutime/cstime.
-            for orphan in machine.proc_children(my_pid):
-                if orphan != child.pid:
-                    try:
-                        os.waitpid(orphan, os.WNOHANG)
-                    except OSError:
-                        pass
+            if subreaper_active:
+                _reap_other_children(child.pid)
+                if cancel_signal and not forwarded_descendants:
+                    forwarded_descendants = True
+                    sig_to_send = cancel_signal[-1]
+                    for dpid, dstart in machine.proc_tree_descendants(my_pid):
+                        if dpid != child.pid:
+                            machine.pidfd_signal(dpid, dstart, sig_to_send)
             tick = time.monotonic()
             if deadline and tick - last > 5:
                 # A turn of this loop that took far longer than its half second: the build was paused
@@ -257,39 +368,63 @@ def supervise(directory: str) -> int:
                 timed_out, term_sent = True, time.monotonic()
                 note(f"\nbuildq: timed out after {float(timeout):.0f}s; stopping it\n")
                 signal_group(child.pid, signal.SIGTERM)
+                if subreaper_active:
+                    for dpid, dstart in machine.proc_tree_descendants(my_pid):
+                        machine.pidfd_signal(dpid, dstart, signal.SIGTERM)
             if term_sent and time.monotonic() - term_sent > 30:
                 signal_group(child.pid, signal.SIGKILL)
-        # Whatever the build left running in its process group goes too, so its turn ends with it.
-        if signal_group(child.pid, signal.SIGTERM):
-            stop_by = time.monotonic() + 10
-            while signal_group(child.pid, 0) and time.monotonic() < stop_by:
-                pump(0.2)
-            signal_group(child.pid, signal.SIGKILL)
-        # And so does anything that left the group (setsid, a double fork): it still carries this
-        # build's BUILDQ_JOB. Under the direct runner nothing else would find it.
-        strays = machine.tagged_processes(job, exclude=os.getpid())
-        if strays:
-            for pid in strays:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-            stop_by = time.monotonic() + 5
-            while machine.tagged_processes(job, exclude=os.getpid()) and time.monotonic() < stop_by:
-                pump(0.2)
-            for pid in machine.tagged_processes(job, exclude=os.getpid()):
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-        # Reap any remaining reparented children so no zombies linger after the build ends.
-        while True:
+                if subreaper_active:
+                    for dpid, dstart in machine.proc_tree_descendants(my_pid):
+                        machine.pidfd_signal(dpid, dstart, signal.SIGKILL)
+        # Reap exited children right away so dead members don't hold killpg(pgid, 0) open as zombies.
+        if subreaper_active:
+            _reap_all_children()
+
+        def _remaining_descendants() -> list[tuple[int, int]]:
+            return machine.proc_tree_descendants(my_pid) if subreaper_active else []
+
+        # Whatever the build left running in its process group, adopted subreaper tree (including
+        # session-detached env-cleared grandchildren), or BUILDQ_JOB-tagged strays goes too.
+        group_alive = signal_group(child.pid, signal.SIGTERM)
+        desc = _remaining_descendants()
+        for dpid, dstart in desc:
+            machine.pidfd_signal(dpid, dstart, signal.SIGTERM)
+        strays = machine.tagged_processes(job, exclude=my_pid)
+        for pid in strays:
             try:
-                reaped, _ = os.waitpid(-1, os.WNOHANG)
-                if reaped <= 0:
-                    break
+                os.kill(pid, signal.SIGTERM)
             except OSError:
-                break
+                pass
+        if group_alive or desc or strays:
+            stop_by = time.monotonic() + 10
+            while time.monotonic() < stop_by:
+                if subreaper_active:
+                    _reap_all_children()
+                still_group = signal_group(child.pid, 0)
+                still_desc = _remaining_descendants()
+                still_strays = machine.tagged_processes(job, exclude=my_pid)
+                if not still_group and not still_desc and not still_strays:
+                    break
+                pump(0.1)
+            # Converging SIGKILL teardown until no adopted descendants or strays survive.
+            for _ in range(5):
+                if subreaper_active:
+                    _reap_all_children()
+                still_group = signal_group(child.pid, signal.SIGKILL)
+                still_desc = _remaining_descendants()
+                for dpid, dstart in still_desc:
+                    machine.pidfd_signal(dpid, dstart, signal.SIGKILL)
+                still_strays = machine.tagged_processes(job, exclude=my_pid)
+                for pid in still_strays:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                if not still_group and not still_desc and not still_strays:
+                    break
+                time.sleep(0.05)
+        if subreaper_active:
+            _reap_all_children()
         drain_by = time.monotonic() + 2
         while open_pipes and time.monotonic() < drain_by:
             pump(0.1)
@@ -327,9 +462,13 @@ def supervise(directory: str) -> int:
                                               os.path.basename(own)) else None
             events = machine.cgroup_events(own) if own else {}
             some, full, high = (machine.cgroup_memory_waits(own) if own else None) or (None, None, None)
+            ru_self = resource.getrusage(resource.RUSAGE_SELF)
+            ru_ch = resource.getrusage(resource.RUSAGE_CHILDREN)
+            cpu_s = round(ru_self.ru_utime + ru_self.ru_stime + ru_ch.ru_utime + ru_ch.ru_stime, 4)
             try:
                 common.write_json(os.path.join(directory, "result.json"),
                            {"exit": code, "ended": time.time(), "timed_out": timed_out,
+                            "cpu_s": cpu_s,
                             "oom_kills": events.get("oom_kill", 0),
                             # "oom" counts the times an allocation was about to fail at the build's
                             # own MemoryMax ("max" only counts reclaim there); a kill without it came

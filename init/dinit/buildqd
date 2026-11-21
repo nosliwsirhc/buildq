@@ -7,10 +7,10 @@
 # For a system service in /etc/dinit.d/buildqd, add:
 #   run-as = <username>
 #   # Optional (after running init/cgroup-setup.sh <username>):
-#   run-in-cgroup = /buildq-<username>/daemon
+#   run-in-cgroup = /buildq-<username>/user/daemon
 
 type = process
-command = /home/USER/.local/bin/buildqd --state-dir /home/USER/.local/state/buildq --config /home/USER/.config/buildq/config.toml --pid-file /home/USER/.local/state/buildq/buildqd.pid --log-file /home/USER/.local/state/buildq/buildqd.log
+command = /home/USER/.local/bin/buildqd --socket /home/USER/.local/state/buildq/run/buildq.sock --state-dir /home/USER/.local/state/buildq --config /home/USER/.config/buildq/config.toml --pid-file /home/USER/.local/state/buildq/buildqd.pid --log-file /home/USER/.local/state/buildq/buildqd.log
 smooth-recovery = true
 restart = true
 stop-timeout = 15

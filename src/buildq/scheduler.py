@@ -7,9 +7,6 @@ import collections
 import math
 import os
 import queue
-import re
-import shutil
-import subprocess
 import threading
 import time
 import traceback
@@ -20,33 +17,6 @@ from .common import FINISHED, GIB, MIB, PENDING
 from .config import CI_LONG_WAITS
 from .runners import Jobserver
 from .ticket import Ticket
-
-_MAKE_FIFO_CACHE: dict[tuple, bool] = {}
-
-
-def _make_supports_fifo(argv0: str, env_path: str | None) -> bool:
-    """GNU make 4.4+ supports `--jobserver-auth=fifo:PATH`; GNU make <= 4.3 aborts on it."""
-    exe = shutil.which(argv0, path=env_path) if env_path or os.path.isabs(argv0) else shutil.which(argv0)
-    if not exe:
-        return True
-    try:
-        st = os.stat(exe)
-    except OSError:
-        return True
-    key = (exe, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
-    cached = _MAKE_FIFO_CACHE.get(key)
-    if cached is not None:
-        return cached
-    supported = True
-    try:
-        res = subprocess.run([exe, "--version"], stdin=common.DEVNULL, capture_output=True, text=True, timeout=2)
-        m = re.search(r"GNU Make\s+(\d+)\.(\d+)", res.stdout or "")
-        if m:
-            supported = (int(m.group(1)), int(m.group(2))) >= (4, 4)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    _MAKE_FIFO_CACHE[key] = supported
-    return supported
 
 class SchedulerMixin:
     """Queue ordering, admission, jobserver rebalancing, slice guard, memory shedding, and watch."""
@@ -965,9 +935,6 @@ class SchedulerMixin:
             tool = os.path.basename((stripped or ["?"])[0])
             known = tools.uses_jobserver(tool)
             wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
-            if wanted and tool in ("make", "gmake") and self.runner.name in ("systemd", "cgroup", "direct"):
-                if not _make_supports_fifo(stripped[0], env.get("PATH")):
-                    wanted = False
             # An inherited jobserver passed by descriptor is dead in the build's service: drop it,
             # and give the build buildq's, unless the caller still brings make flags of its own.
             cleaned = {k: c for k in MAKE_FLAG_VARS if k in env
@@ -1239,6 +1206,9 @@ class SchedulerMixin:
         try:
             with open(os.path.join(path, "memory.max"), "w") as f:
                 f.write(str(value))
+            note_fn = getattr(self.runner, "note_slice_guard_write", None)
+            if note_fn is not None:
+                note_fn(str(value), stopping=stopping)
             self.guard_failed = False
         except OSError as e:
             if not self.guard_failed:
