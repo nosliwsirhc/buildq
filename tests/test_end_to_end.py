@@ -548,7 +548,8 @@ class Enforcement(Harness):
         shutil.copy(BUILDQ, os.path.join(old, "buildq"))
         with open(os.path.join(old, "buildq-shim"), "w") as f:
             f.write("def heavy(tool, args):\n    return True\n")
-        mixed = subprocess.run([sys.executable, os.path.join(old, "buildq"), "run", "--", cargo, "fmt"], env=env,
+        mixed = subprocess.run([sys.executable, os.path.join(old, "buildq"), "run", "--", cargo, "fmt"],
+                               env=dict(env, PYTHONPATH=os.path.join(ROOT, "src")),
                                cwd=self.work, capture_output=True, text=True, timeout=60)
         self.assertRegex(mixed.stdout, r"^cargo fmt job=[0-9a-f-]{36}$", mixed.stderr)
 

@@ -25,7 +25,22 @@
 set -euo pipefail
 
 prefix=${PREFIX:-$HOME/.local}
+case $prefix in
+  '') printf 'install.sh: PREFIX must not be empty\n' >&2; exit 1 ;;
+  '~') prefix=$HOME ;;
+  '~/'*) prefix=$HOME/${prefix#'~/'} ;;
+  /*) ;;
+  *) prefix=$PWD/$prefix ;;
+esac
+if command -v realpath >/dev/null 2>&1; then
+  norm=$(realpath -m -- "$prefix")
+  [[ -n "$norm" && "$norm" == /* ]] || { printf 'install.sh: could not resolve PREFIX (%s)\n' "$prefix" >&2; exit 1; }
+  prefix=$norm
+else
+  while [[ $prefix != / && $prefix == */ ]]; do prefix=${prefix%/}; done
+fi
 bindir=$prefix/bin
+libdir=$prefix/lib/buildq
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 unitdir=$config_home/systemd/user
 confdir=$config_home/buildq
@@ -56,6 +71,7 @@ our_link() {
 # The skill for coding agents, with this machine's notes at its end (`buildq help agents` prints it).
 write_skill() {
   mkdir -p "$skilldir"
+  temps+=("$skilldir/SKILL.md.new.$$")
   {
     cat "$src/skills/buildq/SKILL.md"
     if [[ -r "$confdir/agents.md" ]]; then
@@ -80,6 +96,7 @@ install_skill() {
     mkdir -p "$home/skills"
     ln -sfn "$skilldir" "$link"
     if [[ -r "$skill_list" ]]; then  # one line per link, with its current target
+      temps+=("$skill_list.new.$$")
       awk -F'\t' -v link="$link" '$1 != link' "$skill_list" >"$skill_list.new.$$"
       mv -f "$skill_list.new.$$" "$skill_list"
     fi
@@ -91,16 +108,27 @@ install_skill() {
   fi
 }
 
+temps=()
 # Copies a file into place by renaming a temporary copy over it, so a program running from the
 # old file (a shell script reads its file as it goes) keeps the old one intact.
 put() {
   local mode=$1 from=$2 to=$3 tmp
   tmp="$to.new.$$"
+  temps+=("$tmp")
   install -m "$mode" "$from" "$tmp"
   mv -f "$tmp" "$to"
 }
 
 have_systemd() { command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; }
+
+# Serialize concurrent installs/uninstalls against the same physical prefix directory inode
+# (consistent across symlinked prefix spellings and regardless of XDG_RUNTIME_DIR).
+acquire_lock() {
+  command -v flock >/dev/null 2>&1 || { say "flock is required to serialize installs against $prefix"; exit 1; }
+  mkdir -p "$prefix"
+  exec 9<"$prefix"
+  flock 9 || { say "couldn't lock $prefix for install"; exit 1; }
+}
 
 # Sets or clears build.rustc-wrapper in a cargo configuration, leaving everything else alone.
 rustc_wrapper() {
@@ -143,6 +171,7 @@ EOF
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
+  acquire_lock
   if have_systemd; then
     systemctl --user disable --now buildq.service buildq.socket 2>/dev/null || true
   fi
@@ -167,7 +196,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     done < "$skill_list"
   fi
   rm -f "$skill_list"
-  rm -rf "$shimdir" "$(dirname "$skilldir")"
+  rm -rf "$shimdir" "$(dirname "$skilldir")" "$libdir"
   rm -f "$bindir/buildq" "$bindir/buildqd" "$bindir/buildq-shim" \
         "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice"
   [[ $keep_guard == no ]] && rm -f "$bindir/buildq-rustc-guard"
@@ -214,15 +243,97 @@ esac
 python=$chosen
 [[ -r /proc/stat && -r /proc/meminfo ]] || { say "buildq needs Linux (/proc/stat, /proc/meminfo)."; exit 1; }
 
-mkdir -p "$bindir" "$unitdir" "$confdir"
+acquire_lock
+mkdir -p "$bindir" "$libdir" "$unitdir" "$confdir"
+staged=""
+release=""
+publishing=no
+prev_current=""
+had_current=no
+cleanup() {
+  if [[ $publishing == yes ]]; then
+    if [[ $had_current == yes ]]; then
+      ln -sfn "$prev_current" "$libdir/current.rollback.$$" 2>/dev/null &&
+        mv -Tf "$libdir/current.rollback.$$" "$libdir/current" 2>/dev/null ||
+        rm -f "$libdir/current.rollback.$$" 2>/dev/null || true
+    else
+      rm -f "$libdir/current" 2>/dev/null || true
+    fi
+    if [[ -n "$staged" && -d "$staged/prev-bin" ]]; then
+      for prog in buildq buildqd buildq-shim buildq-rustc-guard; do
+        if [[ -L "$staged/prev-bin/$prog" || -e "$staged/prev-bin/$prog" ]]; then
+          cp -a "$staged/prev-bin/$prog" "$bindir/$prog.rollback.$$" 2>/dev/null &&
+            mv -Tf "$bindir/$prog.rollback.$$" "$bindir/$prog" 2>/dev/null ||
+            rm -f "$bindir/$prog.rollback.$$" 2>/dev/null || true
+        else
+          rm -f "$bindir/$prog" 2>/dev/null || true
+        fi
+      done
+    fi
+  fi
+  if (( ${#temps[@]} )); then
+    rm -f "${temps[@]}"
+  fi
+  if [[ -n "$release" && -e "$release" ]] && [[ ! "$release" -ef "$libdir/current" ]]; then
+    rm -rf "$release"
+  fi
+  [[ -n "$staged" ]] && rm -rf "$staged"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
-trap 'rm -rf "$staged"' EXIT
-for program in buildqd buildq buildq-shim; do  # Python: run by the interpreter checked above
-  { printf '#!%s\n' "$python"; tail -n +2 "$src/bin/$program"; } >"$staged/$program"
-  put 755 "$staged/$program" "$bindir/$program"
+# Stage and validate the versioned package release, generated launchers, and helper scripts
+# (including destination-side temps) before the first live rename, so any error rolls back cleanly.
+# Earlier releases stay in place until `--uninstall` so already-started processes keep working.
+release=$(mktemp -d "$libdir/v-XXXXXX")
+cp -R "$src/src/buildq" "$release/buildq"
+find "$release/buildq" -type d -name '__pycache__' -prune -exec rm -rf {} +
+"$python" -B -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import buildq.daemon, buildq.client' "$release"
+"$python" - "$src/bin/buildq" "$staged/buildq" "$python" "$libdir/current" <<'EOF'
+import sys
+src_path, dst_path, py, pkg_lib = sys.argv[1:5]
+lines = open(src_path).read().splitlines(keepends=True)
+lines[0] = f"#!{py}\n"
+text = "".join(lines)
+if "LIBDIR = None" not in text:
+    sys.exit(f"expected LIBDIR placeholder in {src_path}")
+with open(dst_path, "w") as f:
+    f.write(text.replace("LIBDIR = None", f"LIBDIR = {pkg_lib!r}", 1))
+EOF
+# buildq-shim stays standalone (zero package-import overhead on every shimmed command).
+{ printf '#!%s\n' "$python"; tail -n +2 "$src/bin/buildq-shim"; } >"$staged/buildq-shim"
+cp "$src/bin/buildq-rustc-guard" "$staged/buildq-rustc-guard"
+"$python" -B -I -m py_compile "$staged/buildq" "$staged/buildq-shim"
+bash -n "$staged/buildq-rustc-guard"
+# Prepare every destination temp on the target filesystems before publishing anything.
+temps+=("$libdir/current.new.$$" "$bindir/buildq.new.$$" "$bindir/buildqd.new.$$"
+        "$bindir/buildq-shim.new.$$" "$bindir/buildq-rustc-guard.new.$$")
+ln -sfn "$release" "$libdir/current.new.$$"
+install -m 755 "$staged/buildq" "$bindir/buildq.new.$$"
+ln -sfn buildq "$bindir/buildqd.new.$$"
+install -m 755 "$staged/buildq-shim" "$bindir/buildq-shim.new.$$"
+install -m 755 "$staged/buildq-rustc-guard" "$bindir/buildq-rustc-guard.new.$$"
+# Snapshot previous live targets for rollback if any live rename fails.
+if [[ -L "$libdir/current" ]]; then
+  had_current=yes
+  prev_current=$(readlink "$libdir/current")
+fi
+mkdir -p "$staged/prev-bin"
+for prog in buildq buildqd buildq-shim buildq-rustc-guard; do
+  if [[ -L "$bindir/$prog" || -e "$bindir/$prog" ]]; then
+    cp -a "$bindir/$prog" "$staged/prev-bin/$prog"
+  fi
 done
-put 755 "$src/bin/buildq-rustc-guard" "$bindir/buildq-rustc-guard"
-say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (Python: $python)"
+publishing=yes
+mv -Tf "$libdir/current.new.$$" "$libdir/current"
+mv -Tf "$bindir/buildq.new.$$" "$bindir/buildq"
+mv -Tf "$bindir/buildqd.new.$$" "$bindir/buildqd"
+mv -Tf "$bindir/buildq-shim.new.$$" "$bindir/buildq-shim"
+mv -Tf "$bindir/buildq-rustc-guard.new.$$" "$bindir/buildq-rustc-guard"
+publishing=no
+say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (package in $libdir/current, Python: $python)"
 
 if [[ ! -e "$confdir/config.toml" ]]; then
   put 644 "$src/config.example.toml" "$confdir/config.toml"
@@ -250,6 +361,7 @@ if ! have_systemd; then
   exit 0
 fi
 
+temps+=("$unitdir/buildq.service.new.$$")
 sed "s|@BINDIR@|$bindir|g" "$src/systemd/buildq.service" >"$unitdir/buildq.service.new.$$"
 mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
 put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"

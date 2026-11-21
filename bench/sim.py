@@ -19,6 +19,8 @@ Stdlib only; Python 3.11+.
 from __future__ import annotations
 
 import argparse
+import ast
+import glob
 import hashlib
 import re
 import importlib.machinery
@@ -26,6 +28,7 @@ import importlib.util
 import json
 import math
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -49,9 +52,174 @@ DEFAULT_CONFIG = os.path.join(HERE, "bench.toml")
 DEFAULT_BUILDQD = os.path.join(ROOT, "bin", "buildqd")
 
 
+class _BuildqdPackage:
+    """Facade over an isolated copy of the `buildq` package so sim.py can load two versions side by
+    side and patch both legacy single-file `bin/buildqd` and the split `src/buildq/` package."""
+
+    SUBMODULES = ("common", "commands", "config", "machine", "history", "metrics",
+                  "runners", "ticket", "supervisor", "github", "scheduler", "daemon")
+    LOOKUP_ORDER = ("daemon", *(sub for sub in SUBMODULES if sub != "daemon"))
+
+    def __init__(self, pkg_dir: str, name: str):
+        # Load the isolated package into a temporary sys.modules namespace, then restore sys.modules
+        # so completed simulations never retain references to their patched modules.
+        prefix = name + "."
+        saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k == name or k.startswith(prefix)}
+        try:
+            spec = importlib.util.spec_from_file_location(
+                name, os.path.join(pkg_dir, "__init__.py"), submodule_search_locations=[pkg_dir])
+            pkg = importlib.util.module_from_spec(spec)
+            sys.modules[name] = pkg
+            spec.loader.exec_module(pkg)
+            mods = {sub: importlib.import_module(f"{name}.{sub}") for sub in self.SUBMODULES}
+            object.__setattr__(self, "_mods", mods)
+        finally:
+            for k in [k for k in sys.modules if k == name or k.startswith(prefix)]:
+                sys.modules.pop(k, None)
+            sys.modules.update(saved)
+
+    def __getattr__(self, attr: str):
+        for sub in self.LOOKUP_ORDER:
+            mod = self._mods[sub]
+            if hasattr(mod, attr):
+                return getattr(mod, attr)
+        raise AttributeError(attr)
+
+    def __setattr__(self, attr: str, value) -> None:
+        raise AttributeError(f"use patch({attr!r}, ...) to modify synthetic buildq package attributes")
+
+    def patch(self, attr: str, value) -> None:
+        if attr in ("time", "uuid"):
+            for mod in self._mods.values():
+                if hasattr(mod, attr):
+                    setattr(mod, attr, value)
+            return
+        for mod in self._mods.values():
+            if attr in mod.__dict__:
+                setattr(mod, attr, value)
+
+
+def _shebang_isolation_flags(tokens: list[str]) -> list[str]:
+    """Forward safe Python path-isolation flags (`-s`, `-S`, `-E`, `-I`) present on a shebang."""
+    flags: list[str] = []
+    for tok in tokens:
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            for ch in tok[1:]:
+                if ch in ("s", "S", "E", "I") and f"-{ch}" not in flags:
+                    flags.append(f"-{ch}")
+    return flags
+
+
+def _wrapper_interpreter(source: str) -> tuple[str, list[str]] | None:
+    """Absolute Python executable and safe isolation flags named by a script's shebang
+    (including pip's `/bin/sh` multiline `'''exec'` wrapper)."""
+    lines = source.splitlines()
+    if not lines or not lines[0].startswith("#!"):
+        return None
+    try:
+        tokens = shlex.split(lines[0][2:])
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    first = tokens[0]
+    if os.path.basename(first) == "sh" and len(lines) >= 2 and lines[1].startswith("'''exec'"):
+        try:
+            args = shlex.split(lines[1][len("'''exec'"):])
+        except ValueError:
+            return None
+        cand = args[0] if args else ""
+        if os.path.isabs(cand) and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand, _shebang_isolation_flags(args[1:])
+        return None
+    if os.path.basename(first) == "env":
+        return None
+    if os.path.isabs(first) and os.path.isfile(first) and os.access(first, os.X_OK):
+        return first, _shebang_isolation_flags(tokens[1:])
+    return None
+
+
+def _launcher_pkg_dir(real_path: str) -> str | None:
+    """If `real_path` is a buildq package launcher or console script (not a legacy single-file
+    daemon), return its `buildq` package directory; else None."""
+    try:
+        with open(real_path, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=real_path)
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return None
+    imports_buildq = any(
+        (isinstance(node, ast.ImportFrom) and node.module in ("buildq", "buildq.daemon"))
+        or (isinstance(node, ast.Import) and any(a.name in ("buildq", "buildq.daemon") for a in node.names))
+        for node in ast.walk(tree)
+    )
+    if not imports_buildq:
+        return None
+    libdir = None
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "LIBDIR" for t in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            libdir = node.value.value
+
+    def is_pkg(path: str) -> bool:
+        return os.path.isfile(os.path.join(path, "__init__.py")) and os.path.isfile(os.path.join(path, "daemon.py"))
+
+    candidates = []
+    if libdir:
+        candidates.append(os.path.join(os.path.realpath(libdir), "buildq"))
+    candidates.append(os.path.normpath(os.path.join(os.path.dirname(real_path), "..", "src", "buildq")))
+    for pkg_dir in candidates:
+        if is_pkg(pkg_dir):
+            return pkg_dir
+    # Pip/uv console script: ask the wrapper's own interpreter where its `buildq` package lives,
+    # stripped of PYTHONPATH and CWD so the simulator's checkout never shadows the target venv.
+    wrapper = _wrapper_interpreter(source)
+    if wrapper:
+        interp, flags = wrapper
+        probe_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        probe_env["PYTHONSAFEPATH"] = "1"
+        try:
+            probe = subprocess.run(
+                [interp, *flags, "-c",
+                 "import importlib.util, os, sys; "
+                 "sys.path = [p for p in sys.path if p]; "
+                 "s = importlib.util.find_spec('buildq'); "
+                 "print(os.path.dirname(os.path.realpath(s.origin)) if s and s.origin else '')"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, env=probe_env)
+            found = probe.stdout.strip()
+            if probe.returncode == 0 and found and is_pkg(found):
+                return found
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Fallback: unique site-packages / dist-packages relative to the script's prefix.
+    prefix = os.path.normpath(os.path.join(os.path.dirname(real_path), ".."))
+    found_dirs: list[str] = []
+    seen_real: set[str] = set()
+    for pkg_dir in sorted(glob.glob(os.path.join(glob.escape(prefix), "lib*", "python*", "*-packages", "buildq"))):
+        real_dir = os.path.realpath(pkg_dir)
+        if real_dir not in seen_real and is_pkg(real_dir):
+            seen_real.add(real_dir)
+            found_dirs.append(real_dir)
+    if len(found_dirs) == 1:
+        return found_dirs[0]
+    if len(found_dirs) > 1:
+        raise RuntimeError(f"ambiguous buildq packages under {prefix}: {', '.join(found_dirs)}")
+    raise FileNotFoundError(f"buildq package not found for launcher {real_path}")
+
+
 def load_buildqd(path: str, name: str):
-    """buildqd as a module of its own, so two versions can be loaded side by side."""
-    loader = importlib.machinery.SourceFileLoader(name, os.path.abspath(path))
+    """buildqd as a module (legacy single-file) or isolated package (`src/buildq`), so two versions
+    can be loaded side by side."""
+    abs_path = os.path.abspath(path)
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(f"buildqd not found: {path}")
+    real_path = os.path.realpath(abs_path)
+    pkg_dir = _launcher_pkg_dir(real_path)
+    if pkg_dir is not None:
+        return _BuildqdPackage(pkg_dir, name)
+    loader = importlib.machinery.SourceFileLoader(name, real_path)
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -233,18 +401,19 @@ class Simulation:
 
     def patch_module(self):
         mod, sim = self.mod, self
-        mod.time = self.clock
-        mod.uuid = Ids()
-        mod.log = lambda message, level=None: sim.log_lines.append(f"{sim.clock.now - EPOCH:8.0f} {message}")
-        mod.cgroup_stats = self.stats
-        mod.cgroup_swap = lambda path: 0
-        mod.cgroup_memory_waits = lambda path: None
-        mod.cgroup_freeze_set = lambda path: self.frozen(path)
-        mod.cgroup_frozen = lambda path: self.frozen(path)
-        mod.parent_freeze_set = lambda path: False
-        mod.repo_name = lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd))
-        mod.cargo_cold = lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False)
-        mod.disk_space = lambda path: (1 << 50, 1 << 50)  # (free, size): plenty; there is no disk here
+        set_attr = mod.patch if isinstance(mod, _BuildqdPackage) else lambda k, v: setattr(mod, k, v)
+        set_attr("time", self.clock)
+        set_attr("uuid", Ids())
+        set_attr("log", lambda message, level=None: sim.log_lines.append(f"{sim.clock.now - EPOCH:8.0f} {message}"))
+        set_attr("cgroup_stats", self.stats)
+        set_attr("cgroup_swap", lambda path: 0)
+        set_attr("cgroup_memory_waits", lambda path: None)
+        set_attr("cgroup_freeze_set", lambda path: self.frozen(path))
+        set_attr("cgroup_frozen", lambda path: self.frozen(path))
+        set_attr("parent_freeze_set", lambda path: False)
+        set_attr("repo_name", lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd)))
+        set_attr("cargo_cold", lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False))
+        set_attr("disk_space", lambda path: (1 << 50, 1 << 50))  # (free, size): plenty; there is no disk here
         load = mod.load_config_file
 
         def load_config_file(path, mem_total, ncpu):
@@ -252,7 +421,7 @@ class Simulation:
             # Nothing reaches the host: no analytics writer, no on_finish command, no GitHub status.
             cfg.metrics, cfg.on_finish, cfg.github_status = False, "", False
             return cfg
-        mod.load_config_file = load_config_file
+        set_attr("load_config_file", load_config_file)
         mod.Daemon.run_hooks = lambda daemon, t, now: None  # nor a ticket's own --notify
 
     def job_at(self, path: str | None) -> Job | None:
