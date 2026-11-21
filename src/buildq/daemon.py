@@ -390,7 +390,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         elif agent:
             t.agents = {t.submission or f"anon-{tid}": agent}
         t.git_env = {k: v for k, v in env.items() if GIT_ENV.fullmatch(k)}
-        t.cold = commands.cargo_cold(argv, cwd, env)
+        t.cold = commands.is_cold(argv, cwd, env)
         t.max_log = self.cfg.max_log
         job_env = dict(env)
         for key, value in self.cfg.env.items():
@@ -906,10 +906,11 @@ class Daemon(GitHubMixin, SchedulerMixin):
             self.tickets.pop(t.id, None)
             common.log(f"no longer counting {t.id} ({error or 'lock released'})")
             return
-        try:
-            os.remove(os.path.join(t.dir, "env.json"))
-        except OSError:
-            pass
+        for secret_file in ("env.json", "parallel.json"):
+            try:
+                os.remove(os.path.join(t.dir, secret_file))
+            except OSError:
+                pass
         # A run that a signal ended (a cancel, a timeout) shows how far it got, not what it needs,
         # so it teaches nothing; a run the kernel killed for its own memory cap teaches that it
         # needs more (a slice/ancestor managed-oom kill doesn't inflate this command's own estimate).

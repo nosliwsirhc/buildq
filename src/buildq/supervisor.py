@@ -124,7 +124,12 @@ def supervise(directory: str) -> int:
             os.remove(claimed)  # the environment can hold secrets; it isn't kept once the build has it
         except OSError:
             pass
-        parallel = common.read_json(os.path.join(directory, "parallel.json"))
+        parallel_path = os.path.join(directory, "parallel.json")
+        parallel = common.read_json(parallel_path)
+        try:
+            os.remove(parallel_path)  # merged caller env vars can hold secrets; don't keep on disk
+        except OSError:
+            pass
         if isinstance(env, dict) and isinstance(parallel, dict):
             env.update({str(k): str(v) for k, v in parallel.items()})
         limit = int(spec.get("max_log") or 0)

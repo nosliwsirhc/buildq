@@ -14,7 +14,7 @@ for path in (os.path.join(ROOT, "src"), os.path.join(ROOT, "bench")):
         sys.path.insert(0, path)
 
 import sim  # noqa: E402
-from buildq import commands as bq_commands, metrics as bq_metrics  # noqa: E402
+from buildq import commands as bq_commands, metrics as bq_metrics, tools as bq_tools  # noqa: E402
 scenarios = sim.builtin
 GIB = sim.GIB
 CONFIG = sim.DEFAULT_CONFIG
@@ -396,7 +396,8 @@ class Export(SimCase):
         for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
                      "--filter", "-p", "-F"):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
-        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | sim.Simulation.GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | bq_tools.HONORS_GRANT_TOOLS | {"python3.13", "python2", "py.test", "gcc-16", "clang++-22"}
+        self.assertTrue(sim.Simulation.GRANT_TOOLS <= bq_tools.HONORS_GRANT_TOOLS)
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)
         for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):
@@ -775,6 +776,41 @@ class LoadBuildqd(SimCase):
             f.write("#!/usr/bin/env python3\nfrom buildq.daemon import main\n")
         with self.assertRaisesRegex(RuntimeError, "ambiguous"):
             sim.load_buildqd(ambig_console, "buildqd_ambig")
+
+    def test_package_without_tools_module_loads_and_honors_head_only_grant_tools(self):
+        # Simulate comparing pre-tools-registry `base` (no tools.py) alongside `head` (with tools.py).
+        import shutil
+        base_repo = os.path.join(self.tmp.name, "base-repo")
+        os.makedirs(os.path.join(base_repo, "bin"))
+        pkg_dir = os.path.join(base_repo, "src", "buildq")
+        shutil.copytree(os.path.join(ROOT, "src", "buildq"), pkg_dir)
+        os.remove(os.path.join(pkg_dir, "tools.py"))
+        # Minimal stand-ins so commands/scheduler don't need tools.py (like af1fb2a).
+        with open(os.path.join(pkg_dir, "commands.py"), "w") as f:
+            f.write("SHELLS = {'bash'}\nINTERPRETERS = {'python3'}\n"
+                    "def _tool_and_args(argv): return (argv[0] if argv else ''), argv[1:]\n"
+                    "def cargo_cold(argv, cwd, env): return False\n")
+        for mod_name in ("config", "machine", "history", "metrics", "runners", "ticket", "supervisor", "github", "scheduler", "daemon"):
+            with open(os.path.join(pkg_dir, f"{mod_name}.py"), "w") as f:
+                f.write("pass\n")
+        shutil.copy(os.path.join(ROOT, "bin", "buildq"), os.path.join(base_repo, "bin", "buildq"))
+        os.symlink("buildq", os.path.join(base_repo, "bin", "buildqd"))
+        base_pkg = sim.load_buildqd(os.path.join(base_repo, "bin", "buildqd"), "buildqd_no_tools")
+        self.assertNotIn("tools", base_pkg._mods)
+        self.assertFalse(hasattr(base_pkg, "HONORS_GRANT_TOOLS"))
+
+        # Verify Simulation.honors_grant consults head's honors_grant_tool (supporting new tools)
+        # while falling back to historical GRANT_TOOLS when base lacks tools.py.
+        state = os.path.join(self.tmp.name, "hg")
+        os.makedirs(state)
+        s = sim.Simulation(scenario([]), CONFIG, BUILDQD, state, name="buildqd_hg")
+        t = type("T", (), {"argv": ["zig", "build"], "jobserver": None})()
+        self.assertFalse(s.honors_grant(t))
+        s.mod.patch("honors_grant_tool", lambda name: name == "zig")
+        self.assertTrue(s.honors_grant(t))
+        s.mod = base_pkg
+        self.assertFalse(s.honors_grant(t))  # pre-registry base uses frozen GRANT_TOOLS
+        self.assertTrue(s.honors_grant(type("T", (), {"argv": ["cargo", "build"], "jobserver": None})()))
 
 
 if __name__ == "__main__":

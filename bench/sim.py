@@ -56,9 +56,9 @@ class _BuildqdPackage:
     """Facade over an isolated copy of the `buildq` package so sim.py can load two versions side by
     side and patch both legacy single-file `bin/buildqd` and the split `src/buildq/` package."""
 
-    SUBMODULES = ("common", "commands", "config", "machine", "history", "metrics",
+    SUBMODULES = ("common", "tools", "commands", "config", "machine", "history", "metrics",
                   "runners", "ticket", "supervisor", "github", "scheduler", "daemon")
-    LOOKUP_ORDER = ("daemon", *(sub for sub in SUBMODULES if sub != "daemon"))
+    LOOKUP_ORDER = ("daemon", *(sub for sub in SUBMODULES if sub not in ("daemon", "tools")), "tools")
 
     def __init__(self, pkg_dir: str, name: str):
         # Load the isolated package into a temporary sys.modules namespace, then restore sys.modules
@@ -71,7 +71,9 @@ class _BuildqdPackage:
             pkg = importlib.util.module_from_spec(spec)
             sys.modules[name] = pkg
             spec.loader.exec_module(pkg)
-            mods = {sub: importlib.import_module(f"{name}.{sub}") for sub in self.SUBMODULES}
+            mods = {sub: importlib.import_module(f"{name}.{sub}")
+                    for sub in self.SUBMODULES
+                    if os.path.isfile(os.path.join(pkg_dir, f"{sub}.py"))}
             object.__setattr__(self, "_mods", mods)
         finally:
             for k in [k for k in sys.modules if k == name or k.startswith(prefix)]:
@@ -80,8 +82,8 @@ class _BuildqdPackage:
 
     def __getattr__(self, attr: str):
         for sub in self.LOOKUP_ORDER:
-            mod = self._mods[sub]
-            if hasattr(mod, attr):
+            mod = self._mods.get(sub)
+            if mod is not None and hasattr(mod, attr):
                 return getattr(mod, attr)
         raise AttributeError(attr)
 
@@ -412,7 +414,11 @@ class Simulation:
         set_attr("cgroup_frozen", lambda path: self.frozen(path))
         set_attr("parent_freeze_set", lambda path: False)
         set_attr("repo_name", lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd)))
-        set_attr("cargo_cold", lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False))
+        cold_fn = lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False)
+        if hasattr(mod, "cargo_cold"):
+            set_attr("cargo_cold", cold_fn)
+        if hasattr(mod, "is_cold"):
+            set_attr("is_cold", cold_fn)
         set_attr("disk_space", lambda path: (1 << 50, 1 << 50))  # (free, size): plenty; there is no disk here
         load = mod.load_config_file
 
@@ -504,17 +510,20 @@ class Simulation:
         job.honors_grant = self.honors_grant(ticket)
         self.jobs[ticket.id] = job
 
-    # Tools that hold to the cores buildq grants them: a jobserver's tokens or CARGO_BUILD_JOBS (cargo,
-    # make, ninja), DOTNET_PROCESSOR_COUNT, CMAKE_BUILD_PARALLEL_LEVEL. JS tools and test runners
-    # (vitest, eslint, node) start a worker per core the machine has, jobserver or not.
+    # Frozen historical fallback for pre-registry `base` daemons lacking `buildq.tools`.
+    # Newer daemons supply `honors_grant_tool()` / `HONORS_GRANT_TOOLS` directly.
     GRANT_TOOLS = frozenset({"cargo", "make", "gmake", "ninja", "dotnet", "cmake", "go"})
 
     def honors_grant(self, ticket) -> bool:
-        """cargo, make, ninja, dotnet, cmake and go hold to their grant; a script (a shell or an
+        """Tools registered with honors_grant=True hold to their grant; a script (a shell or an
         interpreter running one) does under a jobserver, through the cargo or make it runs; anything
         else (vitest, eslint, vite, storybook, node, a JS package script) runs at its own pace."""
         tool, _ = self.mod._tool_and_args(list(ticket.argv))  # (wrappers such as env and nice taken off)
-        if tool in self.GRANT_TOOLS:
+        check = getattr(self.mod, "honors_grant_tool", None)
+        if check is not None:
+            if check(tool):
+                return True
+        elif tool in getattr(self.mod, "HONORS_GRANT_TOOLS", self.GRANT_TOOLS):
             return True
         if tool in self.mod.SHELLS or tool in self.mod.INTERPRETERS - {"node", "deno", "bun"} \
                 or re.fullmatch(r"python3(\.\d+)?", tool):
@@ -1062,7 +1071,7 @@ PUBLIC_WORDS = frozenset("""build test check clippy run bench doc fmt nextest in
 PUBLIC_TOOLS = frozenset("""cargo rustc pnpm npm npx pnpx yarn bun bunx node deno vite vitest tsc vue-tsc
     eslint playwright storybook python python3 pytest py.test uv dotnet msbuild make gmake ninja cmake docker
     podman buildah bash sh zsh dash ksh fish ruby perl git go gradle mvn java""".split())
-PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?")  # versioned Pythons
+PUBLIC_TOOL = re.compile(r"python[23](\.\d+)?|(?:gcc|g\+\+|clang|clang\+\+)-\d+")  # versioned tools
 PUBLIC_LANES = frozenset("default heavy check web dotnet image python-tests ci".split())
 
 

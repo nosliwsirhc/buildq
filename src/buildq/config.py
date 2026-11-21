@@ -12,7 +12,7 @@ try:
 except ModuleNotFoundError:  # Python < 3.11
     sys.exit("buildqd needs Python 3.11 or newer (for tomllib).")
 
-from . import commands, common
+from . import commands, common, tools as tool_registry
 from .commands import NOT_SCRIPT_PATTERN, NOT_SCRIPTS
 
 CI_LONG_WAITS = 12  # times starve_seconds a build may queue before it goes ahead of CI jobs' builds past ci_deadline
@@ -205,9 +205,10 @@ class Config:
                                                      for x in scripts):
             raise ValueError("restartable_scripts must be a list of script file names, such as "
                              "[\"run-api-tests.sh\"]")
-        tools = [x for x in scripts if x in NOT_SCRIPTS or NOT_SCRIPT_PATTERN.fullmatch(x)]
-        if tools:
-            raise ValueError(f"restartable_scripts names scripts, not tools: {', '.join(sorted(tools))} "
+        disallowed = [x for x in scripts
+                      if x in NOT_SCRIPTS or NOT_SCRIPT_PATTERN.fullmatch(x) or tool_registry.is_not_script(x)]
+        if disallowed:
+            raise ValueError(f"restartable_scripts names scripts, not tools: {', '.join(sorted(disallowed))} "
                              "would make anything run with them restartable")
         self.restartable_scripts = frozenset(scripts)
         self.unwatched_seconds = common.number(d["unwatched_seconds"], "unwatched_seconds", 1, 86400)

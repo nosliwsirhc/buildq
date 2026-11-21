@@ -11,8 +11,8 @@ import threading
 import time
 import traceback
 
-from . import commands, common, machine
-from .commands import JOBSERVER_TOOLS, MAKE_FLAG_VARS
+from . import commands, common, machine, tools
+from .commands import MAKE_FLAG_VARS
 from .common import FINISHED, GIB, MIB, PENDING
 from .config import CI_LONG_WAITS
 from .runners import Jobserver
@@ -509,7 +509,7 @@ class SchedulerMixin:
         already running can still write below it."""
         paths = [*(t.disk_paths or [t.cwd]), self.state_dir]
         remote = str((t.env or {}).get("DOCKER_HOST") or (t.env or {}).get("CONTAINER_HOST") or "")
-        if commands._tool_and_args(t.argv)[0] in ("docker", "podman", "buildah") and not remote.startswith(("tcp:", "ssh:")):
+        if tools.uses_container_storage(commands._tool_and_args(t.argv)[0]) and not remote.startswith(("tcp:", "ssh:")):
             for path in self.cfg.container_storage:  # (a build on a remote engine writes there, not here)
                 try:
                     os.stat(path)
@@ -875,34 +875,12 @@ class SchedulerMixin:
         self.budget.update(held_mem=held_mem + sum(mem for _, mem, _ in ci_holds),
                            held_cores=held_cpu + sum(cores for _, _, cores in ci_holds))
 
-    def build_env(self, t: Ticket) -> dict:
+    def build_env(self, t: Ticket, caller_env: dict | None = None) -> dict:
         """Parallelism for the build's tools, unless the caller chose its own."""
-        g, w = str(t.granted), str(t.want)
-        values = {"BUILDQ_CORES": g, "CMAKE_BUILD_PARALLEL_LEVEL": g, "GOMAXPROCS": g,
-                  # .NET: MSBuild sizes its worker nodes from the processor count, and node reuse
-                  # leaves workers behind after the build, holding memory nobody accounts for.
-                  "DOTNET_PROCESSOR_COUNT": g, "MSBUILDDISABLENODEREUSE": "1",
-                  # ...and the shared compiler server would compile outside the build's cgroup.
-                  "UseSharedCompilation": "false"}
-        if self.lane(t.lane).test_threads:
-            values.update({"RUST_TEST_THREADS": g, "NEXTEST_TEST_THREADS": g})
         args = commands.strip_wrappers(t.argv)
         tool = os.path.basename(args[0]) if args else ""
-        # make runs in parallel only when asked (-j): a Makefile not written for it can break. Its
-        # -j is then replaced by the build's jobserver (see start()), since a -j on the command
-        # line makes make ignore the jobserver. ninja is parallel by design. Other tools get the
-        # jobserver through CARGO_MAKEFLAGS, which cargo reads first and hands to build scripts.
-        parallel_make = tool == "ninja" or (tool in ("make", "gmake") and commands.asks_for_jobs(args[1:]))
-        if t.jobserver:
-            flags = f"-j{w} --jobserver-auth=fifo:{t.jobserver}"
-            values["CARGO_MAKEFLAGS"] = flags
-            if parallel_make:
-                values["MAKEFLAGS"] = flags
-        else:
-            values["CARGO_BUILD_JOBS"] = g  # no tokens to bound it, so cargo is told the number
-            if parallel_make:
-                values["MAKEFLAGS"] = f"-j{g}"
-        return values
+        return tools.env_for(tool, args[1:], t.granted, t.want, t.jobserver,
+                             self.lane(t.lane).test_threads, caller_env)
 
     def start(self, t: Ticket, now: float, granted: int) -> None:
         lane = self.lane(t.lane)
@@ -927,8 +905,9 @@ class SchedulerMixin:
             env = common.read_json(env_path)
             if not isinstance(env, dict):
                 raise OSError("its environment file is missing")
-            tool = os.path.basename((commands.strip_wrappers(t.argv) or ["?"])[0])
-            known = tool in JOBSERVER_TOOLS
+            stripped = commands.strip_wrappers(t.argv)
+            tool = os.path.basename((stripped or ["?"])[0])
+            known = tools.uses_jobserver(tool)
             wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
             # An inherited jobserver passed by descriptor is dead in the build's service: drop it,
             # and give the build buildq's, unless the caller still brings make flags of its own.
@@ -950,23 +929,29 @@ class SchedulerMixin:
                 t.js = Jobserver(t.jobserver, create=True)
                 t.js.resize(granted - 1)  # every client of a jobserver has one implicit token
                 t.tokens_out = t.js.out
-            t.exec_argv = None
-            if t.jobserver and tool in ("make", "gmake", "ninja") and commands.asks_for_jobs(t.argv[1:]):
-                tool_at = len(t.argv) - len(commands.strip_wrappers(t.argv))  # (a wrapper's own words stay: env -u -j make)
-                t.exec_argv = t.argv[:tool_at] + commands.without_jobs(t.argv[tool_at:])  # its -j would make it ignore the jobserver
+            tool_at = len(t.argv) - len(stripped)  # (a wrapper's own words stay: env -u -j make)
+            t.exec_argv = tools.rewrite_argv_for(tool, t.argv, tool_at, granted, t.jobserver,
+                                                 lane.test_threads, env)
             # buildq's settings go in a file of their own, so a build that is queued again after a
-            # restart gets fresh ones.
-            ours = self.build_env(t)
-            # The caller's own settings win; an empty make variable is no setting (a make recipe
-            # exports MAKEFLAGS= and MFLAGS=), so buildq's flags go in its place.
-            given = {k for k in env if k not in MAKE_FLAG_VARS or str(env[k]).strip()}
+            # restart gets fresh ones. Pass cleaned make flags so a merge callback never sees a
+            # dropped fd jobserver.
+            cleaned_env = {**env, **cleaned} if cleaned else env
+            ours, merged = tools.env_with_merged(tool, stripped[1:], t.granted, t.want, t.jobserver,
+                                                 lane.test_threads, cleaned_env)
+            # The caller's own settings win, except keys explicitly merged by the emitting tool
+            # callback and empty make variables (a make recipe exports MAKEFLAGS= and MFLAGS=).
+            given = {k for k in env
+                     if k not in merged and (k not in MAKE_FLAG_VARS or str(env[k]).strip())}
             parallel = {k: v for k, v in ours.items() if k not in given}
             for k, rest in cleaned.items():
+                if k in merged:
+                    parallel[k] = ours[k]  # merger already folded `rest` via cleaned_env
+                    continue
                 # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
                 # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)
-                mine = ours.get(k) or (f"-j{t.want} --jobserver-auth=fifo:{t.jobserver}"
+                mine = ours.get(k) or (tools.jobserver_flags(t.want, t.jobserver)
                                        if t.jobserver and k != "CARGO_MAKEFLAGS"
-                                       and tool in ("make", "gmake", "ninja") else "")
+                                       and tools.uses_makeflags_jobserver(tool) else "")
                 parallel[k] = commands.with_make_flags(rest, mine)
             common.write_json(os.path.join(t.dir, "parallel.json"), parallel)
             self.runner.prepare(t, self.cfg.slice)
