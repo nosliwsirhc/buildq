@@ -176,9 +176,16 @@ def log(message: str, level: int | None = None) -> None:
 def write_json(path: str, data) -> None:
     """Write a JSON file atomically: readers see the old contents or the new, never a part."""
     tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w") as f:
-        json.dump(data, f, separators=(",", ":"))
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def read_json(path: str):

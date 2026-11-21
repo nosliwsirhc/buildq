@@ -933,15 +933,20 @@ class SchedulerMixin:
             t.exec_argv = tools.rewrite_argv_for(tool, t.argv, tool_at, granted, t.jobserver,
                                                  lane.test_threads, env)
             # buildq's settings go in a file of their own, so a build that is queued again after a
-            # restart gets fresh ones.
+            # restart gets fresh ones. Pass cleaned make flags so a merge callback never sees a
+            # dropped fd jobserver.
+            cleaned_env = {**env, **cleaned} if cleaned else env
             ours, merged = tools.env_with_merged(tool, stripped[1:], t.granted, t.want, t.jobserver,
-                                                 lane.test_threads, env)
+                                                 lane.test_threads, cleaned_env)
             # The caller's own settings win, except keys explicitly merged by the emitting tool
             # callback and empty make variables (a make recipe exports MAKEFLAGS= and MFLAGS=).
             given = {k for k in env
                      if k not in merged and (k not in MAKE_FLAG_VARS or str(env[k]).strip())}
             parallel = {k: v for k, v in ours.items() if k not in given}
             for k, rest in cleaned.items():
+                if k in merged:
+                    parallel[k] = ours[k]  # merger already folded `rest` via cleaned_env
+                    continue
                 # The caller's make ran in parallel (it had a jobserver): a make or ninja build does
                 # too, on buildq's. (cargo hands its own to build scripts through CARGO_MAKEFLAGS.)
                 mine = ours.get(k) or (tools.jobserver_flags(t.want, t.jobserver)

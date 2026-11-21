@@ -980,6 +980,7 @@ class Supervisor(unittest.TestCase):
         with open(os.path.join(d, "stderr.log"), "rb") as f:
             self.assertEqual(f.read(), b"err\n")
         self.assertFalse(os.path.exists(os.path.join(d, "env.json")))  # secrets aren't kept
+        self.assertFalse(os.path.exists(os.path.join(d, "parallel.json")))  # merged secrets aren't kept either
         # Not in a cgroup of its own here, so its memory waits aren't measured.
         self.assertEqual((result["mem_wait_some"], result["mem_wait_full"], result["mem_high"]), (None, None, None))
 
@@ -1407,9 +1408,23 @@ class MergeEnvVars(DaemonCase):
             with open(os.path.join(n.dir, "parallel.json")) as f:
                 n_parallel = json.load(f)
             self.assertNotIn("MAKEFLAGS", n_parallel)
+            # When the MAKEFLAGS merger itself runs with a dead inherited fd jobserver, it receives
+            # the cleaned flags and its merged value is applied once without restoring 3,4.
+            m = self.submit(("othertool", "build"), env={"MAKEFLAGS": "w -j8 --jobserver-auth=3,4"})
+            with open(os.path.join(m.dir, "parallel.json")) as f:
+                m_parallel = json.load(f)
+            self.assertEqual(m_parallel["MAKEFLAGS"], f"w -j{m.granted}")
+            self.assertNotIn("3,4", m_parallel["MAKEFLAGS"])
         # Finalize removes parallel.json alongside env.json so merged caller secrets don't persist.
         self.finish(t)
         self.assertFalse(os.path.exists(os.path.join(t.dir, "parallel.json")))
+
+    def test_write_json_cleans_up_temp_file_on_rename_failure(self):
+        target = os.path.join(self.tmp.name, "parallel.json")
+        with mock.patch.object(common.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                common.write_json(target, {"GRADLE_OPTS": "-Dhttp.proxyPassword=secret"})
+        self.assertFalse(any(name.startswith("parallel.json") for name in os.listdir(self.tmp.name)))
 
 
 if __name__ == "__main__":
