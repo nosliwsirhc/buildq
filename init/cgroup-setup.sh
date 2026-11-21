@@ -96,14 +96,24 @@ chown root:root "$outer"
 chmod 0755 "$outer"
 # Ensure outer control files stay root-owned (including when upgrading from an earlier recursive chown).
 for f in cgroup.procs cgroup.threads cgroup.subtree_control memory.high memory.max; do
-  [ -e "$outer/$f" ] && chown root:root "$outer/$f" 2>/dev/null || true
+  if [ -e "$outer/$f" ]; then
+    chown root:root "$outer/$f" || {
+      printf 'cgroup-setup.sh: failed to reset root ownership on %s/%s\n' "$outer" "$f" >&2
+      exit 1
+    }
+  fi
 done
 enable_ctrls "$outer"
 
 # Host-wide aggregate memory ceiling stays root-owned on `buildq-<user>` so workloads under
-# `$user` cannot raise their own ceiling above `max_pct`% of RAM. Fail closed if writing fails.
+# `$user` cannot raise their own ceiling above `max_pct`% of RAM. Fail closed if MemTotal is
+# unreadable or writing fails.
 mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
-if [ "${mem_kb:-0}" -gt 0 ] && [ "$max_pct" -gt 0 ]; then
+if [ "$max_pct" -gt 0 ]; then
+  if [ "${mem_kb:-0}" -le 0 ]; then
+    printf 'cgroup-setup.sh: could not determine MemTotal from /proc/meminfo to enforce %s%% ceiling\n' "$max_pct" >&2
+    exit 1
+  fi
   high_bytes=$((mem_kb * 1024 * high_pct / 100))
   max_bytes=$((mem_kb * 1024 * max_pct / 100))
   if [ ! -w "$outer/memory.high" ] || [ ! -w "$outer/memory.max" ]; then

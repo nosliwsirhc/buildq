@@ -1042,7 +1042,11 @@ class SchedulerMixin:
         for t in self.active():
             if t.js is not None and t.dir and os.path.exists(os.path.join(t.dir, "make_fixed.json")):
                 # GNU Make < 4.4 downgraded to fixed `-j<granted>` inside the supervisor: stop
-                # treating it as elastic so its cores aren't handed away while Make keeps using them.
+                # treating it as elastic and sync t.granted to the fixed count Make actually uses.
+                fixed = common.read_json(os.path.join(t.dir, "make_fixed.json"))
+                if isinstance(fixed, dict) and isinstance(fixed.get("granted"), int) and fixed["granted"] >= 1:
+                    t.granted = fixed["granted"]
+                    t.max_granted = max(t.max_granted, t.granted)
                 t.elastic = False
                 self.close_jobserver(t)
                 continue
@@ -1210,8 +1214,10 @@ class SchedulerMixin:
             if self.slice_limit != "max":
                 value = min(value, int(self.slice_limit))
         intent_fn = getattr(self.runner, "note_slice_guard_intent", None)
-        if intent_fn is not None:
-            intent_fn(str(value), stopping=stopping)
+        if not stopping and intent_fn is not None and not intent_fn(str(value)):
+            # Fail closed: if we can't persist recovery metadata before lowering memory.max, skip
+            # lowering so a crash can never ratify a temporary cap as the permanent ceiling.
+            return
         try:
             with open(os.path.join(path, "memory.max"), "w") as f:
                 f.write(str(value))

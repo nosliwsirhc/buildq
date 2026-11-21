@@ -268,6 +268,11 @@ class CgroupRunnerUnit(unittest.TestCase):
             f.write(f"{12 * GIB + 4096}\n")
         r2 = self._make_runner()
         self.assertEqual(r2.initial_memory_max, str(16 * GIB))
+        # Simulate crash between writing new intent (8G) and updating memory.max (still 12G+4096):
+        # prev_written preserves recovery of the original 16G baseline!
+        self.assertTrue(r2.note_slice_guard_intent(str(8 * GIB)))
+        r3 = self._make_runner()
+        self.assertEqual(r3.initial_memory_max, str(16 * GIB))
         d.guard_slice(stopping=True)
         self.assertEqual(read_text(os.path.join(self.builds, "memory.max")).strip(), str(16 * GIB))
 
@@ -438,6 +443,9 @@ class FallbacksUnit(unittest.TestCase):
                 # Uses ticket grant (3), not caller-overridable BUILDQ_CORES (99), and marks make_fixed.json.
                 self.assertEqual(env["MAKEFLAGS"], "-j3")
                 self.assertTrue(os.path.isfile(os.path.join(tmp, "make_fixed.json")))
+                # Verify _effective_wrapper_cwd handles -CDIR and non-chaining repeated -C in one env.
+                self.assertEqual(supervisor._effective_wrapper_cwd(["env", "-Ca", "-Cb", "make"], 3, "/base"), "/base/b")
+                self.assertEqual(supervisor._effective_wrapper_cwd(["env", "-C", "a", "env", "-Cb", "make"], 5, "/base"), "/base/a/b")
             finally:
                 os.close(r_fd)
                 try:

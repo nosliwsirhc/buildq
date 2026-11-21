@@ -600,7 +600,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
             pass
         self.close_jobserver(t, remove=True)
         try:
-            for name in ("result.json", "supervisor.json", "child.json"):
+            for name in ("result.json", "supervisor.json", "child.json", "make_fixed.json"):
                 try:
                     os.remove(os.path.join(t.dir, name))
                 except FileNotFoundError:
@@ -788,6 +788,10 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 continue
             # Non-cgroup runner MemoryMax watchdog: kill a build whose complete measured process-tree
             # memory exceeds its lane's MemoryMax, marking it killed for memory so history learns its cap.
+            if t.cap_killed and self.runner_of(t).alive(t) and (t.stop_sent is None or now - t.stop_sent >= 2):
+                # Retry force teardown if an earlier stop left live descendants (e.g. concurrent fork).
+                self.stop(t, now, force=True)
+                continue
             if (not self._runner_has_cgroup(self.runner_of(t)) and t.measured and t._mem_sample_ok
                     and not t.cancel_requested and not t.cap_killed):
                 lane = self.lane(t.lane)

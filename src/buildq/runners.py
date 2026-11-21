@@ -343,7 +343,8 @@ class CgroupRunner:
 
     def _load_or_init_baseline(self) -> str:
         """Read `<builds>/memory.max` while preserving the original ceiling across daemon crashes
-        (SIGKILL / OOM while `slice_guard` held a lowered value), tolerating kernel page rounding."""
+        (SIGKILL / OOM while `slice_guard` held a lowered value), tolerating kernel page rounding
+        and mid-transition crashes between `prev_written` and `last_written`."""
         live = machine.cgroup_memory_max(self.builds_dir) or "max"
         bpath = self._baseline_path()
         bid = machine.boot_id() or ""
@@ -351,45 +352,76 @@ class CgroupRunner:
             rec = common.read_json(bpath)
             if isinstance(rec, dict) and rec.get("builds_dir") == self.builds_dir and rec.get("boot_id") == bid:
                 saved_base = rec.get("baseline")
-                last_written = rec.get("last_written")
                 if isinstance(saved_base, str) and (saved_base == "max" or saved_base.isdigit()):
-                    if last_written is not None and self._limits_match(live, str(last_written)):
-                        return saved_base
+                    for key in ("last_written", "prev_written"):
+                        val = rec.get(key)
+                        if val is not None and self._limits_match(live, str(val)):
+                            self._last_guard_written = live
+                            return saved_base
             try:
                 common.write_private_file_atomic(
                     bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
-                                       "baseline": live, "last_written": None})
+                                       "baseline": live, "prev_written": None, "last_written": None})
                 )
             except OSError:
                 pass
         return live
 
-    def note_slice_guard_intent(self, value: str, *, stopping: bool = False) -> None:
-        """Persist `last_written` BEFORE writing `<builds>/memory.max` (skipping redundant disk
-        writes when the value is unchanged) so a crash mid-write never ratifies a lowered cap."""
-        if not stopping and getattr(self, "_last_guard_written", None) == str(value):
-            return
+    def note_slice_guard_intent(self, value: str) -> bool:
+        """Persist `(prev_written, last_written)` BEFORE writing a lowered `<builds>/memory.max`
+        (skipping redundant disk writes when the value already matches within one page). Returns
+        False if the recovery record could not be persisted."""
+        prev = getattr(self, "_last_guard_written", None)
+        if prev is not None and self._limits_match(prev, str(value)):
+            return True
         bpath = self._baseline_path()
         if not bpath or not self.builds_dir:
-            self._last_guard_written = None if stopping else str(value)
-            return
+            self._last_guard_written = str(value)
+            return True
         bid = machine.boot_id() or ""
         base = self.initial_memory_max or "max"
         try:
             common.write_private_file_atomic(
                 bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
-                                   "baseline": base, "last_written": None if stopping else str(value)})
+                                   "baseline": base, "prev_written": prev, "last_written": str(value)})
             )
-            self._last_guard_written = None if stopping else str(value)
+            self._last_guard_written = str(value)
+            return True
         except OSError:
-            pass
+            return False
 
     def note_slice_guard_write(self, value: str, *, stopping: bool = False) -> None:
-        """Record the kernel's actual page-rounded readback after writing `<builds>/memory.max`."""
-        actual = machine.cgroup_memory_max(self.builds_dir) or str(value) if self.builds_dir else str(value)
-        if not stopping and getattr(self, "_last_guard_written", None) == actual:
+        """Record the kernel's actual page-rounded readback AFTER writing `<builds>/memory.max`,
+        or clear recovery markers only after restoration on shutdown succeeded."""
+        bpath = self._baseline_path()
+        if stopping:
+            self._last_guard_written = None
+            if bpath and self.builds_dir:
+                bid = machine.boot_id() or ""
+                base = self.initial_memory_max or "max"
+                try:
+                    common.write_private_file_atomic(
+                        bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
+                                           "baseline": base, "prev_written": None, "last_written": None})
+                    )
+                except OSError:
+                    pass
             return
-        self.note_slice_guard_intent(actual, stopping=stopping)
+        actual = machine.cgroup_memory_max(self.builds_dir) or str(value) if self.builds_dir else str(value)
+        if getattr(self, "_last_guard_written", None) == actual:
+            return
+        prev = getattr(self, "_last_guard_written", None)
+        self._last_guard_written = actual
+        if bpath and self.builds_dir:
+            bid = machine.boot_id() or ""
+            base = self.initial_memory_max or "max"
+            try:
+                common.write_private_file_atomic(
+                    bpath, json.dumps({"builds_dir": self.builds_dir, "boot_id": bid,
+                                       "baseline": base, "prev_written": prev, "last_written": actual})
+                )
+            except OSError:
+                pass
 
     @staticmethod
     def _enable_controllers(path: str) -> set[str]:

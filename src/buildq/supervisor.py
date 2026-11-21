@@ -140,19 +140,41 @@ def _reap_all_children() -> None:
 
 
 def _effective_wrapper_cwd(argv: list[str], tool_at: int, base_cwd: str) -> str:
-    """Resolve effective working directory if an `env -C DIR` / `--chdir=DIR` wrapper precedes the tool."""
+    """Resolve effective working directory if `env -C DIR` / `-CDIR` / `--chdir=DIR` wrappers
+    precede the tool. Repeated `-C` options within one `env` invocation replace each other relative
+    to that `env`'s starting cwd; a nested `env` starts from the outer `env`'s resolved cwd."""
     cwd = base_cwd
+    env_start = base_cwd
+    in_env = False
     i = 0
     while i < tool_at:
         a = argv[i]
-        if a in ("-C", "--chdir") and i + 1 < tool_at:
-            nxt = argv[i + 1]
-            cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(cwd, nxt))
-            i += 2
+        base = os.path.basename(a)
+        if base == "env":
+            in_env = True
+            env_start = cwd
+            i += 1
             continue
-        if a.startswith("--chdir="):
-            nxt = a.split("=", 1)[1]
-            cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(cwd, nxt))
+        if in_env:
+            if a in ("-C", "--chdir") and i + 1 < tool_at:
+                nxt = argv[i + 1]
+                cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+                i += 2
+                continue
+            if a.startswith("--chdir="):
+                nxt = a.split("=", 1)[1]
+                cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+                i += 1
+                continue
+            if a.startswith("-C") and len(a) > 2:
+                nxt = a[2:]
+                cwd = nxt if os.path.isabs(nxt) else os.path.normpath(os.path.join(env_start, nxt))
+                i += 1
+                continue
+            if a == "--":
+                in_env = False
+            elif not a.startswith("-") and "=" not in a:
+                in_env = False
         i += 1
     return cwd
 
@@ -202,26 +224,65 @@ def _downgrade_old_make_fifo(argv: list[str], cwd: str, env: dict[str, str], job
     exe = _resolve_in_cwd(stripped[0], eff_cwd, eff_path)
     if not exe:
         return jobserver_fd
-    out_text = ""
+    out_chunks: list[bytes] = []
+    out_bytes = 0
     try:
         proc = subprocess.Popen([exe, "--version"], cwd=eff_cwd, env=probe_env, stdin=DEVNULL,
-                                stdout=subprocess.PIPE, stderr=DEVNULL, text=True, process_group=0)
+                                stdout=subprocess.PIPE, stderr=DEVNULL, process_group=0)
+        assert proc.stdout is not None
+        rfd = proc.stdout.fileno()
+        os.set_blocking(rfd, False)
+        sel = selectors.DefaultSelector()
+        sel.register(rfd, selectors.EVENT_READ)
+        eof = False
         deadline = time.monotonic() + 2.0
-        while proc.poll() is None:
-            if cancel_flag:
+        try:
+            while time.monotonic() < deadline:
+                if cancel_flag:
+                    signal_group(proc.pid, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    return jobserver_fd
+                if not eof:
+                    wait = min(0.05, max(0.0, deadline - time.monotonic()))
+                    for _key, _ in sel.select(wait):
+                        while out_bytes < 65536:
+                            try:
+                                chunk = os.read(rfd, 4096)
+                            except BlockingIOError:
+                                break
+                            except OSError:
+                                eof = True
+                                break
+                            if not chunk:
+                                eof = True
+                                break
+                            out_chunks.append(chunk)
+                            out_bytes += len(chunk)
+                else:
+                    time.sleep(0.02)
+                if proc.poll() is not None and (eof or out_bytes >= 65536):
+                    break
+            if proc.poll() is None or not eof:
+                # Kill the entire probe process group (catches any descendant holding stdout open).
                 signal_group(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=1)
-                return jobserver_fd
-            if time.monotonic() >= deadline:
-                signal_group(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=1)
-                return jobserver_fd
-            time.sleep(0.02)
-        out_text = proc.stdout.read() if proc.stdout else ""
-        if proc.stdout:
-            proc.stdout.close()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass
+                if proc.returncode is None:
+                    return jobserver_fd
+        finally:
+            sel.close()
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
     except (OSError, subprocess.SubprocessError):
         return jobserver_fd
+    out_text = b"".join(out_chunks).decode("utf-8", errors="replace")
     m = re.search(r"GNU Make\s+(\d+)\.(\d+)", out_text or "")
     if not m or (int(m.group(1)), int(m.group(2))) >= (4, 4):
         return jobserver_fd

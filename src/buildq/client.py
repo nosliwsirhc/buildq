@@ -1664,50 +1664,36 @@ def _socket_peer_daemon(sock_path: str) -> tuple[int, int] | None:
 
 
 def _read_daemon_pid(pid_file: str, expected_socket: str | None = None) -> tuple[int, int, str | None] | None:
-    """Read `(pid, start_ticks, started_by)` from `pid_file` (JSON record or legacy int),
-    verifying boot ID, socket match, and daemon identity."""
+    """Read `(pid, start_ticks, started_by)` from `pid_file` (structured JSON written by buildqd),
+    requiring matching boot ID, matching socket path, and verified buildqd identity."""
     try:
         with open(pid_file) as f:
             raw = f.read().strip()
     except OSError:
         return None
-    if not raw:
+    if not raw or not raw.startswith("{"):
         return None
-    pid: int | None = None
-    start: int | None = None
-    started_by: str | None = None
-    if raw.startswith("{"):
-        try:
-            rec = json.loads(raw)
-        except ValueError:
-            return None
-        if not isinstance(rec, dict):
-            return None
-        rec_boot = rec.get("boot_id")
-        cur_boot = machine.boot_id()
-        if not rec_boot or (cur_boot and rec_boot != cur_boot):
-            return None
-        rec_sock = rec.get("socket")
-        if expected_socket and rec_sock:
-            if os.path.normpath(os.path.abspath(str(rec_sock))) != os.path.normpath(os.path.abspath(expected_socket)):
-                return None
-        pid = rec.get("pid") if isinstance(rec.get("pid"), int) else None
-        start = rec.get("start") if isinstance(rec.get("start"), int) else None
-        started_by = rec.get("started_by") if isinstance(rec.get("started_by"), str) else None
-        if pid is None or start is None:
-            return None
-    else:
-        try:
-            pid = int(raw)
-        except ValueError:
-            return None
-    if pid is None or not machine.pid_is_buildqd(pid, start):
+    try:
+        rec = json.loads(raw)
+    except ValueError:
         return None
-    if start is None:
-        ident = machine.proc_identity(pid)
-        if ident is None:
+    if not isinstance(rec, dict):
+        return None
+    rec_boot = rec.get("boot_id")
+    cur_boot = machine.boot_id()
+    if not rec_boot or not cur_boot or rec_boot != cur_boot:
+        return None
+    rec_sock = rec.get("socket")
+    if expected_socket:
+        if not isinstance(rec_sock, str) or not rec_sock:
             return None
-        start = ident[0]
+        if os.path.normpath(os.path.abspath(rec_sock)) != os.path.normpath(os.path.abspath(expected_socket)):
+            return None
+    pid = rec.get("pid") if isinstance(rec.get("pid"), int) and not isinstance(rec.get("pid"), bool) else None
+    start = rec.get("start") if isinstance(rec.get("start"), int) and not isinstance(rec.get("start"), bool) else None
+    started_by = rec.get("started_by") if isinstance(rec.get("started_by"), str) else None
+    if pid is None or start is None or not machine.pid_is_buildqd(pid, start):
+        return None
     return (pid, start, started_by)
 
 
@@ -1945,21 +1931,23 @@ def cmd_daemon(args) -> int:
                     sys.stdout.flush()
                     continue
                 try:
-                    nst = os.stat(log_file)
-                    if (nst.st_dev, nst.st_ino) != cur_id or nst.st_size < f.tell():
-                        # Open and verify replacement BEFORE closing current stream so a brief
-                        # disappearance during rotation never leaves a closed handle.
-                        nf = open(log_file, errors="replace")
+                    nst = os.lstat(log_file)
+                    if stat.S_ISREG(nst.st_mode) and ((nst.st_dev, nst.st_ino) != cur_id or nst.st_size < f.tell()):
+                        # Open and verify replacement non-blocking (FIFO-safe) BEFORE closing current stream.
+                        nfd = os.open(log_file, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
                         try:
-                            nf_st = os.fstat(nf.fileno())
+                            nf_st = os.fstat(nfd)
                             if stat.S_ISREG(nf_st.st_mode):
+                                os.set_blocking(nfd, True)
+                                nf = os.fdopen(nfd, "r", errors="replace")
+                                nfd = -1
                                 f.close()
                                 f = nf
                                 cur_id = (nf_st.st_dev, nf_st.st_ino)
                                 continue
-                            nf.close()
-                        except OSError:
-                            nf.close()
+                        finally:
+                            if nfd >= 0:
+                                os.close(nfd)
                 except OSError:
                     pass
                 time.sleep(0.2)
