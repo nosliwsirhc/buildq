@@ -845,16 +845,22 @@ if [ "$do_uninstall" = yes ]; then
     # daemon or an init supervisor respawning buildqd between crashes.
     _start_cs=$(mono_cs || printf '')
     if [ -n "$_start_cs" ]; then
-      _end_cs=$(( _start_cs + 200 ))
+      _end_cs=$(( _start_cs + 201 ))
+      _est_cs=$_start_cs
       while :; do
         if daemon_lock_held; then
           say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
           say "Disable and stop that service first, then re-run ./install.sh --uninstall."
           exit 1
         fi
-        _now_cs=$(mono_cs || printf '%s' "$_end_cs")
+        _now_cs=$(mono_cs || printf '%s' "$_est_cs")
         [ "$_now_cs" -ge "$_end_cs" ] && break
-        sleep 0.2 2>/dev/null || { [ -n "${python:-}" ] && "$python" -c 'import time; time.sleep(0.2)'; } || sleep 1
+        if sleep 0.2 2>/dev/null || { [ -n "${python:-}" ] && "$python" -c 'import time; time.sleep(0.2)'; }; then
+          _est_cs=$(( _now_cs + 20 ))
+        else
+          sleep 1
+          _est_cs=$(( _now_cs + 100 ))
+        fi
       done
     else
       _w=0
