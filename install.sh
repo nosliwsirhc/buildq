@@ -822,6 +822,7 @@ daemon_lock_held() {
 # ---- Uninstall -----------------------------------------------------------------------------------
 if [ "$do_uninstall" = yes ]; then
   acquire_lock
+  find_python || true
   if have_systemd; then
     _was_active=no
     systemctl --user is-active --quiet buildq.service 2>/dev/null && _was_active=yes
@@ -839,13 +840,12 @@ if [ "$do_uninstall" = yes ]; then
       exit 1
     fi
     [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out"
-    # Unconditionally monitor buildqd.lock for a monotonic ~2.2 s window (strictly within 2–3 s,
-    # using fast non-blocking flock probes and never 2 s-retrying socket calls inside the loop) to
-    # catch a starting/unresponsive daemon or an init supervisor respawning buildqd between crashes.
+    # Unconditionally monitor buildqd.lock for a monotonic >=2.0 s window (fast non-blocking flock
+    # probes, never 2 s-retrying socket calls inside the loop) to catch a starting/unresponsive
+    # daemon or an init supervisor respawning buildqd between crashes.
     _start_cs=$(mono_cs || printf '')
     if [ -n "$_start_cs" ]; then
-      _end_cs=$(( _start_cs + 220 ))
-      _cap_cs=$(( _start_cs + 280 ))
+      _end_cs=$(( _start_cs + 200 ))
       while :; do
         if daemon_lock_held; then
           say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
@@ -854,10 +854,7 @@ if [ "$do_uninstall" = yes ]; then
         fi
         _now_cs=$(mono_cs || printf '%s' "$_end_cs")
         [ "$_now_cs" -ge "$_end_cs" ] && break
-        if ! sleep 0.2 2>/dev/null; then
-          [ $(( _now_cs + 100 )) -gt "$_cap_cs" ] && break
-          sleep 1
-        fi
+        sleep 0.2 2>/dev/null || { [ -n "${python:-}" ] && "$python" -c 'import time; time.sleep(0.2)'; } || sleep 1
       done
     else
       _w=0
@@ -867,12 +864,11 @@ if [ "$do_uninstall" = yes ]; then
           say "Disable and stop that service first, then re-run ./install.sh --uninstall."
           exit 1
         fi
-        if ! sleep 0.2 2>/dev/null; then
-          [ "$_w" -ge 6 ] && break
+        if sleep 0.2 2>/dev/null || { [ -n "${python:-}" ] && "$python" -c 'import time; time.sleep(0.2)'; }; then
+          _w=$((_w + 1))
+        else
           sleep 1
           _w=$((_w + 5))
-        else
-          _w=$((_w + 1))
         fi
       done
     fi
@@ -899,7 +895,6 @@ if [ "$do_uninstall" = yes ]; then
     say "buildqd is still running (holding $state_dir/buildqd.lock); stop it first, then re-run ./install.sh --uninstall."
     exit 1
   fi
-  find_python || true
   keep_guard=no
   _default_cargo=${CARGO_HOME:-$HOME/.cargo}/config.toml
   if [ -e "$_default_cargo" ]; then
