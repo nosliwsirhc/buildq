@@ -8,12 +8,13 @@ import tempfile
 import unittest
 import unittest.mock
 
-if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from helpers import ROOT, load_script  # noqa: E402
-from buildq import commands as bq_commands, metrics as bq_metrics  # noqa: E402
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for path in (os.path.join(ROOT, "src"), os.path.join(ROOT, "bench")):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
-sim = load_script("sim", os.path.join(ROOT, "bench", "sim.py"))
+import sim  # noqa: E402
+from buildq import commands as bq_commands, metrics as bq_metrics  # noqa: E402
 scenarios = sim.builtin
 GIB = sim.GIB
 CONFIG = sim.DEFAULT_CONFIG
@@ -656,6 +657,69 @@ class Export(SimCase):
         self.assertEqual(summary["builds"], 5)
         self.assertEqual(summary["outcomes"], {"cancelled": 1, "failed": 1, "succeeded": 3})  # cancelled as it was
 
+
+
+class LoadBuildqd(SimCase):
+    """sim.load_buildqd() handles checkout launchers, stamped LIBDIR, wheels, and legacy single-file scripts."""
+
+    def test_missing_file_raises_file_not_found(self):
+        with self.assertRaises(FileNotFoundError):
+            sim.load_buildqd(os.path.join(ROOT, "bin", "does-not-exist"), "buildqd_missing")
+
+    def test_legacy_script_inside_bin_is_not_mistaken_for_package_launcher(self):
+        repo = os.path.join(self.tmp.name, "repo")
+        os.makedirs(os.path.join(repo, "bin"))
+        os.makedirs(os.path.join(repo, "src", "buildq"))
+        for fname in ("__init__.py", "daemon.py"):
+            with open(os.path.join(repo, "src", "buildq", fname), "w") as f:
+                f.write("raise RuntimeError('should not load src/buildq for legacy monolith')\n")
+        legacy = os.path.join(repo, "bin", "buildqd-legacy")
+        with open(legacy, "w") as f:
+            f.write("MARKER = 'legacy-single-file'\n")
+        mod = sim.load_buildqd(legacy, "buildqd_legacy_test")
+        self.assertEqual(mod.MARKER, "legacy-single-file")
+
+    def test_stamped_libdir_and_wheel_console_script_load_isolated_packages(self):
+        # 1. Stamped LIBDIR launcher pointing at a copied release tree.
+        installed = os.path.join(self.tmp.name, "installed")
+        rel = os.path.join(installed, "lib", "buildq", "v-1")
+        os.makedirs(os.path.join(installed, "bin"))
+        os.makedirs(rel)
+        import shutil
+        shutil.copytree(os.path.join(ROOT, "src", "buildq"), os.path.join(rel, "buildq"))
+        cur = os.path.join(installed, "lib", "buildq", "current")
+        os.symlink(rel, cur)
+        with open(os.path.join(ROOT, "bin", "buildq")) as f:
+            launcher_src = f.read().replace("LIBDIR = None", f"LIBDIR = {cur!r}", 1)
+        launcher = os.path.join(installed, "bin", "buildq")
+        with open(launcher, "w") as f:
+            f.write(launcher_src)
+        daemon_link = os.path.join(installed, "bin", "buildqd")
+        os.symlink("buildq", daemon_link)
+
+        sentinel = object()
+        sys.modules["buildqd_iso_test"] = sentinel
+        try:
+            pkg = sim.load_buildqd(daemon_link, "buildqd_iso_test")
+            self.assertIs(sys.modules.get("buildqd_iso_test"), sentinel)
+            self.assertFalse(any(k.startswith("buildqd_iso_test.") for k in sys.modules))
+            self.assertTrue(hasattr(pkg, "Daemon"))
+            with self.assertRaises(AttributeError):
+                pkg.Daemon = None
+        finally:
+            sys.modules.pop("buildqd_iso_test", None)
+
+        # 2. Wheel-style console script in a prefix's bin/ with site-packages beside it.
+        venv = os.path.join(self.tmp.name, "venv")
+        os.makedirs(os.path.join(venv, "bin"))
+        site_pkg = os.path.join(venv, "lib", "python3.11", "site-packages", "buildq")
+        shutil.copytree(os.path.join(ROOT, "src", "buildq"), site_pkg)
+        console = os.path.join(venv, "bin", "buildqd")
+        with open(console, "w") as f:
+            f.write("#!/usr/bin/env python3\nfrom buildq.daemon import main\nif __name__ == '__main__':\n    main()\n")
+        wheel_pkg = sim.load_buildqd(console, "buildqd_wheel_test")
+        self.assertTrue(hasattr(wheel_pkg, "Daemon"))
+        self.assertNotIn("buildqd_wheel_test", sys.modules)
 
 
 if __name__ == "__main__":

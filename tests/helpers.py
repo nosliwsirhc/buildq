@@ -1,7 +1,5 @@
 """Shared test helpers, stand-in machine/runner, and DaemonCase base class."""
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sys
@@ -20,17 +18,7 @@ from buildq.common import GIB, MIB  # noqa: E402
 
 BUILDQD = os.path.join(ROOT, "bin", "buildqd")
 BUILDQ = os.path.join(ROOT, "bin", "buildq")
-common.set_client_entrypoint(BUILDQ)
 common.log = lambda message, level=None: None  # keep test output readable
-
-
-def load_script(name: str, path: str):
-    """Load a standalone Python script file as a module."""
-    loader = importlib.machinery.SourceFileLoader(name, path)
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
 
 
 class FakeMachine:

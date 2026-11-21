@@ -47,53 +47,53 @@ def daemon_command() -> list[str]:
 def client_command() -> list[str]:
     """Command prefix to invoke buildq (used by the daemon for `buildq source`)."""
     if _DAEMON_ENTRYPOINT:
-        for base in (os.path.dirname(_DAEMON_ENTRYPOINT), os.path.dirname(os.path.realpath(_DAEMON_ENTRYPOINT))):
+        # Prefer the resolved launcher's own directory so an external symlink doesn't mix installs.
+        for base in (os.path.dirname(os.path.realpath(_DAEMON_ENTRYPOINT)), os.path.dirname(_DAEMON_ENTRYPOINT)):
             beside = os.path.join(base, "buildq")
             if os.path.isfile(beside):
                 return [sys.executable, beside]
     return [sys.executable, "-m", "buildq.client"]
 
 
+def package_root() -> str:
+    """Absolute parent directory containing the running `buildq` package."""
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
 def client_bin_dir() -> str:
     """Directory holding the running `buildq` executable (for finding sibling buildq-shim)."""
-    candidates = []
+    candidates: list[str] = []
     if _CLIENT_ENTRYPOINT:
-        candidates.extend([os.path.dirname(_CLIENT_ENTRYPOINT), os.path.dirname(os.path.realpath(_CLIENT_ENTRYPOINT))])
-    elif sys.argv and sys.argv[0] and os.path.isfile(sys.argv[0]):
-        candidates.extend([os.path.dirname(os.path.abspath(sys.argv[0])), os.path.dirname(os.path.realpath(sys.argv[0]))])
+        candidates.extend([os.path.dirname(os.path.realpath(_CLIENT_ENTRYPOINT)), os.path.dirname(_CLIENT_ENTRYPOINT)])
+    else:
+        if sys.argv and sys.argv[0] and os.path.isfile(sys.argv[0]):
+            candidates.extend([os.path.dirname(os.path.realpath(sys.argv[0])), os.path.dirname(os.path.abspath(sys.argv[0]))])
+        # Module-mode (`python -m buildq.client`) fallbacks: checkout bin/ and matching scripts dir.
+        import sysconfig
+        candidates.append(os.path.normpath(os.path.join(package_root(), "..", "bin")))
+        scripts = sysconfig.get_path("scripts")
+        if scripts:
+            candidates.append(os.path.realpath(scripts))
+        candidates.append(os.path.dirname(os.path.abspath(sys.executable)))
     for directory in candidates:
         if os.path.isfile(os.path.join(directory, "buildq-shim")):
             return directory
     return candidates[0] if candidates else os.path.dirname(os.path.realpath(__file__))
 
 
-def _uninstalled_pkg_root() -> str | None:
-    """Parent directory of `buildq` when invoked via `-m` from an uninstalled source tree."""
-    if _DAEMON_ENTRYPOINT is not None:
+def module_pythonpath(existing: str | None = None, *, always: bool = False) -> str | None:
+    """PYTHONPATH placing the running package root first for `-m buildq.*` child processes.
+    Needed when running via `-m` (no entrypoint script) or when a stripped child env could drop
+    user site-packages (`always=True`)."""
+    if not always and _DAEMON_ENTRYPOINT is not None:
         return None
-    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    import site
-    import sysconfig
-    installed = {os.path.realpath(p) for p in (
-        sysconfig.get_path("purelib"),
-        sysconfig.get_path("platlib"),
-        sysconfig.get_path("stdlib"),
-        *(site.getsitepackages() if hasattr(site, "getsitepackages") else ()),
-        *([site.getusersitepackages()] if hasattr(site, "getusersitepackages") else ()),
-    ) if p}
-    return None if root in installed else root
-
-
-def module_pythonpath(existing: str | None = None) -> str | None:
-    """PYTHONPATH value needed for child `-m buildq.*` processes when running uninstalled."""
-    root = _uninstalled_pkg_root()
-    if not root:
-        return None
+    root = package_root()
     if existing:
-        parts = existing.split(os.pathsep)
-        if root in (os.path.realpath(p) for p in parts if p):
+        parts = [p for p in existing.split(os.pathsep) if p]
+        if parts and os.path.isabs(parts[0]) and os.path.realpath(parts[0]) == root:
             return existing
-        return root + os.pathsep + existing
+        kept = [p for p in parts if not (os.path.isabs(p) and os.path.realpath(p) == root)]
+        return os.pathsep.join([root, *kept])
     return root
 
 

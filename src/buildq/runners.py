@@ -100,13 +100,14 @@ class SystemdRunner:
         self.prepare(ticket, slice_name)
         unit = ticket.unit
         properties = [f"--property={k}={v}" for k, v in lane.properties.items()]
-        pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"))
+        cmd = common.daemon_command()
+        pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"), always=True) if len(cmd) >= 2 and cmd[1] == "-m" else None
         setenv = [f"--setenv=PYTHONPATH={pypath}"] if pypath else []
         with open(os.path.join(ticket.dir, "launch.err"), "wb") as err:
             proc = subprocess.Popen(
                 ["systemd-run", "--user", "--quiet", f"--unit={unit}", f"--slice={slice_name}",
                  "--property=KillMode=mixed", "--property=OOMPolicy=continue", "--property=TimeoutStopSec=60",
-                 *properties, *setenv, "--", *common.daemon_command(), "--supervise", ticket.dir],
+                 *properties, *setenv, "--", *cmd, "--supervise", ticket.dir],
                 stdin=DEVNULL, stdout=DEVNULL, stderr=err)
         return proc, False  # running once systemd-run exits 0
 
@@ -225,9 +226,10 @@ class DirectRunner:
         return "gone"
 
     def launch(self, ticket, lane: Lane, slice_name: str):
-        pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"))
+        cmd = common.daemon_command()
+        pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"), always=True) if len(cmd) >= 2 and cmd[1] == "-m" else None
         env = {**os.environ, "PYTHONPATH": pypath} if pypath else None
-        proc = subprocess.Popen([*common.daemon_command(), "--supervise", ticket.dir], stdin=DEVNULL, stdout=DEVNULL,
+        proc = subprocess.Popen([*cmd, "--supervise", ticket.dir], stdin=DEVNULL, stdout=DEVNULL,
                                 stderr=DEVNULL, start_new_session=True, env=env)
         ticket.pid = proc.pid
         ident = machine.proc_identity(proc.pid)

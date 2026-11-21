@@ -1595,7 +1595,7 @@ def cmd_ping(_args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="buildq", description="Drop off builds, get tickets, check on them.")
     parser.add_argument("--version", action="version", version=f"buildq {VERSION}")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1665,8 +1665,12 @@ def main(argv=None) -> int:
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
                 "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source,
                 "query": cmd_query, "top": _cmd_top}
+    return handlers[args.cmd](args)
+
+
+def main(argv=None) -> int:
     try:
-        return handlers[args.cmd](args)
+        return _main(argv)
     except KeyboardInterrupt:
         return 130
 

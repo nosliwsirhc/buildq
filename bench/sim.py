@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import glob
 import hashlib
 import re
 import importlib.machinery
@@ -27,6 +28,7 @@ import importlib.util
 import json
 import math
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -59,17 +61,22 @@ class _BuildqdPackage:
     LOOKUP_ORDER = ("daemon", *(sub for sub in SUBMODULES if sub != "daemon"))
 
     def __init__(self, pkg_dir: str, name: str):
-        # Clear any prior synthetic package of the same name so each simulation starts clean.
+        # Load the isolated package into a temporary sys.modules namespace, then restore sys.modules
+        # so completed simulations never retain references to their patched modules.
         prefix = name + "."
-        for k in [k for k in sys.modules if k == name or k.startswith(prefix)]:
-            sys.modules.pop(k, None)
-        spec = importlib.util.spec_from_file_location(
-            name, os.path.join(pkg_dir, "__init__.py"), submodule_search_locations=[pkg_dir])
-        pkg = importlib.util.module_from_spec(spec)
-        sys.modules[name] = pkg
-        spec.loader.exec_module(pkg)
-        mods = {sub: importlib.import_module(f"{name}.{sub}") for sub in self.SUBMODULES}
-        object.__setattr__(self, "_mods", mods)
+        saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k == name or k.startswith(prefix)}
+        try:
+            spec = importlib.util.spec_from_file_location(
+                name, os.path.join(pkg_dir, "__init__.py"), submodule_search_locations=[pkg_dir])
+            pkg = importlib.util.module_from_spec(spec)
+            sys.modules[name] = pkg
+            spec.loader.exec_module(pkg)
+            mods = {sub: importlib.import_module(f"{name}.{sub}") for sub in self.SUBMODULES}
+            object.__setattr__(self, "_mods", mods)
+        finally:
+            for k in [k for k in sys.modules if k == name or k.startswith(prefix)]:
+                sys.modules.pop(k, None)
+            sys.modules.update(saved)
 
     def __getattr__(self, attr: str):
         for sub in self.LOOKUP_ORDER:
@@ -92,12 +99,37 @@ class _BuildqdPackage:
                 setattr(mod, attr, value)
 
 
+def _wrapper_interpreter(source: str) -> str | None:
+    """Absolute Python executable named by a script's shebang (including pip's `/bin/sh` wrapper)."""
+    lines = source.splitlines()
+    if not lines or not lines[0].startswith("#!"):
+        return None
+    try:
+        tokens = shlex.split(lines[0][2:])
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    first = tokens[0]
+    if os.path.basename(first) == "sh" and len(lines) >= 2 and lines[1].startswith("'''exec'"):
+        try:
+            args = shlex.split(lines[1][len("'''exec'"):])
+        except ValueError:
+            return None
+        cand = args[0] if args else ""
+        return cand if os.path.isabs(cand) and os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+    if os.path.basename(first) == "env":
+        return None
+    return first if os.path.isabs(first) and os.path.isfile(first) and os.access(first, os.X_OK) else None
+
+
 def _launcher_pkg_dir(real_path: str) -> str | None:
-    """If `real_path` is a buildq package launcher (not a legacy single-file daemon), return its
-    `src/buildq` or installed `LIBDIR/buildq` directory; else None."""
+    """If `real_path` is a buildq package launcher or console script (not a legacy single-file
+    daemon), return its `buildq` package directory; else None."""
     try:
         with open(real_path, encoding="utf-8") as f:
-            tree = ast.parse(f.read(), filename=real_path)
+            source = f.read()
+        tree = ast.parse(source, filename=real_path)
     except (OSError, SyntaxError, UnicodeDecodeError):
         return None
     imports_buildq = any(
@@ -114,12 +146,36 @@ def _launcher_pkg_dir(real_path: str) -> str | None:
                 and isinstance(node.value, ast.Constant)
                 and isinstance(node.value.value, str)):
             libdir = node.value.value
+
+    def is_pkg(path: str) -> bool:
+        return os.path.isfile(os.path.join(path, "__init__.py")) and os.path.isfile(os.path.join(path, "daemon.py"))
+
     candidates = []
     if libdir:
         candidates.append(os.path.join(os.path.realpath(libdir), "buildq"))
     candidates.append(os.path.normpath(os.path.join(os.path.dirname(real_path), "..", "src", "buildq")))
     for pkg_dir in candidates:
-        if os.path.isfile(os.path.join(pkg_dir, "__init__.py")) and os.path.isfile(os.path.join(pkg_dir, "daemon.py")):
+        if is_pkg(pkg_dir):
+            return pkg_dir
+    # Pip/uv console script: ask the wrapper's own interpreter where its `buildq` package lives
+    # (handles virtualenvs, editable installs, and multi-Python prefixes accurately).
+    interp = _wrapper_interpreter(source)
+    if interp:
+        try:
+            probe = subprocess.run(
+                [interp, "-c",
+                 "import importlib.util, os; s = importlib.util.find_spec('buildq'); "
+                 "print(os.path.dirname(os.path.realpath(s.origin)) if s and s.origin else '')"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)
+            found = probe.stdout.strip()
+            if probe.returncode == 0 and found and is_pkg(found):
+                return found
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Fallback: site-packages / dist-packages relative to the script's prefix.
+    prefix = os.path.normpath(os.path.join(os.path.dirname(real_path), ".."))
+    for pkg_dir in sorted(glob.glob(os.path.join(prefix, "lib*", "python*", "*-packages", "buildq"))):
+        if is_pkg(pkg_dir):
             return pkg_dir
     raise FileNotFoundError(f"buildq package not found for launcher {real_path}")
 

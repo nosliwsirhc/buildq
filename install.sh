@@ -26,14 +26,17 @@ set -euo pipefail
 
 prefix=${PREFIX:-$HOME/.local}
 case $prefix in
-  ~) prefix=$HOME ;;
-  ~/*) prefix=$HOME/${prefix#~/} ;;
+  '~') prefix=$HOME ;;
+  '~/'*) prefix=$HOME/${prefix#'~/'} ;;
   /*) ;;
   *) prefix=$PWD/$prefix ;;
 esac
 if command -v -- "${PYTHON:-python3}" >/dev/null 2>&1; then
-  prefix=$("${PYTHON:-python3}" -c 'import os, sys; print(os.path.normpath(os.path.abspath(sys.argv[1])))' "$prefix")
+  if norm=$("${PYTHON:-python3}" -c 'import os, sys; print(os.path.normpath(os.path.abspath(sys.argv[1])))' "$prefix" 2>/dev/null); then
+    prefix=$norm
+  fi
 fi
+while [[ $prefix != / && $prefix == */ ]]; do prefix=${prefix%/}; done
 bindir=$prefix/bin
 libdir=$prefix/lib/buildq
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -101,29 +104,30 @@ install_skill() {
   fi
 }
 
+temps=()
 # Copies a file into place by renaming a temporary copy over it, so a program running from the
 # old file (a shell script reads its file as it goes) keeps the old one intact.
 put() {
   local mode=$1 from=$2 to=$3 tmp
   tmp="$to.new.$$"
+  temps+=("$tmp")
   install -m "$mode" "$from" "$tmp"
   mv -f "$tmp" "$to"
 }
 
 have_systemd() { command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; }
 
-# Serialize concurrent installs/uninstalls against the same prefix so release pruning can't race.
+# Serialize concurrent installs/uninstalls against the same physical prefix directory inode
+# (consistent across symlinked prefix spellings and regardless of XDG_RUNTIME_DIR).
 acquire_lock() {
-  command -v flock >/dev/null 2>&1 || return 0
-  local lockdir=${XDG_RUNTIME_DIR:-$confdir}
-  if [[ ! -d "$lockdir" ]]; then
-    [[ "${1:-}" == "--uninstall" ]] && return 0
-    mkdir -p "$lockdir" 2>/dev/null || return 0
+  if [[ "${1:-}" == "--uninstall" ]]; then
+    [[ -d "$prefix" ]] || return 0
+  else
+    mkdir -p "$prefix"
   fi
-  local tag
-  tag=$(printf '%s' "$prefix" | cksum | awk '{print $1}')
-  exec 9>"$lockdir/buildq-install-$tag.lock"
-  flock 9
+  command -v flock >/dev/null 2>&1 || { say "flock is required to serialize installs against $prefix"; exit 1; }
+  exec 9<"$prefix"
+  flock 9 || { say "couldn't lock $prefix for install"; exit 1; }
 }
 
 # Sets or clears build.rustc-wrapper in a cargo configuration, leaving everything else alone.
@@ -241,23 +245,26 @@ python=$chosen
 
 acquire_lock
 mkdir -p "$bindir" "$libdir" "$unitdir" "$confdir"
-staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
-# Install the buildq Python package into a versioned directory and swap the `current` symlink
-# atomically, so running builds or CLI invocations never read half-replaced modules.
-release=$(mktemp -d "$libdir/v-XXXXXX")
-swapped=no
+staged=""
+release=""
 cleanup() {
-  rm -rf "$staged" "$libdir/current.new.$$" "$bindir/buildqd.new.$$"
-  if [[ $swapped != yes ]]; then
+  [[ -n "$staged" ]] && rm -rf "$staged"
+  if (( ${#temps[@]} )); then
+    rm -f "${temps[@]}"
+  fi
+  if [[ -n "$release" && -e "$release" ]] && [[ ! "$release" -ef "$libdir/current" ]]; then
     rm -rf "$release"
   fi
 }
 trap cleanup EXIT
+staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
+# Stage and validate the versioned package release and launcher before publishing `current` or
+# touching `$bindir`, so an error never leaves a partial upgrade live. Earlier releases stay in
+# place until `--uninstall` so already-started processes that pinned an older directory keep working.
+release=$(mktemp -d "$libdir/v-XXXXXX")
 cp -R "$src/src/buildq" "$release/buildq"
 find "$release/buildq" -type d -name '__pycache__' -prune -exec rm -rf {} +
-ln -sfn "$release" "$libdir/current.new.$$"
-mv -Tf "$libdir/current.new.$$" "$libdir/current"
-swapped=yes
+"$python" -B -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import buildq.daemon, buildq.client' "$release"
 "$python" - "$src/bin/buildq" "$staged/buildq" "$python" "$libdir/current" <<'EOF'
 import sys
 src_path, dst_path, py, pkg_lib = sys.argv[1:5]
@@ -269,22 +276,16 @@ if "LIBDIR = None" not in text:
 with open(dst_path, "w") as f:
     f.write(text.replace("LIBDIR = None", f"LIBDIR = {pkg_lib!r}", 1))
 EOF
+# buildq-shim stays standalone (zero package-import overhead on every shimmed command).
+{ printf '#!%s\n' "$python"; tail -n +2 "$src/bin/buildq-shim"; } >"$staged/buildq-shim"
+temps+=("$libdir/current.new.$$" "$bindir/buildqd.new.$$")
+ln -sfn "$release" "$libdir/current.new.$$"
+mv -Tf "$libdir/current.new.$$" "$libdir/current"
 put 755 "$staged/buildq" "$bindir/buildq"
 ln -sfn buildq "$bindir/buildqd.new.$$"
 mv -Tf "$bindir/buildqd.new.$$" "$bindir/buildqd"
-# buildq-shim stays standalone (zero package-import overhead on every shimmed command).
-{ printf '#!%s\n' "$python"; tail -n +2 "$src/bin/buildq-shim"; } >"$staged/buildq-shim"
 put 755 "$staged/buildq-shim" "$bindir/buildq-shim"
 put 755 "$src/bin/buildq-rustc-guard" "$bindir/buildq-rustc-guard"
-prune_old_releases() {
-  local active
-  active=$(readlink -f "$libdir/current" 2>/dev/null || true)
-  for old in "$libdir"/v-*; do
-    if [[ -e "$old" && "$old" != "$release" && "$old" != "$active" ]]; then
-      rm -rf "$old"
-    fi
-  done
-}
 say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (package in $libdir/current, Python: $python)"
 
 if [[ ! -e "$confdir/config.toml" ]]; then
@@ -310,10 +311,10 @@ if ! have_systemd; then
   # (see below). Running install.sh again won't change that.
   say "no systemd user session here, and buildq needs one: each build runs as a systemd service, which is what measures it, caps its memory and lets the queue pause it."
   say "installed the programs in $bindir (and anything listed above), but nothing that needs systemd: no units, --shims and --rustc-guard weren't set up, and install.sh didn't start the daemon. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
-  prune_old_releases
   exit 0
 fi
 
+temps+=("$unitdir/buildq.service.new.$$")
 sed "s|@BINDIR@|$bindir|g" "$src/systemd/buildq.service" >"$unitdir/buildq.service.new.$$"
 mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
 put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
@@ -340,7 +341,6 @@ systemctl --user enable --now buildq.socket >/dev/null
 systemctl --user enable buildq.service >/dev/null
 # A restart loads the new code. Running builds carry on, and the new daemon picks them up.
 systemctl --user restart buildq.service
-prune_old_releases
 # A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
 # file is gone, have systemd create it again.
 if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]]; then

@@ -14,13 +14,31 @@ def _bootstrap() -> None:
     here = os.path.dirname(os.path.realpath(__file__))
     candidates = ([LIBDIR] if LIBDIR else []) + [os.path.normpath(os.path.join(here, "..", "src"))]
     for path in candidates:
-        if path and os.path.isdir(os.path.join(path, "buildq")):
+        if path and os.path.isfile(os.path.join(path, "buildq", "__init__.py")):
             # Resolve symlinks (such as `lib/buildq/current`) once at startup so a live upgrade
-            # cannot mix modules from two releases in one process.
+            # cannot mix modules from two releases in one process, and place it first on sys.path
+            # even if PYTHONPATH already contains it after another checkout.
             real = os.path.realpath(path)
-            if real not in sys.path:
+            if sys.path[:1] != [real]:
+                while real in sys.path:
+                    sys.path.remove(real)
                 sys.path.insert(0, real)
             break
+
+
+def _is_daemon_path(path: str) -> bool:
+    """True when the invoked path or any symlink hop along it is named `buildqd`."""
+    seen: set[str] = set()
+    cur = os.path.abspath(path)
+    while cur not in seen:
+        if os.path.basename(cur) == "buildqd":
+            return True
+        seen.add(cur)
+        if not os.path.islink(cur):
+            break
+        target = os.readlink(cur)
+        cur = os.path.normpath(target if os.path.isabs(target) else os.path.join(os.path.dirname(cur), target))
+    return False
 
 
 _bootstrap()
@@ -28,7 +46,7 @@ _bootstrap()
 from buildq import common  # noqa: E402
 
 _SCRIPT = os.path.abspath(__file__)
-_IS_DAEMON = os.path.basename(_SCRIPT) == "buildqd"
+_IS_DAEMON = _is_daemon_path(_SCRIPT)
 
 if _IS_DAEMON:
     common.set_daemon_entrypoint(_SCRIPT)

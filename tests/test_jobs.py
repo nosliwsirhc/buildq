@@ -1216,5 +1216,64 @@ class ClientAndGuardHelpers(unittest.TestCase):
 
 
 
+class PackagePlumbing(unittest.TestCase):
+    """Package split plumbing: module PYTHONPATH, symlinked entrypoints, and launcher dispatch."""
+
+    def test_module_pythonpath_prepends_absolute_root_over_relative_entries(self):
+        root = common.package_root()
+        with mock.patch.object(common, "_DAEMON_ENTRYPOINT", None):
+            self.assertEqual(common.module_pythonpath(None), root)
+            # Relative `PYTHONPATH=src` must become absolute-first so systemd units in $HOME find buildq.
+            self.assertEqual(common.module_pythonpath("src"), f"{root}{os.pathsep}src")
+            self.assertEqual(common.module_pythonpath(f"{root}{os.pathsep}/other"), f"{root}{os.pathsep}/other")
+            self.assertEqual(common.module_pythonpath(f"/other{os.pathsep}{root}"), f"{root}{os.pathsep}/other")
+        with mock.patch.object(common, "_DAEMON_ENTRYPOINT", BUILDQD):
+            self.assertIsNone(common.module_pythonpath("src"))
+            self.assertEqual(common.module_pythonpath("src", always=True), f"{root}{os.pathsep}src")
+
+    def test_symlinked_entrypoints_prefer_resolved_siblings_and_preserve_daemon_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "checkout", "bin")
+            stable = os.path.join(tmp, "stable", "bin")
+            os.makedirs(checkout)
+            os.makedirs(stable)
+            for name in ("buildq", "buildq-shim"):
+                open(os.path.join(checkout, name), "w").close()
+                open(os.path.join(stable, name), "w").close()
+            os.symlink("buildq", os.path.join(checkout, "buildqd"))
+            ext_daemon = os.path.join(stable, "buildqd")
+            os.symlink(os.path.join(checkout, "buildqd"), ext_daemon)
+            ext_client = os.path.join(stable, "my-buildq")
+            os.symlink(os.path.join(checkout, "buildq"), ext_client)
+            with mock.patch.object(common, "_DAEMON_ENTRYPOINT", None), \
+                 mock.patch.object(common, "_CLIENT_ENTRYPOINT", None):
+                common.set_daemon_entrypoint(ext_daemon)
+                self.assertEqual(common.daemon_command(), [sys.executable, os.path.abspath(ext_daemon)])
+                self.assertEqual(common.client_command(), [sys.executable, os.path.join(checkout, "buildq")])
+                common.set_client_entrypoint(ext_client)
+                self.assertEqual(common.client_bin_dir(), checkout)
+
+    def test_module_mode_client_bin_dir_finds_checkout_shim(self):
+        with mock.patch.object(common, "_CLIENT_ENTRYPOINT", None), \
+             mock.patch.object(sys, "argv", [client.__file__]):
+            self.assertEqual(common.client_bin_dir(), os.path.join(ROOT, "bin"))
+
+    def test_renamed_daemon_symlink_and_pythonpath_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            link = os.path.join(tmp, "buildqd-dev")
+            os.symlink(BUILDQD, link)
+            fake_pkg = os.path.join(tmp, "fake", "buildq")
+            os.makedirs(fake_pkg)
+            with open(os.path.join(fake_pkg, "__init__.py"), "w") as f:
+                f.write("raise RuntimeError('wrong buildq imported')\n")
+            env = dict(os.environ, PYTHONPATH=f"{os.path.join(tmp, 'fake')}{os.pathsep}{os.path.join(ROOT, 'src')}",
+                       PYTHONDONTWRITEBYTECODE="1")
+            res = subprocess.run([sys.executable, link, "--check-config", "--config",
+                                  os.path.join(ROOT, "config.example.toml")],
+                                 env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn('"default_lane"', res.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

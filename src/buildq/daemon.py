@@ -628,7 +628,8 @@ class Daemon(GitHubMixin, SchedulerMixin):
             t = self.tickets.get(tid)
             if t is None or t.requeues != attempt:
                 continue
-            pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"))
+            module_mode = len(self.source_command) >= 3 and self.source_command[1:3] == ["-m", "buildq.client"]
+            pypath = common.module_pythonpath(os.environ.get("PYTHONPATH"), always=True) if module_mode else None
             if t.git_env:
                 env = {"LC_ALL": "C", **t.git_env}
                 if pypath:
