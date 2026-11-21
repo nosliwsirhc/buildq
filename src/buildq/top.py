@@ -290,10 +290,7 @@ class DirSizes:
             self.sizes[folder] = (size, complete, time.monotonic())
 
     @staticmethod
-    def measure(folder: str, limit: float, owner=None) -> tuple[int | None, bool, bool]:
-        """(bytes or None, complete, cut off by the limit). du exits 1 when an entry vanished mid-walk,
-        which a running build does all the time; only an entry it couldn't read makes it partial."""
-        command = ["du", "-sx", "--block-size=1", folder]
+    def _run_du(command: list[str], limit: float, owner=None) -> tuple[bytes, bytes, bool]:
         if shutil.which("ionice"):
             command = ["ionice", "-c3", *command]
         try:
@@ -301,24 +298,41 @@ class DirSizes:
                                     stderr=subprocess.PIPE, preexec_fn=client.die_with(os.getpid()),
                                     env={**os.environ, "LC_ALL": "C"})  # (its messages are matched below)
         except OSError:
-            return None, False, False
+            return b"", b"", False
         if owner is not None:
             owner.proc = proc
         try:
             out, err = proc.communicate(timeout=limit)
+            return out or b"", err or b"", False
         except subprocess.TimeoutExpired:
             proc.kill()
             try:
                 proc.communicate(timeout=1)
             except subprocess.TimeoutExpired:
                 pass  # stuck in the kernel (a hung mount): it goes when it can
-            return None, False, True
+            return b"", b"", True
         finally:
             if owner is not None:
                 owner.proc = None
-        match = re.match(rb"\s*(\d+)", out or b"")
-        size = int(match.group(1)) if match else None
-        unreadable = b"ermission denied" in (err or b"") or b"Input/output error" in (err or b"")
+
+    @classmethod
+    def measure(cls, folder: str, limit: float, owner=None) -> tuple[int | None, bool, bool]:
+        """(bytes or None, complete, cut off by the limit). du exits 1 when an entry vanished mid-walk,
+        which a running build does all the time; only an entry it couldn't read makes it partial.
+        Falls back from GNU `du -sx --block-size=1` to POSIX/BusyBox `du -sxk` (x1024)."""
+        out, err, cut = cls._run_du(["du", "-sx", "--block-size=1", folder], limit, owner)
+        if cut:
+            return None, False, True
+        scale = 1
+        match = re.match(rb"\s*(\d+)", out)
+        if match is None and any(tok in err for tok in (b"unrecognized option", b"illegal option", b"invalid option")):
+            out, err, cut = cls._run_du(["du", "-sxk", folder], limit, owner)
+            if cut:
+                return None, False, True
+            scale = 1024
+            match = re.match(rb"\s*(\d+)", out)
+        size = int(match.group(1)) * scale if match else None
+        unreadable = b"ermission denied" in err or b"Input/output error" in err
         return size, size is not None and not unreadable, False
 
 
@@ -418,11 +432,15 @@ class TopSampler:
         out["filesystems"] = self.filesystems(now, paths, config.get("disk_floor"))
         return out
 
-    def group_paths(self, config: dict) -> dict[str, list[str]]:
+    def group_paths(self, config: dict, overview: dict | None = None) -> dict[str, list[str]]:
         import fnmatch
         apps = os.path.join(self.manager, "app.slice")
-        found = {"builds": [os.path.join(self.manager, slice_dir(config.get("slice") or "buildq.slice"))],
-                 "ci": [], "containers": [], "apps": [apps]}
+        if overview is not None and "builds_cg" in overview:
+            builds_cg = overview.get("builds_cg")
+            builds_list = [builds_cg] if isinstance(builds_cg, str) and builds_cg else []
+        else:
+            builds_list = [os.path.join(self.manager, slice_dir(config.get("slice") or "buildq.slice"))]
+        found = {"builds": builds_list, "ci": [], "containers": [], "apps": [apps] if os.path.isdir(apps) else []}
 
         def children(path):
             try:
@@ -465,7 +483,7 @@ class TopSampler:
         config = (overview or {}).get("config") or {}
         snap = {"time": time.time(), "overview": overview, "machine": self.machine(now, overview), "groups": {},
                 "builds": {}, "dir_sizes": {}}
-        found = self.group_paths(config)
+        found = self.group_paths(config, overview)
         samples = {path: self.cgroup(path, now) for paths in found.values() for path in paths}
         apps_dir = os.path.join(self.manager, "app.slice") + os.sep
         for group, paths in found.items():
@@ -498,8 +516,25 @@ class TopSampler:
                 sample = self.cgroup(row["cg"], now)
                 if sample is not None:
                     snap["builds"][row["id"]] = sample
+            elif row.get("measured"):
+                # Non-cgroup build (direct runner): use daemon's /proc measurement directly.
+                snap["builds"][row["id"]] = {
+                    "cores": float(row.get("cores_now") or 0.0),
+                    "mem": int(row.get("mem_now") or 0),
+                    "swap": int(row.get("swap_now") or 0),
+                    "read_rate": None, "write_rate": None,
+                    "psi_mem": None, "psi_cpu": None, "psi_io": None, "events": {},
+                }
             snap.setdefault("folders", {})[row["id"]] = folders_of(row)
             folders.extend(snap["folders"][row["id"]])
+        # Without a builds cgroup (direct runner), populate the builds group from running builds.
+        if not found["builds"] and snap["builds"]:
+            bgroup = snap["groups"]["builds"]
+            for sample in snap["builds"].values():
+                bgroup["mem"] += int(sample.get("mem") or 0)
+                bgroup["swap"] += int(sample.get("swap") or 0)
+                if sample.get("cores") is not None:
+                    bgroup["cores"] += float(sample["cores"])
         if self.sizes is not None:
             self.sizes.want(folders)
             snap["dir_sizes"] = {f: self.sizes.get(f) for f in folders}

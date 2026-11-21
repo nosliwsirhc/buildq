@@ -104,6 +104,7 @@ def supervise(directory: str) -> int:
     output into output.log (both streams) and stdout.log / stderr.log (each); and, whatever
     happens, its exit status into result.json."""
     os.umask(0o077)
+    machine.set_child_subreaper()
     code, timed_out = 126, False
     outputs = []
     jobserver = None
@@ -146,6 +147,31 @@ def supervise(directory: str) -> int:
         def note(text: str) -> None:
             for output in (combined, streams[2]):
                 output.write(text.encode())
+
+        # Direct cgroup v2 runner: move this supervisor into the build's cgroup BEFORE spawning
+        # the child so every process of the build is born under the cgroup's limits.
+        if spec.get("runner") == "cgroup" and isinstance(spec.get("cg"), str) and spec["cg"]:
+            cg = os.path.realpath(spec["cg"])
+            if not cg.startswith("/sys/fs/cgroup/") or not re.fullmatch(
+                rf"buildq-{re.escape(job)}(-r\d+)?", os.path.basename(cg)
+            ):
+                note(f"buildq: refusing invalid cgroup path {spec['cg']!r}\n")
+                return code
+            try:
+                with open(os.path.join(cg, "cgroup.procs"), "w") as f:
+                    f.write(f"{os.getpid()}\n")
+                actual = machine.proc_cgroup(os.getpid())
+                if not actual or os.path.realpath(actual) != cg:
+                    raise OSError(f"process cgroup is {actual!r}, expected {cg!r}")
+            except OSError as e:
+                note(f"buildq: couldn't join build cgroup {cg}: {e}\n")
+                return code
+        nice_val = spec.get("nice")
+        if isinstance(nice_val, int) and not isinstance(nice_val, bool) and nice_val != 0:
+            try:
+                os.nice(nice_val)
+            except OSError:
+                pass
 
         # Hold the build's jobserver open for as long as the build runs: a pipe's tokens last only
         # while someone has it open, and the daemon may restart in between.
@@ -210,8 +236,17 @@ def supervise(directory: str) -> int:
                     streams[key.data].write(data)
 
         last = time.monotonic()
+        my_pid = os.getpid()
         while child.poll() is None:
             pump(0.5)
+            # Reap any orphaned grandchildren reparented here via PR_SET_CHILD_SUBREAPER (never
+            # touching child.pid) so zombies don't accumulate and their CPU rolls into cutime/cstime.
+            for orphan in machine.proc_children(my_pid):
+                if orphan != child.pid:
+                    try:
+                        os.waitpid(orphan, os.WNOHANG)
+                    except OSError:
+                        pass
             tick = time.monotonic()
             if deadline and tick - last > 5:
                 # A turn of this loop that took far longer than its half second: the build was paused
@@ -247,6 +282,14 @@ def supervise(directory: str) -> int:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
+        # Reap any remaining reparented children so no zombies linger after the build ends.
+        while True:
+            try:
+                reaped, _ = os.waitpid(-1, os.WNOHANG)
+                if reaped <= 0:
+                    break
+            except OSError:
+                break
         drain_by = time.monotonic() + 2
         while open_pipes and time.monotonic() < drain_by:
             pump(0.1)
@@ -280,7 +323,7 @@ def supervise(directory: str) -> int:
             # Only a cgroup of the build's own says anything about the build: under the direct
             # runner the supervisor shares the daemon's (or a terminal's), with its whole history.
             ticket_id = os.path.basename(os.path.normpath(directory))
-            own = own if own and re.fullmatch(rf"buildq-{re.escape(ticket_id)}(-r\d+)?\.service",
+            own = own if own and re.fullmatch(rf"buildq-{re.escape(ticket_id)}(-r\d+)?(\.service)?",
                                               os.path.basename(own)) else None
             events = machine.cgroup_events(own) if own else {}
             some, full, high = (machine.cgroup_memory_waits(own) if own else None) or (None, None, None)

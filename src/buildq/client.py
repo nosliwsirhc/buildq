@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 
-from . import common
+from . import common, machine
 from .common import FINISHED, VERSION
 
 socket_path = common.default_socket
@@ -179,9 +179,14 @@ def command_for(verb: str, rest: str = "") -> str:
 LONG_RUN = 8 * 60  # past this, a tool call that runs the command may well be cut off
 
 
+def daemon_hint() -> str:
+    if common.has_systemd_user():
+        return "systemctl --user status buildq; journalctl --user -u buildq"
+    return "buildq daemon status; buildq daemon logs"
+
+
 def unreachable() -> int:
-    note(f"the queue daemon isn't answering at {socket_path()} "
-         "(systemctl --user status buildq; journalctl --user -u buildq)")
+    note(f"the queue daemon isn't answering at {socket_path()} ({daemon_hint()})")
     return 75
 
 
@@ -868,10 +873,20 @@ def caller() -> str | None:
             for line in f:
                 if line.startswith("0::"):
                     leaf = line[3:].strip().rsplit("/", 1)[-1]
-                    return leaf or None
+                    if leaf:
+                        return leaf
     except OSError:
         pass
-    return None
+    # Non-systemd / flat-cgroup fallback: distinguish terminals, multiplexers, and shells for fair shares.
+    for env_key, prefix in (("TMUX_PANE", "tmux:"), ("STY", "screen:"), ("TERM_SESSION_ID", "term:"),
+                            ("KITTY_WINDOW_ID", "kitty:"), ("WEZTERM_PANE", "wezterm:")):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            return f"{prefix}{val}"[:200]
+    try:
+        return f"sid-{os.getsid(0)}"
+    except OSError:
+        return None
 
 
 def submit_message(args, command: list[str], watch: bool, submission: str) -> dict:
@@ -957,14 +972,14 @@ def inside_a_build() -> bool:
         return False
     try:
         with open("/proc/self/cgroup") as f:
-            if re.search(rf"/buildq-{re.escape(job)}(-r\d+)?\.service(/|$)", f.read(), re.M):
+            if re.search(rf"/buildq-{re.escape(job)}(-r\d+)?(\.service)?(/|$)", f.read(), re.M):
                 return True
     except OSError:
         pass
     try:  # the direct runner has no cgroup to show it: its ticket says instead
         with open(os.path.join(state_dir(), "tickets", job, "ticket.json")) as f:
             record = json.load(f)
-        return record.get("runner") == "direct" and record.get("state") in ("starting", "running")
+        return record.get("runner") in ("direct", "cgroup") and record.get("state") in ("starting", "running")
     except (OSError, ValueError):
         return False
 
@@ -1081,8 +1096,7 @@ def cmd_run(args) -> int:
         now = time.monotonic()
         waiting_since = waiting_since or now
         if now - last_note >= 60:
-            note(f"{why}; waiting for it ({fmt_age(now - waiting_since)} so far; "
-                 "systemctl --user status buildq)")
+            note(f"{why}; waiting for it ({fmt_age(now - waiting_since)} so far; {daemon_hint()})")
             last_note = now
         for _ in range(25):
             if pending:
@@ -1587,6 +1601,197 @@ def cmd_source(args) -> int:
     return 0
 
 
+def _buildqd_command() -> list[str]:
+    """Command prefix to start the sibling buildqd executable (or `python -m buildq.daemon`)."""
+    bin_dir = common.client_bin_dir()
+    sibling = os.path.join(bin_dir, "buildqd")
+    if os.path.isfile(sibling):
+        return [sys.executable, sibling]
+    return [sys.executable, "-m", "buildq.daemon"]
+
+
+def _use_systemd_unit() -> bool:
+    """Whether `buildq daemon` should delegate to the user's systemd `buildq.service` unit."""
+    if any(os.environ.get(k) for k in ("BUILDQ_SOCKET", "BUILDQ_STATE_DIR", "BUILDQ_CONFIG", "BUILDQ_RUNNER")):
+        return False
+    if not common.has_systemd_user():
+        return False
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", "cat", "buildq.service"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _read_daemon_pid(pid_file: str) -> int | None:
+    try:
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if machine.pid_is_buildqd(pid):
+        return pid
+    return None
+
+
+def _daemon_start_local(sdir: str, sock: str, cfg: str, pid_file: str, log_file: str) -> int:
+    reply = request({"op": "ping"}, timeout=2.0)
+    if reply and reply.get("type") == "pong":
+        print(f"buildqd {reply.get('version')} ({reply.get('runner')} runner) is already running at {sock}")
+        return 0
+    os.makedirs(sdir, mode=0o700, exist_ok=True)
+    cmd = [*_buildqd_command(), "--socket", sock, "--state-dir", sdir, "--config", cfg,
+           "--pid-file", pid_file, "--log-file", log_file]
+    env = dict(os.environ)
+    if len(cmd) >= 3 and cmd[1:3] == ["-m", "buildq.daemon"]:
+        pypath = common.module_pythonpath(env.get("PYTHONPATH"), always=True)
+        if pypath:
+            env["PYTHONPATH"] = pypath
+            env["PYTHONSAFEPATH"] = "1"
+    with open(os.devnull, "rb") as devnull, open(log_file, "ab") as log_err:
+        try:
+            os.chmod(log_file, 0o600)
+        except OSError:
+            pass
+        proc = subprocess.Popen(cmd, stdin=devnull, stdout=log_err, stderr=log_err,
+                                start_new_session=True, env=env)
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        reply = request({"op": "ping"}, timeout=1.0)
+        if reply and reply.get("type") == "pong":
+            pid = _read_daemon_pid(pid_file) or proc.pid
+            print(f"buildqd {reply.get('version')} ({reply.get('runner')} runner, pid {pid}) started at {sock}")
+            return 0
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    note(f"buildqd didn't answer at {sock} (see {log_file})")
+    try:
+        with open(log_file, errors="replace") as f:
+            tail = f.read().splitlines()[-15:]
+        for line in tail:
+            print(line, file=sys.stderr)
+    except OSError:
+        pass
+    return 1
+
+
+def _daemon_stop_local(pid_file: str) -> int:
+    pid = _read_daemon_pid(pid_file)
+    if pid is None:
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+        reply = request({"op": "ping"}, timeout=1.0)
+        if reply and reply.get("type") == "pong":
+            note(f"buildqd is answering at {socket_path()}, but no matching pid was found in {pid_file}")
+            return 1
+        print("buildqd is not running")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError as e:
+        note(f"can't stop buildqd (pid {pid}): {e}")
+        return 1
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if not machine.pid_is_buildqd(pid):
+            try:
+                os.remove(pid_file)
+            except OSError:
+                pass
+            print(f"buildqd (pid {pid}) stopped")
+            return 0
+        time.sleep(0.1)
+    note(f"buildqd (pid {pid}) didn't stop within 10s")
+    return 1
+
+
+def cmd_daemon(args) -> int:
+    action = args.action
+    if _use_systemd_unit():
+        if action == "logs":
+            cmd = ["journalctl", "--user", "-u", "buildq"]
+            if args.tail is not None:
+                cmd += ["-n", str(args.tail)]
+            if args.follow:
+                cmd.append("-f")
+            return subprocess.call(cmd)
+        if action == "status":
+            return subprocess.call(["systemctl", "--user", "status", "buildq.service", "--no-pager"])
+        return subprocess.call(["systemctl", "--user", action, "buildq.service"])
+
+    sdir = state_dir()
+    sock = socket_path()
+    cfg = common.default_config()
+    pid_file = common.default_pid_file(sdir)
+    log_file = common.default_log_file(sdir)
+
+    if action == "start":
+        return _daemon_start_local(sdir, sock, cfg, pid_file, log_file)
+    if action == "stop":
+        return _daemon_stop_local(pid_file)
+    if action == "restart":
+        pid = _read_daemon_pid(pid_file)
+        if pid is not None:
+            code = _daemon_stop_local(pid_file)
+            if code != 0:
+                return code
+        return _daemon_start_local(sdir, sock, cfg, pid_file, log_file)
+    if action == "reload":
+        pid = _read_daemon_pid(pid_file)
+        if pid is None:
+            note(f"buildqd isn't running (no live pid in {pid_file})")
+            return 1
+        try:
+            os.kill(pid, signal.SIGHUP)
+            print(f"reloaded buildqd (pid {pid})")
+            return 0
+        except OSError as e:
+            note(f"can't reload buildqd (pid {pid}): {e}")
+            return 1
+    if action == "status":
+        reply = request({"op": "ping"}, timeout=2.0)
+        pid = _read_daemon_pid(pid_file)
+        if reply and reply.get("type") == "pong":
+            who = f", pid {pid}" if pid else ""
+            print(f"buildqd {reply.get('version')} ({reply.get('runner')} runner{who}) is running at {sock}")
+            if os.path.isfile(log_file):
+                print(f"  log     {log_file}")
+            return 0
+        print(f"buildqd is stopped (socket {sock})")
+        if os.path.isfile(log_file):
+            print(f"  log     {log_file}")
+        return 3
+    if action == "logs":
+        if not os.path.isfile(log_file):
+            note(f"no daemon log yet at {log_file}")
+            return 1
+        with open(log_file, errors="replace") as f:
+            lines = f.readlines()
+            show = lines[-args.tail:] if args.tail is not None and args.tail > 0 else lines
+            sys.stdout.writelines(show)
+            sys.stdout.flush()
+            if not args.follow:
+                return 0
+            try:
+                while True:
+                    chunk = f.read()
+                    if chunk:
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+                    else:
+                        time.sleep(0.2)
+            except KeyboardInterrupt:
+                return 0
+    return 2
+
+
 def cmd_ping(_args) -> int:
     reply = request({"op": "ping"})
     if reply is None or reply.get("type") != "pong":
@@ -1657,14 +1862,18 @@ def _main(argv=None) -> int:
     query.add_argument("--limit", type=int, default=200, help="show at most this many rows (0: all; default 200)")
     helper = sub.add_parser("help", help="`buildq help agents`: how a coding agent uses the queue")
     helper.add_argument("topic", nargs="?", default="agents")
+    daemon_p = sub.add_parser("daemon", help="start, stop, restart, reload, check, or view logs of buildqd")
+    daemon_p.add_argument("action", choices=("start", "stop", "restart", "reload", "status", "logs"))
+    daemon_p.add_argument("--tail", "-n", type=int, help="with logs: show the last N lines")
+    daemon_p.add_argument("--follow", "-f", action="store_true", help="with logs: follow new log lines")
     sub.add_parser("ping", help="check that the daemon answers")
     source = sub.add_parser("source", help=argparse.SUPPRESS)
     source.add_argument("directory")
     args = parser.parse_args(argv)
     handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
-                "report": cmd_report, "help": cmd_help, "ping": cmd_ping, "source": cmd_source,
-                "query": cmd_query, "top": _cmd_top}
+                "report": cmd_report, "help": cmd_help, "daemon": cmd_daemon, "ping": cmd_ping,
+                "source": cmd_source, "query": cmd_query, "top": _cmd_top}
     return handlers[args.cmd](args)
 
 

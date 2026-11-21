@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+### BEGIN INIT INFO
+# Provides:          buildqd
+# Required-Start:    $local_fs
+# Required-Stop:     $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: buildq load-aware build queue daemon
+### END INIT INFO
+#
+# SysVinit script for buildqd (Devuan, Slackware, Debian without systemd).
+# Set BUILDQ_USER in /etc/default/buildqd, install to /etc/init.d/buildqd (chmod 755).
+set -eu
+
+[ -r /etc/default/buildqd ] && . /etc/default/buildqd
+: "${BUILDQ_USER:?Set BUILDQ_USER in /etc/default/buildqd}"
+BUILDQ_HOME="${BUILDQ_HOME:-$(getent passwd "$BUILDQ_USER" | cut -d: -f6)}"
+BUILDQ_BIN="${BUILDQ_BIN:-$BUILDQ_HOME/.local/bin/buildq}"
+
+run_as() {
+	su -s /bin/sh "$BUILDQ_USER" -c "HOME='$BUILDQ_HOME' $1"
+}
+
+case "${1:-}" in
+	start)
+		if [ "${BUILDQ_CGROUP_DELEGATE:-no}" = "yes" ] && [ -x /usr/local/libexec/buildq-cgroup-setup.sh ]; then
+			/usr/local/libexec/buildq-cgroup-setup.sh "$BUILDQ_USER" >/dev/null || true
+		fi
+		if [ -w "/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" ]; then
+			printf '%s\n' "$$" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" 2>/dev/null || true
+		fi
+		run_as "'$BUILDQ_BIN' daemon start"
+		;;
+	stop)    run_as "'$BUILDQ_BIN' daemon stop" ;;
+	restart) run_as "'$BUILDQ_BIN' daemon restart" ;;
+	reload)  run_as "'$BUILDQ_BIN' daemon reload" ;;
+	status)  run_as "'$BUILDQ_BIN' daemon status" ;;
+	*)
+		printf 'usage: %s {start|stop|restart|reload|status}\n' "$0" >&2
+		exit 2
+		;;
+esac

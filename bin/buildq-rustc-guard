@@ -38,7 +38,7 @@ pass() { exec "$rustc" "$@"; }
 # Inside a buildq build: the common case, so it is checked first and costs one read.
 cgroup=$(cat /proc/self/cgroup 2>/dev/null)
 case $cgroup in
-  */buildq.slice/*) pass "$@" ;;
+  */buildq.slice/*|*/buildq-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) pass "$@" ;;
 esac
 
 # Not a compile: version and target queries.
@@ -81,13 +81,13 @@ if [ -n "$slice" ]; then
   esac
 fi
 
-# A build of the direct runner has no cgroup to show it; its ticket says it is running.
+# A build of the direct (or cgroup) runner: its ticket says it is running.
 if [ -n "${BUILDQ_JOB:-}" ]; then
   state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
   case $BUILDQ_JOB in
     */*|.*) ;;
     *) ticket=$state_dir/tickets/$BUILDQ_JOB/ticket.json
-       if grep -q '"state":"running"' "$ticket" 2>/dev/null && grep -q '"runner":"direct"' "$ticket" 2>/dev/null; then
+       if grep -Eq '"state":"(starting|running)"' "$ticket" 2>/dev/null && grep -Eq '"runner":"(direct|cgroup)"' "$ticket" 2>/dev/null; then
          pass "$@"
        fi ;;
   esac

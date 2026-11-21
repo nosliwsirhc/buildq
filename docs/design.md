@@ -8,13 +8,12 @@ How buildq works inside. The [README](../README.md) covers installing it, and [U
 | ----- | ------------ |
 | `buildq` | The client: submits builds, follows them, shows status. It never runs a build itself (except in a fallback). |
 | `buildqd` | The daemon: holds the queue, measures the machine and the builds, decides who starts and with how many cores, starts builds, resizes their jobservers, keeps history. |
-| `buildqd --supervise DIR` | The supervisor: one per build, inside its service. Runs the command, writes its output and exit status. |
+| `buildqd --supervise DIR` | The supervisor: one per build, inside its service/cgroup/session. Sets `PR_SET_CHILD_SUBREAPER`, joins the build cgroup (under `cgroup`), runs the command, reaps orphaned descendants, and writes output and exit status. |
 | `buildq-shim` | Optional: standalone zero-import wrapper on `PATH` for `cargo`, `pnpm`, `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet` (plus `cmake`, `ctest`, `zig` and `gradle` when installed) that sends heavy invocations through `buildq run`. |
 | `buildq-rustc-guard` | Optional: cargo's rustc wrapper; refuses compiles outside a buildq build. |
 | `skills/buildq/SKILL.md` | The page for coding agents on using the queue, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end: always installed (`buildq help agents` prints it), and linked into the agents' skill directories with `install.sh --skill`. |
-| `buildq.socket` | Holds the Unix socket (`$XDG_RUNTIME_DIR/buildq.sock`, mode 0600) so it stays open while the daemon restarts. |
-| `buildq.service` | Runs the daemon. `KillMode=process`: stopping the daemon stops nothing else. |
-| `buildq.slice` | The parent of every build's service: one CPU and IO weight for all builds, and a memory backstop. |
+| `buildq.socket`, `buildq.service`, `buildq.slice` | Systemd user units: socket activation (`$XDG_RUNTIME_DIR/buildq.sock`, mode 0600), `KillMode=process`, and the `buildq.slice` aggregate memory/CPU/IO backstop. |
+| `init/` | Optional non-systemd boot service templates (OpenRC, runit, s6, dinit, SysVinit) plus `init/cgroup-setup.sh` for delegating a cgroup v2 subtree (`/sys/fs/cgroup/buildq-<user>`). |
 
 ### Code layout
 
@@ -27,16 +26,16 @@ standard library only):
 | `tools.py` | Declarative tool and compiler registry (`ToolSpec` / `SPECS`). Leaf module with no internal imports. |
 | `commands.py` | Wrapper unwrapping, command keys, environment hashing, path/source safety checks, and `MAKEFLAGS` rewriting. |
 | `config.py` | `config.toml` loading, schema validation, and lane configuration (`Lane`, `Config`). |
-| `machine.py` | Linux `/proc`, PSI, cgroup v2, disk space, `flock` slots, and agent-session process inspection. |
-| `ticket.py` | Ticket model, persistence, cgroup measurement, and client connection tracking. |
+| `machine.py` | Linux `/proc` (including single-pass process-tree CPU/PSS measurement and `PR_SET_CHILD_SUBREAPER`), PSI, cgroup v2, disk space, `flock` slots, and agent-session process inspection. |
+| `ticket.py` | Ticket model, persistence, cgroup & `/proc` measurement, and client connection tracking. |
 | `history.py` | `history.jsonl` persistence and memory/core/duration estimation. |
-| `runners.py` | `SystemdRunner`, `DirectRunner`, and the GNU make FIFO jobserver. |
-| `supervisor.py` | `buildqd --supervise DIR`: output capping, timeout enforcement, process-group cleanup, and `result.json`. |
+| `runners.py` | `SystemdRunner`, `CgroupRunner` (pure Linux cgroup v2), `DirectRunner` (`SIGSTOP`/`SIGCONT`, `MemoryMax` watchdog, `nice`), and the GNU make FIFO jobserver. |
+| `supervisor.py` | `buildqd --supervise DIR`: subreaper setup, cgroup v2 join, output capping, timeout enforcement, process-tree cleanup, and `result.json`. |
 | `scheduler.py` | Admission, queue ordering, jobserver rebalancing, memory shedding, `release_after_peak`, slice guard, and memory watch. |
-| `metrics.py` | Background SQLite writer (`metrics.db`), per-minute/hourly rollups, and cgroup memory consumers. |
+| `metrics.py` | Background SQLite writer (`metrics.db`), per-minute/hourly rollups, and cgroup/process memory consumers. |
 | `github.py` | Asynchronous `gh api` commit status posting with backoff and permanent-error classification. |
-| `daemon.py` | Unix socket server, ticket lifecycle, restart recovery, and `buildqd` entrypoint. |
-| `client.py` | `buildq` CLI (`submit`, `run`, `wait`, `status`, `list`, `logs`, `cancel`, `pause`, `report`, `query`, `source`). |
+| `daemon.py` | Unix socket server, ticket lifecycle, restart recovery, and `buildqd` entrypoint (`--pid-file`, `--log-file`). |
+| `client.py` | `buildq` CLI (`submit`, `run`, `wait`, `status`, `list`, `logs`, `cancel`, `pause`, `report`, `query`, `source`, `daemon`). |
 | `top.py` | `buildq top`: live curses monitor and `--once` snapshot renderer. |
 
 `bin/buildq` (with `bin/buildqd` symlinked to it) is a thin launcher that imports `buildq.client`
@@ -80,11 +79,11 @@ queued ──► starting ──► running ──► succeeded | failed
    configuration may have changed), puts the queue in order, and starts every ticket that fits.
 3. **Start.** The daemon fixes the build's cores (and the memory they need), creates its jobserver
    if it gets one, applies any tool `rewrite_argv` or inline `env` merge into `exec_argv`, writes
-   the parallelism settings to `parallel.json` (mode 0600), saves the ticket with the
-   name its service will have, and runs
-   `systemd-run --user --unit=buildq-<uuid>.service --slice=buildq.slice --property=... -- buildqd --supervise DIR`.
-   The ticket is `starting` until `systemd-run` returns (killed after 60 s if it hangs), then
-   `running`.
+   the parallelism settings to `parallel.json` (mode 0600), saves the ticket with its runner
+   metadata, and launches `buildqd --supervise DIR` via the active runner:
+   - `systemd`: `systemd-run --user --unit=buildq-<uuid>.service --slice=buildq.slice --property=...` (`starting` until `systemd-run` returns, killed after 60 s if it hangs, then `running`);
+   - `cgroup`: creates `<cgroup_root>/builds/buildq-<uuid>`, writes translated cgroup v2 limits (`memory.high`, `memory.max`, `memory.swap.max`, `cpu.weight`, `io.weight`, `pids.max`, `cpu.max`), and spawns the detached supervisor which moves itself into that cgroup before execing the build;
+   - `direct`: spawns the detached supervisor in a new session, applies `nice` priority when configured, and tracks its process tree via `/proc` (`smaps_rollup` PSS, CPU, 1 s `MemoryMax` watchdog, and `SIGSTOP`/`SIGCONT` pausing).
 4. **Supervise.** The supervisor claims `env.json` by renaming it (so a second supervisor for the
    same build, from a late launch after a restart, finds nothing and runs nothing), records its own
    pid, reads and deletes both `env.json` and `parallel.json` immediately (either can hold secrets,

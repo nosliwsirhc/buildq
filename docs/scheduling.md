@@ -167,7 +167,8 @@ them via `GRADLE_OPTS` or Gradle CLI flags, so Gradle stays inside the build's c
 pinned thread counts). Direct `zig build` invocations without `-j` also receive `-j<cores>`.
 `make` runs in parallel only when its caller asked (`-j`): a Makefile not written for it can break.
 
-A build whose tools use the GNU make jobserver protocol, which cargo, make (4.4 and newer) and
+A build whose tools use the GNU make jobserver protocol, which cargo, make (4.4 and newer; older
+GNU make such as 4.3 automatically falls back to `MAKEFLAGS=-j<granted>`) and
 ninja (1.13 and newer) do, also gets a jobserver of its own: a named pipe with one token per core
 beyond the first, passed in `CARGO_MAKEFLAGS` (cargo hands it to its build scripts) and, for ninja
 and a `make -j`, in `MAKEFLAGS`, with the command's own `-j` removed, since make ignores a jobserver
@@ -232,13 +233,17 @@ match = "^(pnpm|npm|npx|yarn|vite|vitest|tsc|eslint|node) "
 lane = "web"
 ```
 
-[config.example.toml](../config.example.toml) lists every key. `properties` are passed to
-`systemd-run --property`, so any service property works (`CPUWeight`, `IOWeight`, `TasksMax`,
-...), and systemd checks them when the configuration loads. Past `MemoryHigh` the kernel slows a
+[config.example.toml](../config.example.toml) lists every key. `properties` follow systemd's
+property names (`MemoryHigh`, `MemoryMax`, `MemorySwapMax`, `CPUWeight`, `IOWeight`, `TasksMax`,
+`CPUQuota`, `Nice`): under `systemd` they are passed to `systemd-run --property` and checked by
+systemd on load; under `cgroup` they are translated directly to Linux cgroup v2 files (`memory.high`,
+`memory.max`, `memory.swap.max`, `cpu.weight`, `io.weight`, `pids.max`, `cpu.max`) plus `nice`;
+under `direct`, a 1 s daemon watchdog enforces `MemoryMax` and `nice` maps `Nice` or low `CPUWeight`.
+Past `MemoryHigh` the kernel slows a
 build and reclaims its memory; past `MemoryMax` it stops that build alone. `CPUWeight` and
 `IOWeight` (default 100) say how the kernel shares an oversubscribed CPU or disk between builds: a
 web lane at 400 beside cargo at 100 gets four times the share while both want more. `buildq status <ticket>`
-and the journal say how long a build waited on memory and whether it went over its `MemoryHigh`:
+and the daemon log say how long a build waited on memory and whether it went over its `MemoryHigh`:
 a command that keeps doing so is being slowed by its cap, which is worth raising if the machine
 has the room.
 

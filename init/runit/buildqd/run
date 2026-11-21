@@ -1,0 +1,51 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# runit service script for buildqd (Void Linux, Artix runit).
+#
+# System service: copy init/runit/buildqd to /etc/sv/buildqd, create /etc/sv/buildqd/conf with:
+#   BUILDQ_USER="youruser"
+#   # Optional: BUILDQ_CGROUP_DELEGATE="yes"
+# Then: ln -s /etc/sv/buildqd /var/service/
+#
+# User service (runsvdir ~/service): copy to ~/service/buildqd (leave BUILDQ_USER unset).
+exec 2>&1
+[ -r ./conf ] && . ./conf
+
+if [ "$(id -u)" -eq 0 ] && [ -n "${BUILDQ_USER:-}" ]; then
+	BUILDQ_HOME="${BUILDQ_HOME:-$(getent passwd "$BUILDQ_USER" | cut -d: -f6)}"
+	export HOME="$BUILDQ_HOME"
+	BUILDQ_BIN="${BUILDQ_BIN:-$BUILDQ_HOME/.local/bin/buildqd}"
+	BUILDQ_STATE_DIR="${BUILDQ_STATE_DIR:-$BUILDQ_HOME/.local/state/buildq}"
+	BUILDQ_CONFIG="${BUILDQ_CONFIG:-$BUILDQ_HOME/.config/buildq/config.toml}"
+	if [ "${BUILDQ_CGROUP_DELEGATE:-no}" = "yes" ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+		if [ -x /usr/local/libexec/buildq-cgroup-setup.sh ]; then
+			/usr/local/libexec/buildq-cgroup-setup.sh "$BUILDQ_USER" >/dev/null || true
+		else
+			group=$(id -gn "$BUILDQ_USER")
+			for ctrl in cpu memory io pids; do
+				printf '+%s\n' "$ctrl" >/sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+			done
+			mkdir -p "/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon" "/sys/fs/cgroup/buildq-$BUILDQ_USER/builds"
+			for ctrl in cpu memory io pids; do
+				printf '+%s\n' "$ctrl" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/cgroup.subtree_control" 2>/dev/null || true
+				printf '+%s\n' "$ctrl" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/builds/cgroup.subtree_control" 2>/dev/null || true
+			done
+			chown -R "$BUILDQ_USER:$group" "/sys/fs/cgroup/buildq-$BUILDQ_USER"
+		fi
+	fi
+	if [ -w "/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" ]; then
+		printf '%s\n' "$$" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" 2>/dev/null || true
+	fi
+	set -- "$BUILDQ_BIN" --state-dir "$BUILDQ_STATE_DIR" --config "$BUILDQ_CONFIG" \
+		--pid-file "$BUILDQ_STATE_DIR/buildqd.pid"
+	[ -n "${BUILDQ_SOCKET:-}" ] && set -- "$@" --socket "$BUILDQ_SOCKET"
+	exec chpst -u "$BUILDQ_USER" "$@"
+fi
+
+BUILDQ_BIN="${BUILDQ_BIN:-$HOME/.local/bin/buildqd}"
+BUILDQ_STATE_DIR="${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}"
+BUILDQ_CONFIG="${BUILDQ_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/buildq/config.toml}"
+set -- "$BUILDQ_BIN" --state-dir "$BUILDQ_STATE_DIR" --config "$BUILDQ_CONFIG" \
+	--pid-file "$BUILDQ_STATE_DIR/buildqd.pid"
+[ -n "${BUILDQ_SOCKET:-}" ] && set -- "$@" --socket "$BUILDQ_SOCKET"
+exec "$@"

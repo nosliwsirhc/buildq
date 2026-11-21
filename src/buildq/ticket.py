@@ -39,7 +39,7 @@ class Conn:
 class Ticket:
     PERSIST = ("id", "name", "argv", "cwd", "lane", "key", "label", "notify", "submitted", "priority", "timeout",
                "workspace", "disk_paths", "submission", "attached", "grant_area", "rlimits", "umask", "exec_argv", "cold", "cores_given", "mem_given", "state", "started", "ended", "exit", "oom",
-               "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "cancel_requested", "want",
+               "timed_out", "error", "unit", "cg", "runner", "pid", "pid_start", "nice", "cancel_requested", "want",
                "need", "rigid", "est_mem", "start_plan", "start_cores", "outgrown_at", "breached_at", "breaches", "start_rule", "start_base", "start_base_cores", "start_rigid", "started_max_cores", "ended_rule", "peak_swap", "tail_used", "mem_base", "mem_cores", "est_src", "peak_mem_cores", "granted", "max_granted", "jobserver", "tokens_out",
                "elastic", "max_log", "mem_peak", "peak_cores", "avg_cores", "measured", "mem_wait_some",
                "mem_wait_full", "mem_high", "source", "dedupe", "caller", "frozen", "frozen_at", "requeues",
@@ -106,6 +106,11 @@ class Ticket:
         self.runner = None
         self.pid = None
         self.pid_start = None
+        self.nice = None
+        self._pids: list[int] = []
+        self._own_stopped: bool | None = None
+        self._all_stopped: bool | None = None
+        self.cap_killed = False
         self.cancel_requested = False
         self.want = 1
         self.need = 1
@@ -286,17 +291,31 @@ class Ticket:
         t.wait_mark = common.sane_count(t.wait_mark)
         return t
 
-    def measure(self, now: float) -> None:
+    def measure(self, now: float, proc_sample: dict | None = None) -> None:
         if self.js is not None:
             self.js.observe()
             if self.js.used and not self.elastic:
                 self.elastic = True
-        if not self.cg:
+        if self.cg:
+            stats = machine.cgroup_stats(self.cg)
+            if stats is None:
+                return
+            usage, need, oom = stats
+            swap = machine.cgroup_swap(self.cg)
+            waits = machine.cgroup_memory_waits(self.cg)
+        elif proc_sample is not None:
+            usage = proc_sample["cpu_usec"]
+            if self.measured and usage < self.cpu_usec:
+                usage = self.cpu_usec  # keep monotonic across brief process-reap gaps
+            need = proc_sample["mem"]
+            swap = proc_sample["swap"]
+            oom = (self.oom_base or 0) + self.oom_kills
+            self._pids = proc_sample.get("pids") or []
+            self._own_stopped = proc_sample.get("own_stopped")
+            self._all_stopped = proc_sample.get("all_stopped")
+            waits = None
+        else:
             return
-        stats = machine.cgroup_stats(self.cg)
-        if stats is None:
-            return
-        usage, need, oom = stats
         if self.cpu_usec_base is None:
             self.cpu_usec_base = usage if self.measured else 0  # picked up after a restart: count from here
         self.measured = True
@@ -311,7 +330,7 @@ class Ticket:
                 self.peak_cores = max(self.peak_cores, self.cores_now)
         self.cpu_usec = usage
         self.mem_now = need
-        self.swap_now = machine.cgroup_swap(self.cg)
+        self.swap_now = swap
         pausing = max(0.0, now - self.frozen_at) if self.frozen and self.frozen_at else 0.0
         elapsed = max(0.0, now - (self.started or now) - self.frozen_attempt - pausing)
         if need > self.mem_peak:
@@ -343,7 +362,6 @@ class Ticket:
             if self.released:
                 common.log(f"{self.id} had a process killed for memory after its peak; holding its full "
                     f"{common.fmt_size(self.est_mem)} again", level=4)
-        waits = machine.cgroup_memory_waits(self.cg)
         if waits is not None:
             self.take_waits(*waits)
 
@@ -398,7 +416,7 @@ class Ticket:
             "log": self.log, "dir": self.dir, "outside": self.flock[0] if self.flock else None,
             "cancel_requested": self.cancel_requested, "runner": self.runner, "timeout": self.timeout,
             # for `buildq top`: where to read it, and what it fills
-            "cg": self.cg, "write_dirs": self.write_dirs, "disk_paths": self.disk_paths, "swap_now": self.swap_now, "waited_by": self.waited_by,
+            "cg": self.cg, "pid": self.pid, "write_dirs": self.write_dirs, "disk_paths": self.disk_paths, "swap_now": self.swap_now, "waited_by": self.waited_by,
             "peak_at": round(self.peak_at, 1), "release_at": self.release_at, "release_hold": self.release_hold,
             "released": bool(self.released and not self.release_revoked),
             "growth": int(self.growth_now) if self.state in ("starting", "running") else 0,

@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# s6 service script for buildqd (Artix s6, Alpine s6).
+# For a system service, set BUILDQ_USER in ./env or edit below; for a user s6-svscan tree, leave unset.
+exec 2>&1
+[ -r ./env ] && . ./env
+
+if [ "$(id -u)" -eq 0 ] && [ -n "${BUILDQ_USER:-}" ]; then
+	BUILDQ_HOME="${BUILDQ_HOME:-$(getent passwd "$BUILDQ_USER" | cut -d: -f6)}"
+	export HOME="$BUILDQ_HOME"
+	BUILDQ_BIN="${BUILDQ_BIN:-$BUILDQ_HOME/.local/bin/buildqd}"
+	BUILDQ_STATE_DIR="${BUILDQ_STATE_DIR:-$BUILDQ_HOME/.local/state/buildq}"
+	BUILDQ_CONFIG="${BUILDQ_CONFIG:-$BUILDQ_HOME/.config/buildq/config.toml}"
+	if [ "${BUILDQ_CGROUP_DELEGATE:-no}" = "yes" ] && [ -x /usr/local/libexec/buildq-cgroup-setup.sh ]; then
+		/usr/local/libexec/buildq-cgroup-setup.sh "$BUILDQ_USER" >/dev/null || true
+	fi
+	if [ -w "/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" ]; then
+		printf '%s\n' "$$" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" 2>/dev/null || true
+	fi
+	set -- "$BUILDQ_BIN" --state-dir "$BUILDQ_STATE_DIR" --config "$BUILDQ_CONFIG" \
+		--pid-file "$BUILDQ_STATE_DIR/buildqd.pid"
+	[ -n "${BUILDQ_SOCKET:-}" ] && set -- "$@" --socket "$BUILDQ_SOCKET"
+	exec s6-setuidgid "$BUILDQ_USER" "$@"
+fi
+
+BUILDQ_BIN="${BUILDQ_BIN:-$HOME/.local/bin/buildqd}"
+BUILDQ_STATE_DIR="${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}"
+BUILDQ_CONFIG="${BUILDQ_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/buildq/config.toml}"
+set -- "$BUILDQ_BIN" --state-dir "$BUILDQ_STATE_DIR" --config "$BUILDQ_CONFIG" \
+	--pid-file "$BUILDQ_STATE_DIR/buildqd.pid"
+[ -n "${BUILDQ_SOCKET:-}" ] && set -- "$@" --socket "$BUILDQ_SOCKET"
+exec "$@"

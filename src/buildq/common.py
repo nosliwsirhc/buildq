@@ -7,11 +7,14 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import Future
 
 VERSION = "0.2.0"
@@ -131,12 +134,48 @@ def module_pythonpath(existing: str | None = None, *, always: bool = False) -> s
     return root
 
 
-def runtime_dir() -> str:
-    return os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{UID}"
+def runtime_dir(state_dir: str | None = None) -> str:
+    """User-private directory for the daemon socket.
+
+    Prefers $XDG_RUNTIME_DIR, then /run/user/<uid> when it already exists and is owned/writable by
+    this user (systemd / elogind / pam_rundir), and otherwise falls back to <state_dir>/run (or
+    /tmp/buildq-<uid> if <state_dir>/run/buildq.sock would approach Linux's 108-byte AF_UNIX limit).
+    """
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        return xdg
+    run_user = f"/run/user/{UID}"
+    try:
+        st = os.lstat(run_user)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == UID and os.access(run_user, os.W_OK | os.X_OK):
+            return run_user
+    except OSError:
+        pass
+    cand = os.path.join(os.path.expanduser(state_dir) if state_dir else default_state_dir(), "run")
+    if len(os.path.join(cand, "buildq.sock").encode("utf-8", errors="surrogateescape")) <= 100:
+        return cand
+    return f"/tmp/buildq-{UID}"
 
 
-def default_socket() -> str:
-    return os.path.expanduser(os.environ.get("BUILDQ_SOCKET") or os.path.join(runtime_dir(), "buildq.sock"))
+def ensure_private_dir(path: str) -> None:
+    """Create `path` (0700) if missing and verify it is a real directory owned by UID (no symlinks)."""
+    if not path:
+        return
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(f"{path} exists and is not a directory")
+    if st.st_uid != UID:
+        raise PermissionError(f"{path} belongs to uid {st.st_uid}, not {UID}")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(path, 0o700)
+
+
+def default_socket(state_dir: str | None = None) -> str:
+    return os.path.expanduser(os.environ.get("BUILDQ_SOCKET") or os.path.join(runtime_dir(state_dir), "buildq.sock"))
 
 
 def default_state_dir() -> str:
@@ -149,7 +188,30 @@ def default_config() -> str:
     return os.path.expanduser(os.environ.get("BUILDQ_CONFIG") or os.path.join(base, "buildq", "config.toml"))
 
 
+def default_pid_file(state: str | None = None) -> str:
+    return os.path.join(state or default_state_dir(), "buildqd.pid")
+
+
+def default_log_file(state: str | None = None) -> str:
+    return os.path.join(state or default_state_dir(), "buildqd.log")
+
+
+def has_systemd_user() -> bool:
+    """Fast check for whether this machine runs systemd with systemctl installed."""
+    return os.path.isdir("/run/systemd/system") and bool(shutil.which("systemctl"))
+
+
 _log_lock = threading.Lock()
+_log_file: str | None = None
+_log_max_bytes: int = 4 << 20
+
+
+def configure_log_file(path: str | None, max_bytes: int = 4 << 20) -> None:
+    """Route `log()` to a timestamped rotating file (for non-systemd background daemons)."""
+    global _log_file, _log_max_bytes
+    with _log_lock:
+        _log_file = os.path.expanduser(path) if path else None
+        _log_max_bytes = max(64 << 10, int(max_bytes))
 
 
 def to_journal() -> bool:
@@ -164,11 +226,31 @@ def to_journal() -> bool:
 
 
 def log(message: str, level: int | None = None) -> None:
-    """A line for the journal, written whole even with threads logging; `level` (syslog: 4 is
-    warning) is marked only when stdout really is the journal."""
-    if level is not None and to_journal():  # journald reads the level of each line by itself
-        message = "\n".join(f"<{level}>{line}" for line in message.split("\n"))
+    """A line for the journal or log file, written whole even with threads logging; `level` (syslog:
+    4 is warning) is marked only when stdout really is the journal."""
     with _log_lock:
+        if _log_file:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            payload = "".join(f"{stamp} {line}\n" for line in message.split("\n"))
+            try:
+                os.makedirs(os.path.dirname(_log_file) or ".", mode=0o700, exist_ok=True)
+                try:
+                    if os.path.getsize(_log_file) > _log_max_bytes:
+                        os.replace(_log_file, _log_file + ".1")
+                except OSError:
+                    pass
+                fd = os.open(_log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                try:
+                    data = payload.encode(errors="backslashreplace")
+                    while data:
+                        data = data[os.write(fd, data):]
+                finally:
+                    os.close(fd)
+                return
+            except OSError:
+                pass
+        if level is not None and to_journal():  # journald reads the level of each line by itself
+            message = "\n".join(f"<{level}>{line}" for line in message.split("\n"))
         sys.stdout.write(message + "\n")
         sys.stdout.flush()
 

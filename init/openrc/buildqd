@@ -1,0 +1,65 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: MIT
+# OpenRC service for buildqd (Alpine, Gentoo, Artix, Devuan OpenRC).
+#
+# Copy to /etc/init.d/buildqd (chmod 755) and create /etc/conf.d/buildqd with:
+#   BUILDQ_USER="youruser"
+#   # Optional: delegate /sys/fs/cgroup/buildq-<user> for full cgroup v2 limits & freezing:
+#   # BUILDQ_CGROUP_DELEGATE="yes"
+# Then: rc-update add buildqd default && rc-service buildqd start
+
+name="buildqd"
+description="buildq load-aware build queue daemon"
+
+: "${BUILDQ_USER:?Set BUILDQ_USER in /etc/conf.d/buildqd}"
+BUILDQ_HOME="${BUILDQ_HOME:-$(getent passwd "$BUILDQ_USER" | cut -d: -f6)}"
+BUILDQ_BIN="${BUILDQ_BIN:-$BUILDQ_HOME/.local/bin/buildqd}"
+BUILDQ_STATE_DIR="${BUILDQ_STATE_DIR:-$BUILDQ_HOME/.local/state/buildq}"
+BUILDQ_CONFIG="${BUILDQ_CONFIG:-$BUILDQ_HOME/.config/buildq/config.toml}"
+BUILDQ_LOG="${BUILDQ_LOG:-$BUILDQ_STATE_DIR/buildqd.log}"
+BUILDQ_PID="${BUILDQ_PID:-$BUILDQ_STATE_DIR/buildqd.pid}"
+
+supervisor="supervise-daemon"
+command="$BUILDQ_BIN"
+command_args="--state-dir $BUILDQ_STATE_DIR --config $BUILDQ_CONFIG --pid-file $BUILDQ_PID --log-file $BUILDQ_LOG"
+[ -n "${BUILDQ_SOCKET:-}" ] && command_args="$command_args --socket $BUILDQ_SOCKET"
+command_user="$BUILDQ_USER"
+supervise_daemon_args="--env HOME=$BUILDQ_HOME"
+extra_started_commands="reload"
+
+depend() {
+	need localmount
+	after bootmisc
+}
+
+start_pre() {
+	local group
+	group=$(id -gn "$BUILDQ_USER")
+	checkpath -d -m 0700 -o "$BUILDQ_USER:$group" "$BUILDQ_STATE_DIR"
+	if [ "${BUILDQ_CGROUP_DELEGATE:-no}" = "yes" ] && [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+		if [ -x /usr/local/libexec/buildq-cgroup-setup.sh ]; then
+			/usr/local/libexec/buildq-cgroup-setup.sh "$BUILDQ_USER" >/dev/null || true
+		else
+			for ctrl in cpu memory io pids; do
+				printf '+%s\n' "$ctrl" >/sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+			done
+			mkdir -p "/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon" "/sys/fs/cgroup/buildq-$BUILDQ_USER/builds"
+			for ctrl in cpu memory io pids; do
+				printf '+%s\n' "$ctrl" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/cgroup.subtree_control" 2>/dev/null || true
+				printf '+%s\n' "$ctrl" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/builds/cgroup.subtree_control" 2>/dev/null || true
+			done
+			chown -R "$BUILDQ_USER:$group" "/sys/fs/cgroup/buildq-$BUILDQ_USER"
+		fi
+		# Place supervise-daemon/buildqd inside the delegated subtree so unprivileged
+		# migration into builds/buildq-<id> satisfies the cgroup v2 common-ancestor rule.
+		if [ -w "/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" ]; then
+			printf '%s\n' "$$" >"/sys/fs/cgroup/buildq-$BUILDQ_USER/daemon/cgroup.procs" 2>/dev/null || true
+		fi
+	fi
+}
+
+reload() {
+	ebegin "Reloading buildqd configuration"
+	supervise-daemon "$RC_SVCNAME" --signal HUP
+	eend $?
+}

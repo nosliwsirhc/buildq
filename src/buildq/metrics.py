@@ -128,9 +128,10 @@ class Consumers:
         except OSError:
             return []
 
-    def groups(self, builds: str) -> dict[str, list[str]]:
+    def groups(self, builds: str | None) -> dict[str, list[str]]:
         apps = os.path.join(self.manager, "app.slice")
-        found = {"builds": [builds], "apps": [apps], "ci": [], "containers": []}
+        found = {"builds": [builds] if builds else [], "apps": [apps] if os.path.isdir(apps) else [],
+                 "ci": [], "containers": []}
         for parent in (self.manager, apps):  # newer systemd puts user services in app.slice
             for name in self.children(parent):
                 if name.endswith(".service") and any(fnmatch.fnmatch(name, p) for p in CI_UNITS):
@@ -147,13 +148,14 @@ class Consumers:
                 found["containers"].append(os.path.join(system, name))
         return found
 
-    def read(self, builds: str, busy: float) -> dict:
+    def read(self, builds: str | None, busy: float, builds_fallback: tuple[int, float] | None = None) -> dict:
         now = time.monotonic()
         usages: dict[str, int] = {}
         found = self.groups(builds)
-        apps = found["apps"][0]
+        apps = os.path.join(self.manager, "app.slice")
         totals: dict[str, list] = {}
         inside_apps = [0, 0.0]  # CI runners within app.slice: taken off the apps' figures
+        builds_measured = False
         for group, paths in found.items():
             mem, cores = 0, 0.0
             for path in paths:
@@ -162,6 +164,8 @@ class Consumers:
                     if self.last is not None and path in self.last[1]:
                         usages[path] = self.last[1][path]  # unreadable this once: keep its baseline
                     continue
+                if group == "builds":
+                    builds_measured = True
                 usage, need, _ = stats
                 usages[path] = usage
                 share = 0.0
@@ -177,12 +181,14 @@ class Consumers:
                     inside_apps[0] += need
                     inside_apps[1] += share
             totals[group] = [mem, cores]
+        if not builds_measured and builds_fallback is not None:
+            totals["builds"] = [int(builds_fallback[0]), float(builds_fallback[1])]
         totals["apps"][0] = max(0, totals["apps"][0] - inside_apps[0])
         totals["apps"][1] = max(0.0, totals["apps"][1] - inside_apps[1])
         out: dict = {}
         for group, (mem, cores) in totals.items():
             out[f"{group}_mem"] = mem
-            if self.last is not None:
+            if self.last is not None or (group == "builds" and not builds_measured and builds_fallback is not None):
                 out[f"{group}_cores"] = round(cores, 3)
         if self.last is not None:
             out["other_cores"] = round(max(0.0, busy - sum(c for _, c in totals.values())), 3)
@@ -216,7 +222,8 @@ class Metrics:
         self.seconds = 0.0
         self.sums: dict[str, float] = collections.defaultdict(float)
         self.extremes: dict[str, float] = {}
-        self.builds_cgroup = ""
+        self.builds_cgroup: str | None = ""
+        self.builds_fallback: tuple[int, float] | None = None
 
     def trouble(self, message: str) -> None:
         """Log a problem with the analytics, at most once an hour."""
@@ -227,12 +234,14 @@ class Metrics:
 
     # ---- on the daemon's loop
 
-    def observe(self, now: float, values: dict, builds_cgroup: str) -> None:
+    def observe(self, now: float, values: dict, builds_cgroup: str | None,
+                builds_fallback: tuple[int, float] | None = None) -> None:
         """Add one tick's numbers to the minute; a new minute sends the last one to be written."""
         minute = int(now // 60) * 60
         self.builds_cgroup = builds_cgroup
+        self.builds_fallback = builds_fallback
         if self.minute is not None and minute != self.minute:
-            self.emit(builds_cgroup)
+            self.emit(builds_cgroup, builds_fallback)
         if minute != self.minute:
             self.minute, self.last, self.seconds = minute, None, 0.0
             self.sums.clear()
@@ -253,12 +262,12 @@ class Metrics:
             self.sums["@free_mem_mem_wait"] += max(values["mem_available"] - values["mem_floor"], 0) * weight
             self.sums["@growth_mem_wait"] += values["growth"] * weight
 
-    def emit(self, builds_cgroup: str) -> None:
+    def emit(self, builds_cgroup: str | None, builds_fallback: tuple[int, float] | None = None) -> None:
         if self.seconds <= 0 or self.minute is None:
             return
         types = {name: kind for name, kind, _ in METRIC_COLUMNS}
         row: dict = {"_kind": "minute", "t": self.minute, "sampled": round(self.seconds, 1),
-                     "_builds": builds_cgroup}
+                     "_builds": builds_cgroup, "_builds_fallback": builds_fallback}
         waited = self.sums.get("mem_wait_seconds", 0.0)
         for name, total in self.sums.items():
             if name.startswith("@"):
@@ -302,7 +311,7 @@ class Metrics:
 
     def stop(self, timeout: float = 2.0) -> None:
         if not self.stopping and self.minute is not None and self.seconds > 0:
-            self.emit(self.builds_cgroup)  # the minute so far
+            self.emit(self.builds_cgroup, self.builds_fallback)  # the minute so far
             self.minute = None
         with self.lock:
             self.stopping = True
@@ -394,7 +403,8 @@ class Metrics:
                 written += 1
                 if kind == "minute":
                     builds = item.pop("_builds")
-                    item.update(consumers.read(builds, float(item.get("cpu_busy") or 0.0)))
+                    builds_fallback = item.pop("_builds_fallback", None)
+                    item.update(consumers.read(builds, float(item.get("cpu_busy") or 0.0), builds_fallback))
                     if not full:
                         names = [n for n in item if n == "t" or n in {c for c, _, _ in METRIC_COLUMNS}]
                         db.execute(f"INSERT OR REPLACE INTO minute ({', '.join(names)}) VALUES "

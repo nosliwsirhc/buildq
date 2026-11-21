@@ -30,7 +30,7 @@ from .github import GitHubMixin
 from .history import History
 from .machine import Machine, T3_THREAD_VAR, user_manager_cgroup
 from .metrics import Metrics, WAIT_COLUMN, WAIT_COLUMNS
-from .runners import DirectRunner, Jobserver, SystemdRunner
+from .runners import CgroupRunner, DirectRunner, Jobserver, SystemdRunner
 from .scheduler import SchedulerMixin
 from .ticket import Conn, Ticket
 
@@ -57,6 +57,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         if runner is not None:
             self.runners[runner.name] = runner
         self._systemd_ok = None
+        self._cgroup_probed: tuple[str, str | None] | None = None
         self.cfg = None
         self.cfg = self.load_config()
         self.runner = self.runner_for_config(self.cfg)
@@ -183,24 +184,52 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 self.pending_queries.pop(key, None)
         return answer
 
+    def _cgroup_runner(self, configured_root: str) -> CgroupRunner | None:
+        key = os.environ.get("BUILDQ_CGROUP_ROOT", "").strip() or configured_root
+        if self._cgroup_probed is None or self._cgroup_probed[0] != key:
+            self._cgroup_probed = (key, CgroupRunner.discover(configured_root))
+        root = self._cgroup_probed[1]
+        if not root:
+            return None
+        existing = self.runners.get("cgroup")
+        if isinstance(existing, CgroupRunner) and existing.root == root and existing._ready:
+            return existing
+        runner = CgroupRunner(root, self.machine.mem_total)
+        if not runner._ready:
+            self._cgroup_probed = (key, None)
+            return None
+        self.runners["cgroup"] = runner
+        return runner
+
     def runner_for_config(self, cfg: Config):
         """The runner new builds use. A build already running keeps the runner it started under."""
         if self.override is not None:
             return self.override
         wanted = os.environ.get("BUILDQ_RUNNER") or cfg.runner
-        if wanted not in ("auto", "systemd", "direct"):
-            common.log(f"BUILDQ_RUNNER={wanted!r} isn't auto, systemd or direct; using {cfg.runner}")
+        if wanted not in ("auto", "systemd", "cgroup", "direct"):
+            common.log(f"BUILDQ_RUNNER={wanted!r} isn't auto, systemd, cgroup or direct; using {cfg.runner}")
             wanted = cfg.runner
         if os.environ.get("INVOCATION_ID") and wanted != "systemd":
             # Running as a systemd service: the direct runner would put every build inside the
             # daemon's own small cgroup. A slow probe under load mustn't pick it.
-            if wanted == "direct":
-                common.log("runner = \"direct\" can't be used while buildqd runs as a systemd service; using systemd")
+            if wanted != "auto":
+                common.log(f"runner = {wanted!r} can't be used while buildqd runs as a systemd service; using systemd")
             wanted = "systemd"
         if wanted == "auto":
             if self._systemd_ok is None:
                 self._systemd_ok = SystemdRunner.available()
-            wanted = "systemd" if self._systemd_ok else "direct"
+            if self._systemd_ok:
+                wanted = "systemd"
+            elif self._cgroup_runner(cfg.cgroup_root) is not None:
+                wanted = "cgroup"
+            else:
+                wanted = "direct"
+        if wanted == "cgroup":
+            cg_runner = self._cgroup_runner(cfg.cgroup_root)
+            if cg_runner is not None:
+                return cg_runner
+            raise ValueError("runner = \"cgroup\" needs a writable cgroup v2 directory with cpu and memory "
+                             "controllers (set cgroup_root, run init/cgroup-setup.sh, or use runner = \"auto\")")
         return self.runners[wanted]
 
     def runner_of(self, t: "Ticket"):
@@ -216,7 +245,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
             for lane in cfg.lanes.values():
                 problem = runner.check_lane(lane)
                 if problem:
-                    raise ValueError(f"systemd refuses lanes.{lane.name}.properties: {problem}")
+                    raise ValueError(f"{runner.name} refuses lanes.{lane.name}.properties: {problem}")
             if os.path.exists(self.config_path):
                 shutil.copyfile(self.config_path, self.last_good)
             return cfg
@@ -572,6 +601,10 @@ class Daemon(GitHubMixin, SchedulerMixin):
         t.force_sent = t.freeze_failed = t.thaw_failed = False
         t.state, t.started, t.running_since, t.result_seen, t.stop_sent = "queued", None, None, None, None
         t.unit = t.cg = t.launcher = t.last_grant_t = t.cpu_usec_base = t.freeze_asked = t.exec_argv = None
+        t.nice = None
+        t.cap_killed = False
+        t._pids = []
+        t._own_stopped = t._all_stopped = None
         t.started_max_cores = t.max_granted  # (the row describes the last attempt that started)
         t.ended_rule = self.cfg.scale_mem_with_cores
         t.granted = t.max_granted = t.tokens_out = 0
@@ -686,14 +719,18 @@ class Daemon(GitHubMixin, SchedulerMixin):
     # ---- watching builds
 
     def check(self, now: float) -> None:
-        for t in self.active():
+        active = self.active()
+        direct_jobs = {t.id: (t.pid, t.pid_start) for t in active
+                       if not t.flock and t.state == "running" and not t.cg}
+        proc_snap = machine.proc_trees_snapshot(direct_jobs) if direct_jobs else {}
+        for t in active:
             if t.flock:
                 t.measure(now)
                 self.outgrown(t, now)
                 continue
             if t.state == "starting" and not self.check_starting(t, now):
                 continue
-            t.measure(now)
+            t.measure(now, proc_sample=proc_snap.get(t.id))
             if t.release_dirty:  # a take-back is saved at once, so a crash can't bring the decision back
                 t.release_dirty = False
                 self.save(t)
@@ -710,13 +747,27 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 else:
                     self.requeue(t, now)
                 continue
+            # Non-cgroup runner MemoryMax watchdog: kill a build whose measured process-tree memory
+            # exceeds its lane's MemoryMax, marking it killed for memory so history learns its cap.
+            if not self._runner_has_cgroup(self.runner_of(t)) and t.measured and not t.cancel_requested and not t.cap_killed:
+                lane = self.lane(t.lane)
+                if lane.mem_cap and t.mem_now > lane.mem_cap:
+                    t.cap_killed = True
+                    t.kills_own_cap = True
+                    t.oom_kills += 1
+                    t.error = f"exceeded its lane's MemoryMax ({common.fmt_size(lane.mem_cap)})"
+                    common.log(f"{t.id} exceeded its lane's MemoryMax ({common.fmt_size(t.mem_now)} > "
+                               f"{common.fmt_size(lane.mem_cap)}); stopping it", level=4)
+                    self.stop(t, now, force=True)
+                    self.save(t)
+                    continue
             self.outgrown(t, now)
             if t.last_grant_t is not None and not t.frozen:
                 t.grant_area += t.granted * max(0.0, now - t.last_grant_t)
             t.last_grant_t = now
             result = common.read_json(os.path.join(t.dir, "result.json"))
             if isinstance(result, dict):
-                # Give systemd a moment to stop anything the build left behind, so the turn ends
+                # Give systemd/runner a moment to stop anything the build left behind, so the turn ends
                 # with the build's last process.
                 t.result_seen = t.result_seen or now
                 if self.runner_of(t).alive(t):
@@ -726,28 +777,33 @@ class Daemon(GitHubMixin, SchedulerMixin):
                         common.log(f"{t.id} ended, but processes it left are still running; killing them")
                         self.stop(t, now, force=True)
                     continue
-                self.finalize(t, now, result.get("exit"), oom=supervisor.oom_of(result),
-                              timed_out=bool(result.get("timed_out")), result=result)
+                self.finalize(t, now, result.get("exit"), oom=t.cap_killed or supervisor.oom_of(result),
+                              timed_out=bool(result.get("timed_out")), error=t.error if t.cap_killed else None,
+                              result=result, learn_oom=True if t.cap_killed else None)
                 continue
             if t.cancel_requested and t.stop_sent and now - t.stop_sent > 75:
                 self.stop(t, now, force=True)
             if not self.runner_of(t).alive(t) and now - (t.running_since or now) > 3:
                 result = common.read_json(os.path.join(t.dir, "result.json"))
                 if isinstance(result, dict):
-                    self.finalize(t, now, result.get("exit"), oom=supervisor.oom_of(result),
-                                  timed_out=bool(result.get("timed_out")), result=result)
+                    self.finalize(t, now, result.get("exit"), oom=t.cap_killed or supervisor.oom_of(result),
+                                  timed_out=bool(result.get("timed_out")), error=t.error if t.cap_killed else None,
+                                  result=result, learn_oom=True if t.cap_killed else None)
                 else:
-                    # Killed as a whole, supervisor and all: systemd-oomd, or SIGKILL from outside.
+                    # Killed as a whole, supervisor and all: cgroup OOM, watchdog cap, systemd-oomd, or SIGKILL.
                     verdict = self.result_of(t)
                     if verdict is PENDING:
                         continue  # finalized on a later tick, with systemd's verdict
-                    oom = verdict == "oom-kill"
+                    oom = verdict == "oom-kill" or t.cap_killed
                     managed_oom = verdict == "managed-oom-kill"
+                    slice_oom = verdict == "slice-oom-kill"
                     error = None if t.cancel_requested else (
+                        t.error if t.cap_killed and t.error else
                         "it was stopped for memory (systemd-oomd)" if managed_oom else
+                        "it was stopped for memory (slice memory limit)" if slice_oom else
                         "it was stopped for memory (systemd-oomd or the kernel)" if oom else
                         f"the build ended without reporting an exit status ({verdict or 'killed?'})")
-                    self.finalize(t, now, None, lost=True, oom=oom or managed_oom, learn_oom=oom, error=error)
+                    self.finalize(t, now, None, lost=True, oom=oom or managed_oom or slice_oom, learn_oom=oom, error=error)
 
     def attempt_seconds(self, t: Ticket, now: float | None) -> float:
         """Seconds into this attempt, pauses left out: the clock attempt_wall and the profile use."""
@@ -770,7 +826,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         else:
             breached = False
         lane = self.lane(t.lane)
-        cap = lane.mem_cap if self.runner_of(t).name == "systemd" else None
+        cap = lane.mem_cap if self._runner_enforces_mem_cap(self.runner_of(t)) else None
         raised = cap if cap and cap > t.mem_now else int(t.mem_now * 1.5)
         if raised > t.est_mem:
             common.log(f"{t.id} passed its estimate ({common.fmt_size(t.est_mem)}); planning it at {common.fmt_size(raised)}")
@@ -801,11 +857,17 @@ class Daemon(GitHubMixin, SchedulerMixin):
             if os.path.exists(os.path.join(t.dir, "env.json")) and t.cancel_requested:
                 self.finalize(t, now, None)  # it never started, and it was cancelled
             elif os.path.exists(os.path.join(t.dir, "env.json")):
-                # Systemd has neither the service nor a job to start it, and no supervisor read
-                # its environment: it never started. Queue it again, clearing any failed unit of
-                # that name first, so the next launch can use it.
-                if self.query(("reset-failed", self.attempt(t)), machine.reset_failed_unit, t.unit) is PENDING:
-                    return False  # the build stays starting until the name is free
+                # The runner has neither the service nor a job to start it, and no supervisor read
+                # its environment: it never started. Queue it again, clearing any failed unit/cgroup
+                # of that name first, so the next launch can use it.
+                if runner.name == "systemd":
+                    if self.query(("reset-failed", self.attempt(t)), machine.reset_failed_unit, t.unit) is PENDING:
+                        return False  # the build stays starting until the name is free
+                else:
+                    try:
+                        runner.cleanup(t)
+                    except OSError:
+                        pass
                 self.close_jobserver(t, remove=True)
                 self.drop_queries(t)  # (this attempt is over)
                 t.state, t.started, t.unit, t.cg, t.exec_argv, t.granted, t.elastic = "queued", None, None, None, None, 0, False
@@ -1058,7 +1120,9 @@ class Daemon(GitHubMixin, SchedulerMixin):
             "free_mem": budget.get("free_mem", 0), "free_cpu": budget.get("free_cores", 0),
         }
         values.update({name: waits.get(name, 0) for name in WAIT_COLUMNS})
-        self.metrics.observe(now, values, os.path.join(self.cg_base, machine.slice_path(cfg.slice)))
+        builds_cg = self._runner_builds_cgroup(self.runner)
+        builds_fallback = (sum(t.mem_now for t in running), sum(t.cores_now for t in running))
+        self.metrics.observe(now, values, builds_cg, builds_fallback)
 
     def run_hooks(self, t: Ticket, now: float) -> None:
         for command in (t.notify, *t.extra_notify, self.cfg.on_finish):
@@ -1197,27 +1261,28 @@ class Daemon(GitHubMixin, SchedulerMixin):
             t.observed_gap = True  # it ran unwatched for a while: its peak and after may have been missed
             t.release_stood_at_load = t.release_at is not None and not t.release_revoked
             t.release_open_at_gap = t.release_open_at_gap or t.release_stood_at_load
-            if isinstance(t.freeze_asked, list) and len(t.freeze_asked) >= 2 and t.cg:
+            runner = self.runner_of(t)
+            if isinstance(t.freeze_asked, list) and len(t.freeze_asked) >= 2 and getattr(runner, "can_freeze", False):
                 wanted = bool(t.freeze_asked[0])
                 t.freeze_asked = (wanted, now)  # sent again, with a full minute: its sender went with the old daemon
                 try:
-                    proc = self.runner_of(t).freeze(t, wanted)
+                    proc = runner.freeze(t, wanted)
                     if proc is not None:
                         self.helpers.append((proc, now + 30))
                 except OSError:
                     pass
             else:
                 t.freeze_asked = None
-            if t.cg and t.freeze_asked is None:
-                own = machine.cgroup_freeze_set(t.cg)
+            if t.freeze_asked is None:
+                own, took, parent_frozen = self._runner_freeze_state(runner, t)
                 if own is not None:
                     if not own and t.frozen:  # resumed while the daemon was away: the pause ends now
                         if t.frozen_at:
                             t.frozen_attempt += max(0.0, now - t.frozen_at)
                         t.frozen, t.frozen_at, t.thaw_failed = False, None, False
-                    elif own and not t.frozen and not machine.parent_freeze_set(t.cg):
-                        t.frozen, t.frozen_at = True, (now if machine.cgroup_frozen(t.cg) else None)
-                    elif own and t.frozen and not t.frozen_at and machine.cgroup_frozen(t.cg):
+                    elif own and not t.frozen and not parent_frozen:
+                        t.frozen, t.frozen_at = True, (now if took else None)
+                    elif own and t.frozen and not t.frozen_at and took:
                         t.frozen_at = now  # (a pause counts only once in effect)
             if t.state == "starting":
                 t.recheck_at = now + 10
@@ -1247,7 +1312,9 @@ class Daemon(GitHubMixin, SchedulerMixin):
         running = sorted(self.active(), key=lambda t: t.started or 0)
         recent = sorted((t for t in self.tickets.values() if t.state in FINISHED), key=lambda t: t.ended or 0)[-10:]
         return {
-            "version": VERSION, "now": now, "runner": self.runner.name, "machine": self.machine.summary(),
+            "version": VERSION, "now": now, "runner": self.runner.name,
+            "builds_cg": self._runner_builds_cgroup(self.runner),
+            "machine": self.machine.summary(),
             "budget": self.budget, "config": self.cfg.summary(), "paused": self.paused,
             "running": [t.row(now) for t in running],
             "queued": [t.row(now, i) for i, t in enumerate(queue)],
@@ -1578,7 +1645,8 @@ def listening_socket(path: str):
         os.unlink(path)
     except FileNotFoundError:
         pass
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    parent = os.path.dirname(path) or "."
+    common.ensure_private_dir(parent)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.bind(path)  # mode 0600: the daemon runs with umask 077
     sock.listen(128)
@@ -1603,6 +1671,13 @@ async def serve(args) -> None:
     daemon.prune(now)
     daemon.scan_flock_slots(now)
     sock, owned = listening_socket(args.socket)
+    pid_file = os.path.expanduser(args.pid_file) if getattr(args, "pid_file", None) else None
+    if pid_file:
+        os.makedirs(os.path.dirname(pid_file) or ".", mode=0o700, exist_ok=True)
+        tmp_pid = f"{pid_file}.tmp.{os.getpid()}"
+        with open(tmp_pid, "w") as f:
+            f.write(f"{os.getpid()}\n")
+        os.replace(tmp_pid, pid_file)
     # Python 3.13+ removes a Unix server's socket file when the server closes. A socket systemd
     # passed us belongs to systemd and must outlive this process; ours we remove ourselves.
     keep = {"cleanup_socket": False} if sys.version_info >= (3, 13) else {}
@@ -1625,21 +1700,34 @@ async def serve(args) -> None:
             os.unlink(args.socket)
         except OSError:
             pass
+    if pid_file:
+        try:
+            with open(pid_file) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.unlink(pid_file)
+        except OSError:
+            pass
     common.log(f"stopping; {len(daemon.active())} running build(s) carry on, and the next daemon picks them up")
 
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(prog="buildqd", description="The buildq daemon: a load-aware build queue.")
-    parser.add_argument("--socket", default=common.default_socket(), help="Unix socket to listen on (default: %(default)s)")
+    parser.add_argument("--socket", default=None, help=f"Unix socket to listen on (default: {common.default_socket()})")
     parser.add_argument("--state-dir", default=common.default_state_dir(), help="tickets and history (default: %(default)s)")
     parser.add_argument("--config", default=common.default_config(), help="TOML configuration file (default: %(default)s)")
+    parser.add_argument("--pid-file", help="write daemon PID to this file while running (for non-systemd init/daemon CLI)")
+    parser.add_argument("--log-file", help="append timestamped logs to this file with rotation (for non-systemd runs)")
     parser.add_argument("--check-config", action="store_true", help="load the configuration, print it, and exit")
     parser.add_argument("--supervise", metavar="TICKET_DIR", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=f"buildqd {VERSION}")
     args = parser.parse_args(argv)
+    if args.socket is None:
+        args.socket = common.default_socket(state_dir=args.state_dir)
     os.umask(0o077)  # tickets, logs, history and the socket are private to this user
     if args.supervise:
         sys.exit(supervisor.supervise(args.supervise))
+    if args.log_file:
+        common.configure_log_file(args.log_file)
     try:
         sys.stdout.reconfigure(errors="backslashreplace")
     except (AttributeError, ValueError):
@@ -1647,11 +1735,20 @@ def main(argv=None) -> None:
     if args.check_config:
         m = Machine()
         cfg = config.load_config_file(args.config, m.mem_total, m.ncpu)
-        if SystemdRunner.available():
+        wanted = os.environ.get("BUILDQ_RUNNER") or cfg.runner
+        if wanted in ("auto", "systemd") and SystemdRunner.available():
             for lane in cfg.lanes.values():
                 problem = SystemdRunner.check_lane(lane)
                 if problem:
                     sys.exit(f"systemd refuses lanes.{lane.name}.properties: {problem}")
+        else:
+            if wanted == "cgroup" and not CgroupRunner.discover(cfg.cgroup_root):
+                sys.exit("cgroup runner needs a writable cgroup v2 directory with cpu and memory controllers "
+                         "(set cgroup_root, run init/cgroup-setup.sh, or use runner = \"auto\")")
+            for lane in cfg.lanes.values():
+                problem = CgroupRunner.check_lane(lane, m.mem_total)
+                if problem:
+                    sys.exit(f"runner refuses lanes.{lane.name}.properties: {problem}")
         if cfg.gh and not (os.path.isfile(cfg.gh) and os.access(cfg.gh, os.X_OK)):
             # (a warning, not a refusal: the configuration loads, and statuses are tried when sent)
             print(f"buildqd: warning: gh = {cfg.gh!r} isn't an executable file; commit statuses can't be "

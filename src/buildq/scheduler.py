@@ -7,21 +7,77 @@ import collections
 import math
 import os
 import queue
+import re
+import shutil
+import subprocess
 import threading
 import time
 import traceback
 
-from . import commands, common, machine, tools
+from . import commands, common, machine, runners, tools
 from .commands import MAKE_FLAG_VARS
 from .common import FINISHED, GIB, MIB, PENDING
 from .config import CI_LONG_WAITS
 from .runners import Jobserver
 from .ticket import Ticket
 
+_MAKE_FIFO_CACHE: dict[tuple, bool] = {}
+
+
+def _make_supports_fifo(argv0: str, env_path: str | None) -> bool:
+    """GNU make 4.4+ supports `--jobserver-auth=fifo:PATH`; GNU make <= 4.3 aborts on it."""
+    exe = shutil.which(argv0, path=env_path) if env_path or os.path.isabs(argv0) else shutil.which(argv0)
+    if not exe:
+        return True
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return True
+    key = (exe, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+    cached = _MAKE_FIFO_CACHE.get(key)
+    if cached is not None:
+        return cached
+    supported = True
+    try:
+        res = subprocess.run([exe, "--version"], stdin=common.DEVNULL, capture_output=True, text=True, timeout=2)
+        m = re.search(r"GNU Make\s+(\d+)\.(\d+)", res.stdout or "")
+        if m:
+            supported = (int(m.group(1)), int(m.group(2))) >= (4, 4)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    _MAKE_FIFO_CACHE[key] = supported
+    return supported
+
 class SchedulerMixin:
     """Queue ordering, admission, jobserver rebalancing, slice guard, memory shedding, and watch."""
 
     REBALANCE_SECONDS = 5.0
+
+    # ---- runner capability helpers (stay compatible with minimal test/sim runners)
+
+    @staticmethod
+    def _runner_has_cgroup(r) -> bool:
+        return bool(getattr(r, "has_cgroup", r.name == "systemd"))
+
+    @staticmethod
+    def _runner_enforces_mem_cap(r) -> bool:
+        return bool(getattr(r, "enforces_mem_cap", r.name == "systemd"))
+
+    def _runner_builds_cgroup(self, r) -> str | None:
+        fn = getattr(r, "builds_cgroup", None)
+        if fn is not None:
+            return fn(self.cfg.slice)
+        return os.path.join(self.cg_base, machine.slice_path(self.cfg.slice)) if r.name == "systemd" else None
+
+    @staticmethod
+    def _runner_freeze_state(r, t: Ticket) -> tuple[bool | None, bool | None, bool]:
+        fn = getattr(r, "freeze_state", None)
+        if fn is not None:
+            return fn(t)
+        if not t.cg:
+            return None, None, False
+        return (machine.cgroup_freeze_set(t.cg), machine.cgroup_frozen(t.cg),
+                machine.parent_freeze_set(t.cg))
 
     # ---- the ticket index
 
@@ -126,7 +182,7 @@ class SchedulerMixin:
 
     def estimate(self, t: Ticket, now: float) -> None:
         e = self.history.estimate(t.key, self.lane(t.lane), self.cfg, self.machine.ncpu,
-                                  self.runner.name == "systemd", t.cold, now)
+                                  self._runner_enforces_mem_cap(self.runner), t.cold, now)
         t.want, t.need, t.est_src, t.rigid, t.expected = e.want, e.need, e.source, e.rigid, e.wall
         t.mem_base, t.mem_cores = e.mem, e.mem_cores
         if t.cores_given is not None:
@@ -155,7 +211,7 @@ class SchedulerMixin:
             return base
         scaled = int(base * cores / t.mem_cores)
         lane = self.lane(t.lane)
-        if lane.mem_cap and self.runner_of(t).name == "systemd":
+        if lane.mem_cap and self._runner_enforces_mem_cap(self.runner_of(t)):
             scaled = min(scaled, max(lane.mem_cap, base))
         return scaled
 
@@ -261,9 +317,10 @@ class SchedulerMixin:
             if frozen:
                 return
             # A thaw that couldn't even be sent still has its minute: then the build is stopped.
-        observable = bool(t.cg) and machine.cgroup_frozen(t.cg) is not None
-        # A pause begins, and ends, when the cgroup says so (reconcile_freezes); where that can't be
-        # seen, at once.
+        _, took, _ = self._runner_freeze_state(self.runner_of(t), t)
+        observable = took is not None
+        # A pause begins, and ends, when the cgroup (or process state) says so (reconcile_freezes);
+        # where that can't be seen, at once.
         if frozen:
             t.frozen, t.frozen_at, t.thaw_failed = True, (None if observable else now), False
         elif not observable:
@@ -285,13 +342,12 @@ class SchedulerMixin:
         stopped, if shed_memory is on. With no request pending, the ticket follows the build's own
         setting (a freeze that landed late; a thaw from before a restart)."""
         for t in builds:
-            own = machine.cgroup_freeze_set(t.cg) if t.cg else None
-            took = machine.cgroup_frozen(t.cg) if t.cg else None
+            own, took, parent_frozen = self._runner_freeze_state(self.runner_of(t), t)
             if t.freeze_asked is None:
                 if own is None:
                     if t.frozen and t.frozen_at is None:
                         t.frozen_at = now  # can't be seen: paused, as far as is known, from now
-                elif own and not t.frozen and machine.parent_freeze_set(t.cg):
+                elif own and not t.frozen and parent_frozen:
                     pass  # its slice is frozen (older systemd sets each member's own setting too): not buildq's
                 elif own and not t.frozen:
                     t.frozen, t.frozen_at = True, (now if took else None)
@@ -676,7 +732,7 @@ class SchedulerMixin:
             killed = kills > t.release_oom_base or (t.oom and not t.timed_out and not t.cancel_requested)
             if killed:
                 lane = self.lane(t.lane)
-                own = t.kills_own_cap and lane.mem_cap and self.runner_of(t).name == "systemd"
+                own = t.kills_own_cap and lane.mem_cap and self._runner_enforces_mem_cap(self.runner_of(t))
                 # At its own cap it used that much; killed from outside (the slice's limit, oomd), it
                 # may not have grown at all, so count what was let go.
                 size = (lane.mem_cap if own else (t.release_est or t.est_mem)) - t.release_hold
@@ -909,6 +965,9 @@ class SchedulerMixin:
             tool = os.path.basename((stripped or ["?"])[0])
             known = tools.uses_jobserver(tool)
             wanted = lane.jobserver == "all" or (lane.jobserver == "tools" and known)
+            if wanted and tool in ("make", "gmake") and self.runner.name in ("systemd", "cgroup", "direct"):
+                if not _make_supports_fifo(stripped[0], env.get("PATH")):
+                    wanted = False
             # An inherited jobserver passed by descriptor is dead in the build's service: drop it,
             # and give the build buildq's, unless the caller still brings make flags of its own.
             cleaned = {k: c for k in MAKE_FLAG_VARS if k in env
@@ -982,6 +1041,12 @@ class SchedulerMixin:
                                        and tools.uses_makeflags_jobserver(tool) else "")
                 parallel[k] = commands.with_make_flags(rest, mine)
             common.write_json(os.path.join(t.dir, "parallel.json"), parallel)
+            t.nice = None
+            if self.runner.name == "direct":
+                t.nice = runners.lane_nice(lane)
+            elif self.runner.name == "cgroup":
+                _, hints = runners.translate_cgroup_properties(lane, self.machine.mem_total or 1)
+                t.nice = hints.get("nice")
             self.runner.prepare(t, self.cfg.slice)
             self.save(t)  # with its service's name, before it exists
             t.launcher, running = self.runner.launch(t, lane, self.cfg.slice)
@@ -1008,8 +1073,11 @@ class SchedulerMixin:
         usual cores, using all it has, takes cores from agents' builds above their minimum."""
         m, cfg = self.machine, self.cfg
         for t in self.active():
-            if t.js is not None and not t.elastic and t.cg and machine.fifo_in_use(t.cg, t.jobserver):
-                t.elastic = t.js.used = True
+            if t.js is not None and not t.elastic:
+                if (t.cg and machine.fifo_in_use(t.cg, t.jobserver)) or (
+                    not t.cg and t._pids and machine.fifo_in_use_pids(t._pids, t.jobserver)
+                ):
+                    t.elastic = t.js.used = True
         elastic = [t for t in self.active() if t.js is not None and t.elastic and t.state == "running"
                    and not t.cancel_requested]
         if not elastic:
@@ -1140,17 +1208,21 @@ class SchedulerMixin:
         the slice is configured with (the installer's 85% drop-in, or yours), and never below what
         the builds hold now (so the kernel needn't reclaim anything when it is written); when the
         daemon stops, the configured limit is put back."""
-        if not self.cfg.slice_guard or self.runner.name != "systemd":
+        path = self._runner_builds_cgroup(self.runner)
+        if not self.cfg.slice_guard or not path:
             return
-        path = os.path.join(self.cg_base, machine.slice_path(self.cfg.slice))
         if self.slice_limit is None:
-            if stopping:  # (putting the limit back as the daemon stops: no later tick to wait for)
-                self.slice_limit = machine.configured_memory_max(self.cfg.slice) or "max"
+            if self.runner.name == "systemd":
+                if stopping:  # (putting the limit back as the daemon stops: no later tick to wait for)
+                    self.slice_limit = machine.configured_memory_max(self.cfg.slice) or "max"
+                else:
+                    limit = self.query(("slice-max", self.cfg.slice), machine.configured_memory_max, self.cfg.slice)
+                    if limit is PENDING:
+                        return  # guarded from a later tick, once systemd has said
+                    self.slice_limit = limit or "max"
             else:
-                limit = self.query(("slice-max", self.cfg.slice), machine.configured_memory_max, self.cfg.slice)
-                if limit is PENDING:
-                    return  # guarded from a later tick, once systemd has said
-                self.slice_limit = limit or "max"
+                fn = getattr(self.runner, "slice_memory_max", None)
+                self.slice_limit = (fn(self.cfg.slice) if fn is not None else None) or "max"
         m = self.machine
         if stopping:
             value = self.slice_limit
@@ -1241,6 +1313,9 @@ class SchedulerMixin:
             self.walk_wanted.clear()
             try:
                 top, complete = machine.biggest_cgroups(self.cg_root, deadline=time.monotonic() + 20)
+                if not top and complete:
+                    # Non-systemd / cgroup-v1 / flat-cgroup fallback: top processes from /proc.
+                    top, complete = machine.biggest_processes(deadline=time.monotonic() + 15)
                 listed = ", ".join(f"{machine.short_cgroup(rel)}{f' ({name})' if name else ''} {common.fmt_size(held)}"
                                    f"{f' + {common.fmt_size(swap)} swap' if swap >= 256 * MIB else ''}"
                                    for held, swap, rel, name in top)

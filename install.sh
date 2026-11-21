@@ -19,11 +19,33 @@
 #                                machine's own notes from ~/.config/buildq/agents.md added at its end;
 #                                run it again after changing those notes. (The page itself is always
 #                                installed: `buildq help agents` prints it.)
+#   ./install.sh --no-start      install without starting/restarting the daemon (for images/packaging)
 #   ./install.sh --uninstall     stop and remove it all (keeps ~/.config/buildq and ~/.local/state/buildq)
 #
 # PREFIX (default ~/.local) sets where the programs go. PYTHON (default: python3 on PATH) sets the
 # interpreter they run with; it is written into them, so a different python3 on PATH later doesn't matter.
 set -euo pipefail
+
+have_realpath_m=no
+if command -v realpath >/dev/null 2>&1 && realpath -m -- / >/dev/null 2>&1; then
+  have_realpath_m=yes
+fi
+
+normpath() {
+  local p=$1
+  if [[ $have_realpath_m == yes ]]; then
+    realpath -m -- "$p" 2>/dev/null || printf '%s' "$p"
+    return
+  fi
+  if command -v realpath >/dev/null 2>&1 && [[ -e "$p" || -L "$p" ]]; then
+    realpath "$p" 2>/dev/null && return
+  fi
+  if [[ -n "${python:-}" && -x "${python:-}" ]]; then
+    "$python" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null && return
+  fi
+  while [[ $p != / && $p == */ ]]; do p=${p%/}; done
+  printf '%s' "$p"
+}
 
 prefix=${PREFIX:-$HOME/.local}
 case $prefix in
@@ -33,13 +55,9 @@ case $prefix in
   /*) ;;
   *) prefix=$PWD/$prefix ;;
 esac
-if command -v realpath >/dev/null 2>&1; then
-  norm=$(realpath -m -- "$prefix")
-  [[ -n "$norm" && "$norm" == /* ]] || { printf 'install.sh: could not resolve PREFIX (%s)\n' "$prefix" >&2; exit 1; }
-  prefix=$norm
-else
-  while [[ $prefix != / && $prefix == */ ]]; do prefix=${prefix%/}; done
-fi
+norm=$(normpath "$prefix")
+[[ -n "$norm" && "$norm" == /* ]] || { printf 'install.sh: could not resolve PREFIX (%s)\n' "$prefix" >&2; exit 1; }
+prefix=$norm
 bindir=$prefix/bin
 libdir=$prefix/lib/buildq
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -58,17 +76,17 @@ optional_shim_tools=(cmake ctest zig gradle)
 
 has_real_tool() {
   local name=$1 dir cand real_shimdir real_dir real_shim
-  real_shimdir=$(realpath -m -- "$shimdir" 2>/dev/null || printf '%s' "$shimdir")
-  real_shim=$(realpath -m -- "$bindir/buildq-shim" 2>/dev/null || printf '%s' "$bindir/buildq-shim")
+  real_shimdir=$(normpath "$shimdir")
+  real_shim=$(normpath "$bindir/buildq-shim")
   local -a dirs
   IFS=: read -r -a dirs <<< "$PATH"
   for dir in "${dirs[@]}"; do
     [[ -n "$dir" ]] || continue
-    real_dir=$(realpath -m -- "$dir" 2>/dev/null || printf '%s' "$dir")
+    real_dir=$(normpath "$dir")
     [[ "$real_dir" == "$real_shimdir" ]] && continue
     cand=$dir/$name
     if [[ -f "$cand" && -x "$cand" ]]; then
-      [[ "$(realpath -m -- "$cand" 2>/dev/null || printf '%s' "$cand")" == "$real_shim" ]] && continue
+      [[ "$(normpath "$cand")" == "$real_shim" ]] && continue
       return 0
     fi
   done
@@ -197,6 +215,8 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   acquire_lock
   if have_systemd; then
     systemctl --user disable --now buildq.service buildq.socket 2>/dev/null || true
+  elif [[ -x "$bindir/buildq" ]]; then
+    "$bindir/buildq" daemon stop >/dev/null 2>&1 || true
   fi
   keep_guard=no
   configs=("${CARGO_HOME:-$HOME/.cargo}/config.toml")
@@ -366,64 +386,75 @@ fi
   { say "$confdir/config.toml doesn't load; fix it and run install.sh again."; exit 1; }
 
 
+no_start=no
 for option in "$@"; do
-  case $option in --shims | --skill | --rustc-guard | --rustc-guard=*) ;; *) say "unknown option $option"; exit 2 ;; esac
+  case $option in
+    --shims | --skill | --rustc-guard | --rustc-guard=*) ;;
+    --no-start) no_start=yes ;;
+    *) say "unknown option $option"; exit 2 ;;
+  esac
 done
 skill_linked=no
 for option in "$@"; do
   if [[ $option == --skill ]]; then install_skill; skill_linked=yes; fi
 done
 [[ $skill_linked == yes ]] || write_skill
-if ! have_systemd; then
-  # buildq is built on systemd: each build is a service of its own, which is what measures it, caps
-  # its memory and lets the queue pause it. Without a user session there is nothing to install the
-  # units into, and without a daemon that answers, the shims and the guard would only hold builds up
-  # (see below). Running install.sh again won't change that.
-  say "no systemd user session here, and buildq needs one: each build runs as a systemd service, which is what measures it, caps its memory and lets the queue pause it."
-  say "installed the programs in $bindir (and anything listed above), but nothing that needs systemd: no units, --shims and --rustc-guard weren't set up, and install.sh didn't start the daemon. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
-  exit 0
+if have_systemd; then
+  temps+=("$unitdir/buildq.service.new.$$")
+  sed "s|@BINDIR@|$bindir|g" "$src/systemd/buildq.service" >"$unitdir/buildq.service.new.$$"
+  mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
+  put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
+  put 644 "$src/systemd/buildq.slice" "$unitdir/buildq.slice"
+  # A backstop for all builds together: if the estimates are wrong, the kernel slows and then
+  # stops builds before they can take the machine's memory. Edit or remove it freely.
+  # (The daemon also lowers these every few seconds to what the machine has free; see slice_guard.)
+  if [[ ! -e "$unitdir/buildq.slice.d/50-buildq-memory.conf" ]]; then
+    mkdir -p "$unitdir/buildq.slice.d"
+    printf '[Slice]\nMemoryHigh=75%%\nMemoryMax=85%%\n' >"$unitdir/buildq.slice.d/50-buildq-memory.conf"
+    say "capped all builds together at 75%/85% of memory ($unitdir/buildq.slice.d/50-buildq-memory.conf)"
+  fi
+  # Distros such as Fedora set ManagedOOMMemoryPressure=kill on every user slice, so a single build
+  # slowed at its own MemoryHigh can make systemd-oomd kill it even while plenty of RAM is free.
+  # buildq enforces per-build MemoryMax, slice_guard and shed_memory itself; this user-range drop-in
+  # disables pressure monitoring rooted at buildq.slice while leaving ancestor/system oomd intact.
+  if [[ ! -e "$unitdir/buildq.slice.d/60-buildq-oomd.conf" ]]; then
+    mkdir -p "$unitdir/buildq.slice.d"
+    printf '[Slice]\nManagedOOMMemoryPressure=auto\nManagedOOMMemoryPressureLimit=\n' >"$unitdir/buildq.slice.d/60-buildq-oomd.conf"
+    say "disabled per-slice systemd-oomd pressure kills on buildq.slice ($unitdir/buildq.slice.d/60-buildq-oomd.conf)"
+  fi
+  systemctl --user daemon-reload
+  if [[ $no_start == no ]]; then
+    systemctl --user enable --now buildq.socket >/dev/null
+    systemctl --user enable buildq.service >/dev/null
+    # A restart loads the new code. Running builds carry on, and the new daemon picks them up.
+    systemctl --user restart buildq.service
+    # A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
+    # file is gone, have systemd create it again.
+    if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]]; then
+      systemctl --user stop buildq.service
+      systemctl --user restart buildq.socket
+      systemctl --user start buildq.service
+    fi
+    for _ in $(seq 1 40); do
+      "$bindir/buildq" ping >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    "$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
+  else
+    say "installed systemd user units (--no-start: skipped enabling/restarting buildq.service)"
+  fi
+else
+  if [[ $no_start == no ]]; then
+    say "no systemd user session here; starting buildqd as a user background daemon"
+    "$bindir/buildq" daemon restart || { say "couldn't start buildqd; not enabling shims or the guard."; exit 1; }
+    "$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
+    say "manage it with: buildq daemon status|restart|reload|stop|logs"
+    say "for boot-time supervision (OpenRC, runit, s6, dinit, sysvinit) or optional cgroup v2 delegation, see $src/init/"
+  else
+    say "no systemd user session here (--no-start: skipped starting buildqd; start it with \`buildq daemon start\`)"
+  fi
 fi
-
-temps+=("$unitdir/buildq.service.new.$$")
-sed "s|@BINDIR@|$bindir|g" "$src/systemd/buildq.service" >"$unitdir/buildq.service.new.$$"
-mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
-put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
-put 644 "$src/systemd/buildq.slice" "$unitdir/buildq.slice"
-# A backstop for all builds together: if the estimates are wrong, the kernel slows and then
-# stops builds before they can take the machine's memory. Edit or remove it freely.
-# (The daemon also lowers these every few seconds to what the machine has free; see slice_guard.)
-if [[ ! -e "$unitdir/buildq.slice.d/50-buildq-memory.conf" ]]; then
-  mkdir -p "$unitdir/buildq.slice.d"
-  printf '[Slice]\nMemoryHigh=75%%\nMemoryMax=85%%\n' >"$unitdir/buildq.slice.d/50-buildq-memory.conf"
-  say "capped all builds together at 75%/85% of memory ($unitdir/buildq.slice.d/50-buildq-memory.conf)"
-fi
-# Distros such as Fedora set ManagedOOMMemoryPressure=kill on every user slice, so a single build
-# slowed at its own MemoryHigh can make systemd-oomd kill it even while plenty of RAM is free.
-# buildq enforces per-build MemoryMax, slice_guard and shed_memory itself; this user-range drop-in
-# disables pressure monitoring rooted at buildq.slice while leaving ancestor/system oomd intact.
-if [[ ! -e "$unitdir/buildq.slice.d/60-buildq-oomd.conf" ]]; then
-  mkdir -p "$unitdir/buildq.slice.d"
-  printf '[Slice]\nManagedOOMMemoryPressure=auto\nManagedOOMMemoryPressureLimit=\n' >"$unitdir/buildq.slice.d/60-buildq-oomd.conf"
-  say "disabled per-slice systemd-oomd pressure kills on buildq.slice ($unitdir/buildq.slice.d/60-buildq-oomd.conf)"
-fi
-systemctl --user daemon-reload
-systemctl --user enable --now buildq.socket >/dev/null
-systemctl --user enable buildq.service >/dev/null
-# A restart loads the new code. Running builds carry on, and the new daemon picks them up.
-systemctl --user restart buildq.service
-# A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
-# file is gone, have systemd create it again.
-if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]]; then
-  systemctl --user stop buildq.service
-  systemctl --user restart buildq.socket
-  systemctl --user start buildq.service
-fi
-for _ in $(seq 1 40); do
-  "$bindir/buildq" ping >/dev/null 2>&1 && break
-  sleep 0.5
-done
-"$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
-# Shims and the guard only once the daemon answers: without it, they would hold builds up.
+# Shims and the guard only once the daemon answers (or explicitly with --no-start for image builds).
 for option in "$@"; do
   case $option in
     --shims)
@@ -441,7 +472,7 @@ for option in "$@"; do
       say "shims for ${installed_shims[*]} are in $shimdir. Put it first on PATH, at the end of ~/.bashrc:"
       say "    export PATH=\"$shimdir:\$PATH\""
       ;;
-    --skill) ;;  # done above: it needs neither systemd nor the daemon
+    --skill | --no-start) ;;
     --rustc-guard | --rustc-guard=*)
       targets=()
       if [[ $option == --rustc-guard ]]; then

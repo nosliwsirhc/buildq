@@ -24,8 +24,9 @@ Telling agents to use the queue works most of the time. Two optional pieces make
   turns them off for one command.
 - **The Rust guard** (`./install.sh --rustc-guard=~/src,~/work`). Cargo runs every `rustc` under those
   directories through `buildq-rustc-guard`, which refuses to compile unless the process is inside a
-  buildq build. It checks the build's cgroup, which the kernel sets and an environment variable
-  can't fake. It lets through version queries, GitHub Actions jobs, editors
+  buildq build. Under `systemd` and `cgroup` it checks the build's cgroup (which the kernel sets and
+  an environment variable can't fake); under `direct` it verifies `BUILDQ_JOB` against a live running
+  ticket in the daemon's state directory. It lets through version queries, GitHub Actions jobs, editors
   (`rust-analyzer`), and anything listed in `~/.config/buildq/guard.env`, where `RUN_WITH` also sets
   the command its refusal tells you to use (default `buildq run --`). Prefer directories to the
   bare `--rustc-guard`, which writes `$CARGO_HOME/config.toml`: that file is also read by CI jobs on

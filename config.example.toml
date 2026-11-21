@@ -135,11 +135,19 @@ mem_margin = 1.15
 # ---- Running builds -------------------------------------------------------------------------
 
 # "systemd" runs each build as a transient user service (limits, measurement, clean stops);
-# "direct" runs it as a plain process (no limits, not measured); "auto" uses systemd if it can.
+# "cgroup" uses Linux cgroup v2 directly without systemd (same kernel limits & freezer; needs a
+# writable delegated cgroup v2 directory via cgroup_root or init/cgroup-setup.sh);
+# "direct" runs builds as plain processes with /proc measurement, SIGSTOP/SIGCONT pausing and a
+# daemon MemoryMax watchdog (zero systemd, zero cgroups, zero root);
+# "auto" picks systemd, then cgroup, then direct.
 runner = "auto"
 
-# The slice the build services go in.
+# The slice the build services go in (systemd runner).
 slice = "buildq.slice"
+
+# Optional delegated cgroup v2 directory for the "cgroup" runner (e.g. "/sys/fs/cgroup/buildq-alice").
+# Empty (the default) auto-detects /sys/fs/cgroup/buildq-<user> or a writable delegated subtree.
+# cgroup_root = "/sys/fs/cgroup/buildq-alice"
 
 # A build's output log keeps at most this much; past it, only the end is kept.
 max_log = "64M"
@@ -212,7 +220,7 @@ default_lane = "default"
 #   cores = 4           cores a build with no history wants
 #   min_cores = 1       the fewest cores a build starts with when the machine is busy
 #   max_cores = cores   the most cores a build may grow to
-#   mem = "4G"          memory a build with no history is expected to need
+#   mem = "4G"          memory a build with no history is expected to need (default: 4G, or 25% of RAM under 16 GiB)
 #   min_mem = 0         a floor for the memory estimate (a lane whose small runs hide big ones)
 #   priority = 0        higher lanes go first when builds are waiting
 #   extra_jobs = 0      builds of this lane that may run on top of max_jobs
@@ -234,7 +242,7 @@ default_lane = "default"
 # Defining any lane replaces this default one.
 [lanes.default]
 cores = 4
-mem = "4G"
+# mem defaults to 4G, or 25% of RAM on machines with less than 16 GiB.
 properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 
 # An example for a machine shared by agents building Rust, .NET and web front ends. Front-end
