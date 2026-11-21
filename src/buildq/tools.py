@@ -344,7 +344,10 @@ GRADLE_RESTART_LEAF = re.compile(
 
 
 def _gradle_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]:
-    return [tool] + positionals(rest, GRADLE_VALUE_OPTIONS)[:2]
+    words = [tool] + positionals(rest, GRADLE_VALUE_OPTIONS)[:2]
+    if not ({"--stop", "--status", "--foreground"} & set(rest)) and not _gradle_honors_grant(tool, rest):
+        words.append("--max-workers")
+    return words
 
 
 def _gradle_opts_tokens(raw: str) -> list[str]:
@@ -560,6 +563,8 @@ def _ctest_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[s
     words += [f"--preset {p}" for p in option_values(rest, {"--preset"})[:1]]
     words += [f"-C {c}" for c in option_values(rest, {"-C", "--build-config"})[:1]]
     words += [f"-R {r}" for r in option_values(rest, {"-R", "--tests-regex"})[:1]]
+    if not _ctest_honors_grant(tool, rest):
+        words.append("-j")
     # Keep dashboard/script/build-and-test modes distinct from ordinary test runs in history & replay.
     for a in rest:
         if re.fullmatch(r"-(?:D|M|T|S|A).*", a):
@@ -604,16 +609,16 @@ CC_VALUE_OPTIONS = frozenset({
 })
 CC_OPT_FLAG = re.compile(r"-O(?:[0-3sgz]|fast)?$")
 CC_EMIT_EXACT = frozenset({
-    "-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-MG", "-MP", "-save-temps", "--coverage",
-    "-Xpreprocessor", "-Xclang", "-Xlinker", "-Xassembler", "-Xanalyzer", "--analyze", "-analyze",
-    "--serialize-diagnostics", "-serialize-diagnostics", "--write-dependencies",
+    "-c", "-S", "-E", "-M", "-MM", "-MD", "-MMD", "-MG", "-MP", "-save-temps", "--save-temps",
+    "--coverage", "-Xpreprocessor", "-Xclang", "-Xlinker", "-Xassembler", "-Xanalyzer", "--analyze",
+    "-analyze", "--serialize-diagnostics", "-serialize-diagnostics", "--write-dependencies",
     "--write-user-dependencies", "--dependencies", "-dumpdir", "-fstack-usage", "-fcallgraph-info",
     "-gen-cdb-fragment-path", "-load", "-###", "-dumpversion", "-dumpfullversion", "-dumpmachine",
     "--precompile", "-precompile", "-extract-api", "--extract-api", "-V",
 })
 CC_EMIT_PREFIXES = (
-    "-o", "-MF", "-MT", "-MQ", "-MJ", "--output", "-save-temps=", "-ftime-trace", "-fprofile",
-    "-dumpbase", "-aux-info", "-ftest-coverage", "-Wp,", "-Wl,", "-Wa,", "-X",
+    "-o", "-MF", "-MT", "-MQ", "-MJ", "--output", "-save-temps=", "--save-temps=", "-ftime-trace",
+    "-fprofile", "-dumpbase", "-aux-info", "-ftest-coverage", "-Wp,", "-Wl,", "-Wa,", "-X",
     "-fdump-", "-fdiagnostics-format=", "-fdiagnostics-add-output=", "-fdiagnostics-set-output=",
     "-fdeps-file=", "-save-stats", "-fmodule-output", "-fplugin", "-print-", "--print-",
     "-emit-", "--emit-", "--serialize-diagnostics=", "-serialize-diagnostics=",

@@ -1545,6 +1545,21 @@ class SystemCompilers(DaemonCase):
             "./gradlew", "test",
         ])
         self.finish(t_reset)
+        t_dash_reset = self.submit(("env", "--", "-", "./gradlew", "test"), cwd=self.workdir("g_dash_reset"))
+        self.assertEqual(t_dash_reset.exec_argv, [
+            "env", "--", "-",
+            f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_dash_reset.granted}",
+            "./gradlew", "test",
+        ])
+        self.finish(t_dash_reset)
+        t_unset = self.submit(("env", "-u", "GRADLE_OPTS", "./gradlew", "test"),
+                              env={"GRADLE_OPTS": "-Xmx8g"}, cwd=self.workdir("g_unset"))
+        self.assertEqual(t_unset.exec_argv, [
+            "env", "-u", "GRADLE_OPTS",
+            f"GRADLE_OPTS=-Dorg.gradle.daemon=false -Dorg.gradle.workers.max={t_unset.granted}",
+            "./gradlew", "test",
+        ])
+        self.finish(t_unset)
         # Non-Gradle `env -i` does not get GRADLE_OPTS injected into its argv.
         t_cargo_reset = self.submit(("env", "-i", "PATH=/usr/bin", "cargo", "build"), cwd=self.workdir("g_cargo"))
         self.assertIsNone(t_cargo_reset.exec_argv)
@@ -1759,6 +1774,7 @@ class SystemCompilers(DaemonCase):
                      ("clang", "-fsyntax-only", "-Xclang", "-emit-ast", "a.c"),
                      ("gcc", "-fsyntax-only", "-fdump-tree-all", "a.c"),
                      ("gcc", "-fsyntax-only", "-o", "out", "a.c"), ("gcc", "-fsyntax-only", "-oout", "a.c"),
+                     ("gcc", "--save-temps", "-fsyntax-only", "a.c"),
                      ("gcc", "-fsyntax-only", "--version", "a.c"), ("gcc", "-fsyntax-only", "-x", "c", "-")):
             self.assertFalse(commands.reusable_check(list(argv)), argv)
         self.assertTrue(commands.paths_inside(["gcc", "-fsyntax-only", "-fPIC", "-DCONFIG=1", "a.c"], "/r", "/r"))
@@ -1770,6 +1786,8 @@ class SystemCompilers(DaemonCase):
                                                       "/r", "/r"), resolved)
         self.assertFalse(commands.paths_inside(["clang", "-working-directory", "sub", "-fsyntax-only", "a.c"], "/r", "/r"))
         self.assertFalse(commands.paths_inside(["cc", "-fsyntax-only", "a.c"], "/r", "/r", env={"CPATH": "/shared/inc"}))
+        self.assertFalse(commands.paths_inside(["uv", "run", "--no-sync", "gcc", "-fsyntax-only", "a.c"],
+                                               "/r", "/r", env={"CPATH": "/shared/inc"}))
         self.assertFalse(commands.paths_inside(["gcc", "-fsyntax-only", "a.c"], "/r", "/r",
                                                env={"C_INCLUDE_PATH": "/shared/inc"}))
         self.assertFalse(commands.paths_inside(["env", "CC=/tmp/evil-cc", "gcc", "-fsyntax-only", "a.c"], "/r", "/r"))
@@ -1866,6 +1884,8 @@ class SystemCompilers(DaemonCase):
                                               env={"PYTEST_ADDOPTS": "-q"}))
         self.assertTrue(commands.paths_inside(["python3", "-m", "pytest", "-kTestClient", "tests/"], "/r", "/r"))
         self.assertTrue(commands.paths_inside(["uv", "run", "--no-sync", "pytest", "-kTestClient", "tests/"], "/r", "/r"))
+        self.assertTrue(commands.paths_inside(["uv", "run", "--no-sync", "python3", "-m", "pytest", "-kTestClient", "tests/"],
+                                              "/r", "/r"))
         # Daemon admission checks config [env] defaults (e.g. PYTEST_ADDOPTS=--collect-only) before dedupe.
         self.daemon.cfg.env = {"PYTEST_ADDOPTS": "--collect-only"}
         repo = self.workdir("cfg_env_repo")

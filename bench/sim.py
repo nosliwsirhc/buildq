@@ -1101,10 +1101,11 @@ PUBLIC_OPTIONS = frozenset("""--release --profile --lib --bins --tests --benches
     --coverage --fix --no-build --configuration --verbose --quiet --manifest-path --target-dir --target --shard
     --doc --build --workflow --preset --config --clean-first --test-dir --max-workers --no-daemon --daemon
     --no-sync --no-dev --build-and-test --dashboard --test-model --test-action --script
-    --script-new-process --extra-submit --test-command""".split())
+    --script-new-process --add-notes --track --group --submit --extra-submit --submit-index
+    --http-header --http1.0 --tomorrow-tag --overwrite --test-command""".split())
 COUNT_OPTIONS = frozenset({"-j", "--jobs", "-l", "--load-average", "--test-threads"})
 KNOWN_VALUES = {"--profile": frozenset({"dev", "release", "test", "bench"}),
-                "--target": frozenset({"all", "test", "check"})}
+                "--target": frozenset({"all", "test", "check", "ALL_BUILD"})}
 TOOLCHAINS = frozenset({"+stable", "+beta", "+nightly"})  # cargo +nightly test
 GRADLE_ANON_UNSAFE = re.compile(
     r"(publish|upload|deploy|install|uninstall|push|format|apply|fix|clean|connected|instrumented|"

@@ -514,13 +514,17 @@ def wrapper_settings(argv: list[str]) -> set[int]:
     return out
 
 
-def wrapper_env_sites(argv: list[str], tool_at: int) -> tuple[dict[str, int], int | None]:
+def wrapper_env_sites(argv: list[str], tool_at: int) -> tuple[dict[str, int], int | None, dict[str, int]]:
     """Walk wrapper tokens in `argv[:tool_at]` as `strip_wrappers` does, returning:
     - `inline_idx`: map from variable name to the last `VAR=val` index set by `env`/`sudo`;
-    - `reset_insert_at`: if an `env -i`/`-`/`--ignore-environment` clears the inherited env,
-      the index inside that `env` command's assignment section where defaults can be inserted."""
+    - `reset_insert_at`: if `env -i` / `env -` / `env -- -` / `env --ignore-environment` clears
+      the inherited env, the index inside that `env` command's assignment section where defaults
+      can be inserted;
+    - `unset_at`: map from variable name explicitly unset via `env -u`/`--unset` (and not set
+      again later) to the assignment-section index where a direct-tool default can be inserted."""
     inline_idx: dict[str, int] = {}
     reset_insert_at: int | None = None
+    unset_at: dict[str, int] = {}
     i = 0
     while i < tool_at:
         head = os.path.basename(argv[i])
@@ -531,23 +535,43 @@ def wrapper_env_sites(argv: list[str], tool_at: int) -> tuple[dict[str, int], in
             if rest is None:
                 break
             cmd_at = tool_at - len(rest)
-            opts_end = cmd_at
-            while opts_end > i + 1 and "=" in argv[opts_end - 1] and not argv[opts_end - 1].startswith("-"):
-                opts_end -= 1
+            # Parse `env` options forward (matching `env_command`), avoiding confusion with `-C dir=1`.
             k = i + 1
-            while k < opts_end:
+            while k < cmd_at and argv[k].startswith("-") and argv[k] != "-":
                 opt = argv[k]
+                k += 1
                 if opt == "--":
                     break
-                if opt in ("-", "--ignore-environment") or (re.fullmatch(r"-[i0v]+", opt) and "i" in opt):
+                if opt == "--ignore-environment" or (re.fullmatch(r"-[i0v]+", opt) and "i" in opt):
                     inline_idx.clear()
+                    unset_at.clear()
                     reset_insert_at = cmd_at
-                elif opt in ("-u", "--unset", "-C", "--chdir"):
-                    k += 1  # skip its value (e.g. `env -u -i`)
+                elif opt in ("-u", "--unset") and k < cmd_at:
+                    name = argv[k]
+                    inline_idx.pop(name, None)
+                    unset_at[name] = cmd_at
+                    k += 1
+                elif opt in ("-C", "--chdir") and k < cmd_at:
+                    k += 1
+                elif opt.startswith("-u") and len(opt) > 2:
+                    name = opt[2:]
+                    inline_idx.pop(name, None)
+                    unset_at[name] = cmd_at
+                elif opt.startswith("--unset="):
+                    name = opt[len("--unset="):]
+                    if name:
+                        inline_idx.pop(name, None)
+                        unset_at[name] = cmd_at
+            if k < cmd_at and argv[k] == "-":  # `env -` or `env -- -`: same as `-i`
+                inline_idx.clear()
+                unset_at.clear()
+                reset_insert_at = cmd_at
                 k += 1
-            for k_idx in range(opts_end, cmd_at):
-                k, _ = argv[k_idx].split("=", 1)
-                inline_idx[k] = k_idx
+            while k < cmd_at and "=" in argv[k]:
+                name, _ = argv[k].split("=", 1)
+                inline_idx[name] = k
+                unset_at.pop(name, None)
+                k += 1
             i = cmd_at
         elif head == "timeout":
             i += 1
@@ -565,12 +589,13 @@ def wrapper_env_sites(argv: list[str], tool_at: int) -> tuple[dict[str, int], in
                     i += 1
             if head == "sudo":
                 while i < tool_at and ASSIGNMENT.match(argv[i]):
-                    k, _ = argv[i].split("=", 1)
-                    inline_idx[k] = i
+                    name, _ = argv[i].split("=", 1)
+                    inline_idx[name] = i
+                    unset_at.pop(name, None)
                     i += 1
         else:
             break
-    return inline_idx, reset_insert_at
+    return inline_idx, reset_insert_at, unset_at
 
 
 def moving_words(argv: list[str]) -> list[str]:
@@ -611,9 +636,17 @@ def moving_words(argv: list[str]) -> list[str]:
             if is_module and inner[0] in ("pytest", "mypy"):
                 exempt = ("-k", "-m") if inner[0] == "pytest" else ("-p", "-m")
                 return argv[1:at + inner_at + 1] + [a for a in inner[1:] if not a.startswith(exempt)]
-            if not is_module and os.path.basename(inner[0]) in ("pytest", "py.test", "mypy"):
-                exempt = ("-k", "-m") if os.path.basename(inner[0]) != "mypy" else ("-p", "-m")
-                return argv[1:at + inner_at + 1] + [a for a in inner[1:] if not a.startswith(exempt)]
+            if not is_module:
+                inner_tool = os.path.basename(inner[0])
+                if inner_tool in ("pytest", "py.test", "mypy"):
+                    exempt = ("-k", "-m") if inner_tool != "mypy" else ("-p", "-m")
+                    return argv[1:at + inner_at + 1] + [a for a in inner[1:] if not a.startswith(exempt)]
+                if inner_tool in ("python", "python3") or re.fullmatch(r"python3\.\d+", inner_tool):
+                    call = tools._python_module_call(inner[1:])
+                    if call and call[0] in ("pytest", "mypy"):
+                        exempt = ("-k", "-m") if call[0] == "pytest" else ("-p", "-m")
+                        mod_at = len(inner) - len(call[1])
+                        return argv[1:at + inner_at + mod_at] + [a for a in call[1] if not a.startswith(exempt)]
     return argv[1:]
 
 
@@ -635,7 +668,17 @@ def _uses_pytest(tool: str, args: list[str]) -> bool:
 
 def _uses_direct_cc(tool: str, args: list[str]) -> bool:
     spec = tools.lookup(tool)
-    return bool((spec and "gcc" in spec.names) or (tool == "zig" and args[:1] in (["cc"], ["c++"])))
+    if (spec and "gcc" in spec.names) or (tool == "zig" and args[:1] in (["cc"], ["c++"])):
+        return True
+    if tool == "uv":
+        parsed = tools._uv_parse_strict(args)
+        if parsed and parsed[0] == "run":
+            _, inner, is_module, _ = parsed
+            if not is_module:
+                inner_tool = os.path.basename(inner[0])
+                if inner_tool != "uv":
+                    return _uses_direct_cc(inner_tool, inner[1:])
+    return False
 
 
 def paths_inside(argv: list[str], cwd: str, top: str, env: dict | None = None) -> bool:

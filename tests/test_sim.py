@@ -421,8 +421,12 @@ class Export(SimCase):
         # Key -> export -> anonymize -> replay preserves both restart_safe and honors_grant.
         for raw in (["zig", "build", "test", "-Doptimize=ReleaseSafe"],
                     ["zig", "build", "-j8", "test"],
+                    ["cmake", "--build", "out", "--target", "ALL_BUILD"],
+                    ["ctest", "-j8"],
                     ["ctest", "-T", "Submit"],
-                    ["gradle", "assembleRelease"]):
+                    ["ctest", "--add-notes", "n.txt"],
+                    ["gradle", "assembleRelease"],
+                    ["gradle", "--max-workers=8", "test"]):
             key_words = bq_commands.command_words(raw)
             self.assertEqual(bq_commands.command_words(key_words), key_words, raw)
             anon = sim.anonymous_argv(key_words)

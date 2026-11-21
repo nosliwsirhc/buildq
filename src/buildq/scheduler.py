@@ -934,20 +934,22 @@ class SchedulerMixin:
                                                  lane.test_threads, env)
             # buildq's settings go in a file of their own, so a build that is queued again after a
             # restart gets fresh ones. Pass cleaned make flags plus any inline wrapper assignments
-            # (`nice -n 10 env GRADLE_OPTS=-Xmx2g gradle test`) or env resets (`env -i ...`) so
-            # merged defaults (such as Gradle's cgroup/worker flags) survive wrapper overrides.
-            inline_idx, reset_at = commands.wrapper_env_sites(t.argv, tool_at)
+            # (`nice -n 10 env GRADLE_OPTS=-Xmx2g gradle test`), unsets (`env -u GRADLE_OPTS ...`),
+            # or env resets (`env -i ...` / `env -- - ...`) so merged defaults survive wrappers.
+            inline_idx, reset_at, unset_at = commands.wrapper_env_sites(t.argv, tool_at)
             if reset_at is not None:
                 cleaned_env = {k: t.argv[idx].split("=", 1)[1] for k, idx in inline_idx.items()}
             else:
                 cleaned_env = {**env, **cleaned} if cleaned else dict(env)
+                for k in unset_at:
+                    cleaned_env.pop(k, None)
                 for k, idx in inline_idx.items():
                     cleaned_env[k] = t.argv[idx].split("=", 1)[1]
             ours, merged = tools.env_with_merged(tool, stripped[1:], t.granted, t.want, t.jobserver,
                                                  lane.test_threads, cleaned_env)
             direct_spec = tools.lookup(tool)
             direct_merged = set(direct_spec.merge_env_vars) if direct_spec else set()
-            inserted: list[str] = []
+            insertions: dict[int, list[str]] = {}
             for k in sorted(merged):
                 if k not in ours:
                     continue
@@ -955,11 +957,15 @@ class SchedulerMixin:
                     argv_out = list(t.exec_argv) if t.exec_argv is not None else list(t.argv)
                     argv_out[inline_idx[k]] = f"{k}={ours[k]}"
                     t.exec_argv = argv_out
-                elif reset_at is not None and k in direct_merged:
-                    inserted.append(f"{k}={ours[k]}")
-            if inserted and reset_at is not None:
+                elif k in direct_merged:
+                    site = unset_at.get(k, reset_at)
+                    if site is not None:
+                        insertions.setdefault(site, []).append(f"{k}={ours[k]}")
+            if insertions:
                 argv_out = list(t.exec_argv) if t.exec_argv is not None else list(t.argv)
-                t.exec_argv = argv_out[:reset_at] + inserted + argv_out[reset_at:]
+                for site in sorted(insertions, reverse=True):
+                    argv_out[site:site] = insertions[site]
+                t.exec_argv = argv_out
             # The caller's own settings win, except keys explicitly merged by the emitting tool
             # callback and empty make variables (a make recipe exports MAKEFLAGS= and MFLAGS=).
             given = {k for k in env
