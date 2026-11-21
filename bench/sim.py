@@ -49,9 +49,54 @@ DEFAULT_CONFIG = os.path.join(HERE, "bench.toml")
 DEFAULT_BUILDQD = os.path.join(ROOT, "bin", "buildqd")
 
 
+class _BuildqdPackage:
+    """Facade over an isolated copy of the `buildq` package so sim.py can load two versions side by
+    side and patch both legacy single-file `bin/buildqd` and the split `src/buildq/` package."""
+
+    SUBMODULES = ("common", "commands", "config", "machine", "history", "metrics",
+                  "runners", "ticket", "supervisor", "github", "scheduler", "daemon")
+
+    def __init__(self, pkg_dir: str, name: str):
+        # Clear any prior synthetic package of the same name so each simulation starts clean.
+        prefix = name + "."
+        for k in [k for k in sys.modules if k == name or k.startswith(prefix)]:
+            sys.modules.pop(k, None)
+        spec = importlib.util.spec_from_file_location(
+            name, os.path.join(pkg_dir, "__init__.py"), submodule_search_locations=[pkg_dir])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules[name] = pkg
+        spec.loader.exec_module(pkg)
+        self._mods = {}
+        for sub in self.SUBMODULES:
+            self._mods[sub] = importlib.import_module(f"{name}.{sub}")
+
+    def __getattr__(self, attr: str):
+        for sub in ("daemon", "common", "config", "commands", "machine", "history",
+                    "metrics", "runners", "ticket", "supervisor", "github", "scheduler"):
+            mod = self._mods[sub]
+            if hasattr(mod, attr):
+                return getattr(mod, attr)
+        raise AttributeError(attr)
+
+    def patch(self, attr: str, value) -> None:
+        if attr in ("time", "uuid"):
+            for mod in self._mods.values():
+                if hasattr(mod, attr):
+                    setattr(mod, attr, value)
+            return
+        for mod in self._mods.values():
+            if attr in mod.__dict__:
+                setattr(mod, attr, value)
+
+
 def load_buildqd(path: str, name: str):
-    """buildqd as a module of its own, so two versions can be loaded side by side."""
-    loader = importlib.machinery.SourceFileLoader(name, os.path.abspath(path))
+    """buildqd as a module (legacy single-file) or isolated package (`src/buildq`), so two versions
+    can be loaded side by side."""
+    abs_path = os.path.abspath(path)
+    pkg_dir = os.path.normpath(os.path.join(os.path.dirname(abs_path), "..", "src", "buildq"))
+    if os.path.isfile(os.path.join(pkg_dir, "__init__.py")) and os.path.isfile(os.path.join(pkg_dir, "daemon.py")):
+        return _BuildqdPackage(pkg_dir, name)
+    loader = importlib.machinery.SourceFileLoader(name, abs_path)
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -233,18 +278,19 @@ class Simulation:
 
     def patch_module(self):
         mod, sim = self.mod, self
-        mod.time = self.clock
-        mod.uuid = Ids()
-        mod.log = lambda message, level=None: sim.log_lines.append(f"{sim.clock.now - EPOCH:8.0f} {message}")
-        mod.cgroup_stats = self.stats
-        mod.cgroup_swap = lambda path: 0
-        mod.cgroup_memory_waits = lambda path: None
-        mod.cgroup_freeze_set = lambda path: self.frozen(path)
-        mod.cgroup_frozen = lambda path: self.frozen(path)
-        mod.parent_freeze_set = lambda path: False
-        mod.repo_name = lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd))
-        mod.cargo_cold = lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False)
-        mod.disk_space = lambda path: (1 << 50, 1 << 50)  # (free, size): plenty; there is no disk here
+        set_attr = mod.patch if isinstance(mod, _BuildqdPackage) else lambda k, v: setattr(mod, k, v)
+        set_attr("time", self.clock)
+        set_attr("uuid", Ids())
+        set_attr("log", lambda message, level=None: sim.log_lines.append(f"{sim.clock.now - EPOCH:8.0f} {message}"))
+        set_attr("cgroup_stats", self.stats)
+        set_attr("cgroup_swap", lambda path: 0)
+        set_attr("cgroup_memory_waits", lambda path: None)
+        set_attr("cgroup_freeze_set", lambda path: self.frozen(path))
+        set_attr("cgroup_frozen", lambda path: self.frozen(path))
+        set_attr("parent_freeze_set", lambda path: False)
+        set_attr("repo_name", lambda cwd: sim.repo_of.get(os.path.abspath(cwd), os.path.basename(cwd)))
+        set_attr("cargo_cold", lambda argv, cwd, env: sim.cold_of.get(os.path.abspath(cwd), False))
+        set_attr("disk_space", lambda path: (1 << 50, 1 << 50))  # (free, size): plenty; there is no disk here
         load = mod.load_config_file
 
         def load_config_file(path, mem_total, ncpu):
@@ -252,7 +298,7 @@ class Simulation:
             # Nothing reaches the host: no analytics writer, no on_finish command, no GitHub status.
             cfg.metrics, cfg.on_finish, cfg.github_status = False, "", False
             return cfg
-        mod.load_config_file = load_config_file
+        set_attr("load_config_file", load_config_file)
         mod.Daemon.run_hooks = lambda daemon, t, now: None  # nor a ticket's own --notify
 
     def job_at(self, path: str | None) -> Job | None:

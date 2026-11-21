@@ -26,6 +26,7 @@ set -euo pipefail
 
 prefix=${PREFIX:-$HOME/.local}
 bindir=$prefix/bin
+libdir=$prefix/lib/buildq
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
 unitdir=$config_home/systemd/user
 confdir=$config_home/buildq
@@ -167,7 +168,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     done < "$skill_list"
   fi
   rm -f "$skill_list"
-  rm -rf "$shimdir" "$(dirname "$skilldir")"
+  rm -rf "$shimdir" "$(dirname "$skilldir")" "$libdir"
   rm -f "$bindir/buildq" "$bindir/buildqd" "$bindir/buildq-shim" \
         "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice"
   [[ $keep_guard == no ]] && rm -f "$bindir/buildq-rustc-guard"
@@ -214,15 +215,43 @@ esac
 python=$chosen
 [[ -r /proc/stat && -r /proc/meminfo ]] || { say "buildq needs Linux (/proc/stat, /proc/meminfo)."; exit 1; }
 
-mkdir -p "$bindir" "$unitdir" "$confdir"
+mkdir -p "$bindir" "$libdir" "$unitdir" "$confdir"
 staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
 trap 'rm -rf "$staged"' EXIT
-for program in buildqd buildq buildq-shim; do  # Python: run by the interpreter checked above
-  { printf '#!%s\n' "$python"; tail -n +2 "$src/bin/$program"; } >"$staged/$program"
+# Install the buildq Python package into a versioned directory and swap the `current` symlink
+# atomically, so running builds or CLI invocations never read half-replaced modules.
+release=$libdir/v-$$
+mkdir -p "$release"
+cp -R "$src/src/buildq" "$release/buildq"
+find "$release/buildq" -name '__pycache__' -exec rm -rf {} +
+ln -sfn "$release" "$libdir/current.new.$$"
+mv -Tf "$libdir/current.new.$$" "$libdir/current"
+for program in buildqd buildq; do
+  "$python" - "$src/bin/$program" "$staged/$program" "$python" "$libdir/current" <<'EOF'
+import sys
+src_path, dst_path, py, pkg_lib = sys.argv[1:5]
+lines = open(src_path).read().splitlines(keepends=True)
+lines[0] = f"#!{py}\n"
+text = "".join(lines)
+if "LIBDIR = None" not in text:
+    sys.exit(f"expected LIBDIR placeholder in {src_path}")
+with open(dst_path, "w") as f:
+    f.write(text.replace("LIBDIR = None", f"LIBDIR = {pkg_lib!r}", 1))
+EOF
   put 755 "$staged/$program" "$bindir/$program"
 done
+# buildq-shim stays standalone (zero package-import overhead on every shimmed command).
+{ printf '#!%s\n' "$python"; tail -n +2 "$src/bin/buildq-shim"; } >"$staged/buildq-shim"
+put 755 "$staged/buildq-shim" "$bindir/buildq-shim"
 put 755 "$src/bin/buildq-rustc-guard" "$bindir/buildq-rustc-guard"
-say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (Python: $python)"
+prune_old_releases() {
+  for old in "$libdir"/v-*; do
+    if [[ -e "$old" && "$old" != "$release" ]]; then
+      rm -rf "$old"
+    fi
+  done
+}
+say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (package in $libdir/current, Python: $python)"
 
 if [[ ! -e "$confdir/config.toml" ]]; then
   put 644 "$src/config.example.toml" "$confdir/config.toml"
@@ -247,6 +276,7 @@ if ! have_systemd; then
   # (see below). Running install.sh again won't change that.
   say "no systemd user session here, and buildq needs one: each build runs as a systemd service, which is what measures it, caps its memory and lets the queue pause it."
   say "installed the programs in $bindir (and anything listed above), but nothing that needs systemd: no units, --shims and --rustc-guard weren't set up, and install.sh didn't start the daemon. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
+  prune_old_releases
   exit 0
 fi
 
@@ -276,6 +306,7 @@ systemctl --user enable --now buildq.socket >/dev/null
 systemctl --user enable buildq.service >/dev/null
 # A restart loads the new code. Running builds carry on, and the new daemon picks them up.
 systemctl --user restart buildq.service
+prune_old_releases
 # A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
 # file is gone, have systemd create it again.
 if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]]; then

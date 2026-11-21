@@ -11,6 +11,11 @@ import unittest
 import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC = os.path.join(ROOT, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+from buildq import commands as bq_commands, metrics as bq_metrics  # noqa: E402
 
 
 def load(name, path):
@@ -264,10 +269,9 @@ class Replay(SimCase):
 
 class Export(SimCase):
     def metrics(self):
-        buildqd = load("buildqd_for_export", BUILDQD)
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
-        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in bq_metrics.BUILD_COLUMNS) + ")")
         rows = [("a", 1000, 900, "secretrepo|heavy|cargo test -p private-crate", "ci:x", "ci:secretrepo:tests",
                  "heavy", "runner-9", 1, 600.0, 12 * GIB, json.dumps([100, 200, 300]), 6.5, 0, "succeeded",
                  "/home/someone/secret/target", 0, 600.0),
@@ -314,10 +318,9 @@ class Export(SimCase):
         # C came in at 11500 and waited 500s for B. From 11500, A is gone, but B enters as it really
         # started, so C waits as long. D was cancelled while queued; the only whole run of its command
         # (A) ended before the window, and is what it replays as.
-        buildqd = load("buildqd_for_window", BUILDQD)
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
-        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in bq_metrics.BUILD_COLUMNS) + ")")
         rows = [("a", 10000, 11000, 1000.0, "succeeded", "app|heavy|cargo test -p a", "w", 0.0),
                 ("b", 10100, 12000, 1000.0, "succeeded", "app|heavy|cargo test -p b", "w", 900.0),
                 ("c", 11500, 12100, 100.0, "succeeded", "app|heavy|cargo test -p c", "w", 500.0),
@@ -354,10 +357,9 @@ class Export(SimCase):
         # Requeued, then cancelled while queued again (attempt_wall 0): it was queued when the window
         # began, whatever its earlier attempts took, so it enters then and holds w as its whole run
         # does; the build submitted at 5000 waits for it, as it did.
-        buildqd = load("buildqd_for_attempt", BUILDQD)
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
-        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in bq_metrics.BUILD_COLUMNS) + ")")
         db.executemany("INSERT INTO build (id, submitted, ended, wall, attempt_wall, state, key, lane, workspace, "
                        "waited, requeues, mem_peak, avg_cores, exit) VALUES (?,?,?,?,?,?,?,'heavy','w',?,?,?,1.0,?)",
                        [("run", 0, 1000, 1000.0, 1000.0, "succeeded", "app|heavy|cargo test", 0.0, 0, GIB, 0),
@@ -385,10 +387,9 @@ class Export(SimCase):
         self.assertEqual(s.daemon.schedule.__name__, "<lambda>")  # (what was there before is back)
 
     def test_a_ci_build_that_ran_past_the_default_limit_keeps_its_longer_one(self):
-        buildqd = load("buildqd_for_limit", BUILDQD)
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
-        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in bq_metrics.BUILD_COLUMNS) + ")")
         db.executemany("INSERT INTO build (id, submitted, ended, wall, state, key, lane, from_ci, mem_peak, exit) "
                        "VALUES (?,?,?,?,?,'app|heavy|cargo test','heavy',1,?,0)",
                        [("long", 0, 4000, 1000.0, "succeeded", GIB), ("short", 100, 700, 600.0, "succeeded", GIB)])
@@ -404,17 +405,16 @@ class Export(SimCase):
         # Kept in step with the daemon, so the lists can't drift apart: the flags command_words keeps
         # in a history key, the tools honors_grant and the lane rules read, the subcommands
         # restart_safe reads (cargo's short forms too).
-        buildqd = load("buildqd_for_public", BUILDQD)
         for flag in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc", "--profile",
                      "--filter", "-p", "-F"):
             self.assertEqual(sim.anonymous_argv(["cargo", "test", flag])[2], flag)
-        tools = buildqd.SHELLS | buildqd.INTERPRETERS | sim.Simulation.GRANT_TOOLS | {"python3.13", "python2", "py.test"}
+        tools = bq_commands.SHELLS | bq_commands.INTERPRETERS | sim.Simulation.GRANT_TOOLS | {"python3.13", "python2", "py.test"}
         for tool in sorted(tools):
             self.assertEqual(sim.anonymous_argv([tool])[0], tool)
         for argv in (["cargo", "c"], ["cargo", "b"], ["cargo", "t"], ["ninja", "all"], ["cargo", "test", "--doc"]):
             self.assertEqual(sim.anonymous_argv(argv), argv)
-            self.assertEqual(buildqd.restart_safe(sim.anonymous_argv(argv)), buildqd.restart_safe(argv))
-        key = lambda argv: buildqd.command_words(sim.anonymous_argv(argv))  # noqa: E731
+            self.assertEqual(bq_commands.restart_safe(sim.anonymous_argv(argv)), bq_commands.restart_safe(argv))
+        key = lambda argv: bq_commands.command_words(sim.anonymous_argv(argv))  # noqa: E731
         self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
 
     def test_an_option_like_value_doesn_t_survive_from_the_database_to_the_trace(self):
@@ -449,8 +449,7 @@ class Export(SimCase):
     def test_a_build_cancelled_while_queued_replays_as_its_command_runs_until_its_cancel(self):
         db = sqlite3.connect(":memory:")
         self.addCleanup(db.close)
-        buildqd = load("buildqd_for_cancel", BUILDQD)
-        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in buildqd.BUILD_COLUMNS) + ")")
+        db.execute("CREATE TABLE build (" + ", ".join(f"{n} {t}" for n, t in bq_metrics.BUILD_COLUMNS) + ")")
         db.execute("INSERT INTO build (id, ended, submitted, key, lane, wall, attempt_wall, mem_peak, avg_cores, state, "
                    "exit) VALUES ('ok', 1400, 1000, 'app|heavy|cargo test', 'heavy', 400.0, 400.0, ?, 4.0, "
                    "'succeeded', 0)", (8 * GIB,))
