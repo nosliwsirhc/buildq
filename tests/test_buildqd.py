@@ -3080,7 +3080,7 @@ class GitHubStatuses(DaemonCase):
             launched.append(a[0])
             return proc
 
-        t_start = p1["first"] + 10
+        t_start = t1.ended + 10
         with mock.patch.object(buildqd.subprocess, "Popen", side_effect=fake_popen):
             self.daemon.send_status_posts(t_start)
         self.assertEqual(len(launched), 1)
