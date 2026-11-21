@@ -138,10 +138,10 @@ a build that caused some of them (a CI job's own containers, say). A minute that
 builds used (rows older than those columns, or the first after the daemon started) is left out and
 the minute before holds, as it does across a gap in the rows. Minute rows are kept 14 days and
 builds 180, so an older window has no rows and replays with the built-in fixed background. Older
-databases from before `direct` process-tree tracking don't separate build memory from other work,
-so replaying a trace exported from one can count it twice (`export` warns on stderr when that
-happens). `run --no-background` replays a trace with the fixed background anyway, to see what the
-recorded minutes change.
+databases from before `direct` process-tree tracking may not separate build memory from other work,
+so replaying a trace exported from one can count it twice (`export` notes missing minute or build
+columns on stderr). `run --no-background` replays a trace with the fixed background anyway, to see
+what the recorded minutes change.
 
 Each build's memory profile, cores and run time are what the machine measured, for its last attempt. A build that was stopped and queued again (`requeued`) has its last attempt's run time where
 the database keeps it (`attempt_wall`, since #39). In an older database it has every attempt's run time

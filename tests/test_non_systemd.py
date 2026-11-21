@@ -874,6 +874,156 @@ class InstallScriptTests(unittest.TestCase):
         self.assertEqual(res1.returncode, 2)
         res2 = subprocess.run(["/bin/sh", self.INSTALL_SH, "--uninstall", "--shims"], capture_output=True, text=True, timeout=10)
         self.assertEqual(res2.returncode, 2)
+        res3 = subprocess.run(["/bin/sh", self.INSTALL_SH, "--check", "--install-deps"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res3.returncode, 2)
+        res4 = subprocess.run(["/bin/sh", self.INSTALL_SH, "--check", "--shims"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(res4.returncode, 2)
+
+    def test_broken_config_aborts_before_publishing_release(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            cfg_dir = os.path.join(tmp, "cfg", "buildq")
+            os.makedirs(cfg_dir)
+            with open(os.path.join(cfg_dir, "config.toml"), "w") as f:
+                f.write("not_valid_toml = [[\n")
+            bindir = self._stub_bin(
+                tmp,
+                {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
+                copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+            )
+            res = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--no-start"],
+                env={
+                    "PATH": bindir,
+                    "HOME": tmp,
+                    "PREFIX": prefix,
+                    "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
+                    "XDG_DATA_HOME": os.path.join(tmp, "data"),
+                    "XDG_STATE_HOME": os.path.join(tmp, "state"),
+                },
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("doesn't load", res.stdout)
+            self.assertFalse(os.path.exists(os.path.join(prefix, "lib", "buildq", "current")))
+            self.assertFalse(os.path.exists(os.path.join(prefix, "bin", "buildq")))
+
+    def test_relative_rustc_guard_and_uninstall_checks_running_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            work_parent = os.path.join(tmp, "projects")
+            work = os.path.join(work_parent, "myrepo")
+            os.makedirs(work)
+            bindir = self._stub_bin(
+                tmp,
+                {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
+                copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep"),
+            )
+            env = {
+                "PATH": bindir,
+                "HOME": tmp,
+                "PREFIX": prefix,
+                "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
+                "XDG_DATA_HOME": os.path.join(tmp, "data"),
+                "XDG_STATE_HOME": os.path.join(tmp, "state"),
+            }
+            # Install using a relative `--rustc-guard=myrepo` path from `work_parent`.
+            inst = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--no-start", "--rustc-guard=myrepo"],
+                cwd=work_parent, env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(inst.returncode, 0, inst.stdout + inst.stderr)
+            guard_list = read_text(os.path.join(tmp, "cfg", "buildq", "guard-configs")).strip()
+            self.assertTrue(os.path.isabs(guard_list), guard_list)
+            guard_cfg = os.path.join(work, ".cargo", "config.toml")
+            self.assertIn("buildq-rustc-guard", read_text(guard_cfg))
+
+            # Uninstall from a DIFFERENT directory (`tmp`) must still clean up the guard config.
+            uninst = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--uninstall"],
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(uninst.returncode, 0, uninst.stdout + uninst.stderr)
+            self.assertNotIn("buildq-rustc-guard", read_text(guard_cfg))
+
+            # If a supervised daemon respawns after stop, `--uninstall` MUST refuse to delete it.
+            os.makedirs(os.path.join(prefix, "bin"), exist_ok=True)
+            fake_bq = os.path.join(prefix, "bin", "buildq")
+            with open(fake_bq, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")  # status/ping/stop all exit 0 -> looks respawned!
+            os.chmod(fake_bq, 0o755)
+            refused = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--uninstall"],
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("restarted after stop", refused.stdout)
+            self.assertTrue(os.path.exists(fake_bq))
+
+    def test_systemd_unit_quotes_prefix_with_spaces_and_ampersand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "my tools & builds")
+            bindir = self._stub_bin(
+                tmp,
+                {
+                    "python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n",
+                    "systemctl": "#!/bin/sh\nexit 0\n",
+                },
+                copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
+                           "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath"),
+            )
+            res = subprocess.run(
+                ["/bin/sh", self.INSTALL_SH, "--no-start"],
+                env={
+                    "PATH": bindir,
+                    "HOME": tmp,
+                    "PREFIX": prefix,
+                    "XDG_CONFIG_HOME": os.path.join(tmp, "cfg"),
+                    "XDG_DATA_HOME": os.path.join(tmp, "data"),
+                    "XDG_STATE_HOME": os.path.join(tmp, "state"),
+                },
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            unit = read_text(os.path.join(tmp, "cfg", "systemd", "user", "buildq.service"))
+            self.assertIn(f'ExecStart="{prefix}/bin/buildqd"', unit)
+
+    def test_python_pkg_selection_for_ubuntu_2204_and_rhel9_without_python3(self):
+        # Verify python_pkg_for picks versioned Python 3.11+ even when no python3 exists yet.
+        script = (
+            f"eval \"$(sed -n '/^python_pkg_for()/,/^}}/p' '{self.INSTALL_SH}')\"\n"
+            "PATH=/nonexistent\n"
+            "distro_id=ubuntu distro_version=22.04 distro_codename=jammy\n"
+            "p1=$(python_pkg_for apt-get)\n"
+            "[ \"$p1\" = python3.11 ] || { echo \"ubuntu22=$p1\" >&2; exit 11; }\n"
+            "distro_id=rhel distro_version=9.4 distro_codename=''\n"
+            "p2=$(python_pkg_for dnf)\n"
+            "[ \"$p2\" = python3.11 ] || { echo \"rhel9=$p2\" >&2; exit 12; }\n"
+            "distro_id=opensuse-leap distro_version=15.6 distro_codename=''\n"
+            "p3=$(python_pkg_for zypper)\n"
+            "[ \"$p3\" = python311 ] || { echo \"leap15=$p3\" >&2; exit 13; }\n"
+            "distro_id=fedora distro_version=42 distro_codename=''\n"
+            "p4=$(python_pkg_for dnf)\n"
+            "[ \"$p4\" = python3 ] || { echo \"fedora=$p4\" >&2; exit 14; }\n"
+            "distro_id=ubuntu distro_version=24.04 distro_codename=noble\n"
+            "p5=$(python_pkg_for apt-get)\n"
+            "[ \"$p5\" = python3 ] || { echo \"ubuntu24=$p5\" >&2; exit 15; }\n"
+            "exit 0\n"
+        )
+        res = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_strict_posix_shells_when_available(self):
+        # Exercise --help and --check under dash or busybox sh whenever installed on the host/CI.
+        for shell_cmd in (["dash"], ["busybox", "sh"]):
+            if not shutil.which(shell_cmd[0]):
+                continue
+            res = subprocess.run([*shell_cmd, "-n", self.INSTALL_SH], capture_output=True, text=True, timeout=10)
+            self.assertEqual(res.returncode, 0, f"{shell_cmd} -n failed: {res.stderr}")
+            chk = subprocess.run([*shell_cmd, self.INSTALL_SH, "--check"], capture_output=True, text=True, timeout=10)
+            self.assertEqual(chk.returncode, 0, f"{shell_cmd} --check failed: {chk.stdout}{chk.stderr}")
 
     def test_full_install_shims_skill_rustc_guard_and_uninstall_under_posix_sh(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -40,11 +40,11 @@ buildq daemon logs --tail 50 --follow   # watch the daemon log
 
 By default (`runner = "auto"`), buildq automatically uses the strongest mode your system supports:
 
-| Mode | When it's used | What you get | Setup needed |
-| --- | --- | --- | --- |
-| **`systemd`** | Standard systemd Linux (Ubuntu, Fedora, Arch, Debian) | Kernel memory/CPU/IO caps, kernel pausing, automatic safety ceiling, socket activation | None |
-| **`direct`** | Any non-systemd Linux, WSL2, or container | Automatic memory & CPU measurement, learned build sizes, live core resizing, low-RAM pausing, memory-cap watchdog, full child-process cleanup | **None** — works immediately |
-| **`cgroup`** | Non-systemd Linux with optional cgroup v2 setup | Same kernel-enforced memory caps, pausing, and dynamic safety ceiling as systemd, without needing systemd | One boot-time script (below) |
+| Priority | Mode | When it's used | What you get | Setup needed |
+| --- | --- | --- | --- | --- |
+| 1 | **`systemd`** | Standard systemd Linux (Ubuntu, Fedora, Arch, Debian) | Kernel memory/CPU/IO caps, kernel pausing, automatic safety ceiling, socket activation | None |
+| 2 | **`cgroup`** | Non-systemd Linux with optional cgroup v2 setup | Same kernel-enforced memory caps, pausing, and dynamic safety ceiling as systemd, without needing systemd | Boot-time init service + helper script (below) |
+| 3 | **`direct`** | Any non-systemd Linux, WSL2, or container | Automatic memory & CPU measurement, learned build sizes, live core resizing, low-RAM pausing, memory-cap watchdog, full child-process cleanup | **None** — works immediately |
 
 Most people on WSL2, containers, or personal non-systemd machines don't need anything beyond the
 default `direct` mode — it works out of the box with zero root access.
@@ -77,16 +77,16 @@ cgroup helper at boot:
    ```sh
    sudo install -Dm755 init/cgroup-setup.sh /usr/local/libexec/buildq-cgroup-setup.sh
    ```
-2. Either enable `BUILDQ_CGROUP_DELEGATE="yes"` in your init service config (see the comments at
-   the top of each template in `init/`), or run it once at boot for your user:
-   ```sh
-   sudo /usr/local/libexec/buildq-cgroup-setup.sh "$USER"
-   ```
-3. Start `buildqd` through the init service (which automatically places `buildqd` inside the
-   delegated cgroup). Run `buildq daemon status` to confirm it switched to the `cgroup` runner.
+2. Install one of the boot-time init services above (OpenRC, runit, s6, dinit, or SysVinit) and
+   enable `BUILDQ_CGROUP_DELEGATE="yes"` in its service config (or set
+   `run-in-cgroup = /buildq-<user>/user/daemon` in dinit after running the helper at boot). Because
+   `/sys/fs/cgroup` resets on every reboot, the init service runs the helper at startup **and**
+   places `buildqd` inside the delegated `user/daemon` cgroup automatically.
+3. Start the service and run `buildq daemon status` to confirm it reports the `cgroup` runner.
 
-If you ever start `buildqd` by hand outside that service, `runner = "auto"` safely falls back to
-`direct` mode instead of failing.
+Running the helper script by hand only creates the cgroup folders — starting `buildqd` manually
+from a login shell outside the init service still falls back cleanly to `direct` mode instead of
+failing.
 
 <details>
 <summary>Technical details: how the cgroup v2 layout works</summary>

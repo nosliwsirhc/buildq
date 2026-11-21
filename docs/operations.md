@@ -36,7 +36,8 @@ result), `history.jsonl` (one line per finished build; delete it to forget every
 analytics, below), `config.last-good.toml`, `buildqd.lock` (ensures only one daemon runs for this
 state directory), `cgroup-slice-baseline.json` (used by the `cgroup` runner to restore the original
 memory ceiling after a crash), and on non-systemd hosts `buildqd.pid`, `buildqd.log`, and
-`run/buildq.sock`. Everything is private to the user.
+`run/buildq.sock` (or `/tmp/buildq-<uid>/buildq.sock` if the home state path is too long for a
+Unix socket). Everything is private to the user.
 
 ## Analytics
 

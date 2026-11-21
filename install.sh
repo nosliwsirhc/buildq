@@ -111,6 +111,10 @@ if [ "$do_uninstall" = yes ] && { [ "$do_check" = yes ] || [ "$auto_install_deps
   say "--uninstall cannot be combined with other options"
   exit 2
 fi
+if [ "$do_check" = yes ] && { [ "$auto_install_deps" = yes ] || [ "$has_install_opts" = yes ]; }; then
+  say "--check cannot be combined with install options"
+  exit 2
+fi
 
 # ---- Helpers -------------------------------------------------------------------------------------
 have_realpath_m=no
@@ -148,6 +152,7 @@ distro_name=""
 distro_id=""
 distro_like=""
 distro_version=""
+distro_codename=""
 env_tags=""
 pkg_mgr=""
 elevate_cmd=""
@@ -157,10 +162,11 @@ detect_os_release() {
   distro_id=""
   distro_like=""
   distro_version=""
+  distro_codename=""
   if [ -r /etc/os-release ]; then
     while IFS= read -r _line || [ -n "$_line" ]; do
       case $_line in
-        PRETTY_NAME=*|ID=*|ID_LIKE=*|VERSION_ID=*)
+        PRETTY_NAME=*|ID=*|ID_LIKE=*|VERSION_ID=*|VERSION_CODENAME=*|UBUNTU_CODENAME=*)
           _k=${_line%%=*}
           _v=${_line#*=}
           # Strip one pair of surrounding quotes without evaluating shell code.
@@ -169,10 +175,12 @@ detect_os_release() {
             \'*\') _v=${_v#\'}; _v=${_v%\'} ;;
           esac
           case $_k in
-            PRETTY_NAME) distro_name=$_v ;;
-            ID)          distro_id=$_v ;;
-            ID_LIKE)     distro_like=$_v ;;
-            VERSION_ID)  distro_version=$_v ;;
+            PRETTY_NAME)      distro_name=$_v ;;
+            ID)               distro_id=$_v ;;
+            ID_LIKE)          distro_like=$_v ;;
+            VERSION_ID)       distro_version=$_v ;;
+            VERSION_CODENAME) [ -n "$distro_codename" ] || distro_codename=$_v ;;
+            UBUNTU_CODENAME)  distro_codename=$_v ;;
           esac
           ;;
       esac
@@ -193,9 +201,12 @@ detect_runner_mode() {
   fi
   if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
     _user=${USER:-$(id -un 2>/dev/null || true)}
-    _cg=${BUILDQ_CGROUP_ROOT:-/sys/fs/cgroup/buildq-$_user/user}
-    if [ -n "$_user" ] && [ -d "$_cg/builds" ] && [ -w "$_cg/builds" ]; then
-      printf '%s' "non-systemd (cgroup v2 runner)"
+    _cg=${BUILDQ_CGROUP_ROOT:-}
+    if [ -z "$_cg" ] && [ -n "$_user" ]; then
+      _cg="/sys/fs/cgroup/buildq-$_user/user"
+    fi
+    if [ -n "$_cg" ] && [ -d "$_cg/builds" ] && [ -w "$_cg/builds" ]; then
+      printf '%s' "non-systemd (direct runner; cgroup v2 available)"
       return
     fi
   fi
@@ -318,7 +329,18 @@ find_python() {
 
 detect_pkg_mgr() {
   pkg_mgr=""
-  for _pm in apk apt-get dnf pacman xbps-install zypper emerge; do
+  # Prefer the package manager matching /etc/os-release ID / ID_LIKE before scanning the generic list.
+  _pref_pms=""
+  case " $distro_id $distro_like " in
+    *" alpine "*)                                        _pref_pms="apk" ;;
+    *" debian "*|*" ubuntu "*|*" devuan "*|*" mint "*)   _pref_pms="apt-get" ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*) _pref_pms="dnf" ;;
+    *" arch "*|*" artix "*|*" manjaro "*)                _pref_pms="pacman" ;;
+    *" void "*)                                          _pref_pms="xbps-install" ;;
+    *" suse "*|*" opensuse "*|*" sles "*)                _pref_pms="zypper" ;;
+    *" gentoo "*)                                        _pref_pms="emerge" ;;
+  esac
+  for _pm in $_pref_pms apk apt-get dnf pacman xbps-install zypper emerge; do
     if command -v "$_pm" >/dev/null 2>&1; then
       pkg_mgr=$_pm
       break
@@ -336,6 +358,72 @@ detect_pkg_mgr() {
   fi
 }
 
+# Pick the Python 3.11+ package name for distros whose default `python3` may be < 3.11 even on a
+# brand-new container image where no `python3` binary is installed yet (Ubuntu 22.04, RHEL 8/9,
+# openSUSE Leap 15, etc.).
+python_pkg_for() {
+  _pm=$1
+  case $_pm in
+    apk)          printf '%s' "python3" ;;
+    pacman)       printf '%s' "python" ;;
+    xbps-install) printf '%s' "python3" ;;
+    emerge)       printf '%s' "dev-lang/python" ;;
+    apt-get)
+      _need_versioned=no
+      if command -v python3 >/dev/null 2>&1; then
+        _need_versioned=yes
+      else
+        case "$distro_id:$distro_version:$distro_codename" in
+          ubuntu:20.*:*|ubuntu:22.*:*|debian:10*:*|debian:11*:*|devuan:4*:*|*:*:focal|*:*:jammy|*:*:bullseye|*:*:chimaera)
+            _need_versioned=yes
+            ;;
+        esac
+      fi
+      if [ "$_need_versioned" = yes ]; then
+        if command -v apt-cache >/dev/null 2>&1 && apt-cache show python3.12 >/dev/null 2>&1; then
+          printf '%s' "python3.12"
+        elif command -v apt-cache >/dev/null 2>&1 && apt-cache show python3.11 >/dev/null 2>&1; then
+          printf '%s' "python3.11"
+        else
+          printf '%s' "python3.11"
+        fi
+      else
+        printf '%s' "python3"
+      fi
+      ;;
+    dnf)
+      _need_versioned=no
+      if command -v python3 >/dev/null 2>&1; then
+        _need_versioned=yes
+      elif [ "$distro_id" != "fedora" ]; then
+        case $distro_version in
+          8|8.*|9|9.*) _need_versioned=yes ;;
+        esac
+      fi
+      if [ "$_need_versioned" = yes ]; then
+        printf '%s' "python3.11"
+      else
+        printf '%s' "python3"
+      fi
+      ;;
+    zypper)
+      _need_versioned=no
+      if command -v python3 >/dev/null 2>&1; then
+        _need_versioned=yes
+      else
+        case "$distro_id:$distro_version" in
+          opensuse-leap:15*|sles:15*|*:15.*) _need_versioned=yes ;;
+        esac
+      fi
+      if [ "$_need_versioned" = yes ]; then
+        printf '%s' "python311"
+      else
+        printf '%s' "python3"
+      fi
+      ;;
+  esac
+}
+
 # Build package list for the detected package manager from abstract dependency tokens.
 # Only emits hardcoded package names for known tokens.
 pkg_names_for() {
@@ -344,112 +432,42 @@ pkg_names_for() {
   _out=""
   for _dep in "$@"; do
     _pkg=""
-    case $_pm in
-      apk)
-        case $_dep in
-          python)    _pkg="python3" ;;
-          flock)     _pkg="util-linux-misc" ;;
-          coreutils) _pkg="coreutils" ;;
-          awk)       _pkg="gawk" ;;
-          sed)       _pkg="sed" ;;
-          grep)      _pkg="grep" ;;
-          find)      _pkg="findutils" ;;
-        esac
-        ;;
-      apt-get)
-        case $_dep in
-          python)
-            # On Ubuntu 22.04 or older distros where default python3 is < 3.11, prefer python3.11 if available.
-            if command -v python3 >/dev/null 2>&1; then
-              if command -v apt-cache >/dev/null 2>&1 && apt-cache show python3.12 >/dev/null 2>&1; then
-                _pkg="python3.12"
-              elif command -v apt-cache >/dev/null 2>&1 && apt-cache show python3.11 >/dev/null 2>&1; then
-                _pkg="python3.11"
-              elif [ "$distro_id" = "ubuntu" ] && [ "$distro_version" = "22.04" ]; then
-                _pkg="python3.11"
-              else
-                _pkg="python3"
-              fi
-            else
-              _pkg="python3"
-            fi
-            ;;
-          flock)     _pkg="util-linux" ;;
-          coreutils) _pkg="coreutils" ;;
-          awk)       _pkg="gawk" ;;
-          sed)       _pkg="sed" ;;
-          grep)      _pkg="grep" ;;
-          find)      _pkg="findutils" ;;
-        esac
-        ;;
-      dnf)
-        case $_dep in
-          python)
-            if command -v python3 >/dev/null 2>&1; then
-              _pkg="python3.11"
-            else
-              _pkg="python3"
-            fi
-            ;;
-          flock)     _pkg="util-linux" ;;
-          coreutils) _pkg="coreutils" ;;
-          awk)       _pkg="gawk" ;;
-          sed)       _pkg="sed" ;;
-          grep)      _pkg="grep" ;;
-          find)      _pkg="findutils" ;;
-        esac
-        ;;
-      pacman)
-        case $_dep in
-          python)    _pkg="python" ;;
-          flock)     _pkg="util-linux" ;;
-          coreutils) _pkg="coreutils" ;;
-          awk)       _pkg="gawk" ;;
-          sed)       _pkg="sed" ;;
-          grep)      _pkg="grep" ;;
-          find)      _pkg="findutils" ;;
-        esac
-        ;;
-      xbps-install)
-        case $_dep in
-          python)    _pkg="python3" ;;
-          flock)     _pkg="util-linux" ;;
-          coreutils) _pkg="coreutils" ;;
-          awk)       _pkg="gawk" ;;
-          sed)       _pkg="sed" ;;
-          grep)      _pkg="grep" ;;
-          find)      _pkg="findutils" ;;
-        esac
-        ;;
-      zypper)
-        case $_dep in
-          python)
-            if command -v python3 >/dev/null 2>&1; then
-              _pkg="python311"
-            else
-              _pkg="python3"
-            fi
-            ;;
-          flock)     _pkg="util-linux" ;;
-          coreutils) _pkg="coreutils" ;;
-          awk)       _pkg="gawk" ;;
-          sed)       _pkg="sed" ;;
-          grep)      _pkg="grep" ;;
-          find)      _pkg="findutils" ;;
-        esac
-        ;;
-      emerge)
-        case $_dep in
-          python)    _pkg="dev-lang/python" ;;
-          flock)     _pkg="sys-apps/util-linux" ;;
-          coreutils) _pkg="sys-apps/coreutils" ;;
-          awk)       _pkg="sys-apps/gawk" ;;
-          sed)       _pkg="sys-apps/sed" ;;
-          grep)      _pkg="sys-apps/grep" ;;
-          find)      _pkg="sys-apps/findutils" ;;
-        esac
-        ;;
-    esac
+    if [ "$_dep" = "python" ]; then
+      _pkg=$(python_pkg_for "$_pm")
+    else
+      case $_pm in
+        apk)
+          case $_dep in
+            flock)     _pkg="util-linux-misc" ;;
+            coreutils) _pkg="coreutils" ;;
+            awk)       _pkg="gawk" ;;
+            sed)       _pkg="sed" ;;
+            grep)      _pkg="grep" ;;
+            find)      _pkg="findutils" ;;
+          esac
+          ;;
+        apt-get|dnf|pacman|xbps-install|zypper)
+          case $_dep in
+            flock)     _pkg="util-linux" ;;
+            coreutils) _pkg="coreutils" ;;
+            awk)       _pkg="gawk" ;;
+            sed)       _pkg="sed" ;;
+            grep)      _pkg="grep" ;;
+            find)      _pkg="findutils" ;;
+          esac
+          ;;
+        emerge)
+          case $_dep in
+            flock)     _pkg="sys-apps/util-linux" ;;
+            coreutils) _pkg="sys-apps/coreutils" ;;
+            awk)       _pkg="sys-apps/gawk" ;;
+            sed)       _pkg="sys-apps/sed" ;;
+            grep)      _pkg="sys-apps/grep" ;;
+            find)      _pkg="sys-apps/findutils" ;;
+          esac
+          ;;
+      esac
+    fi
     [ -n "$_pkg" ] || continue
     case " $_out " in
       *" $_pkg "*) ;;
@@ -780,9 +798,29 @@ EOF
 if [ "$do_uninstall" = yes ]; then
   acquire_lock
   if have_systemd; then
-    systemctl --user disable --now buildq.service buildq.socket 2>/dev/null || true
+    _was_active=no
+    systemctl --user is-active --quiet buildq.service 2>/dev/null && _was_active=yes
+    if ! systemctl --user disable --now buildq.service buildq.socket 2>/dev/null; then
+      if [ "$_was_active" = yes ] && systemctl --user is-active --quiet buildq.service 2>/dev/null; then
+        say "couldn't stop buildq.service; stop it first (systemctl --user disable --now buildq.service buildq.socket) and re-run ./install.sh --uninstall"
+        exit 1
+      fi
+    fi
   elif [ -x "$bindir/buildq" ]; then
-    "$bindir/buildq" daemon stop >/dev/null 2>&1 || true
+    if "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
+      if ! "$bindir/buildq" daemon stop; then
+        say "couldn't stop buildqd; stop it (or disable its init service) first, then re-run ./install.sh --uninstall"
+        exit 1
+      fi
+      # Pause briefly so an init supervisor (OpenRC/runit/s6/dinit) respawning buildqd is caught
+      # before we delete the live binary out from under it.
+      sleep 0.5 2>/dev/null || sleep 1
+      if "$bindir/buildq" daemon status >/dev/null 2>&1 || "$bindir/buildq" ping >/dev/null 2>&1; then
+        say "buildqd restarted after stop (it is likely managed by an init service such as OpenRC, runit, s6, or dinit)."
+        say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+        exit 1
+      fi
+    fi
   fi
   find_python || true
   keep_guard=no
@@ -969,6 +1007,15 @@ EOF
 cp "$src/bin/buildq-rustc-guard" "$staged/buildq-rustc-guard"
 "$python" -B -I -m py_compile "$staged/buildq" "$staged/buildq-shim"
 /bin/sh -n "$staged/buildq-rustc-guard"
+# Validate the active configuration against the staged release BEFORE publishing `current` or any
+# launchers, so a broken config.toml never leaves a new release published on a failed install.
+if [ -e "$confdir/config.toml" ]; then
+  _cfg_to_check="$confdir/config.toml"
+else
+  _cfg_to_check="$src/config.example.toml"
+fi
+"$python" -B -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from buildq import daemon; sys.exit(daemon.main(["--check-config", "--config", sys.argv[2]]))' "$release" "$_cfg_to_check" >/dev/null ||
+  { say "$_cfg_to_check doesn't load; fix it and run install.sh again."; exit 1; }
 # Prepare every destination temp on the target filesystems before publishing anything.
 for _tmp in "$libdir/current.new.$$" "$bindir/buildq.new.$$" "$bindir/buildqd.new.$$" \
             "$bindir/buildq-shim.new.$$" "$bindir/buildq-rustc-guard.new.$$"; do
@@ -1003,8 +1050,6 @@ if [ ! -e "$confdir/config.toml" ]; then
   put 644 "$src/config.example.toml" "$confdir/config.toml"
   say "wrote $confdir/config.toml (all defaults; edit it for your machine)"
 fi
-"$bindir/buildqd" --check-config --config "$confdir/config.toml" >/dev/null ||
-  { say "$confdir/config.toml doesn't load; fix it and run install.sh again."; exit 1; }
 
 if [ "$do_skill" = yes ]; then
   install_skill
@@ -1014,7 +1059,17 @@ fi
 
 if have_systemd; then
   add_temp "$unitdir/buildq.service.new.$$"
-  sed "s|@BINDIR@|$bindir|g" "$src/systemd/buildq.service" >"$unitdir/buildq.service.new.$$"
+  # Render systemd unit safely via Python so PREFIX paths with spaces, &, |, %, or $ stay valid.
+  "$python" -B -I - "$src/systemd/buildq.service" "$unitdir/buildq.service.new.$$" "$bindir" <<'EOF'
+import sys
+src_u, dst_u, bindir = sys.argv[1:4]
+exe = bindir.rstrip("/") + "/buildqd"
+esc = exe.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+rendered = f'"{esc}"' if any(c.isspace() or c in "\"'\\;&$%" for c in exe) else exe
+text = open(src_u).read().replace("@BINDIR@/buildqd", rendered).replace("@BINDIR@", bindir)
+with open(dst_u, "w") as f:
+    f.write(text)
+EOF
   mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
   put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
   put 644 "$src/systemd/buildq.slice" "$unitdir/buildq.slice"
@@ -1110,7 +1165,10 @@ if [ -n "$rustc_guard_dirs" ]; then
     case $_dir in
       '~')   _dir=$HOME ;;
       '~/'*) _dir=$HOME/${_dir#'~/'} ;;
+      /*)    ;;
+      *)     _dir=$PWD/$_dir ;;
     esac
+    _dir=$(normpath "$_dir")
     apply_rustc_guard "$_dir/.cargo/config.toml"
   done
 fi

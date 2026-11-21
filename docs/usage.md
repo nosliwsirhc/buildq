@@ -178,7 +178,7 @@ the news without polling:
 
 | Variable | Effect |
 | -------- | ------ |
-| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock` or `/run/user/$UID/buildq.sock` on systemd hosts, and `~/.local/state/buildq/run/buildq.sock` on non-systemd hosts so background services and terminal sessions always share the same daemon) |
+| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock` or `/run/user/$UID/buildq.sock` on systemd hosts, and `~/.local/state/buildq/run/buildq.sock` on non-systemd hosts — falling back to `/tmp/buildq-<uid>/buildq.sock` only if that path exceeds the OS ~104-byte socket limit — so background services and terminal sessions always share the same daemon) |
 | `BUILDQ_RUNNER` | override `runner` from `config.toml` (`auto`, `systemd`, `cgroup`, or `direct`) |
 | `BUILDQ_CGROUP_ROOT` | override `cgroup_root` from `config.toml` (optional custom cgroup v2 folder for the `cgroup` runner) |
 | `BUILDQ_FALLBACK` | what `buildq run` does when the daemon can't be reached. Unset: wait for it. `fail`: exit 75. `run`: run the command unqueued. Anything else: a command prefix to run it through instead. |

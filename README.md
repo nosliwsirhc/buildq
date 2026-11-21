@@ -100,7 +100,7 @@ cd buildq
 
 `install.sh` sets everything up automatically for your Linux machine:
 - checks that you're on Linux, detects your distro and init system, verifies Python 3.11+ and required utilities, and offers a `[y/N]` prompt (or `--install-deps`) to install any missing prerequisites;
-- installs `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` into `~/.local/bin` (change with `PREFIX`), locking them to the Python 3.11+ it verified (`PYTHON=...` to choose one) so switching virtualenvs or upgrading later never breaks running builds;
+- installs `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` into `~/.local/bin` (change with `PREFIX`), pinning them to the Python 3.11+ it verified (`PYTHON=...` to choose one) so switching virtualenvs or changing `python3` on `PATH` later won't break them, and keeping each release in its own versioned folder under `~/.local/lib/buildq/` so upgrades don't disturb already-running builds;
 - creates `~/.config/buildq/config.toml` with sensible defaults if you don't have one yet;
 - on **systemd** machines: installs and starts the user background service (`buildq.service`) with a 75%/85% memory safety cap for all builds together;
 - on **non-systemd** machines: starts `buildqd` directly in the background (logs in `~/.local/state/buildq/buildqd.log`), ready to use right away. Pass `--no-start` in Dockerfiles or packaging scripts. Want boot-time startup (OpenRC, runit, s6, dinit, SysVinit) or optional kernel memory limits without systemd? See [`init/README.md`](init/README.md).
