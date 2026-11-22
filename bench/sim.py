@@ -8,8 +8,9 @@ build's memory and CPU (through the module's cgroup_stats). Builds follow a reco
 memory over the run, and how many cores they kept busy. See docs/benchmark.md for the model and its
 simplifications.
 
-    sim.py run SCENARIO [--config FILE] [--buildqd FILE] [--json] [--jobs FILE]
+    sim.py run SCENARIO [--policy buildq|none|slots:N] [--config FILE] [--buildqd FILE] [--json] [--jobs FILE]
     sim.py compare SCENARIO... [--base FILE] [--head FILE] [--base-config FILE] [--config FILE]
+    sim.py baselines [SCENARIO...] [--policies none,slots:2,slots:4,slots:6,buildq] [--config FILE] [--json]
     sim.py export --db metrics.db [--since T] [--until T] [--lead-in D] [--anonymize] > trace.jsonl
     sim.py scenarios
 
@@ -718,6 +719,247 @@ class Simulation:
         return summarize(self, s)
 
 
+class _BaselineTicket:
+    """Minimal ticket stand-in for BaselineSimulation (no daemon, no core grant)."""
+
+    def __init__(self, tid: str, submitted: float, lane: str, workspace: str | None, ncpu: int):
+        self.id = tid
+        self.submitted = submitted
+        self.lane = lane
+        self.workspace = workspace
+        self.granted = max(1, ncpu)
+        self.state = "queued"
+
+
+class _BaselineMod:
+    FINISHED = frozenset({"succeeded", "failed", "cancelled"})
+
+
+def parse_policy(spec: str) -> tuple[str, int | None, str]:
+    """Parse a simulation policy: 'buildq', 'none' (no queue), or 'slots:N' (fixed FIFO slots).
+
+    Returns (canonical_name, max_slots_or_None, display_label).
+    """
+    raw = spec.strip().lower()
+    if raw == "buildq":
+        return "buildq", None, "buildq"
+    if raw in ("none", "no-queue", "no_queue"):
+        return "none", None, "no queue"
+    if raw.startswith("slots:"):
+        count_str = raw.split(":", 1)[1]
+        if count_str.isdigit() and int(count_str) >= 1:
+            n = int(count_str)
+            return f"slots:{n}", n, "1 slot" if n == 1 else f"{n} slots"
+    raise ValueError(f"unknown policy {spec!r}: expected 'buildq', 'none', or 'slots:N' (N >= 1)")
+
+
+class BaselineSimulation:
+    """Replay the same builds on the same machine physics without buildq: either with no queue
+    ('none': everything starts at once) or a fixed number of FIFO slots ('slots:N', as in pueue,
+    task-spooler, or a flock slot script).
+
+    Builds share the exact same CPU contention, memory profiles, kernel OOM killer, workspace lock
+    serialization, CI timeouts, and memory-floor accounting as Simulation, but have no learned
+    memory admission, no dynamic core caps/jobserver, no CI priority, and no memory shedding.
+    """
+
+    mod = _BaselineMod
+
+    def __init__(self, scenario: dict, policy: str, cfg):
+        canonical, max_slots, label = parse_policy(policy)
+        if canonical == "buildq":
+            raise ValueError("BaselineSimulation only runs baseline policies ('none' or 'slots:N')")
+        self.scenario = scenario
+        self.policy = canonical
+        self.policy_label = label
+        self.max_slots = max_slots
+        self.cfg = cfg
+        self.mem_floor = int(cfg.mem_floor)
+        self.cpu_target = float(cfg.cpu_target)
+        self.clock = Clock()
+        self.ids = Ids()
+        machine = scenario["machine"]
+        self.background_mem = machine.get("background_mem", 0)
+        self.background_cpu = machine.get("background_cpu", 0.0)
+        self.background = sorted(machine.get("background") or [], key=lambda b: b[0])
+        self.background_next = 0
+        self.machine = Machine(int(machine["ncpu"]), int(machine["mem_total"]))
+        self.jobs: dict[str, Job] = {}
+        self.tickets: dict[str, _BaselineTicket] = {}
+        self.queue: list[_BaselineTicket] = []
+        self.specs: dict[str, dict] = {}
+        self.records: dict[str, dict] = {}
+        self.events = {"machine_oom": 0, "own_cap_oom": 0, "stopped_seconds": 0.0, "cancelled_seconds": 0.0,
+                       "idle_core_seconds": 0.0, "ci_timed_out": 0, "min_available": None, "below_floor_s": 0}
+        self.log_lines: list[str] = []
+
+    def follow_background(self):
+        now = self.clock.now - EPOCH
+        while self.background_next < len(self.background) and self.background[self.background_next][0] <= now:
+            _, mem, cores = self.background[self.background_next]
+            self.background_mem, self.background_cpu = int(mem), float(cores)
+            self.background_next += 1
+
+    def _finish(self, job: Job, outcome: str):
+        job.alive = False
+        job.mem = 0
+        t = job.ticket
+        t.state = outcome
+        rec = self.records[t.id]
+        rec["ended"] = self.clock.now - EPOCH
+        rec["outcome"] = outcome
+
+    def _cancel(self, ticket: _BaselineTicket):
+        if ticket.state == "queued":
+            self.queue = [q for q in self.queue if q.id != ticket.id]
+        else:
+            job = self.jobs.get(ticket.id)
+            if job is not None and job.alive:
+                job.alive = False
+                job.mem = 0
+                job.discarded = True
+                self.events["cancelled_seconds"] += self.clock.now - job.started
+        ticket.state = "cancelled"
+        rec = self.records[ticket.id]
+        rec["ended"] = self.clock.now - EPOCH
+        rec["outcome"] = "cancelled"
+
+    def submit(self, spec: dict):
+        tid = str(self.ids.uuid4())
+        lane = spec.get("lane") if spec.get("lane") in self.cfg.lanes else self.cfg.lane_for(list(spec["argv"]))
+        submitted = EPOCH + float(spec["submitted_at"]) if spec.get("submitted_at") is not None else self.clock.now
+        ticket = _BaselineTicket(tid, submitted, lane, spec.get("workspace"), self.machine.ncpu)
+        self.tickets[tid] = ticket
+        self.specs[tid] = spec
+        self.records[tid] = {
+            "name": spec.get("name", " ".join(spec["argv"])[:60]), "lane": lane, "ci": bool(spec.get("ci")),
+            "submitted": self.clock.now - EPOCH, "first_start": None, "ended": None, "attempts": 0,
+            "outcome": None, "peak": 0, "planned": 0, "requeues": 0, "ci_stops": 0,
+            "failed_stop": False, "released": False,
+        }
+        self.queue.append(ticket)
+        return ticket
+
+    def step(self):
+        self.follow_background()
+        live = [j for j in self.jobs.values() if j.alive]
+        cap = max(self.machine.ncpu - self.background_cpu, 1.0)
+        demand = sum(j.wanted_cores() for j in live)
+        share = min(1.0, cap / demand) if demand > 0 else 1.0
+        for job in live:
+            job.used_cores = job.wanted_cores() * share
+            job.cpu_usec += int(job.used_cores * 1e6)
+            avg = max(float(job.spec.get("avg_cores") or 1.0), 0.1)
+            job.progress += min(job.used_cores / avg, 1.0)
+            job.mem = job.last_mem = job.memory_at(min(job.progress, float(job.spec["wall"])))
+            rec = self.records[job.ticket.id]
+            rec["peak"] = max(rec["peak"], job.mem)
+        ran = list(live)
+        used = self.background_mem + sum(j.mem for j in live)
+        while used > self.machine.mem_total and live:  # kernel OOM killer: largest live build dies (exit 137)
+            victim = max(live, key=lambda j: (j.mem, j.ticket.id))
+            self.events["machine_oom"] += 1
+            used -= victim.mem
+            self._finish(victim, "failed")
+            live.remove(victim)
+        for job in live:
+            if job.progress >= float(job.spec["wall"]) and not job.spec.get("unfinished"):
+                self._finish(job, "succeeded" if int(job.spec.get("exit", 0)) == 0 else "failed")
+        live = [j for j in live if j.alive]
+        used = self.background_mem + sum(j.mem for j in live)
+        self.machine.mem_available = max(0, self.machine.mem_total - used)
+        if self.machine.mem_available < self.mem_floor:
+            self.events["below_floor_s"] += 1
+        low = self.events["min_available"]
+        self.events["min_available"] = self.machine.mem_available if low is None else min(low, self.machine.mem_available)
+        busy = self.background_cpu + sum(j.used_cores for j in ran)
+        self.machine.busy += (busy - self.machine.busy) * AVERAGE
+        self.machine.busy_now = busy
+        if self.queue:
+            self.events["idle_core_seconds"] += max(0.0, self.machine.ncpu * self.cpu_target - busy)
+
+    def refresh_memory(self):
+        used = self.background_mem + sum(j.mem for j in self.jobs.values() if j.alive)
+        self.machine.mem_available = max(0, self.machine.mem_total - used)
+
+    def ci_timeouts(self, now: float):
+        for tid, spec in self.specs.items():
+            t = self.tickets[tid]
+            if not spec.get("ci") or t.state in self.mod.FINISHED:
+                continue
+            if now - t.submitted >= float(spec.get("timeout_s", DEFAULT_TIMEOUT)):
+                self.events["ci_timed_out"] += 1
+                self.records[tid]["timed_out_queued"] = t.state == "queued"
+                self._cancel(t)
+
+    def trace_cancels(self, now: float):
+        for tid, spec in self.specs.items():
+            if spec.get("cancel_at") is None:
+                continue
+            t = self.tickets[tid]
+            if t.state in self.mod.FINISHED:
+                continue
+            if now - t.submitted >= float(spec["cancel_at"]):
+                self.records[tid]["cancelled_by_trace"] = True
+                self._cancel(t)
+
+    def schedule(self, now: float):
+        busy_ws = {j.ticket.workspace for j in self.jobs.values() if j.alive and j.ticket.workspace}
+        running = sum(1 for j in self.jobs.values() if j.alive)
+        remaining: list[_BaselineTicket] = []
+        for t in self.queue:
+            if (self.max_slots is None or running < self.max_slots) and (not t.workspace or t.workspace not in busy_ws):
+                t.state = "running"
+                rec = self.records[t.id]
+                rec["first_start"] = now - EPOCH
+                rec["attempts"] = 1
+                rec["waited"] = round(max(0.0, now - t.submitted), 1)
+                job = Job(t, self.specs[t.id], now)
+                job.honors_grant = False  # no buildq core cap or jobserver
+                self.jobs[t.id] = job
+                running += 1
+                if t.workspace:
+                    busy_ws.add(t.workspace)
+            else:
+                remaining.append(t)
+        self.queue = remaining
+
+    def run(self, horizon: float | None = None) -> dict:
+        arrivals = sorted(enumerate(self.scenario["jobs"]), key=lambda p: (float(p[1]["t"]), p[0]))
+        last = float(arrivals[-1][1]["t"]) if arrivals else 0.0
+        horizon = horizon if horizon is not None else last + 6 * 3600
+        i, s = 0, 0
+        while True:
+            self.clock.now = EPOCH + s
+            now = self.clock.now
+            self.step()
+            while i < len(arrivals) and float(arrivals[i][1]["t"]) <= s:
+                _, spec = arrivals[i]
+                self.submit(spec)
+                i += 1
+            self.ci_timeouts(now)
+            self.trace_cancels(now)
+            self.refresh_memory()
+            self.schedule(now)
+            if i >= len(arrivals) and not self.queue and not any(j.alive for j in self.jobs.values()):
+                break
+            if s >= horizon:
+                break
+            s += 1
+        for tid, t in self.tickets.items():
+            rec = self.records[tid]
+            if rec["outcome"] is None:
+                rec["outcome"] = t.state
+            if "waited" not in rec:
+                end_t = (EPOCH + rec["ended"]) if rec["ended"] is not None else now
+                rec["waited"] = round(max(0.0, end_t - t.submitted), 1)
+            rec["recorded_wait"] = self.specs[tid].get("recorded_wait")
+            rec["warmup"] = bool(self.specs[tid].get("warmup"))
+        summary = summarize(self, s)
+        summary["policy"] = self.policy
+        return summary
+
+
 def history_runs(spec: dict, key: str, lane: str, now: float, lane_cores: int) -> list[dict]:
     """Three earlier runs of a build, as the daemon records them (see Daemon.finalize): granted its
     lane's cores (or as many as it kept busy, if more), its peak measured with those."""
@@ -955,9 +1197,23 @@ def simulate(scenario: dict, config: str, buildqd: str, name: str = "buildqd_sim
         shutil.rmtree(state, ignore_errors=True)
 
 
+def simulate_baseline(scenario: dict, policy: str, config: str = DEFAULT_CONFIG,
+                      buildqd: str = DEFAULT_BUILDQD, name: str = "buildqd_basecfg") -> tuple[dict, BaselineSimulation]:
+    """Run a baseline policy ('none' or 'slots:N') on a scenario using the config's mem_floor/cpu_target."""
+    mod = load_buildqd(buildqd, name)
+    machine = scenario["machine"]
+    cfg = mod.load_config_file(config, int(machine["mem_total"]), int(machine["ncpu"]))
+    sim = BaselineSimulation(scenario, policy, cfg)
+    return sim.run(), sim
+
+
 def cmd_run(args) -> int:
     scenario = load_scenario(args.scenario, args.seed_history, background=not args.no_background)
-    summary, sim = simulate(scenario, args.config, args.buildqd)
+    canonical, _, label = parse_policy(args.policy)
+    if canonical == "buildq":
+        summary, sim = simulate(scenario, args.config, args.buildqd)
+    else:
+        summary, sim = simulate_baseline(scenario, canonical, args.config, args.buildqd)
     if args.jobs:
         with open(args.jobs, "w") as f:
             for rec in sim.records.values():
@@ -965,7 +1221,8 @@ def cmd_run(args) -> int:
     if args.log:
         with open(args.log, "w") as f:
             f.write("\n".join(sim.log_lines) + "\n")
-    print(json.dumps(summary, indent=1, sort_keys=True) if args.json else f"{summary['scenario']}\n{table(summary)}")
+    header = summary["scenario"] if canonical == "buildq" else f"{summary['scenario']} ({label})"
+    print(json.dumps(summary, indent=1, sort_keys=True) if args.json else f"{header}\n{table(summary)}")
     return 0
 
 
@@ -1028,6 +1285,129 @@ def cmd_compare(args) -> int:
         head, _ = simulate(load_scenario(name, args.seed_history), args.config, args.head, name="buildqd_head")
         out += [compare_markdown(name, base, head), ""]
     text = "\n".join(out)
+    print(text)
+    if args.summary_file:
+        with open(args.summary_file, "a") as f:
+            f.write(text + "\n")
+    return 0
+
+
+DEFAULT_BASELINE_POLICIES = ("none", "slots:2", "slots:4", "slots:6", "buildq")
+
+
+def _fmt_succeeded(s: dict) -> str:
+    ok = s["outcomes"].get("succeeded", 0)
+    return f"{ok}/{s['builds']}"
+
+
+def _fmt_ci_wait(s: dict) -> str:
+    w = s["wait"]["ci"]
+    if not w["builds"]:
+        return "-"
+    return f"{fmt_s(w['p50'])} / {fmt_s(w['max'])}"
+
+
+def _fmt_makespan(s: dict) -> str:
+    return fmt_s(s["makespan_s"]) + ("" if s.get("complete", True) else " (cut off)")
+
+
+def baselines_markdown(name: str, about: str, results: list[tuple[str, dict]]) -> str:
+    """Side-by-side markdown table comparing baseline policies and buildq on one scenario."""
+    has_ci = any(s["wait"]["ci"]["builds"] > 0 for _, s in results)
+    builds = results[0][1]["builds"] if results else 0
+    heading = f"#### {name} ({builds} builds — {about})" if about else f"#### {name} ({builds} builds)"
+    headers = [label for label, _ in results]
+    lines = [heading, "", "| | " + " | ".join(headers) + " |",
+             "|---|" + "|".join("---:" for _ in headers) + "|"]
+    rows: list[tuple[str, object]] = [
+        ("succeeded", _fmt_succeeded),
+        ("OOM kills", lambda s: str(s["oom_kills"]["own_cap"] + s["oom_kills"]["machine"])),
+    ]
+    if has_ci:
+        rows.append(("CI timed out", lambda s: str(s["ci_timed_out"])))
+    rows.append(("makespan", _fmt_makespan))
+    if has_ci:
+        rows.append(("CI wait p50 / max", _fmt_ci_wait))
+    rows += [
+        ("agent turnaround p50", lambda s: fmt_s(s["turnaround"]["agent"]["p50"])),
+        ("least free RAM", lambda s: f"{s['least_free_gib']}G"),
+        ("time below RAM floor", lambda s: fmt_s(s["below_floor_s"])),
+        ("idle core-s (waiting)", lambda s: f"{s['idle_core_s_while_waiting']:.0f}"),
+    ]
+    for row_label, fmt in rows:
+        cells = [fmt(s) for _, s in results]
+        lines.append(f"| {row_label} | " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _baseline_totals(policy_order: list[tuple[str, str]], per_scenario: dict[str, dict[str, dict]]) -> dict[str, dict]:
+    totals: dict[str, dict] = {}
+    for canonical, label in policy_order:
+        items = [sc_map[canonical] for sc_map in per_scenario.values()]
+        builds = sum(s["builds"] for s in items)
+        succeeded = sum(s["outcomes"].get("succeeded", 0) for s in items)
+        oom = sum(s["oom_kills"]["own_cap"] + s["oom_kills"]["machine"] for s in items)
+        ci_to = sum(s["ci_timed_out"] for s in items)
+        below = sum(s["below_floor_s"] for s in items)
+        least = min((s["least_free_gib"] for s in items), default=0.0)
+        idle = round(sum(s["idle_core_s_while_waiting"] for s in items), 1)
+        totals[canonical] = {
+            "label": label, "builds": builds, "succeeded": succeeded,
+            "success_pct": round(100.0 * succeeded / builds, 1) if builds else 100.0,
+            "oom_kills": oom, "ci_timed_out": ci_to, "below_floor_s": below,
+            "least_free_gib": least, "idle_core_s_while_waiting": idle,
+        }
+    return totals
+
+
+def baselines_totals_markdown(policy_order: list[tuple[str, str]], totals: dict[str, dict], n_scenarios: int) -> str:
+    total_builds = next(iter(totals.values()))["builds"] if totals else 0
+    lines = [f"#### Totals across {n_scenarios} scenarios ({total_builds} builds)", "",
+             "| Policy | Succeeded | OOM kills | CI timed out | Time below RAM floor | Least free RAM |",
+             "|---|---:|---:|---:|---:|---:|"]
+    for canonical, _ in policy_order:
+        t = totals[canonical]
+        pct = f"{t['success_pct']:.0f}%"
+        lines.append(f"| {t['label']} | {t['succeeded']}/{t['builds']} ({pct}) | {t['oom_kills']} | "
+                     f"{t['ci_timed_out']} | {fmt_s(t['below_floor_s'])} | {t['least_free_gib']}G |")
+    return "\n".join(lines)
+
+
+def cmd_baselines(args) -> int:
+    names = args.scenario or sorted(builtin.SCENARIOS)
+    raw_policies = [p.strip() for p in args.policies.split(",") if p.strip()]
+    policy_order: list[tuple[str, str]] = []
+    for p in raw_policies:
+        canonical, _, label = parse_policy(p)
+        policy_order.append((canonical, label))
+    mod = load_buildqd(args.buildqd, "buildqd_baselines_cfg")
+    per_scenario: dict[str, dict[str, dict]] = {}
+    blocks = ["### buildq vs. baselines (no queue and fixed slots)", ""]
+    scenario_tables: list[str] = []
+    for idx, name in enumerate(names):
+        sc = load_scenario(name, args.seed_history, background=not args.no_background)
+        cfg = mod.load_config_file(args.config, int(sc["machine"]["mem_total"]), int(sc["machine"]["ncpu"]))
+        sc_results: list[tuple[str, dict]] = []
+        sc_map: dict[str, dict] = {}
+        for canonical, label in policy_order:
+            if canonical == "buildq":
+                summary, _ = simulate(sc, args.config, args.buildqd, name=f"buildqd_bl_{idx}")
+            else:
+                summary = BaselineSimulation(sc, canonical, cfg).run()
+            sc_results.append((label, summary))
+            sc_map[canonical] = summary
+        per_scenario[sc["name"]] = sc_map
+        scenario_tables.append(baselines_markdown(sc["name"], sc.get("about", ""), sc_results))
+    totals = _baseline_totals(policy_order, per_scenario)
+    if args.json:
+        payload = {"policies": [c for c, _ in policy_order], "scenarios": per_scenario, "totals": totals}
+        print(json.dumps(payload, indent=1, sort_keys=True))
+        return 0
+    if len(names) > 1:
+        blocks += [baselines_totals_markdown(policy_order, totals, len(names)), ""]
+    for block in scenario_tables:
+        blocks += [block, ""]
+    text = "\n".join(blocks).rstrip()
     print(text)
     if args.summary_file:
         with open(args.summary_file, "a") as f:
@@ -1463,6 +1843,7 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="command", required=True)
     r = sub.add_parser("run", help="replay one scenario or trace and print its summary")
     r.add_argument("scenario")
+    r.add_argument("--policy", default="buildq", help="scheduler policy: buildq (default), none, or slots:N")
     r.add_argument("--config", default=DEFAULT_CONFIG)
     r.add_argument("--buildqd", default=DEFAULT_BUILDQD)
     r.add_argument("--json", action="store_true")
@@ -1479,6 +1860,16 @@ def main(argv=None) -> int:
     c.add_argument("--base-config")
     c.add_argument("--summary-file", help="also append the table here ($GITHUB_STEP_SUMMARY)")
     c.add_argument("--seed-history", action="store_true")
+    b = sub.add_parser("baselines", help="compare buildq against no queue and fixed-slot baselines")
+    b.add_argument("scenario", nargs="*")
+    b.add_argument("--policies", default=",".join(DEFAULT_BASELINE_POLICIES),
+                   help="comma-separated policies (default: none,slots:2,slots:4,slots:6,buildq)")
+    b.add_argument("--config", default=DEFAULT_CONFIG)
+    b.add_argument("--buildqd", default=DEFAULT_BUILDQD)
+    b.add_argument("--json", action="store_true")
+    b.add_argument("--summary-file", help="also append the markdown tables here")
+    b.add_argument("--seed-history", action="store_true")
+    b.add_argument("--no-background", action="store_true")
     k = sub.add_parser("check", help="replay each scenario twice; fail if the summaries differ")
     k.add_argument("scenario", nargs="*")
     k.add_argument("--config", default=DEFAULT_CONFIG)
@@ -1494,8 +1885,8 @@ def main(argv=None) -> int:
                                      "warmup: the replay builds the queue the window begins with")
     sub.add_parser("scenarios", help="list the built-in scenarios")
     args = p.parse_args(argv)
-    return {"run": cmd_run, "compare": cmd_compare, "check": cmd_check, "export": cmd_export,
-            "scenarios": cmd_scenarios}[args.command](args)
+    return {"run": cmd_run, "compare": cmd_compare, "baselines": cmd_baselines, "check": cmd_check,
+            "export": cmd_export, "scenarios": cmd_scenarios}[args.command](args)
 
 
 if __name__ == "__main__":
