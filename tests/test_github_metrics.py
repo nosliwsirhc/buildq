@@ -392,7 +392,11 @@ class Analytics(DaemonCase):
         self.sample(t, 300, 2, kills=1)  # the slice's limit killed the linker; a sample saw it
         t.ended = None
         self.daemon.finalize(t, self.now + 310, 1, oom=False, result={"exit": 1, "oom_kills": 1, "hit_own_cap": False})
+        self.assertFalse(t.oom)  # sampled outside kill must not override hit_own_cap=False (#79)
         self.assertEqual(t.past_peak_most_over, 20 * GIB - int(2 * GIB * 1.1))
+        # Next run must keep its learned estimate instead of inflating to the lane's MemoryMax (26G).
+        nxt = self.submit(t.argv, cwd=t.cwd, again=True)
+        self.assertLess(nxt.est_mem, 24 * GIB)
 
     def test_switching_it_off_ends_a_standing_decision_without_a_breach(self):
         t = self.past_its_peak()

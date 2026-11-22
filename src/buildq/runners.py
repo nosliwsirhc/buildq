@@ -231,10 +231,19 @@ class SystemdRunner:
         # systemd prints UINT64_MAX (18446744073709551615) when an OOM counter is unavailable;
         # sane_count() rejects that sentinel alongside non-numeric or negative values.
         if int(common.sane_count(props.get("OOMKills")) or 0) > 0:
+            if ticket.cg:
+                local = machine.cgroup_events(ticket.cg)
+                if local and local.get("oom", 0) == 0:
+                    return "slice-oom-kill"
             return "oom-kill"
         if int(common.sane_count(props.get("ManagedOOMKills")) or 0) > 0:
             return "managed-oom-kill"
-        return props.get("Result", "").strip()
+        verdict = props.get("Result", "").strip()
+        if verdict == "oom-kill" and ticket.cg:
+            local = machine.cgroup_events(ticket.cg)
+            if local and local.get("oom", 0) == 0:
+                return "slice-oom-kill"
+        return verdict
 
     def cleanup(self, ticket):
         """Unload the build's service once its outcome is read (a failed one stays loaded until then)."""

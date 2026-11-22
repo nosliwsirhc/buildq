@@ -234,6 +234,7 @@ class Ticket:
         self.cpu_usec_base = None
         self.oom_base = 0
         self.oom_kills = 0
+        self.sampled_own_oom: bool | None = None  # from memory.events.local `oom` when a kill is sampled
         self.flock = None  # (lock path, holder pid) for a build found holding a flock slot
         self.reason = ""
         self.reason_cat = ""
@@ -363,7 +364,16 @@ class Ticket:
                     if self.released:
                         common.log(f"{self.id} grew past what was kept for it after its peak ({common.fmt_size(used)} > "
                             f"{common.fmt_size(self.release_hold)}); holding its full {common.fmt_size(self.est_mem)} again", level=4)
+        prev_kills = self.oom_kills
         self.oom_kills = max(0, oom - (self.oom_base or 0))
+        if self.cg and self.oom_kills > prev_kills:
+            local = machine.cgroup_events(self.cg)
+            if local:
+                if local.get("oom", 0) > 0:
+                    self.sampled_own_oom = True
+                    self.kills_own_cap = True
+                elif self.sampled_own_oom is None:
+                    self.sampled_own_oom = False
         if self.release_at is not None and not self.release_revoked and self.oom_kills > self.release_oom_base:
             self.release_revoked = self.release_breach = self.release_dirty = True  # something in it was killed for memory
             self.release_end = round(elapsed, 1)
