@@ -73,24 +73,28 @@ class SchedulerMixin:
             passes = bool(lane and lane.may_pass_held)
             # A build that has waited starve_seconds goes ahead of everything else, or a stream of
             # quicker or higher builds could keep it waiting for ever. With ci_first a CI job's build
-            # counts so at once, and any build that has waited much longer goes before it: a
-            # session's, or a CI job's that higher-lane CI builds keep passing.
+            # counts so at once, and any build that has waited much longer (in the queue, not its
+            # running time) or was stopped to free memory goes before it: a session's, or a CI job's
+            # that higher-lane CI builds keep passing.
             starving = self.starving(t, now) and not passes
+            queued_time = t.wait_total + max(0.0, now - (t.queued_at or t.submitted))  # (its queued time, not its runs)
             overdue = (self.cfg.ci_first and not passes and not self.yielding(t, now)
-                       and (now - t.submitted >= 3 * self.cfg.starve_seconds or t.requeues > 0))
+                       and (queued_time >= 3 * self.cfg.starve_seconds or t.requeues > t.ci_stops))
             # A CI job's build goes before the others at its priority, and one that has waited out its
             # turn before newer ones, or a stream of quicker CI builds could keep it waiting past its
             # job's time limit. Not among overdue builds (they go in the plain order, or a backlog of
             # CI builds could keep an overdue session's build waiting), nor in a lane that passes held
             # room (it gets no head start there).
             first = self.cfg.ci_first and t.from_ci and not passes and not overdue
-            # A CI job's build near its job's time limit goes before all of them, the oldest first (the
-            # nearest to its limit, whatever its lane); a build that has waited CI_LONG_WAITS times
-            # starve_seconds (two hours here) goes before even that, so a stream of CI jobs can't keep
-            # it waiting for ever, while a release's steps still go first in any likely queue.
-            due = self.ci_due(t, now)
-            queued = t.wait_total + max(0.0, now - (t.queued_at or t.submitted))  # (its queued time, not its runs)
-            long = overdue and not t.from_ci and queued >= CI_LONG_WAITS * self.cfg.starve_seconds
+            # A CI job's build near its job's time limit (or one we just stopped running builds to
+            # make room for) goes before all of them, the oldest first (the nearest to its limit,
+            # whatever its lane); a build that has waited CI_LONG_WAITS times starve_seconds (two
+            # hours here) goes before even that, so a stream of CI jobs can't keep it waiting for
+            # ever, while a release's steps still go first in any likely queue.
+            room_ready = (t.from_ci and not passes and t.id in self.room_made
+                          and now - self.room_made[t.id] < self.ROOM_PAUSE)
+            due = self.ci_due(t, now) or room_ready
+            long = overdue and not t.from_ci and queued_time >= CI_LONG_WAITS * self.cfg.starve_seconds
             return (not long, not due, t.submitted if due else 0.0, not overdue, not starving, -self.weight(t),
                     not first, not (first and self.waited_out(t, now)))
 
@@ -434,6 +438,8 @@ class SchedulerMixin:
 
     ROOM_PAUSE = 120.0  # seconds after making room for a CI job's build, while it is queued, before more is made
 
+    SOON_FINISH = 180.0  # seconds: wait instead of stopping if running builds finishing this soon cover the shortfall
+
     def was_overdue(self, t: Ticket) -> bool:
         """It went before CI jobs' builds when it started: it had waited three times starve_seconds,
         or it had been stopped once, and its lane doesn't pass held room (see queue)."""
@@ -486,6 +492,18 @@ class SchedulerMixin:
             short = ci.est_mem - (free_now - ci.short_hm)
             if short <= 0:
                 continue  # it fits: it starts on the next pass
+            # If running builds with known history are expected to finish within SOON_FINISH and
+            # already cover the shortfall (e.g. a short CI step started just before this one), wait
+            # for them rather than stopping a long-running build and throwing its work away.
+            soon_free = sum(
+                t.mem_now + self.still_to_grow(t, now)
+                for t in running
+                if not t.flock and t.state == "running" and not t.frozen
+                and t.expected is not None and t.started is not None
+                and 0.0 <= t.expected - (now - t.started - self.paused_for(t, now)) <= self.SOON_FINISH
+            )
+            if soon_free >= short:
+                return
             weight = self.weight(ci)
             spare = self.cfg.make_room_spare_after
             protect = not self.cfg.make_room_behind_agents
@@ -883,7 +901,9 @@ class SchedulerMixin:
             if holds and not passes and self.starving(t, now):
                 t.held = True
                 cores = t.need if lane.waits_for_cpu else 0  # it would start without that room
-                if self.waited_out(t, now) or self.ci_due(t, now):
+                room_ready = (t.from_ci and t.id in self.room_made
+                              and now - self.room_made[t.id] < self.ROOM_PAUSE)
+                if self.waited_out(t, now) or self.ci_due(t, now) or room_ready:
                     held_mem += t.est_mem
                     held_cpu += cores
                     held_n_mem += 1
@@ -1069,14 +1089,18 @@ class SchedulerMixin:
         changed = []
         idle_grown = 0  # cores handed out from measured idle ones this pass
         waiting_for_memory = any(t.reason_cat == "memory" for t in queued)
-        if spare >= 1 and free_mem > 0 and not waiting_for_memory:
+        if spare >= 1:
             growers = sorted((t for t in elastic if t.granted < t.want and t.cores_now >= 0.75 * t.granted
                               and (t.release_at is None or t.release_revoked)),
                              key=lambda t: (not t.from_ci, t.granted / max(t.want, 1)))
             for t in growers:
+                # While a build waits for memory, take no extra memory for more cores (mem_room = 0),
+                # but still hand out idle cores that cost zero extra memory so running builds finish
+                # faster and free their memory sooner.
+                mem_room = 0 if waiting_for_memory else max(free_mem, 0)
                 add = int(min(t.want - t.granted, math.floor(spare)))
-                while add >= 1 and self.mem_for(t, t.granted + add) - t.est_mem > free_mem:
-                    add -= 1  # the memory more cores would need isn't free
+                while add >= 1 and self.mem_for(t, t.granted + add) - t.est_mem > mem_room:
+                    add -= 1  # the memory more cores would need isn't free (or a build waits for memory)
                 if add >= 1:
                     new_mem = max(t.est_mem, self.mem_for(t, t.granted + add))
                     free_mem -= new_mem - t.est_mem

@@ -2022,6 +2022,50 @@ class MakeRoomForCI(DaemonCase):
         self.daemon.shed(u, self.now)
         self.assertIn("fourth time", u.shed_error)
 
+    def test_a_build_stopped_for_ci_doesnt_jump_ahead_of_other_ci_builds_as_overdue(self):
+        # A build that ran for a long time (0s queued) and was stopped for CI step #1 still goes
+        # ahead of other agent builds once step #1 starts, but must not jump ahead of CI step #2.
+        old, new = self.agents(12, 12)
+        ci1 = self.ci_waiting("16G")
+        ci2 = self.submit(("cargo", "test", "-p", "second"), mem="16G", env=self.CI, cwd=self.workdir())
+        # Simulate that `new` ran 40 minutes before being stopped for ci1 (0s prior queue wait).
+        new.submitted = self.now - 2400
+        new.wait_total = 0.0
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [new.id])
+        self.runner.running.discard(new.id)
+        self.daemon.check(self.now + 302)
+        self.machine.mem_available += 12 * GIB
+        self.tick(303)  # ci1 starts; new stops yielding to ci1
+        self.assertEqual(ci1.state, "running")
+        self.assertEqual([t.id for t in self.daemon.queue(self.now + 303)], [ci2.id, new.id])
+        del old
+
+    def test_overdue_agent_cannot_steal_room_just_made_for_a_ci_build(self):
+        # When make_room_for_ci has just stopped a build for `ci`, `ci` is prioritized over queued
+        # overdue agent builds during ROOM_PAUSE so they cannot steal the newly-freed memory.
+        old, new = self.agents(12, 12)
+        overdue = self.submit(("cargo", "test", "-p", "old-agent"), mem="12G", caller="a", cwd=self.workdir())
+        overdue.submitted = self.now - 3 * self.daemon.cfg.starve_seconds - 60
+        overdue.queued_at = overdue.submitted
+        ci = self.ci_waiting("12G")
+        self.daemon.room_made[ci.id] = self.now
+        self.assertEqual([t.id for t in self.daemon.queue(self.now)][:2], [ci.id, overdue.id])
+        del old, new
+
+    def test_no_build_is_stopped_when_a_running_build_finishing_soon_covers_the_shortfall(self):
+        # A running build expected to finish within SOON_FINISH (3 min) that covers the shortfall
+        # avoids killing a long-running build. Once it runs past its expected time, it no longer holds.
+        long_build, short_build = self.agents(12, 12)
+        long_build.expected = 3600.0
+        short_build.expected = 360.0  # started at self.now + 1: 60s left at self.now + 301
+        self.ci_waiting("16G")  # lacks 5G; short_build (12G) finishes in ~60s
+        self.tick(301)
+        self.assertEqual(self.runner.forced, [])
+        # Past short_build's expected end (360s): it ran slower than history, so make room now.
+        self.tick(365)
+        self.assertEqual(self.runner.forced, [short_build.id])
+
 
 
 class Priorities(DaemonCase):
