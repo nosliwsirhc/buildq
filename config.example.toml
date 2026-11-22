@@ -138,10 +138,10 @@ mem_margin = 1.15
 # ---- Running builds -------------------------------------------------------------------------
 
 # How buildq runs and limits each build. Leave on "auto" unless you want to force a specific mode:
-#   "auto"    — automatically picks systemd, else cgroup v2 (if set up), else direct (works everywhere).
-#   "systemd" — runs each build as a transient systemd user service (Ubuntu, Fedora, Arch, Debian).
-#   "cgroup"  — uses Linux cgroup v2 directly without systemd (see init/README.md for boot setup).
-#   "direct"  — works on any Linux host, WSL2, or container with zero setup and no root.
+#   "auto":    automatically picks systemd, else cgroup v2 (if set up), else direct (works everywhere).
+#   "systemd": runs each build as a transient systemd user service (Ubuntu, Fedora, Arch, Debian).
+#   "cgroup":  uses Linux cgroup v2 directly without systemd (see init/README.md for boot setup).
+#   "direct":  works on any Linux host, WSL2, or container with zero setup and no root.
 runner = "auto"
 
 # The systemd slice builds run in (used when runner is "systemd").

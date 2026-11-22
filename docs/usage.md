@@ -80,9 +80,9 @@ arguments name no path outside the tree:
   check, clippy, test or `nextest run`, dotnet test, `zig test` or `zig ast-check`, `gcc`/`g++`/
   `clang`/`clang++`/`cc`/`c++` with `-fsyntax-only`, `pytest`, `mypy`, `pyright`/`basedpyright`,
   `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv run --no-sync <check>` (explicit `--no-sync`
-  is required so reuse never skips `.venv` syncing), `tsc --noEmit`, eslint, `vitest run` — none
-  with mutating, dry-run, info, response-file (`@file`), or watch flags (`--fix`, vitest's `-u`/
-  `-ut`, `--update-snapshots`, `--no-run`, `--collect-only`, etc.) — run directly or behind a
+  is required so reuse never skips `.venv` syncing), `tsc --noEmit`, eslint, `vitest run`, with none
+  of the mutating, dry-run, info, response-file (`@file`), or watch flags (`--fix`, vitest's `-u`/
+  `-ut`, `--update-snapshots`, `--no-run`, `--collect-only`, etc.), run directly or behind a
   wrapper buildq can read for certain (`env` with exact options, `timeout DURATION`, `nice`/`time`
   with no options: behind `ionice -c3` or `nice -n 5`, say, it isn't). Gradle and CTest are not
   auto-reused without `--reuse` (Gradle writes build/test reports by default; CTest runs prebuilt
@@ -178,7 +178,7 @@ the news without polling:
 
 | Variable | Effect |
 | -------- | ------ |
-| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock` or `/run/user/$UID/buildq.sock` on systemd hosts, and `~/.local/state/buildq/run/buildq.sock` on non-systemd hosts — falling back to `/tmp/buildq-<uid>/buildq.sock` only if that path exceeds 100 bytes — so background services and terminal sessions always share the same daemon) |
+| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock` or `/run/user/$UID/buildq.sock` on systemd hosts, and `~/.local/state/buildq/run/buildq.sock` on non-systemd hosts, falling back to `/tmp/buildq-<uid>/buildq.sock` only if that path exceeds 100 bytes, so background services and terminal sessions always share the same daemon) |
 | `BUILDQ_RUNNER` | override `runner` from `config.toml` (`auto`, `systemd`, `cgroup`, or `direct`) |
 | `BUILDQ_CGROUP_ROOT` | override `cgroup_root` from `config.toml` (optional custom cgroup v2 folder for the `cgroup` runner) |
 | `BUILDQ_FALLBACK` | what `buildq run` does when the daemon can't be reached. Unset: wait for it. `fail`: exit 75. `run`: run the command unqueued. Anything else: a command prefix to run it through instead. |

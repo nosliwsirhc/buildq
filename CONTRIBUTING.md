@@ -1,21 +1,19 @@
 # Contributing to buildq
 
-Thanks for your interest in contributing to **buildq**! Bug reports, documentation improvements,
-testing on different Linux distributions and init systems, new build tool integrations, and code
-fixes are all welcome.
+Contributions to buildq are welcome: bug reports, documentation fixes, testing on different Linux distributions and init systems, new build tool integrations, and code fixes.
 
 ## Ways to contribute
 
 - **Report a bug or suggest a feature** using the [issue templates](https://github.com/nosliwsirhc/buildq/issues/new/choose).
 - **Ask questions or share distro setups** in [GitHub Discussions](https://github.com/nosliwsirhc/buildq/discussions).
-- **Improve the docs** — if something in [README.md](README.md), [init/README.md](init/README.md),
+- **Improve the docs:** if something in [README.md](README.md), [init/README.md](init/README.md),
   or `docs/` was confusing or hard to follow, a pull request to make it clearer is always welcome.
-- **Test on your Linux setup** — especially non-systemd distros (Alpine, Void, Gentoo, Artix,
+- **Test on your Linux setup:** especially non-systemd distros (Alpine, Void, Gentoo, Artix,
   Devuan, Chimera, Slackware), WSL2, containers, or unusual build tools.
-- **Add support for a build tool or compiler** — most tools only need a single `ToolSpec` entry in
+- **Add support for a build tool or compiler:** most tools only need a single `ToolSpec` entry in
   [src/buildq/tools.py](src/buildq/tools.py) (plus optional shim routing in
   [bin/buildq-shim](bin/buildq-shim) and [install.sh](install.sh)).
-- **Pick up an open issue** — look for issues labeled
+- **Pick up an open issue:** look for issues labeled
   [`good first issue`](https://github.com/nosliwsirhc/buildq/labels/good%20first%20issue) or
   [`help wanted`](https://github.com/nosliwsirhc/buildq/labels/help%20wanted).
 
@@ -34,7 +32,7 @@ the approach before you spend time writing code.
 5. Push your branch and open a pull request against `main`.
 
 > **First-time contributors:** GitHub Actions waits for a maintainer to approve CI runs on a
-> first-time contributor's fork PR. That's normal — a maintainer will approve it when reviewing.
+> first-time contributor's fork PR. That's normal; a maintainer will approve it when reviewing.
 
 ## Running tests locally
 
@@ -58,7 +56,7 @@ sh -n install.sh bin/buildq-rustc-guard init/cgroup-setup.sh init/runit/buildqd/
 ```
 
 If you change scheduling behavior, you can also compare your branch against `main` using the replay
-simulator — see [docs/benchmark.md](docs/benchmark.md).
+simulator (see [docs/benchmark.md](docs/benchmark.md)).
 
 CI also runs free automated security checks on every pull request (`shellcheck` + `dash -n`,
 `ruff`, `semgrep`, `gitleaks`, `actionlint`, `zizmor`, and GitHub CodeQL).
@@ -78,6 +76,6 @@ CI also runs free automated security checks on every pull request (`shellcheck` 
 
 ## Code of Conduct & Security
 
-- Please be respectful and constructive — see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- Please be respectful and constructive (see [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)).
 - To report a security issue privately, see [SECURITY.md](SECURITY.md) rather than opening a public
   issue.
