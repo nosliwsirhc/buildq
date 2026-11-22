@@ -12,7 +12,7 @@ link runs this program, which finds the real tool further down PATH and then:
   - runs everything directly inside a build, which already holds a turn.
 
 Heavy means it compiles or runs a whole suite: any cargo subcommand but the few that never
-compile (fmt, metadata, tree, clean, ...), npm/pnpm/yarn scripts named build*, test*, lint*,
+compile (fmt, metadata, tree, ...), npm/pnpm/yarn scripts named build*, test*, lint*,
 check*, e2e* and the like, `vitest run`, `jest`, `vite build`, `tsc`, `playwright test`, make and
 ninja (except dry runs and long-running targets such as dev, serve or up), `dotnet build/test/
 publish/pack`, `cmake --build/--workflow`, `ctest` (except `--show-only`/`--list-presets`),
@@ -38,7 +38,7 @@ import sys
 # redefine these ("Aliases are not allowed to redefine existing built-in commands", cargo's
 # configuration reference; seen with cargo 1.99: CARGO_ALIAS_TREE is ignored).
 CARGO_OWN_LIGHT = {"metadata", "tree", "version", "help", "search", "login", "logout", "owner", "yank",
-                   "locate-project", "pkgid", "read-manifest", "verify-project", "clean", "new", "init", "add",
+                   "locate-project", "pkgid", "read-manifest", "verify-project", "new", "init", "add",
                    "remove", "update", "fetch", "generate-lockfile", "vendor", "config", "report", "uninstall"}
 # Names an alias may take: other programs' (cargo-fmt, cargo-watch, cargo-deny, ...); `rm`, itself
 # cargo's alias for `remove`, which a user's alias replaces (CARGO_ALIAS_RM=version cargo rm prints
@@ -160,7 +160,7 @@ def never_builds(tool: str, args: list[str]) -> bool:
         return False  # (cargo's --config can define an alias, or anything else)
     if sub[0] == "fmt":
         return "CARGO_ALIAS_FMT" not in os.environ
-    return sub[0] in CARGO_OWN_LIGHT and sub[0] != "clean"
+    return sub[0] in CARGO_OWN_LIGHT
 
 
 def heavy(tool: str, args: list[str]) -> bool:

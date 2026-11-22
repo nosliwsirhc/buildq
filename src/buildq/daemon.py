@@ -656,8 +656,9 @@ class Daemon(GitHubMixin, SchedulerMixin):
         t.release_at, t.release_hold, t.after_release_peak, t.release_revoked = None, 0, 0, False
         t.settled_since, t.swap_now, t.observed_gap, t.release_end, t.peak_cpu = None, 0, False, None, 0.0
         t.peak_swap = t.tail_used = 0
-        t.release_est = t.release_oom_base = t.kills_seen = 0
+        t.release_est = t.release_oom_base = t.kills_seen = t.oom_kills = 0
         t.release_breach = t.kills_own_cap = t.release_open_at_gap = False
+        t.sampled_own_oom = None
         t.mem_wait_some = t.mem_wait_full = 0.0
         t.mem_high = 0
         t.source_verified = None  # the next attempt is checked afresh
@@ -838,9 +839,11 @@ class Daemon(GitHubMixin, SchedulerMixin):
                     verdict = self.result_of(t)
                     if verdict is PENDING:
                         continue  # finalized on a later tick, with systemd's verdict
-                    oom = verdict == "oom-kill" or t.cap_killed
+                    own_cap_now = bool(t.cg) and machine.cgroup_events(t.cg).get("oom", 0) > 0
+                    slice_oom = verdict == "slice-oom-kill" or (
+                        verdict == "oom-kill" and t.sampled_own_oom is False and not own_cap_now)
+                    oom = (verdict == "oom-kill" and not slice_oom) or t.cap_killed
                     managed_oom = verdict == "managed-oom-kill"
-                    slice_oom = verdict == "slice-oom-kill"
                     error = None if t.cancel_requested else (
                         t.error if t.cap_killed and t.error else
                         "it was stopped for memory (systemd-oomd)" if managed_oom else
@@ -980,7 +983,12 @@ class Daemon(GitHubMixin, SchedulerMixin):
         exit_code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
         lane = self.lane(t.lane)
         t.exit = exit_code
-        own_oom = bool((oom if learn_oom is None else learn_oom) or t.oom_kills) or (
+        result_hit_own_cap = result.get("hit_own_cap") if isinstance(result, dict) and "hit_own_cap" in result else None
+        sampled_own_oom = (bool(t.oom_kills)
+                           and result_hit_own_cap is not False
+                           and learn_oom is not False
+                           and t.sampled_own_oom is not False)
+        own_oom = bool((oom if learn_oom is None else learn_oom) or sampled_own_oom) or (
             exit_code == 137 and bool(lane.mem_cap) and t.mem_peak >= 0.9 * lane.mem_cap)
         t.oom = bool(oom) or own_oom
         t.timed_out = timed_out
@@ -1450,11 +1458,18 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 for conn in self.watchers.get(t.id, ()):
                     if getattr(conn, "submission", None) in t.interests:
                         t.followed[conn.submission] = now
+                dirty = False
                 gone = [who for who, kind in t.interests.items() if kind == "run" and who not in self.waiting(t, now)]
                 if gone and len(gone) < len(t.interests):  # (the last one's going is the unwatched rule below)
                     for who in gone:
                         del t.interests[who]
                         t.followed.pop(who, None)
+                    dirty = True
+                want_attached = "submit" not in t.interests.values()
+                if t.attached != want_attached:
+                    t.attached = want_attached
+                    dirty = True
+                if dirty:
                     self.save(t)
             if not t.attached or t.state in FINISHED or t.cancel_requested or t.flock:
                 continue
@@ -1583,9 +1598,10 @@ class Daemon(GitHubMixin, SchedulerMixin):
                         # A `run` that made or joined it was interrupted: that submission stops
                         # waiting. The build stops only when it was the last one waiting.
                         del t.interests[who]
+                        t.followed.pop(who, None)
+                        t.agents.pop(who, None)
                         if self.waiting(t, now):
-                            if "submit" in t.interests.values():
-                                t.attached = False  # a dropped-off submission waits: no client's going cancels it
+                            t.attached = "submit" not in t.interests.values()
                             self.save(t)
                             common.log(f"{t.id}: a submission that waited for it went; {len(self.waiting(t, now))} still wait")
                             conn.send({"type": "ticket", **t.row(now, self.position(t)), "kept": True})

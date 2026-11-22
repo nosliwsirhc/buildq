@@ -12,7 +12,8 @@ Telling agents to use the queue works most of the time. Two optional pieces make
   `gradle` when those binaries exist on `PATH` (absent optional tools aren't linked, so wrappers
   like `command -v gradle || ./gradlew` keep working).
   A heavy command runs as `buildq run -- <the real tool> ...`: any cargo subcommand that compiles
-  (everything but `fmt`, `metadata`, `tree`, `clean` and the like, external subcommands included),
+  (everything but `fmt`, `metadata`, `tree` and the like, external subcommands included; `cargo clean`
+  also queues so it waits for builds using the same target directory),
   npm and pnpm scripts named like `build*`, `test*`, `lint*` or `e2e*`, `vitest run`, `make`
   (except long-running targets such as `dev` or `up`), `dotnet build/test`, `cmake --build` /
   `--workflow`, `ctest` (except `--show-only`/`--list-presets`), `zig build/test/build-exe/

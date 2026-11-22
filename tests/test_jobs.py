@@ -1152,6 +1152,9 @@ class ShimRules(unittest.TestCase):
                         "make help", "make --version", "pnpm --version", "npm version", "dotnet --info",
                         "env X=1 cargo fmt", "sh -c cargo-fmt", "./cargo-fmt.sh"):
             self.assertFalse(self.never_builds(command), command)
+        # Shimmed `cargo clean` must also queue so it waits for any build using the same target directory (#76).
+        self.assertTrue(self.shim.heavy("cargo", ["clean"]))
+        self.assertTrue(self.shim.heavy("cargo", ["clean", "-p", "api"]))
 
     def test_duplicate_option_values_do_not_confuse_tool_or_subcommand_position(self):
         self.assertTrue(self.shim.heavy("pnpm", ["--filter", "vite", "vite", "build"]))

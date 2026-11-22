@@ -517,6 +517,51 @@ class SheddingMemory(DaemonCase):
         inflated = self.submit(("cargo", "test"), cwd=cwd, again=True)
         self.assertGreaterEqual(inflated.est_mem, 20 * GIB)
 
+    def test_systemd_slice_oom_kill_does_not_inflate_future_estimates(self):
+        # Part 2 of #79: distinguish shared-slice OOM kills from own-cap OOM kills via memory.events.local.
+        cg = os.path.join(self.tmp.name, "cg-slice-oom")
+        os.makedirs(cg, exist_ok=True)
+        with open(os.path.join(cg, "memory.events.local"), "w") as f:
+            f.write("low 0\nhigh 0\nmax 0\noom 0\noom_kill 1\n")
+        runner = runners.SystemdRunner(self.tmp.name)
+        probe = self.submit(("cargo", "check"), cwd=self.workdir("probe"))
+        probe.unit, probe.cg = "buildq-probe.service", cg
+        out = "LoadState=loaded\nResult=signal\nOOMKills=1\nManagedOOMKills=0\n"
+        with mock.patch.object(runners.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, stdout=out, stderr="")):
+            self.assertEqual(runner.result(probe), "slice-oom-kill")
+        with open(os.path.join(cg, "memory.events.local"), "w") as f:
+            f.write("low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\n")
+        with mock.patch.object(runners.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, stdout=out, stderr="")):
+            self.assertEqual(runner.result(probe), "oom-kill")
+
+        # Even if the cgroup is already gone when systemd reports OOMKills=1, a prior 1 Hz sample
+        # that saw memory.events.local `oom 0` prevents inflating future estimates.
+        cwd = self.workdir("slice-sampled")
+        base = self.submit(("cargo", "test"), cwd=cwd)
+        base.measured, base.mem_peak = True, 2 * GIB
+        self.finish(base, 0)
+        self.now += 40
+        victim = self.submit(("cargo", "test"), cwd=cwd, again=True)
+        self.assertLess(victim.est_mem, 5 * GIB)
+        victim.cg = cg
+        with open(os.path.join(cg, "memory.events.local"), "w") as f:
+            f.write("low 0\nhigh 0\nmax 0\noom 0\noom_kill 1\n")
+        with mock.patch.object(machine, "cgroup_stats", return_value=(1_000_000, 2 * GIB, 1)), \
+                mock.patch.object(machine, "cgroup_swap", return_value=0), \
+                mock.patch.object(machine, "cgroup_memory_waits", return_value=None):
+            victim.measure(self.now + 10)
+        self.assertIs(victim.sampled_own_oom, False)
+        self.runner.running.discard(victim.id)
+        self.runner.result = lambda ticket: "oom-kill"
+        self.daemon.check(self.now + 40)
+        self.assertEqual((victim.state, victim.oom), ("lost", True))
+        self.assertIn("slice memory limit", victim.error)
+        self.now += 50
+        after = self.submit(("cargo", "test"), cwd=cwd, again=True)
+        self.assertLess(after.est_mem, 5 * GIB)
+
     def test_turning_it_off_lets_paused_builds_go_on(self):
         (t,) = self.running(1)
         self.falling_to(4 * GIB, self.now + 100)

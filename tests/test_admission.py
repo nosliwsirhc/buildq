@@ -702,6 +702,40 @@ class SameSource(DaemonCase):
         self.daemon.drop_unwatched(self.now + 100)  # the killed run never followed again
         self.assertEqual(list(owner.interests), ["owner"])
 
+    def test_drop_unwatched_and_cancel_keep_attached_in_sync_with_interests(self):
+        # Corner 1 (#74): a `buildq run` starts, a `buildq submit` joins, and the `run` dies outright.
+        # Even if `attached` stayed True, once only `submit` interests remain it must become False and stay alive.
+        run_first = self.submit(("cargo", "test"), source=SOURCE, attach=True, submission="r1")
+        self.submit(("cargo", "test"), cwd=run_first.cwd, source=SOURCE, attach=False, submission="s1")
+        run_first.attached = True  # simulate stale attached=True
+        run_first.last_watched = self.now
+        self.daemon.started_at = self.now - 1000
+        self.daemon.drop_unwatched(self.now + 100)
+        self.assertEqual(run_first.interests, {"s1": "submit"})
+        self.assertFalse(run_first.attached)
+        self.assertFalse(run_first.cancel_requested)
+
+        # Corner 2 (#74): a `buildq submit` starts, a `buildq run` joins, `submit` cancels its own submission,
+        # leaving only `run`. `attached` must flip to True so killing `run` cancels the unwatched build.
+        sub_first = self.submit(("cargo", "build"), cwd=self.workdir("c2"), source=SOURCE, attach=False, submission="s2")
+        self.submit(("cargo", "build"), cwd=sub_first.cwd, source=SOURCE, attach=True, submission="r2")
+        self.assertFalse(sub_first.attached)
+
+        class Conn:
+            sent = []
+
+            def send(self, msg):
+                self.sent.append(msg)
+                return True
+
+        self.daemon.started_at = self.now - 1000
+        self.daemon.handle_message({"op": "cancel", "ticket": sub_first.id, "submission": "s2"}, Conn(), self.now + 5)
+        self.assertFalse(sub_first.cancel_requested)
+        self.assertEqual(sub_first.interests, {"r2": "run"})
+        self.assertTrue(sub_first.attached)
+        self.daemon.drop_unwatched(self.now + 100)  # r2 was killed outright and never followed again
+        self.assertTrue(sub_first.cancel_requested)
+
     def test_a_new_joiners_grace_holds_off_the_unwatched_cancel(self):
         run = self.submit(("cargo", "test"), source=SOURCE, attach=True, submission="first")
         run.last_watched = self.now  # its client last followed now, and went
