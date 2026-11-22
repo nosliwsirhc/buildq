@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions & distro setup help
+    url: https://github.com/nosliwsirhc/buildq/discussions
+    about: Ask usage questions, share configs, or get help setting up buildq on your Linux distro.
+  - name: Report a security vulnerability
+    url: https://github.com/nosliwsirhc/buildq/security/advisories/new
+    about: Please report security issues privately instead of opening a public issue.

@@ -1,0 +1,21 @@
+name: Feature request or new build tool
+description: Suggest an improvement, a new compiler/tool, or init-system support
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the workflow, build tool, or Linux environment you're using and what's missing or painful today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed idea
+      description: How would you like buildq to behave? For a new build tool, mention how it controls parallelism (env vars, CLI flags, or GNU make jobserver) and whether it spawns a background daemon.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, examples, or anything else that helps.
