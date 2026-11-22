@@ -929,6 +929,46 @@ class Baselines(SimCase):
         self.assertEqual(payload["policies"], ["none", "buildq"])
         self.assertEqual(payload["totals"]["buildq"]["succeeded"], 10)
 
+    def test_charts_renders_valid_svg_for_dark_and_light(self):
+        import xml.etree.ElementTree as ET
+        import charts  # bench/ is on sys.path via tests/test_sim.py
+
+        # Minimal synthetic baselines payload matching `sim.py baselines --json`
+        def sc_entry(ok, builds, oom, ci_to, ci_p50, makespan):
+            return {
+                "builds": builds,
+                "outcomes": {"succeeded": ok},
+                "oom_kills": {"own_cap": 0, "machine": oom},
+                "ci_timed_out": ci_to,
+                "wait": {"ci": {"p50": ci_p50}},
+                "makespan_s": makespan,
+            }
+
+        data = {
+            "policies": ["none", "slots:2", "slots:4", "slots:6", "buildq"],
+            "totals": {
+                "none": {"builds": 132, "succeeded": 114, "oom_kills": 18, "ci_timed_out": 0, "least_free_gib": 0.2, "below_floor_s": 4397},
+                "slots:2": {"builds": 132, "succeeded": 98, "oom_kills": 0, "ci_timed_out": 34, "least_free_gib": 58.9, "below_floor_s": 0},
+                "slots:4": {"builds": 132, "succeeded": 124, "oom_kills": 0, "ci_timed_out": 8, "least_free_gib": 23.3, "below_floor_s": 0},
+                "slots:6": {"builds": 132, "succeeded": 127, "oom_kills": 1, "ci_timed_out": 4, "least_free_gib": 0.1, "below_floor_s": 2146},
+                "buildq": {"builds": 132, "succeeded": 132, "oom_kills": 0, "ci_timed_out": 0, "least_free_gib": 23.4, "below_floor_s": 0},
+            },
+            "scenarios": {
+                "mixed-day": {p: sc_entry(75, 75, 0, 0, 7 if p == "buildq" else 990, 12000) for p in ("none", "slots:2", "slots:4", "slots:6", "buildq")},
+                "ci-behind-agents": {p: sc_entry(12, 12, 0, 0, 294 if p == "buildq" else 2052, 5400) for p in ("none", "slots:2", "slots:4", "slots:6", "buildq")},
+                "ci-behind-overdue": {p: sc_entry(13, 13, 0, 0, 678 if p == "buildq" else 3000, 8280) for p in ("none", "slots:2", "slots:4", "slots:6", "buildq")},
+                "outgrows-estimate": {p: sc_entry(22, 22, 0, 0, 0, 3720 if p == "buildq" else 4230) for p in ("none", "slots:2", "slots:4", "slots:6", "buildq")},
+                "burst": {p: sc_entry(10, 10, 0, 0, 0, 2400) for p in ("none", "slots:2", "slots:4", "slots:6", "buildq")},
+            },
+        }
+        for mode in ("dark", "light"):
+            ov = charts.render_overview(data, mode)
+            sc = charts.render_scenarios(data, mode)
+            self.assertEqual(ET.fromstring(ov).tag, "{http://www.w3.org/2000/svg}svg")
+            self.assertEqual(ET.fromstring(sc).tag, "{http://www.w3.org/2000/svg}svg")
+            self.assertIn("132/132", ov)
+            self.assertIn("7s (141x vs 4 slots)", sc)
+
 
 if __name__ == "__main__":
     unittest.main()
