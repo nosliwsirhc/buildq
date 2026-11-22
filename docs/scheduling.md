@@ -28,9 +28,9 @@ session's build can wait. It goes ahead of every build that hasn't waited `starv
 whatever its lane, and of the others at its priority, so when room frees up it gets it first. While
 it waits, the room it needs is held only from builds of its priority or lower: a higher lane may
 still start in room that is free (until the CI build has really waited `starve_seconds`). A
-build that has waited three times `starve_seconds`, or was stopped to free memory, goes before
+build that has waited in the queue three times `starve_seconds`, or was stopped to free memory, goes before
 those (a CI build in a lane with `may_pass_held` gets no head start, like any build there), unless a
-CI build has waited `ci_deadline` (see [CI jobs](ci.md)): that goes first, the oldest first, except
+CI build has waited `ci_deadline` or just had room made for it (see [CI jobs](ci.md)): that goes first, the oldest first, except
 before a build that has queued twelve times `starve_seconds` (two hours at 600), which goes before it;
 and except
 one stopped to make room for a CI build (`make_room_for_ci`, see [CI jobs](ci.md)): until that CI
@@ -185,7 +185,9 @@ unless a `-j` or jobserver of the caller's is still left in those options (a `-j
 `SUBMAKE=make\ -j4`, is a value, not a setting). A make or ninja build
 whose caller's make ran in parallel that way gets buildq's jobserver in `MAKEFLAGS`, with or without
 a `-j` of its own. Every five seconds buildq hands idle cores to
-builds that are using all of theirs, if the memory more cores need is free, and takes cores back when
+builds that are using all of theirs, if the memory more cores need is free (even while another build
+waits for memory, if adding cores needs no extra memory, so running builds finish and free RAM
+sooner), and takes cores back when
 the machine is over its target or a queued build needs them. A CI job's build comes first both ways
 (#45): it gets idle cores first and is cut last, and one running below its lane's usual `cores`
 while using all it has takes cores from agents' builds above their `min_cores` (the most above

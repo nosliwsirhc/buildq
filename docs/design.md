@@ -275,14 +275,17 @@ long and lacks memory that buildq builds hold (`short_by`, worked out as the que
 what it needs less what is free after the floor, growth and the room held for tickets ahead of it;
 worked out again after the pass, since a lane that passes held room may have started a build after
 it) stops running builds after each pass, unless its lane passes held room (it holds none). The wait
-counts from when the CI ticket was submitted. The builds it may stop are those not CI tickets' or flock slots', of its priority or lower,
+counts from when the CI ticket was submitted. If running builds with known history are expected to
+finish within 3 minutes (`SOON_FINISH`, excluding frozen builds and builds past their expected time)
+and already cover `short_by`, buildq waits for them instead of stopping a build and discarding its
+work. The builds it may stop are those not CI tickets' or flock slots', of its priority or lower,
 restart-safe (`restart_safe`, with `restartable_scripts`) or `--restartable`, with their environment known, stopped this way fewer than twice,
 stopped for memory fewer than three times (a fourth stop would fail them), and not running longer
 than `make_room_spare_after` (if set). With `make_room_behind_agents = false`, a CI ticket that the
 room held for agents' tickets ahead of it binds (`short_agents`, the part of `short_hm` held for
 non-CI tickets, any amount) stops nothing, since what it freed would go to them first; and a build
-that was overdue when it started (`was_overdue`: three times `starve_seconds` waited, or stopped once)
-is never stopped for one. `make_room_spare_after` counts run time without the pauses.
+that was overdue when it started (`was_overdue`: three times `starve_seconds` queued, or stopped once
+for memory) is never stopped for one. `make_room_spare_after` counts run time without the pauses.
 A build gives back what it uses plus what it may still grow into, as admission counts it. The
 newest whose share covers `short_by` is stopped, else the newest few whose shares do together;
 none if all of them wouldn't. Stopped builds take the requeue path, with `yields_to` naming the CI
@@ -291,8 +294,10 @@ counts neither as overdue nor as waited out. A stop is counted (`ci_stops`) once
 queued again, not if it finished by itself first, and doesn't count toward the limit of three stops
 for memory. One CI ticket at a
 time: nothing more is stopped while builds stopped for one are still going, nor within two minutes of
-making room for a CI ticket that is still queued (what the stops free may not show yet), whichever
-CI ticket it would be for.
+making room for a CI ticket that is still queued (`ROOM_PAUSE`: what the stops free may not show yet),
+whichever CI ticket it would be for. During that two-minute window, the CI ticket room was made for
+gets `due` priority and holds its full room against every lane (except `may_pass_held`), so overdue
+agent builds cannot claim the memory just freed for it.
 
 **Holding room.** Once a ticket has waited `starve_seconds` (a CI ticket with `ci_first`: at
 once, but until it has waited `starve_seconds` its room binds only tickets of its priority or
@@ -303,12 +308,14 @@ stop the queue. A ticket kept out of its workspace holds nothing, except (with `
 has waited `starve_seconds` and is kept out only by a fresh CI ticket's hold on that workspace: it
 still holds its room and the workspace, so builds behind it can't pass it there.
 
-**Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped to
-free memory, or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` and `RUNNER_NAME`
+**Order.** A ticket that has waited `starve_seconds`, or was queued again after being stopped,
+or (with `ci_first`) was submitted from a CI job (`GITHUB_ACTIONS` and `RUNNER_NAME`
 both set), goes first (unless its lane may pass held room). With `ci_first`, any ticket that has
-waited three times `starve_seconds`, or was queued again after being stopped, goes before all of
+queued three times `starve_seconds` (counting queue wait time across attempts, not run time), or
+was stopped to free memory (`requeues > ci_stops`), goes before all of
 those, so a stream of CI tickets can't keep it waiting for ever; among those, CI tickets get no
-preference. With `ci_deadline`, a CI ticket that has waited that long goes before even those, the
+preference. With `ci_deadline`, a CI ticket that has waited that long (or one room was just made
+for during `ROOM_PAUSE`) goes before even those, the
 oldest first; a ticket that has queued twelve times `starve_seconds` (`CI_LONG_WAITS`) goes before
 even that, so CI tickets can't keep it waiting for ever either. A ticket stopped to make room for a CI ticket (`make_room_for_ci`) is neither, holds
 nothing and doesn't start, until that CI ticket has started (30 minutes at most). Then tickets go by priority (lane plus ticket, highest first), then, with `ci_first`,
@@ -333,7 +340,7 @@ for its extra cores is free, sharing what is free among the builds it grows.
 
 **The slice guard.** Every five seconds, and every second while memory is short (less than twice
 `mem_floor` free), under machine-wide pressure (memory "full" above 1% while available memory is
-scarce — under the greater of twice `mem_floor` or a quarter of RAM) or has fallen a gigabyte since
+scarce: under the greater of twice `mem_floor` or a quarter of RAM) or has fallen a gigabyte since
 the last time, the daemon sets `buildq.slice`'s `memory.max` to what its
 builds hold (`memory.current`) plus what the machine has free above half of `mem_floor`, at least
 2 GB above what they hold, and never above the `MemoryMax` the slice is configured with. When other
@@ -374,10 +381,13 @@ spare = cpu_target × cores − max(busy, busy_now) − ramping of other builds 
 ```
 
 If `spare ≥ 1` and memory allows, builds that use at least 75% of their cores and want more get
-more, the furthest below their want first. If `spare ≤ −1`, builds above their minimum give cores
-back, the most above first. The daemon writes tokens into a build's FIFO to grow it, and reads
-free ones out to shrink it; tokens in use come back to the FIFO as their processes end, and the
-next rebalance takes them then.
+more, the furthest below their want first (CI builds first). When another build is waiting for
+memory, the rebalancer takes no additional memory for growth, but still hands out idle cores whose
+extra memory cost is zero (for example under `scale_mem_with_cores = "never"` or within the cores a
+build's estimate was measured at) so running builds finish and free their memory sooner. If
+`spare ≤ −1`, builds above their minimum give cores back, the most above first. The daemon writes
+tokens into a build's FIFO to grow it, and reads free ones out to shrink it; tokens in use come back
+to the FIFO as their processes end, and the next rebalance takes them then.
 
 ## Giving memory back
 

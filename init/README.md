@@ -1,11 +1,11 @@
 # Running buildq without systemd
 
-buildq works on any Linux distribution with Python 3.11 or newer — Alpine, Void, Gentoo, Artix,
-Devuan, Slackware, WSL2, and Docker/Podman containers — with **no systemd and no root required**.
+buildq works on any Linux distribution with Python 3.11 or newer (Alpine, Void, Gentoo, Artix,
+Devuan, Slackware, WSL2, and Docker/Podman containers), with no systemd and no root required.
 
 ## Quick start (zero setup)
 
-Run the installer — it uses plain `/bin/sh` (even on minimal Alpine without `bash`), detects your
+Run the installer. It uses plain `/bin/sh` (even on minimal Alpine without `bash`), detects your
 distro and init system, checks for Python 3.11+ and `flock`, and offers to install anything missing
 via your package manager (`apk`, `apt`, `dnf`, `pacman`, `xbps-install`, `zypper`, `emerge`):
 
@@ -13,11 +13,11 @@ via your package manager (`apk`, `apt`, `dnf`, `pacman`, `xbps-install`, `zypper
 ./install.sh --shims --skill
 ```
 
-Want to check compatibility first without changing anything? Run `./install.sh --check`.
-Want it to install missing prerequisites automatically without prompting? Add `--install-deps`.
+To check compatibility first without changing anything, run `./install.sh --check`.
+To install missing prerequisites automatically without prompting, add `--install-deps`.
 
-That's it. The installer detects that systemd isn't running, starts `buildqd` in the background for
-your user, puts its socket and logs under `~/.local/state/buildq/`, and verifies it responds.
+The installer detects that systemd isn't running, starts `buildqd` in the background for your user,
+puts its socket and logs under `~/.local/state/buildq/`, and checks that it responds.
 Because the socket lives in your home state directory rather than a per-login folder, background
 services and terminal sessions always talk to the same daemon and builds keep running if you log
 out.
@@ -44,10 +44,10 @@ By default (`runner = "auto"`), buildq automatically uses the strongest mode you
 | --- | --- | --- | --- | --- |
 | 1 | **`systemd`** | Standard systemd Linux (Ubuntu, Fedora, Arch, Debian) | Kernel memory/CPU/IO caps, kernel pausing, automatic safety ceiling, socket activation | None |
 | 2 | **`cgroup`** | Non-systemd Linux with optional cgroup v2 setup | Same kernel-enforced memory caps, pausing, and dynamic safety ceiling as systemd, without needing systemd | Boot-time init service + helper script (below) |
-| 3 | **`direct`** | Any non-systemd Linux, WSL2, or container | Automatic memory & CPU measurement, learned build sizes, live core resizing, low-RAM pausing, memory-cap watchdog, full child-process cleanup | **None** — works immediately |
+| 3 | **`direct`** | Any non-systemd Linux, WSL2, or container | Automatic memory & CPU measurement, learned build sizes, live core resizing, low-RAM pausing, memory-cap watchdog, full child-process cleanup | None (works immediately) |
 
 Most people on WSL2, containers, or personal non-systemd machines don't need anything beyond the
-default `direct` mode — it works out of the box with zero root access.
+default `direct` mode: it works out of the box with zero root access.
 
 ## Keeping buildq running after a reboot
 
@@ -84,7 +84,7 @@ cgroup helper at boot:
    places `buildqd` inside the delegated `user/daemon` cgroup automatically.
 3. Start the service and run `buildq daemon status` to confirm it reports the `cgroup` runner.
 
-Running the helper script by hand only creates the cgroup folders — starting `buildqd` manually
+Running the helper script by hand only creates the cgroup folders; starting `buildqd` manually
 from a login shell outside the init service still falls back cleanly to `direct` mode instead of
 failing.
 
@@ -93,9 +93,9 @@ failing.
 
 `init/cgroup-setup.sh` sets up a two-level cgroup v2 hierarchy following `man 7 cgroups`:
 
-- `/sys/fs/cgroup/buildq-$USER` — **root-owned**, holding the overall memory ceiling (75% soft /
+- `/sys/fs/cgroup/buildq-$USER`: root-owned, holding the overall memory ceiling (75% soft /
   85% hard RAM by default) so user builds can never raise their own ceiling.
-- `/sys/fs/cgroup/buildq-$USER/user` — owned by `$USER`, with two subdirectories: `daemon/` (where
+- `/sys/fs/cgroup/buildq-$USER/user`: owned by `$USER`, with two subdirectories: `daemon/` (where
   `buildqd` runs) and `builds/` (where each build gets its own `buildq-<id>` cgroup and
   `slice_guard` dynamically tightens `builds/memory.max` when system memory runs low).
 
