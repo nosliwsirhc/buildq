@@ -63,6 +63,59 @@ What each build used is recorded under its command (repository, lane, tool, subc
 and the next run of that command is planned from it. The daemon re-plans every second and whenever
 a build arrives or ends.
 
+## Benchmarks
+
+To compare **buildq** against running **without a queue** (starting everything at once) and behind
+**fixed slots** (like `pueue`, `task-spooler`, or a `flock` slot script), the repository includes a
+deterministic replay suite (`bench/sim.py`) that runs the real `buildqd` daemon against five
+workloads modeled on a shared 32-core, 125 GB workstation (132 builds total: agent bursts, CI
+releases arriving behind long agent builds, builds that outgrow their memory estimates, and a
+two-hour mixed day).
+
+| Policy | Builds succeeded | OOM kills | CI timed out | Time below 16 GB RAM floor | Lowest free RAM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **No queue** (everything at once) | 114 / 132 (86%) | 18 | 0 | 73.3 min | 0.2 GB |
+| **Fixed slots (2)** | 98 / 132 (74%) | 0 | 34 | 0 s | 58.9 GB |
+| **Fixed slots (4)** | 124 / 132 (94%) | 0 | 8 | 0 s | 23.3 GB |
+| **Fixed slots (6)** | 127 / 132 (96%) | 1 | 4 | 35.8 min | 0.1 GB |
+| **buildq** | **132 / 132 (100%)** | **0** | **0** | **0 s** | **23.4 GB** |
+
+Highlights by scenario:
+
+- **Burst of 22 builds where two outgrow their estimates (`outgrows-estimate`):** Without a queue,
+  **half the builds (11/22) are OOM-killed**. With 6 fixed slots, one still OOMs and RAM drops to
+  0.1 GB free. With 2 slots, total time stretches to **2.2 hours** (4 slots: **70.5 min**). **buildq**
+  finishes all **22/22 in 62.0 min** (12% faster than 4 slots, 2.1× faster than 2 slots) with
+  **0 OOM kills** and **23.4 GB** minimum free RAM.
+- **CI release arriving behind 7 long agent builds (`ci-behind-agents`):** Without a queue, **3/12
+  builds OOM**. Behind 2, 4, or 6 fixed slots, **2 to 5 CI jobs time out** (median CI wait
+  34–50 min). **buildq** completes **12/12** with **0 OOM kills**, **0 CI timeouts**, and a **4.8 min**
+  median CI wait (max 5.0 min).
+- **Two-hour mixed day of 75 agent + CI builds (`mixed-day`):** 2 slots times out **24/32 CI jobs**;
+  4 slots leaves CI waiting **16.5 min** median (32.8 min max). **buildq** completes **75/75** with
+  **10 s** median CI wait (10.0 min max) and never drops below **41.1 GB** free RAM.
+
+**Honest trade-offs:** buildq keeps a 16 GB RAM safety margin and prioritizes CI releases, so on
+steady workloads that happen not to OOM without a queue (`mixed-day`), individual agent builds can
+have higher median turnaround (54 min vs. 24–28 min) in exchange for zero OOM kills, zero CI
+timeouts, and an interactive machine. Raw makespan can also look shorter without a queue on
+overloaded scenarios only because 25–50% of the builds crashed to OOM instead of finishing.
+
+Reproduce all five scenarios locally in a few seconds (no root, no extra packages):
+
+```sh
+python3 bench/sim.py baselines
+```
+
+We also verified the same behavior on a real Linux 6.12 KVM virtual machine (4 vCPUs, 2 GB RAM, no
+swap) compiling real C code with `gcc -O2` and `make -j4` (6 heavy builds + 4 quick CI checks):
+**no queue** triggered **3 real kernel OOM kills** (7/10 succeeded, `MemAvailable` down to 74 MB),
+**4 fixed slots** triggered **1 kernel OOM kill** (9/10 succeeded, 0 MB available), **2 fixed
+slots** kept CI checks waiting **28.8 s** median, and **buildq** (`direct` runner, zero setup)
+completed **10/10** with **0 OOM kills**, **8.8 s** median CI turnaround (3.3× faster than 2 slots),
+and over **1 GB** free RAM throughout. See [Benchmarking](docs/benchmark.md) for the full per-scenario
+tables, model details, and how to replay traces from your own machine.
+
 ## What you get
 
 | Feature | What it does |
@@ -171,7 +224,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | [CI jobs](docs/ci.md) | queueing a workflow step on a self-hosted runner, `ci_first`, a new step's first run |
 | [Operating buildq](docs/operations.md) | logs, the memory watch, restarts, files, analytics, `buildq top`, configuration errors, reboots, reports, GitHub statuses |
 | [Non-systemd Linux & init systems](init/README.md) | running on Alpine/OpenRC, Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2 and containers, plus optional cgroup v2 delegation |
-| [Benchmarking](docs/benchmark.md) | replaying builds against the scheduler: scenarios, comparing two versions or configurations, a trace from your machine |
+| [Benchmarking](docs/benchmark.md) | replaying builds against the scheduler: comparing buildq against no queue and fixed slots, two versions or configurations, or a trace from your machine |
 | [Design](docs/design.md) | the internals: code layout, the tool registry, the daemon, the protocol, the analytics schema |
 | [config.example.toml](config.example.toml) | every setting, with what it does |
 

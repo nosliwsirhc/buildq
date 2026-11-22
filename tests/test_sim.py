@@ -856,5 +856,79 @@ class LoadBuildqd(SimCase):
         self.assertTrue(s.honors_grant(type("T", (), {"argv": ["cargo", "build"], "jobserver": None})()))
 
 
+class Baselines(SimCase):
+    """BaselineSimulation ('none' and 'slots:N') and `sim.py baselines` compare buildq apples-to-apples."""
+
+    def test_parse_policy(self):
+        self.assertEqual(sim.parse_policy("buildq"), ("buildq", None, "buildq"))
+        self.assertEqual(sim.parse_policy("none"), ("none", None, "no queue"))
+        self.assertEqual(sim.parse_policy("no-queue"), ("none", None, "no queue"))
+        self.assertEqual(sim.parse_policy("slots:1"), ("slots:1", 1, "1 slot"))
+        self.assertEqual(sim.parse_policy("slots:4"), ("slots:4", 4, "4 slots"))
+        for bad in ("", "slots:0", "slots:-2", "slots:abc", "fifo"):
+            with self.assertRaises(ValueError):
+                sim.parse_policy(bad)
+
+    def test_no_queue_oom_kills_when_builds_exceed_machine_memory(self):
+        # 6x 20G builds on an 80G machine (0 background) -> no queue OOMs; 2 slots & buildq succeed.
+        jobs = [scenarios.build(i, ("cargo", "build", "-p", f"c{i}"), 20, 120, 4, shape=(1.0,) * 10,
+                                repo="app", caller=f"s{i}", workspace=f"w{i}", history=True)
+                for i in range(6)]
+        sc = scenario(jobs, mem_total=80 * GIB, background_mem=0)
+        noq, _ = sim.simulate_baseline(sc, "none", CONFIG, BUILDQD, name="bq_bl_noq")
+        slots2, _ = sim.simulate_baseline(sc, "slots:2", CONFIG, BUILDQD, name="bq_bl_s2")
+        bq, _ = sim.simulate(sc, CONFIG, BUILDQD, name="bq_bl_bq")
+        self.assertGreater(noq["oom_kills"]["machine"], 0)
+        self.assertLess(noq["outcomes"].get("succeeded", 0), 6)
+        self.assertEqual((slots2["oom_kills"]["machine"], slots2["outcomes"]), (0, {"succeeded": 6}))
+        self.assertEqual((bq["oom_kills"]["machine"], bq["outcomes"]), (0, {"succeeded": 6}))
+
+    def test_fixed_slots_respect_concurrency_and_workspace_locks(self):
+        # 3 builds sharing one workspace serialize even under 'none'; 3 distinct builds under slots:2 run 2 then 1.
+        shared = [scenarios.build(i, ("cargo", "build"), 2, 60, 2, repo="app", caller=f"s{i}",
+                                  workspace="shared-ws") for i in range(3)]
+        _, s_shared = sim.simulate_baseline(scenario(shared), "none", CONFIG, BUILDQD, name="bq_bl_ws")
+        starts = sorted(r["first_start"] for r in s_shared.records.values())
+        self.assertEqual(starts, [0.0, 60.0, 120.0])
+
+        distinct = [scenarios.build(0, ("cargo", "build", "-p", f"c{i}"), 2, 60, 2, repo="app",
+                                    caller=f"s{i}", workspace=f"w{i}") for i in range(3)]
+        _, s_slots = sim.simulate_baseline(scenario(distinct), "slots:2", CONFIG, BUILDQD, name="bq_bl_cap")
+        starts = sorted(r["first_start"] for r in s_slots.records.values())
+        self.assertEqual(starts, [0.0, 0.0, 60.0])
+
+    def test_baseline_is_deterministic_and_cmd_baselines_renders_markdown_and_json(self):
+        sc = scenarios.burst()
+        a, _ = sim.simulate_baseline(sc, "slots:4", CONFIG, BUILDQD, name="bq_bl_det1")
+        b, _ = sim.simulate_baseline(sc, "slots:4", CONFIG, BUILDQD, name="bq_bl_det2")
+        self.assertEqual(json.dumps(a, sort_keys=True), json.dumps(b, sort_keys=True))
+
+        out_md = io.StringIO()
+        args_md = sim.argparse.Namespace(
+            scenario=["burst", "ci-behind-agents"], policies="none,slots:4,buildq",
+            config=CONFIG, buildqd=BUILDQD, json=False, summary_file=None,
+            seed_history=False, no_background=False,
+        )
+        with unittest.mock.patch("sys.stdout", out_md):
+            self.assertEqual(sim.cmd_baselines(args_md), 0)
+        text = out_md.getvalue()
+        self.assertIn("Totals across 2 scenarios (22 builds)", text)
+        self.assertIn("| no queue |", text)
+        self.assertIn("| 4 slots |", text)
+        self.assertIn("| buildq |", text)
+
+        out_json = io.StringIO()
+        args_json = sim.argparse.Namespace(
+            scenario=["burst"], policies="none,buildq",
+            config=CONFIG, buildqd=BUILDQD, json=True, summary_file=None,
+            seed_history=False, no_background=False,
+        )
+        with unittest.mock.patch("sys.stdout", out_json):
+            self.assertEqual(sim.cmd_baselines(args_json), 0)
+        payload = json.loads(out_json.getvalue())
+        self.assertEqual(payload["policies"], ["none", "buildq"])
+        self.assertEqual(payload["totals"]["buildq"]["succeeded"], 10)
+
+
 if __name__ == "__main__":
     unittest.main()

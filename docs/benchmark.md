@@ -14,12 +14,43 @@ a spare machine running real builds, is planned there.
 ```sh
 python3 bench/sim.py scenarios                  # the built-in scenarios
 python3 bench/sim.py run ci-behind-agents       # one scenario's summary (--json for all of it)
+python3 bench/sim.py run burst --policy none    # replay with a baseline policy (none, slots:N, or buildq)
+python3 bench/sim.py baselines                  # buildq vs. no queue and fixed slots (2, 4, 6) across all scenarios
 python3 bench/sim.py check                      # each scenario twice, the second in a fresh process: they must match
 python3 bench/sim.py compare                    # this checkout's daemon against itself, every scenario
 ```
 
-`run` also takes `--jobs FILE` (what happened to each build, JSONL) and `--log FILE` (the daemon's
-own log, in simulated seconds).
+`run` also takes `--policy buildq|none|slots:N`, `--jobs FILE` (what happened to each build, JSONL),
+and `--log FILE` (the daemon's own log, in simulated seconds).
+
+### Comparing buildq against no queue and fixed slots
+
+`sim.py baselines` runs every scenario under the same machine physics with no queue (`none`: every
+build starts as soon as it arrives, waiting only if another live build holds the same target
+workspace), fixed FIFO slots (`slots:2`, `slots:4`, `slots:6`: like `pueue`, `task-spooler`, or a
+`flock` slot script), and the real `buildqd` daemon:
+
+```sh
+python3 bench/sim.py baselines
+python3 bench/sim.py baselines burst mixed-day --policies none,slots:4,buildq
+python3 bench/sim.py baselines ~/morning.jsonl --seed-history --json
+```
+
+Across all five built-in scenarios (132 builds on the modeled 32-core, 125 GB workstation):
+
+| Policy | Succeeded | OOM kills | CI timed out | Time below 16 GB floor | Least free RAM |
+|---|---:|---:|---:|---:|---:|
+| no queue | 114/132 (86%) | 18 | 0 | 73.3m | 0.2G |
+| 2 slots | 98/132 (74%) | 0 | 34 | 0s | 58.9G |
+| 4 slots | 124/132 (94%) | 0 | 8 | 0s | 23.3G |
+| 6 slots | 127/132 (96%) | 1 | 4 | 35.8m | 0.1G |
+| buildq | 132/132 (100%) | 0 | 0 | 0s | 23.4G |
+
+The baseline simulator uses the same per-second CPU sharing, memory profiles, workspace locks,
+CI timeouts, and machine-wide OOM killer as `Simulation`, without buildq's learned memory admission,
+dynamic core grants, CI priority, or memory shedding. Baseline builds run at their recorded
+`avg_cores` (rather than spawning an unbounded worker per host core), which is conservative in the
+baselines' favor.
 
 **Two versions of the daemon** on the same scenarios:
 
