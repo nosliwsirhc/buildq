@@ -76,6 +76,9 @@ make_room_for_ci = "0"
 # builds then lets those go first too. false: it waits behind them, all or nothing (what is freed
 # would go to them first anyway), and the builds that went before CI jobs' builds when they started
 # (overdue, or stopped once) are never stopped for one (#38).
+# Recommended: when you turn on make_room_for_ci (e.g. "5m"), set make_room_behind_agents = false
+# and set ci_deadline (e.g. "10m"–"20m") so CI doesn't thrash overdue agent builds while still
+# getting ahead of them before its job time limit.
 make_room_behind_agents = true
 
 # With ci_first: a CI job's build that has waited this long ("20m") goes before every other build
