@@ -89,17 +89,23 @@ Highlights by scenario:
   **0 OOM kills** and **23.4 GB** minimum free RAM.
 - **CI release arriving behind 7 long agent builds (`ci-behind-agents`):** Without a queue, **3/12
   builds OOM**. Behind 2, 4, or 6 fixed slots, **2 to 5 CI jobs time out** (median CI wait
-  34–50 min). **buildq** completes **12/12** with **0 OOM kills**, **0 CI timeouts**, and a **4.8 min**
-  median CI wait (max 5.0 min).
+  34–50 min). **buildq** completes **12/12** in **1.5 hours** with **0 OOM kills**, **0 CI
+  timeouts**, and a **4.9 min** median CI wait (max 5.0 min).
+- **CI release arriving behind overdue agent builds (`ci-behind-overdue`):** Without a queue,
+  **4/13 builds OOM**. Behind 2 or 4 fixed slots, **all 5 CI jobs time out** (6 slots: 2 time out).
+  **buildq** completes **13/13** with **0 OOM kills**, **0 CI timeouts**, only **1** preemptive
+  stop, and **11.3 min** median CI wait (max 12.0 min).
 - **Two-hour mixed day of 75 agent + CI builds (`mixed-day`):** 2 slots times out **24/32 CI jobs**;
   4 slots leaves CI waiting **16.5 min** median (32.8 min max). **buildq** completes **75/75** with
-  **10 s** median CI wait (10.0 min max) and never drops below **41.1 GB** free RAM.
+  **7 s** median CI wait (141× lower than 4 slots), **35.7 min** median agent turnaround, and never
+  drops below **41.7 GB** free RAM.
 
 **Honest trade-offs:** buildq keeps a 16 GB RAM safety margin and prioritizes CI releases, so on
-steady workloads that happen not to OOM without a queue (`mixed-day`), individual agent builds can
-have higher median turnaround (54 min vs. 24–28 min) in exchange for zero OOM kills, zero CI
-timeouts, and an interactive machine. Raw makespan can also look shorter without a queue on
-overloaded scenarios only because 25–50% of the builds crashed to OOM instead of finishing.
+steady workloads that happen not to OOM without a queue (`mixed-day`), individual agent builds trade
+a few extra minutes of median turnaround (35.7 min vs. 27.9 min for 4 slots) in exchange for zero
+OOM kills, zero CI timeouts, and an interactive machine. Raw makespan can also look shorter without
+a queue on overloaded scenarios only because 25–50% of the builds crashed to OOM instead of
+finishing.
 
 Reproduce all five scenarios locally in a few seconds (no root, no extra packages):
 

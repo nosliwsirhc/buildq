@@ -79,7 +79,7 @@ class Replay(SimCase):
     def test_ci_first_lowers_a_ci_build_s_wait(self):
         # Without ci_first the queued agent builds, expected to finish sooner, would go first.
         jobs = agents(9, 10, 300, step=5) + [ci_step(60, 14, 900)]
-        off = self.run_sim(jobs, self.config(ci_first="false", make_room_for_ci='"0"'))
+        off = self.run_sim(jobs, self.config(ci_first="false", make_room_for_ci='"0"', ci_deadline='"0"'))
         on = self.run_sim(jobs, self.config(make_room_for_ci='"0"'))
         self.assertLess(on["wait"]["ci"]["p50"], off["wait"]["ci"]["p50"])
 

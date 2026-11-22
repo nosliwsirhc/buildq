@@ -399,6 +399,28 @@ class Jobservers(DaemonCase):
         self.daemon.rebalance(self.now + 140)
         self.assertLess(running.granted, 12)  # waiting on cores does shrink it
 
+    def test_rebalance_hands_zero_memory_cost_idle_cores_while_another_build_waits_for_memory(self):
+        # Running build started at 2 cores when its history was measured at 8 cores (mem_cores=8).
+        # Growing from 2 -> 8 costs 0 extra bytes, so idle cores speed it up even while another
+        # build waits for memory — without spending any extra memory above mem_cores.
+        tree = self.workdir("tree")
+        first = self.submit(cwd=tree)
+        self.daemon.history.add({"key": first.key, "t": self.now, "peak_mem": 10 * GIB,
+                                 "peak_cores": 8.0, "granted": 8})
+        self.finish(first)
+        self.machine.busy = self.machine.busy_now = 30.0
+        running = self.submit(cwd=tree)
+        self.assertEqual((running.granted, running.mem_cores), (2, 8))
+        plan_before = running.est_mem
+        running.elastic, running.cores_now = True, 2.0
+        self.machine.mem_available = 12 * GIB
+        waiting = self.submit(cwd=self.workdir("waiter"), mem="16G")
+        self.assertEqual((waiting.state, waiting.reason_cat), ("queued", "memory"))
+        self.machine.busy = self.machine.busy_now = 4.0  # plenty of idle cores
+        self.daemon.rebalance(self.now + 120)
+        self.assertEqual(running.granted, 8)  # grew up to mem_cores (0 extra bytes)
+        self.assertEqual(running.est_mem, plan_before)  # took zero memory from the waiting build
+
 
 
 class Recovery(DaemonCase):

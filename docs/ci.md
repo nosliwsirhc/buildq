@@ -48,7 +48,8 @@ the builds that can safely start over (a compile or test run, one submitted `--r
 listed in `restartable_scripts`), of
 its priority or lower and not a CI job's. It stops the one whose memory covers what the step lacks,
 or, if no one build does, the newest few that do together, and none if stopping all of them wouldn't
-make it fit. Each stopped build is queued again with its place and yields to that CI build: it
+make it fit or if running builds expected to finish within three minutes already cover what it
+lacks. Each stopped build is queued again with its place and yields to that CI build: it
 doesn't start, whatever its lane, until that build has started (or for 30 minutes at most), and then
 goes first. cargo keeps the crates it finished, so it repeats only the ones it was compiling. A
 build is stopped this way at most twice, and never for a CI step in a lane with `may_pass_held`,
