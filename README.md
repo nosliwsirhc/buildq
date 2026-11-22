@@ -1,179 +1,72 @@
 # buildq
 
-**A load-aware build queue for one shared Linux machine.** Drop off a build, get a ticket; buildq
-runs it when the machine has room, sized to fit.
+**Stop parallel builds, coding agents, and CI runners from crashing your Linux machine — without leaving your CPUs idle.**
+
+Drop off a build, get a ticket; `buildq` runs it when your machine actually has the RAM and CPU for it, resizing parallel builds live as load changes.
 
 [![tests](https://github.com/nosliwsirhc/buildq/actions/workflows/tests.yml/badge.svg)](https://github.com/nosliwsirhc/buildq/actions/workflows/tests.yml)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Linux: systemd, cgroup v2, or direct](https://img.shields.io/badge/linux-systemd%20%C2%B7%20cgroup%20v2%20%C2%B7%20direct-informational)
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**Completely open source:** buildq is free software under the [MIT License](LICENSE), and all of it
-is in this repository.
+Free and completely open source under the [MIT License](LICENSE) — everything is in this repository.
 
-When several people, coding agents and CI runners share a build box, each starts compiles and test
-suites without knowing what the others are doing. Left alone, they pile on until the machine runs
-out of memory. Put behind a fixed number of slots, they wait in line while most of the cores sit
-idle: a slot held by a single-threaded link step, or by a test suite waiting on a database, counts
-the same as one held by a 16-core compile.
+---
 
-buildq replaces the slot count with measurement.
+### The problem
+
+Running multiple coding agents (Claude Code, Codex, Cursor, Antigravity), parallel terminals, or self-hosted GitHub Actions runners on one Linux box?
+
+- **Without a queue:** everyone launches `cargo test`, `make -j`, `pytest`, or `vitest` at once until the machine freezes and the Linux OOM killer starts crashing builds.
+- **With fixed slots** (`pueue`, `task-spooler`, `flock`): set the limit low and half your CPU cores sit idle while CI jobs time out in line; set it high and heavy builds still run the machine out of memory.
+- **With `buildq`:** every build is admitted using **live machine RAM/CPU measurements** plus **learned per-command history**, parallel builds (`cargo`, `make`, `ninja`) are resized while they run, and builds are paused or cleanly restarted if memory runs tight anyway.
+
+## Why use buildq?
+
+Across **5 realistic shared-workstation workloads** (132 builds on a 32-core, 125 GB Linux box — agent bursts, self-hosted CI releases, surprise memory spikes, and a busy mixed workday):
+
+- **100% of builds finish (132 / 132)** — vs. **86%** with no queue (**18 OOM crashes**) and **74–96%** with fixed slots (**4–34 timed-out CI jobs**).
+- **Zero OOM crashes, zero low-memory freezes** — never once dropped below the 16 GB RAM safety buffer, vs. **73.3 minutes** starved of RAM with no queue and **35.8 minutes** with 6 fixed slots.
+- **7-second typical CI wait on a busy day** — **141× shorter** than 4 fixed slots (**16.5 minutes**), with **zero timed-out releases** across every scenario.
+- **Up to 2.1× faster than safe fixed slots** during memory-heavy bursts — finishes 22 builds in **62.0 minutes** vs. **2.2 hours** (2 slots) or **70.5 minutes** (4 slots), with zero crashes.
+
+| Setup | Builds finished | Crashed (OOM) | CI timed out | Time starved of RAM (<16 GB free) | Lowest free RAM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **No queue** (run everything at once) | 114 / 132 (86%) | 18 | 0 | 73.3 min | 0.2 GB |
+| **2 fixed slots** | 98 / 132 (74%) | 0 | 34 | 0 s | 58.9 GB |
+| **4 fixed slots** | 124 / 132 (94%) | 0 | 8 | 0 s | 23.3 GB |
+| **6 fixed slots** | 127 / 132 (96%) | 1 | 4 | 35.8 min | 0.1 GB |
+| **buildq** | **132 / 132 (100%)** | **0** | **0** | **0 s** | **23.4 GB** |
+
+> **Verified on real Linux hardware too:** on a Linux 6.12 KVM machine (4 vCPUs, 2 GB RAM, no swap) compiling real C code with `gcc -O2` and `make -j4`, running without a queue caused **3 real kernel OOM kills** (7/10 finished); **buildq** finished **10/10** with **0 OOM kills**, **3.3× faster CI turnaround** than 2 safe fixed slots (`8.8 s` vs. `28.8 s`), and **>1 GB RAM free** throughout.
+>
+> Reproduce the full replay benchmark locally in a few seconds (no root, no extra packages): `python3 bench/sim.py baselines` · [See all per-scenario numbers & trade-offs below ↓](#benchmarks-the-full-numbers)
+
+## Fixed slots vs. buildq
 
 | | A fixed number of slots | buildq |
 | --- | --- | --- |
-| **When a build starts** | a slot is free | its expected peak memory fits in what's free, and, while other builds run, there are cores for it |
-| **What it sees** | its own jobs | the whole machine: CI runners, containers, anything outside the queue |
-| **How big a build is** | every build is "one slot" | learned from that command's past runs |
-| **Cores per build** | whatever the build picks | sized to the build and the machine; builds that use a jobserver (cargo, `make -j`, ninja) are resized while they run |
-| **When memory runs out anyway** | the machine stalls | buildq pauses its newest build in place while memory falls, and stops one when it gets critically low; a build that can safely start over is queued again at the front |
-
-## How it works
-
-```mermaid
-flowchart TB
-    A["Coding agents"] --> Q
-    T["You, in a terminal"] --> Q
-    C["CI steps that call buildq run"] --> Q
-    Q["The queue: buildq submit · buildq run<br/>a repeat of a queued or running build joins it"] --> D
-    M["The whole machine<br/>/proc · PSI · build cgroups"] -.-> D
-    D("Fits now?<br/>memory · cores · pressure · disk · job count · workspace") -- "yes" --> S
-    D -. "not yet" .-> Q
-    S["Each build isolated &amp; measured<br/>(systemd service · cgroup v2 · direct /proc)<br/>with a jobserver, its cores resized while it runs"]
-    S -. "memory low and falling:<br/>paused in place" .-> S
-    S -. "memory critically low: stopped;<br/>queued again if it can safely start over" .-> Q
-    S -- "peak memory, cores, time" --> H[("History, per command")]
-    H -. "sizes and orders the next run" .-> Q
-```
-
-Every build runs under a lightweight supervisor so buildq can measure it, cap its resources, pause
-it if memory runs short, and clean up all of its child processes when it finishes. By default
-(`runner = "auto"`), buildq detects your Linux setup automatically:
-
-1. **With systemd (Ubuntu, Fedora, Arch, Debian, …):** runs each build as a private user service
-   inside `buildq.slice`, using systemd and the Linux kernel for memory caps, pausing, and cleanup.
-2. **Without systemd, out of the box (Alpine, Void, Gentoo, Artix, Devuan, WSL2, Docker/Podman):**
-   zero setup and no root needed — tracks each build's full process tree, limits its cores, pauses
-   it if RAM runs low, stops builds that pass their memory cap, and cleans up every child process.
-3. **Optional kernel caps without systemd (`cgroup`):** on non-systemd machines that have Linux
-   cgroup v2, running one boot-time script ([`init/cgroup-setup.sh`](init/cgroup-setup.sh)) gives
-   builds the same kernel-enforced memory limits and freezing as systemd. See
-   [`init/README.md`](init/README.md).
-
-What each build used is recorded under its command (repository, lane, tool, subcommand, package),
-and the next run of that command is planned from it. The daemon re-plans every second and whenever
-a build arrives or ends.
-
-## Benchmarks
-
-To compare **buildq** against running **without a queue** (starting everything at once) and behind
-**fixed slots** (like `pueue`, `task-spooler`, or a `flock` slot script), the repository includes a
-deterministic replay suite (`bench/sim.py`) that runs the real `buildqd` daemon against five
-workloads modeled on a shared 32-core, 125 GB workstation (132 builds total: agent bursts, CI
-releases arriving behind long agent builds, builds that outgrow their memory estimates, and a
-two-hour mixed day).
-
-| Policy | Builds succeeded | OOM kills | CI timed out | Time below 16 GB RAM floor | Lowest free RAM |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **No queue** (everything at once) | 114 / 132 (86%) | 18 | 0 | 73.3 min | 0.2 GB |
-| **Fixed slots (2)** | 98 / 132 (74%) | 0 | 34 | 0 s | 58.9 GB |
-| **Fixed slots (4)** | 124 / 132 (94%) | 0 | 8 | 0 s | 23.3 GB |
-| **Fixed slots (6)** | 127 / 132 (96%) | 1 | 4 | 35.8 min | 0.1 GB |
-| **buildq** | **132 / 132 (100%)** | **0** | **0** | **0 s** | **23.4 GB** |
-
-Highlights by scenario:
-
-- **Burst of 22 builds where two outgrow their estimates (`outgrows-estimate`):** Without a queue,
-  **half the builds (11/22) are OOM-killed**. With 6 fixed slots, one still OOMs and RAM drops to
-  0.1 GB free. With 2 slots, total time stretches to **2.2 hours** (4 slots: **70.5 min**). **buildq**
-  finishes all **22/22 in 62.0 min** (12% faster than 4 slots, 2.1× faster than 2 slots) with
-  **0 OOM kills** and **23.4 GB** minimum free RAM.
-- **CI release arriving behind 7 long agent builds (`ci-behind-agents`):** Without a queue, **3/12
-  builds OOM**. Behind 2, 4, or 6 fixed slots, **2 to 5 CI jobs time out** (median CI wait
-  34–50 min). **buildq** completes **12/12** in **1.5 hours** with **0 OOM kills**, **0 CI
-  timeouts**, and a **4.9 min** median CI wait (max 5.0 min).
-- **CI release arriving behind overdue agent builds (`ci-behind-overdue`):** Without a queue,
-  **4/13 builds OOM**. Behind 2 or 4 fixed slots, **all 5 CI jobs time out** (6 slots: 2 time out).
-  **buildq** completes **13/13** with **0 OOM kills**, **0 CI timeouts**, only **1** preemptive
-  stop, and **11.3 min** median CI wait (max 12.0 min).
-- **Two-hour mixed day of 75 agent + CI builds (`mixed-day`):** 2 slots times out **24/32 CI jobs**;
-  4 slots leaves CI waiting **16.5 min** median (32.8 min max). **buildq** completes **75/75** with
-  **7 s** median CI wait (141× lower than 4 slots), **35.7 min** median agent turnaround, and never
-  drops below **41.7 GB** free RAM.
-
-**Honest trade-offs:** buildq keeps a 16 GB RAM safety margin and prioritizes CI releases, so on
-steady workloads that happen not to OOM without a queue (`mixed-day`), individual agent builds trade
-a few extra minutes of median turnaround (35.7 min vs. 27.9 min for 4 slots) in exchange for zero
-OOM kills, zero CI timeouts, and an interactive machine. Raw makespan can also look shorter without
-a queue on overloaded scenarios only because 25–50% of the builds crashed to OOM instead of
-finishing.
-
-Reproduce all five scenarios locally in a few seconds (no root, no extra packages):
-
-```sh
-python3 bench/sim.py baselines
-```
-
-We also verified the same behavior on a real Linux 6.12 KVM virtual machine (4 vCPUs, 2 GB RAM, no
-swap) compiling real C code with `gcc -O2` and `make -j4` (6 heavy builds + 4 quick CI checks):
-**no queue** triggered **3 real kernel OOM kills** (7/10 succeeded, `MemAvailable` down to 74 MB),
-**4 fixed slots** triggered **1 kernel OOM kill** (9/10 succeeded, 0 MB available), **2 fixed
-slots** kept CI checks waiting **28.8 s** median, and **buildq** (`direct` runner, zero setup)
-completed **10/10** with **0 OOM kills**, **8.8 s** median CI turnaround (3.3× faster than 2 slots),
-and over **1 GB** free RAM throughout. See [Benchmarking](docs/benchmark.md) for the full per-scenario
-tables, model details, and how to replay traces from your own machine.
-
-## What you get
-
-| Feature | What it does |
-| --- | --- |
-| **Admission by measurement** | A build starts when its expected peak memory fits in what is free, after setting aside room for running builds to grow into. While other builds run, it also waits for free cores and low CPU pressure, unless its lane doesn't wait for CPU. [How it decides](docs/scheduling.md#when-a-build-starts) |
-| **Learned sizes** | Peak memory, peak cores and time are recorded per command, and the next run is planned with them. [Estimates](docs/scheduling.md#estimates) |
-| **Cores that follow the load** | Each build starts with the cores that are free and memory allows, between its lane's minimum and what its history says it can use. buildq passes the grant through each tool's environment (`CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `GRADLE_OPTS`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `GOMAXPROCS`) or CLI (`zig build -j`), and gives Cargo, `make -j` and Ninja builds a jobserver of their own that is resized live with the load. [Cores](docs/scheduling.md#cores) has the conditions. |
-| **Quick builds first** | Lanes have priorities; at the same priority, after fair shares, the build expected to finish soonest goes first. A build that has waited `starve_seconds` goes ahead of them all, so slow builds aren't passed for ever. A front-end lane can have turns of its own and never wait for CPU. [Order](docs/scheduling.md#order) |
-| **CI first, if you want** | With `ci_first`, a GitHub Actions step gets a head start and holds the room it needs from builds of its priority or lower, so a release is less likely to time out in the queue. A build that has waited three times `starve_seconds` or was stopped to free memory still goes ahead of it, unless the step has waited `ci_deadline`: then it goes first, the oldest such step first, except before a build that has queued twelve times `starve_seconds`. With `make_room_for_ci`, a step that has waited that long for memory stops the newest agent builds that can safely start over. [CI jobs](docs/ci.md) |
-| **Caps** | Lanes set per-build resource limits (`MemoryHigh`, `MemoryMax`, `CPUWeight`, `IOWeight`, `TasksMax`, `CPUQuota`, `Nice`). With `systemd` or `cgroup`, the Linux kernel enforces them directly and keeps all running builds under a safety ceiling that adjusts as other programs use RAM. In `direct` mode, a 1 s watchdog stops builds that exceed `MemoryMax` and `nice` lowers priority. |
-| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build in place while memory is low and falling, and stops one when it gets critically low, before the machine can stall. A compile or test run (cargo, dotnet, gradle/gradlew, cmake `--build`, ctest, zig, gcc/clang, pytest/unittest/mypy/pyright/uv, tsc, eslint, vitest, ninja) or a build submitted with `--restartable` (or run by a script the machine lists in `restartable_scripts`) is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
-| **One build per source** | A repeat submission (the same command on the same source, in the same directory, lane, environment and settings) joins the build already queued or running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
-| **Fair shares** | At the same priority, the caller (a session, a CI runner) with fewer builds running goes first. |
-| **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` waits for it, streams its output and exits with its code; builds have no stdin or terminal. [Using buildq](docs/usage.md) |
-| **Visibility** | `buildq top` is a live view like btop. `buildq report --capacity` says what builds waited for, and SQLite analytics answer the rest. [Operating](docs/operations.md) |
-| **Small** | The Python 3.11 standard library, POSIX shell scripts, and optional systemd units or OpenRC/runit/s6/dinit/SysVinit service templates. No root required. |
+| **When a build starts** | Whenever a slot is free | When its expected peak RAM fits in what's actually free, and there are cores for it |
+| **What it sees** | Only its own jobs | The whole machine: CI runners, containers, and anything running outside the queue |
+| **How big a build is** | Every build counts as "1 slot" | Learned automatically from that command's past runs |
+| **Cores per build** | Static — whatever the build picks | Sized to the build and load; `cargo`, `make -j`, and `ninja` are resized live while running |
+| **When memory runs out anyway** | The machine freezes or OOM-kills | Pauses the newest build while RAM falls, and stops + requeues it cleanly before the box stalls |
 
 ## Quick start
 
-You need Linux and Python 3.11 or newer — works with systemd **or** without it (Alpine/OpenRC,
-Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2, Docker/Podman containers). `install.sh`
-uses standard `/bin/sh` (no `bash` needed), checks compatibility and dependencies up front, and
-offers to install anything missing via your package manager (`apt`, `dnf`, `pacman`, `apk`,
-`xbps-install`, `zypper`, or `emerge`).
+You need **Linux** and **Python 3.11+**. Works with systemd **or** without it (Alpine/OpenRC, Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2, Docker/Podman). Zero external Python dependencies, no root required.
 
 ```sh
 git clone https://github.com/nosliwsirhc/buildq.git
 cd buildq
 ./install.sh                       # check system, install/upgrade, and start the daemon
 ./install.sh --check               # optional: check compatibility & dependencies without installing
-./install.sh --shims               # optional: heavy commands go through the queue by themselves
-./install.sh --rustc-guard=~/src   # optional: cargo under ~/src refuses to compile Rust outside the queue
-./install.sh --skill               # optional: a skill that teaches coding agents to use the queue
+./install.sh --shims               # optional: heavy commands go through the queue automatically
+./install.sh --rustc-guard=~/src   # optional: refuse to compile Rust under ~/src outside the queue
+./install.sh --skill               # optional: install a skill teaching coding agents to use buildq
 ```
 
-`install.sh` sets everything up automatically for your Linux machine:
-- checks that you're on Linux, detects your distro and init system, verifies Python 3.11+ and required utilities, and offers a `[y/N]` prompt (or `--install-deps`) to install any missing prerequisites;
-- installs `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` into `~/.local/bin` (change with `PREFIX`), pinning them to the Python 3.11+ it verified (`PYTHON=...` to choose one) so switching virtualenvs or changing `python3` on `PATH` later won't break them, and keeping each release in its own versioned folder under `~/.local/lib/buildq/` so upgrades don't disturb already-running builds;
-- creates `~/.config/buildq/config.toml` with sensible defaults if you don't have one yet;
-- on **systemd** machines: installs and starts the user background service (`buildq.service`) with a 75%/85% memory safety cap for all builds together;
-- on **non-systemd** machines: starts `buildqd` directly in the background (logs in `~/.local/state/buildq/buildqd.log`), ready to use right away. Pass `--no-start` in Dockerfiles or packaging scripts. Want boot-time startup (OpenRC, runit, s6, dinit, SysVinit) or optional kernel memory limits without systemd? See [`init/README.md`](init/README.md).
-
-While running under `systemd` or `cgroup`, buildq automatically tightens the shared builds memory
-ceiling whenever other programs on the machine need RAM (`slice_guard`). To upgrade later, just run
-`install.sh` again — builds already running finish normally and queued builds keep their place.
-
-To keep the daemon running after you log out: run `loginctl enable-linger "$USER"` on systemd
-machines, or use a boot service from [`init/`](init/README.md) (or `@reboot ~/.local/bin/buildq daemon start`)
-on non-systemd machines. `./install.sh --uninstall` stops the daemon and removes everything except
-your config and build history.
-
-Then drop off a build. (This output is from a machine with a `heavy` lane and history for this command; a fresh install has one `default` lane.)
+Drop off a build (example from a workstation with a `heavy` lane and past history; a fresh install starts with one `default` lane):
 
 ```console
 $ buildq submit -- cargo test -p api
@@ -194,6 +87,215 @@ $ buildq wait 3f2a; echo "exit $?"
 buildq: 3f2a91c0 succeeded after 6m40s; peak 14G, 8.0 cores
 exit 0
 ```
+
+<details>
+<summary><strong>What <code>install.sh</code> sets up (systemd, non-systemd, upgrades, and uninstall)</strong></summary>
+
+`install.sh` uses standard `/bin/sh` (no `bash` needed), checks compatibility and dependencies up front, and offers a `[y/N]` prompt (or `--install-deps`) to install missing prerequisites via your package manager (`apt`, `dnf`, `pacman`, `apk`, `xbps-install`, `zypper`, or `emerge`).
+
+- Installs `buildq`, `buildqd`, `buildq-shim`, and `buildq-rustc-guard` into `~/.local/bin` (change with `PREFIX`), pinned to the Python 3.11+ it verified (`PYTHON=...` to choose one) so switching virtualenvs won't break them, with versioned folders under `~/.local/lib/buildq/` so upgrades don't disturb running builds.
+- Creates `~/.config/buildq/config.toml` with sensible defaults if you don't have one yet.
+- On **systemd** machines: installs and starts the user background service (`buildq.service`) with a 75%/85% aggregate memory safety cap (`buildq.slice`) that tightens automatically whenever other programs need RAM (`slice_guard`).
+- On **non-systemd** machines: starts `buildqd` directly in the background (logs in `~/.local/state/buildq/buildqd.log`), ready to use right away. Pass `--no-start` in Dockerfiles or packaging scripts. For boot-time startup (OpenRC, runit, s6, dinit, SysVinit) or optional kernel memory limits without systemd, see [`init/README.md`](init/README.md).
+- To keep the daemon running after you log out: run `loginctl enable-linger "$USER"` on systemd machines, or use a boot service from [`init/`](init/README.md) (or `@reboot ~/.local/bin/buildq daemon start`) on non-systemd machines.
+- To upgrade later, run `./install.sh` again — running builds finish normally and queued builds keep their place. `./install.sh --uninstall` stops the daemon and removes everything except your config and build history.
+
+</details>
+
+---
+
+## How it works
+
+```mermaid
+flowchart TB
+    A["Coding agents"] --> Q
+    T["You, in a terminal"] --> Q
+    C["CI steps that call buildq run"] --> Q
+    Q["The queue: buildq submit · buildq run<br/>a repeat of a queued or running build joins it"] --> D
+    M["The whole machine<br/>/proc · PSI · build cgroups"] -.-> D
+    D("Fits now?<br/>memory · cores · pressure · disk · job count · workspace") -- "yes" --> S
+    D -. "not yet" .-> Q
+    S["Each build isolated &amp; measured<br/>(systemd service · cgroup v2 · direct /proc)<br/>with a jobserver, its cores resized while it runs"]
+    S -. "memory low and falling:<br/>paused in place" .-> S
+    S -. "memory critically low: stopped;<br/>queued again if it can safely start over" .-> Q
+    S -- "peak memory, cores, time" --> H[("History, per command")]
+    H -. "sizes and orders the next run" .-> Q
+```
+
+Every build runs under a lightweight supervisor so `buildq` can measure it, cap its resources, pause
+it if memory runs short, and clean up all of its child processes when it finishes. By default
+(`runner = "auto"`), `buildq` detects your Linux setup automatically:
+
+1. **With systemd (Ubuntu, Fedora, Arch, Debian, …):** runs each build as a private user service
+   inside `buildq.slice`, using systemd and the Linux kernel for memory caps, pausing, and cleanup.
+2. **Without systemd, out of the box (Alpine, Void, Gentoo, Artix, Devuan, WSL2, Docker/Podman):**
+   zero setup and no root needed — tracks each build's full process tree, limits its cores, pauses
+   it if RAM runs low, stops builds that pass their memory cap, and cleans up every child process.
+3. **Optional kernel caps without systemd (`cgroup`):** on non-systemd machines that have Linux
+   cgroup v2, running one boot-time script ([`init/cgroup-setup.sh`](init/cgroup-setup.sh)) gives
+   builds the same kernel-enforced memory limits and freezing as systemd. See
+   [`init/README.md`](init/README.md).
+
+What each build used is recorded under its command (repository, lane, tool, subcommand, package),
+and the next run of that command is planned from it. The daemon re-plans every second and whenever
+a build arrives or ends.
+
+## Benchmarks: the full numbers
+
+The headline table at the top comes from `bench/sim.py`, a deterministic replay suite that drives the
+real `buildqd` daemon against five workloads modeled on a 32-core, 125 GB workstation (with 26 GB and
+3 cores held by background work), compared against **no queue** (everything starts immediately) and
+**fixed FIFO slots** (`2`, `4`, `6` — like `pueue`, `task-spooler`, or a `flock` slot script):
+
+- **Surprise memory spike (`outgrows-estimate`, 22 builds):** Two builds grow from a 3 GB history to
+  24 GB while twenty 12 GB builds arrive. Without a queue, **half the builds (11/22) are OOM-killed**.
+  With 6 fixed slots, one still OOMs and free RAM drops to 0.1 GB. Safe fixed slots finish in **2.2 h**
+  (2 slots) or **70.5 min** (4 slots). **buildq** finishes all **22/22 in 62.0 min** (**12% faster**
+  than 4 slots, **2.1× faster** than 2 slots) with **0 OOM kills** and **23.4 GB** minimum free RAM.
+- **CI release behind 7 long agent builds (`ci-behind-agents`, 12 builds):** Without a queue, **3/12
+  builds OOM**. Behind 2, 4, or 6 fixed slots, **2 to 5 CI jobs time out** (median CI wait
+  34–50 min). **buildq** completes **12/12** in **1.5 h** with **0 OOM kills**, **0 CI timeouts**,
+  and a **4.9 min** median CI wait (max **5.0 min**).
+- **CI release behind overdue agent builds (`ci-behind-overdue`, 13 builds):** Without a queue,
+  **4/13 builds OOM**. Behind 2 or 4 fixed slots, **all 5 CI jobs time out** (6 slots: 2 time out).
+  **buildq** completes **13/13** with **0 OOM kills**, **0 CI timeouts**, only **1** preemptive stop,
+  and **11.3 min** median CI wait (max **12.0 min**).
+- **Two-hour mixed workday (`mixed-day`, 75 builds):** 2 fixed slots times out **24/32 CI jobs**;
+  4 fixed slots leaves CI waiting **16.5 min** median (**32.8 min** max). **buildq** completes
+  **75/75** with **7 s** median CI wait (**141× shorter** than 4 slots), **35.7 min** median agent
+  turnaround, and never drops below **41.7 GB** free RAM.
+- **Ten cargo builds at once (`burst`, 10 builds):** No queue dips below the 16 GB RAM floor for
+  68 s (13.0 GB min RAM); 2 fixed slots takes **66.5 min** with 34,120 idle core-seconds. **buildq**
+  finishes **10/10 in 40.0 min** (**28.1 min** median turnaround, **50.4 GB** min RAM, **0 s** below
+  the floor, and only 362 idle core-seconds).
+
+**Honest trade-offs:** `buildq` keeps a 16 GB RAM safety margin and prioritizes CI releases, so on
+steady workloads that happen not to OOM without a queue (`mixed-day`), individual agent builds trade
+a few extra minutes of median turnaround (`35.7 min` vs. `27.9 min` for 4 slots) in exchange for zero
+OOM kills, zero CI timeouts, and an interactive machine. Raw makespan can also look shorter without
+a queue on overloaded scenarios only because 25–50% of the builds crashed to OOM instead of
+finishing.
+
+```sh
+python3 bench/sim.py baselines   # reproduce all 5 scenarios locally in a few seconds
+```
+
+<details>
+<summary><strong>Full per-scenario tables (all 5 workloads, 132 builds)</strong></summary>
+
+#### `burst` (10 builds — ten cargo builds at once)
+
+| Metric | No queue | 2 slots | 4 slots | 6 slots | buildq |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Succeeded | 10/10 | 10/10 | 10/10 | 10/10 | **10/10** |
+| OOM kills | 0 | 0 | 0 | 0 | **0** |
+| Makespan | 33.5m | 66.5m | 38.3m | 35.1m | 40.0m |
+| Agent turnaround p50 | 30.8m | 38.0m | 25.0m | 23.2m | 28.1m |
+| Least free RAM | 13.0G | 78.7G | 59.3G | 48.7G | 50.4G |
+| Time below 16G floor | 68s | 0s | 0s | 0s | **0s** |
+| Idle core-s (waiting) | 0 | 34,120 | 0 | 0 | 362 |
+
+#### `ci-behind-agents` (12 builds — a release arrives behind seven long agent test builds)
+
+| Metric | No queue | 2 slots | 4 slots | 6 slots | buildq |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Succeeded | 9/12 | 7/12 | 9/12 | 10/12 | **12/12** |
+| OOM kills | 3 | 0 | 0 | 0 | **0** |
+| CI timed out | 0 | 5 | 3 | 2 | **0** |
+| Makespan | 59.0m | 2.1h | 75.0m | 74.9m | 1.5h |
+| CI wait p50 / max | 0s / 0s | 50.0m / 50.0m | 34.2m / 49.9m | 41.5m / 42.5m | **4.9m / 5.0m** |
+| Agent turnaround p50 | 47.5m | 71.0m | 39.2m | 52.4m | 66.9m |
+| Least free RAM | 1.0G | 66.4G | 33.8G | 4.5G | 35.7G |
+| Time below 16G floor | 34.1m | 0s | 0s | 25.5m | **0s** |
+| Idle core-s (waiting) | 0 | 69,986 | 116 | 0 | 3,711 |
+
+#### `ci-behind-overdue` (13 builds — a release arrives behind agent builds that have waited past overdue)
+
+| Metric | No queue | 2 slots | 4 slots | 6 slots | buildq |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Succeeded | 9/13 | 8/13 | 8/13 | 11/13 | **13/13** |
+| OOM kills | 4 | 0 | 0 | 0 | **0** |
+| CI timed out | 0 | 5 | 5 | 2 | **0** |
+| Makespan | 1.6h | 3.4h | 1.9h | 1.6h | 2.3h |
+| CI wait p50 / max | 0s / 0s | 50.0m / 50.0m | 50.0m / 50.0m | 45.1m / 48.6m | **11.3m / 12.0m** |
+| Agent turnaround p50 | 84.1m | 2.6h | 75.0m | 83.9m | 1.5h |
+| Least free RAM | 1.0G | 71.8G | 45.7G | 20.4G | 41.4G |
+| Time below 16G floor | 25.7m | 0s | 0s | 0s | **0s** |
+| Idle core-s (waiting) | 0 | 146,555 | 1,494 | 0 | 2,824 |
+
+#### `mixed-day` (75 builds — two hours of agents' builds, four releases, a PR check every ten minutes)
+
+| Metric | No queue | 2 slots | 4 slots | 6 slots | buildq |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Succeeded | 75/75 | 51/75 | 75/75 | 75/75 | **75/75** |
+| OOM kills | 0 | 0 | 0 | 0 | **0** |
+| CI timed out | 0 | 24 | 0 | 0 | **0** |
+| Makespan | 3.2h | 4.4h | 3.3h | 3.3h | 3.6h |
+| CI wait p50 / max | 0s / 19.2m | 50.0m / 50.0m | 16.5m / 32.8m | 2.4m / 15.2m | **7s / 15.8m** |
+| Agent turnaround p50 | 23.9m | 76.6m | 27.9m | 21.8m | 35.7m |
+| Least free RAM | 27.0G | 74.0G | 52.1G | 38.8G | 41.7G |
+| Time below 16G floor | 0s | 0s | 0s | 0s | **0s** |
+| Idle core-s (waiting) | 40,160 | 179,392 | 47,003 | 49,659 | 42,377 |
+
+#### `outgrows-estimate` (22 builds — two builds grow far past their estimates on a full machine)
+
+| Metric | No queue | 2 slots | 4 slots | 6 slots | buildq |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Succeeded | 11/22 | 22/22 | 22/22 | 21/22 | **22/22** |
+| OOM kills | 11 | 0 | 0 | 1 | **0** |
+| Makespan | 24.8m | 2.2h | 70.5m | 50.0m | **62.0m** |
+| Agent turnaround p50 | 10.0m | 73.4m | 34.9m | 24.0m | **34.5m** |
+| Least free RAM | 0.2G | 58.9G | 23.3G | 0.1G | 23.4G |
+| Time below 16G floor | 12.3m | 0s | 0s | 10.2m | **0s** |
+| Idle core-s (waiting) | 0 | 134,829 | 41,598 | 12,672 | 29,829 |
+
+</details>
+
+<details>
+<summary><strong>Real Linux 6.12 KVM verification (<code>direct</code> and <code>cgroup</code> v2 runners, real <code>gcc -O2</code> builds)</strong></summary>
+
+Measured on an isolated Alpine Linux 3.21 KVM virtual machine (Linux 6.12, 4 vCPUs, 2 GB RAM, no swap) compiling real C programs with `gcc -O2` and `make -j4` (6 heavy agent builds + 4 quick CI checks).
+
+**Zero-setup `direct` runner (~8 s heavy builds):**
+
+| Policy | Succeeded | Real kernel OOM kills | CI turnaround p50 | Lowest `MemAvailable` |
+| --- | ---: | ---: | ---: | ---: |
+| No queue | 7 / 10 | 3 | 1.5 s* | 74 MB |
+| 4 fixed slots | 9 / 10 | 1 | 14.5 s* | 0 MB |
+| 2 fixed slots | 10 / 10 | 0 | 28.8 s | 761 MB |
+| **buildq (`direct`)** | **10 / 10** | **0** | **8.8 s (3.3× faster than 2 slots)** | **1,032 MB** |
+
+**Kernel-enforced `cgroup` v2 runner (longer ~16 s heavy builds):**
+
+| Policy | Succeeded | Real kernel OOM kills | CI turnaround p50 | Lowest `MemAvailable` |
+| --- | ---: | ---: | ---: | ---: |
+| No queue | 7 / 10 | 3 | 1.6 s* | 0 MB |
+| 4 fixed slots | 8 / 10 | 2 | 21.9 s* | 290 MB |
+| 2 fixed slots | 10 / 10 | 0 | 51.0 s | 758 MB |
+| **buildq (`cgroup` v2)** | **10 / 10** | **0** | **17.8 s (2.9× faster than 2 slots)** | **616 MB** |
+
+*\*CI checks started immediately only because the policy didn't limit RAM and let 1–3 heavy builds crash to the Linux OOM killer.*
+
+</details>
+
+See [Benchmarking](docs/benchmark.md) for the simulation model, caveats, and how to replay traces from your own machine.
+
+## Under the hood
+
+| Feature | What it does |
+| --- | --- |
+| **Admission by measurement** | A build starts when its expected peak memory fits in what is free, after setting aside room for running builds to grow into. While other builds run, it also waits for free cores and low CPU pressure, unless its lane doesn't wait for CPU. [How it decides](docs/scheduling.md#when-a-build-starts) |
+| **Learned sizes** | Peak memory, peak cores and time are recorded per command, and the next run is planned with them. [Estimates](docs/scheduling.md#estimates) |
+| **Cores that follow the load** | Each build starts with the cores that are free and memory allows, between its lane's minimum and what its history says it can use. buildq passes the grant through each tool's environment (`CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `GRADLE_OPTS`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `GOMAXPROCS`) or CLI (`zig build -j`), and gives Cargo, `make -j` and Ninja builds a jobserver of their own that is resized live with the load. [Cores](docs/scheduling.md#cores) has the conditions. |
+| **Quick builds first** | Lanes have priorities; at the same priority, after fair shares, the build expected to finish soonest goes first. A build that has waited `starve_seconds` goes ahead of them all, so slow builds aren't passed for ever. A front-end lane can have turns of its own and never wait for CPU. [Order](docs/scheduling.md#order) |
+| **CI first, if you want** | With `ci_first`, a GitHub Actions step gets a head start and holds the room it needs from builds of its priority or lower, so a release is less likely to time out in the queue. A build that has waited three times `starve_seconds` or was stopped to free memory still goes ahead of it, unless the step has waited `ci_deadline`: then it goes first, the oldest such step first, except before a build that has queued twelve times `starve_seconds`. With `make_room_for_ci`, a step that has waited that long for memory stops the newest agent builds that can safely start over. [CI jobs](docs/ci.md) |
+| **Caps** | Lanes set per-build resource limits (`MemoryHigh`, `MemoryMax`, `CPUWeight`, `IOWeight`, `TasksMax`, `CPUQuota`, `Nice`). With `systemd` or `cgroup`, the Linux kernel enforces them directly and keeps all running builds under a safety ceiling that adjusts as other programs use RAM. In `direct` mode, a 1 s watchdog stops builds that exceed `MemoryMax` and `nice` lowers priority. |
+| **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build in place while memory is low and falling, and stops one when it gets critically low, before the machine can stall. A compile or test run (cargo, dotnet, gradle/gradlew, cmake `--build`, ctest, zig, gcc/clang, pytest/unittest/mypy/pyright/uv, tsc, eslint, vitest, ninja) or a build submitted with `--restartable` (or run by a script the machine lists in `restartable_scripts`) is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
+| **One build per source** | A repeat submission (the same command on the same source, in the same directory, lane, environment and settings) joins the build already queued or running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
+| **Fair shares** | At the same priority, the caller (a session, a CI runner) with fewer builds running goes first. |
+| **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` waits for it, streams its output and exits with its code; builds have no stdin or terminal. [Using buildq](docs/usage.md) |
+| **Visibility** | `buildq top` is a live view like btop. `buildq report --capacity` says what builds waited for, and SQLite analytics answer the rest. [Operating](docs/operations.md) |
+| **Small** | The Python 3.11 standard library, POSIX shell scripts, and optional systemd units or OpenRC/runit/s6/dinit/SysVinit service templates. No root required. |
 
 ## Commands
 

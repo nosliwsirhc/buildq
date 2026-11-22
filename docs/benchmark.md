@@ -50,7 +50,8 @@ The baseline simulator uses the same per-second CPU sharing, memory profiles, wo
 CI timeouts, and machine-wide OOM killer as `Simulation`, without buildq's learned memory admission,
 dynamic core grants, CI priority, or memory shedding. Baseline builds run at their recorded
 `avg_cores` (rather than spawning an unbounded worker per host core), which is conservative in the
-baselines' favor.
+baselines' favor. `bench/bench.toml` pairs `ci_first = true` and `make_room_for_ci = "5m"` with
+`make_room_behind_agents = false` and `ci_deadline = "10m"`.
 
 **Two versions of the daemon** on the same scenarios:
 
@@ -71,14 +72,15 @@ which prints (base: no stops for CI; head: stops after 5 minutes):
 
 | | base | head | change |
 |---|---:|---:|---:|
-| makespan | 1.6h | 1.8h | +13% |
-| CI wait p50 | 23.9m | 4.8m | -80% |
-| CI wait max | 31.1m | 5.0m | -84% |
-| agent wait p50 | 30.3m | 35.2m | +16% |
-| CI timed out | 1 | 1 | same |
+| makespan | 1.6h | 1.5h | -3% |
+| CI wait p50 | 23.9m | 4.9m | -80% |
+| CI wait max | 24.6m | 5.0m | -80% |
+| agent wait p50 | 30.3m | 10.7m | -65% |
+| agent turnaround p50 | 66.4m | 66.9m | +1% |
+| CI timed out | 0 | 0 | same |
 | stops (memory + CI) | 0 | 2 | +2 |
 | running time lost to stops | 0s | 22.0m | +22.0m |
-| running time lost to cancels | 18.9m | 45.1m | +138% |
+| idle core-seconds while waiting | 6778 | 3711 | -45% |
 
 Temporary state goes under `$TMPDIR` and is deleted after each run.
 
