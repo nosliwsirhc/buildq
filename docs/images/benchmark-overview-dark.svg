@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="358" viewBox="0 0 920 358" role="img" aria-label="buildq vs. no queue and fixed slots: build outcomes and RAM safety margin">
+  <title>buildq vs. no queue and fixed slots: build outcomes and RAM safety margin</title>
+  <style>
+    .t { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .m { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
+    .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #6e7681; }
+    .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace; fill: #8b949e; }
+  </style>
+  <rect x="0.5" y="0.5" width="919" height="357" rx="12" fill="#0d1117" stroke="#30363d"/>
+  <text x="24" y="34" class="t" font-size="16" font-weight="700">buildq vs. no queue &amp; fixed slots (132 builds across 5 workloads)</text>
+  <text x="24" y="54" class="m" font-size="12">32-core, 125 GB Linux workstation replay (python3 bench/sim.py baselines) · 16 GB RAM safety floor</text>
+  <rect x="20" y="72" width="434" height="264" rx="8" fill="#161b22" stroke="#30363d"/>
+  <rect x="466" y="72" width="434" height="264" rx="8" fill="#161b22" stroke="#30363d"/>
+  <text x="36" y="98" class="t" font-size="13" font-weight="600">Build outcomes (all 132 builds)</text>
+  <rect x="36.0" y="108" width="10" height="10" rx="2" fill="#4493f8"/>
+  <text x="50.0" y="117" class="m" font-size="10.5">Baseline ok</text>
+  <rect x="126.7" y="108" width="10" height="10" rx="2" fill="#3fb950"/>
+  <text x="140.7" y="117" class="m" font-size="10.5">buildq ok</text>
+  <rect x="206.0" y="108" width="10" height="10" rx="2" fill="#f85149"/>
+  <text x="220.0" y="117" class="m" font-size="10.5">OOM killed</text>
+  <rect x="291.0" y="108" width="10" height="10" rx="2" fill="#d29922"/>
+  <text x="305.0" y="117" class="m" font-size="10.5">CI timed out</text>
+  <text x="112" y="155" text-anchor="end" class="t" font-size="12" font-weight="500">No queue</text>
+  <rect x="122" y="142" width="170" height="18" rx="4" fill="#21262d"/>
+  <rect x="122.0" y="142" width="146.8" height="18" rx="3" fill="#4493f8"/>
+  <rect x="268.8" y="142" width="23.2" height="18" rx="2" fill="#f85149"/>
+  <text x="302" y="155" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#f85149" font-size="11.5" font-weight="500">114/132 · 18 OOM</text>
+  <text x="112" y="190" text-anchor="end" class="t" font-size="12" font-weight="500">2 fixed slots</text>
+  <rect x="122" y="177" width="170" height="18" rx="4" fill="#21262d"/>
+  <rect x="122.0" y="177" width="126.2" height="18" rx="3" fill="#4493f8"/>
+  <rect x="248.2" y="177" width="43.8" height="18" rx="2" fill="#d29922"/>
+  <text x="302" y="190" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#e6edf3" font-size="11.5" font-weight="500">98/132 · 34 T/O</text>
+  <text x="112" y="225" text-anchor="end" class="t" font-size="12" font-weight="500">4 fixed slots</text>
+  <rect x="122" y="212" width="170" height="18" rx="4" fill="#21262d"/>
+  <rect x="122.0" y="212" width="159.7" height="18" rx="3" fill="#4493f8"/>
+  <rect x="281.7" y="212" width="10.3" height="18" rx="2" fill="#d29922"/>
+  <text x="302" y="225" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#e6edf3" font-size="11.5" font-weight="500">124/132 · 8 T/O</text>
+  <text x="112" y="260" text-anchor="end" class="t" font-size="12" font-weight="500">6 fixed slots</text>
+  <rect x="122" y="247" width="170" height="18" rx="4" fill="#21262d"/>
+  <rect x="122.0" y="247" width="163.6" height="18" rx="3" fill="#4493f8"/>
+  <rect x="285.6" y="247" width="3.0" height="18" rx="2" fill="#f85149"/>
+  <rect x="288.6" y="247" width="5.2" height="18" rx="2" fill="#d29922"/>
+  <text x="302" y="260" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#f85149" font-size="11.5" font-weight="500">127/132 · 1 OOM, 4 T/O</text>
+  <rect x="28" y="276" width="418" height="30" rx="6" fill="#13231a" stroke="#3fb950" stroke-opacity="0.45"/>
+  <text x="112" y="295" text-anchor="end" class="t" font-size="12" font-weight="700">buildq</text>
+  <rect x="122" y="282" width="170" height="18" rx="4" fill="#21262d"/>
+  <rect x="122.0" y="282" width="170.0" height="18" rx="3" fill="#3fb950"/>
+  <text x="302" y="295" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#3fb950" font-size="11.5" font-weight="700">132/132 · 100%</text>
+  <text x="482" y="98" class="t" font-size="13" font-weight="600">Lowest free RAM (16 GB safety floor)</text>
+  <text x="482" y="117" class="m" font-size="10.5">Right of dashed line = safe · left = starved of RAM</text>
+  <line x1="568.0" y1="136" x2="568.0" y2="308" stroke="#21262d" stroke-width="1"/>
+  <text x="568.0" y="324" text-anchor="middle" class="s" font-size="10">0G</text>
+  <line x1="613.0" y1="132" x2="613.0" y2="310" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <text x="613.0" y="324" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#f85149" font-size="10" font-weight="600">16G floor</text>
+  <line x1="658.0" y1="136" x2="658.0" y2="308" stroke="#21262d" stroke-width="1"/>
+  <text x="658.0" y="324" text-anchor="middle" class="s" font-size="10">32G</text>
+  <line x1="703.0" y1="136" x2="703.0" y2="308" stroke="#21262d" stroke-width="1"/>
+  <text x="703.0" y="324" text-anchor="middle" class="s" font-size="10">48G</text>
+  <line x1="748.0" y1="136" x2="748.0" y2="308" stroke="#21262d" stroke-width="1"/>
+  <text x="748.0" y="324" text-anchor="middle" class="s" font-size="10">64G</text>
+  <text x="558" y="155" text-anchor="end" class="t" font-size="12" font-weight="500">No queue</text>
+  <rect x="568" y="142" width="4.0" height="18" rx="3" fill="#f85149"/>
+  <text x="758" y="155" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#f85149" font-size="11.5" font-weight="500">0.2G (73.3m below)</text>
+  <text x="558" y="190" text-anchor="end" class="t" font-size="12" font-weight="500">2 fixed slots</text>
+  <rect x="568" y="177" width="165.7" height="18" rx="3" fill="#3b5370"/>
+  <text x="758" y="190" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#8b949e" font-size="11.5" font-weight="500">58.9G (0s below)</text>
+  <text x="558" y="225" text-anchor="end" class="t" font-size="12" font-weight="500">4 fixed slots</text>
+  <rect x="568" y="212" width="65.5" height="18" rx="3" fill="#3b5370"/>
+  <text x="758" y="225" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#8b949e" font-size="11.5" font-weight="500">23.3G (0s below)</text>
+  <text x="558" y="260" text-anchor="end" class="t" font-size="12" font-weight="500">6 fixed slots</text>
+  <rect x="568" y="247" width="4.0" height="18" rx="3" fill="#f85149"/>
+  <text x="758" y="260" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#f85149" font-size="11.5" font-weight="500">0.1G (35.8m below)</text>
+  <rect x="474" y="276" width="418" height="30" rx="6" fill="#13231a" stroke="#3fb950" stroke-opacity="0.45"/>
+  <text x="558" y="295" text-anchor="end" class="t" font-size="12" font-weight="700">buildq</text>
+  <rect x="568" y="282" width="65.8" height="18" rx="3" fill="#3fb950"/>
+  <text x="758" y="295" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" fill="#3fb950" font-size="11.5" font-weight="700">23.4G (0s below)</text>
+  <line x1="613.0" y1="132" x2="613.0" y2="310" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4,3"/>
+</svg>

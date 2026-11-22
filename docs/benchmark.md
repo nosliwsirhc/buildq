@@ -16,12 +16,16 @@ python3 bench/sim.py scenarios                  # the built-in scenarios
 python3 bench/sim.py run ci-behind-agents       # one scenario's summary (--json for all of it)
 python3 bench/sim.py run burst --policy none    # replay with a baseline policy (none, slots:N, or buildq)
 python3 bench/sim.py baselines                  # buildq vs. no queue and fixed slots (2, 4, 6) across all scenarios
+python3 bench/charts.py                         # regenerate dark/light SVG charts in docs/images/ from sim.py baselines --json
+python3 bench/charts.py --input results.json    # render SVG charts from a saved `baselines --json` file
 python3 bench/sim.py check                      # each scenario twice, the second in a fresh process: they must match
 python3 bench/sim.py compare                    # this checkout's daemon against itself, every scenario
 ```
 
 `run` also takes `--policy buildq|none|slots:N`, `--jobs FILE` (what happened to each build, JSONL),
-and `--log FILE` (the daemon's own log, in simulated seconds).
+and `--log FILE` (the daemon's own log, in simulated seconds). `charts.py` runs `sim.py baselines --json`
+(or reads `--input`) and writes `benchmark-overview-{dark,light}.svg` and
+`benchmark-scenarios-{dark,light}.svg` into `docs/images/` (override with `--out-dir`).
 
 ### Comparing buildq against no queue and fixed slots
 
@@ -37,6 +41,18 @@ python3 bench/sim.py baselines ~/morning.jsonl --seed-history --json
 ```
 
 Across all five built-in scenarios (132 builds on the modeled 32-core, 125 GB workstation):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/benchmark-overview-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="images/benchmark-overview-light.svg">
+  <img alt="Benchmark overview comparing build outcomes across 132 builds and lowest free RAM against the 16 GB safety floor for no queue, 2, 4, and 6 fixed slots, and buildq" src="images/benchmark-overview-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/benchmark-scenarios-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="images/benchmark-scenarios-light.svg">
+  <img alt="Benchmark scenarios comparing median CI wait time across mixed-day, ci-behind-agents, and ci-behind-overdue, plus outgrows-estimate memory-spike completion time" src="images/benchmark-scenarios-light.svg">
+</picture>
 
 | Policy | Succeeded | OOM kills | CI timed out | Time below 16 GB floor | Least free RAM |
 |---|---:|---:|---:|---:|---:|
