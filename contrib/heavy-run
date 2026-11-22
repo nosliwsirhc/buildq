@@ -2,14 +2,14 @@
 # heavy-run: run a heavy job through buildq, this workstation's build queue.
 #
 #   ~/.agents/bin/heavy-run <command> [args...]           queue it, stream its output, exit with its code
-#   ~/.agents/bin/heavy-run --web <command> [args...]     the same, in the web lane (a FileDrop push that
+#   ~/.agents/bin/heavy-run --web <command> [args...]     the same, in the web lane (a web-only push that
 #                                                         changes nothing outside src/, public/ and docs)
 #   ~/.agents/bin/heavy-run --submit <command> [args...]  drop it off: prints a ticket and returns at once
 #   ~/.agents/bin/heavy-run --wait <ticket> [--timeout 9m]   block until it ends; exit with its code
 #   ~/.agents/bin/heavy-run --logs <ticket> [--tail 100] [--follow]
 #   ~/.agents/bin/heavy-run --status [<ticket>]           a ticket, or the whole queue and the machine
 #   ~/.agents/bin/heavy-run --list | --cancel <ticket>
-#   ~/.agents/bin/heavy-run --wsl <command> [args...]     run it on living-room-wsl instead (heavy-run-wsl)
+#   ~/.agents/bin/heavy-run --wsl <command> [args...]     run it on a remote WSL host instead (heavy-run-wsl)
 #
 # Before the command (or before --submit), these pass through to buildq:
 #   --again        run it even if the same command on the same source already ran (no joining)

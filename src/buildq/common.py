@@ -158,13 +158,13 @@ def runtime_dir(state_dir: str | None = None) -> str:
     cand = os.path.join(os.path.expanduser(state_dir) if state_dir else default_state_dir(), "run")
     if len(os.path.join(cand, "buildq.sock").encode("utf-8", errors="surrogateescape")) <= 100:
         return cand
-    return f"/tmp/buildq-{UID}"
+    return f"/tmp/buildq-{UID}"  # noqa: S108 (verified private 0700 dir via ensure_private_dir)
 
 
 def fallback_runtime_dirs(state_dir: str | None = None) -> set[str]:
     """Directories owned and managed by buildq itself when no systemd runtime dir is used."""
     sdir = os.path.expanduser(state_dir) if state_dir else default_state_dir()
-    return {os.path.normpath(os.path.join(sdir, "run")), f"/tmp/buildq-{UID}"}
+    return {os.path.normpath(os.path.join(sdir, "run")), f"/tmp/buildq-{UID}"}  # noqa: S108
 
 
 def ensure_private_dir(path: str) -> None:
@@ -188,6 +188,8 @@ def ensure_private_dir(path: str) -> None:
         if st.st_uid != UID:
             raise PermissionError(f"{path} belongs to uid {st.st_uid}, not {UID}")
         if stat.S_IMODE(st.st_mode) & 0o077:
+            # dfd is an O_DIRECTORY fd; 0o700 is owner-only rwx (strictest private directory mode).
+            # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
             os.fchmod(dfd, 0o700)
     finally:
         os.close(dfd)

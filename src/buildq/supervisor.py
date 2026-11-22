@@ -249,7 +249,8 @@ def _downgrade_old_make_fifo(argv: list[str], cwd: str, env: dict[str, str], job
     try:
         proc = subprocess.Popen([exe, "--version"], cwd=eff_cwd, env=probe_env, stdin=DEVNULL,
                                 stdout=subprocess.PIPE, stderr=DEVNULL, process_group=0)
-        assert proc.stdout is not None
+        if proc.stdout is None:
+            return jobserver_fd
         rfd = proc.stdout.fileno()
         os.set_blocking(rfd, False)
         sel = selectors.DefaultSelector()

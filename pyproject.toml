@@ -23,3 +23,9 @@ script-files = ["bin/buildq-shim", "bin/buildq-rustc-guard"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff.lint]
+# High-signal Python security checks (flake8-bandit `S`), ignoring noisy rules for a systems build
+# runner that intentionally spawns subprocesses, reads /proc, and uses seeded RNG in benchmarks.
+select = ["S"]
+ignore = ["S110", "S112", "S311", "S603", "S606", "S607"]

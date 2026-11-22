@@ -751,7 +751,7 @@ class TopHistory:
                 cols = {r[1] for r in db.execute("PRAGMA table_info(minute)")}
                 pick = lambda *names: next((n for n in names if n in cols), "NULL")  # noqa: E731
                 # (each minute's average: the graph shows the average of each step, as btop does)
-                rows = db.execute(f"SELECT t, {pick('cpu_busy')}, {pick('cores')}, {pick('mem_total')}, "
+                rows = db.execute(f"SELECT t, {pick('cpu_busy')}, {pick('cores')}, {pick('mem_total')}, "  # noqa: S608 (hardcoded column names)
                                   f"{pick('mem_available')}, {pick('builds_mem_avg', 'builds_mem')}, {pick('growth')} "
                                   "FROM minute WHERE t >= ? ORDER BY t", (now - TOP_SPAN,)).fetchall()
             finally:

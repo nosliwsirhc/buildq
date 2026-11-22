@@ -420,12 +420,12 @@ class Metrics:
                     item.update(consumers.read(builds, float(item.get("cpu_busy") or 0.0), builds_fallback))
                     if not full:
                         names = [n for n in item if n == "t" or n in {c for c, _, _ in METRIC_COLUMNS}]
-                        db.execute(f"INSERT OR REPLACE INTO minute ({', '.join(names)}) VALUES "
+                        db.execute(f"INSERT OR REPLACE INTO minute ({', '.join(names)}) VALUES "  # noqa: S608 (schema constants)
                                    f"({', '.join('?' * len(names))})", [item[n] for n in names])
                         since = min(since, float(item["t"])) if since is not None else float(item["t"])
                 elif kind == "build" and not full:
                     names = [n for n, _ in BUILD_COLUMNS if n in item]
-                    db.execute(f"INSERT OR REPLACE INTO build ({', '.join(names)}) VALUES "
+                    db.execute(f"INSERT OR REPLACE INTO build ({', '.join(names)}) VALUES "  # noqa: S608 (schema constants)
                                f"({', '.join('?' * len(names))})", [item[n] for n in names])
                 if time.monotonic() - cleaned >= 3600:
                     cleaned = time.monotonic()  # (a failure is tried again in an hour)
@@ -450,7 +450,7 @@ class Metrics:
             start = min(start, int(since // 3600) * 3600)
         db.execute("BEGIN")
         try:
-            db.execute(f"INSERT OR REPLACE INTO hour (t, {', '.join(names)}) SELECT (t / 3600) * 3600, {rolled} "
+            db.execute(f"INSERT OR REPLACE INTO hour (t, {', '.join(names)}) SELECT (t / 3600) * 3600, {rolled} "  # noqa: S608 (schema constants)
                        "FROM minute WHERE t >= ? GROUP BY t / 3600", (start,))
             db.execute("DELETE FROM minute WHERE t < ?", (now - self.MINUTE_DAYS * 86400,))
             db.execute("DELETE FROM hour WHERE t < ?", (now - self.HOUR_DAYS * 86400,))

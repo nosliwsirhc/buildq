@@ -353,6 +353,7 @@ def main() -> int:
         if build_first is not None:
             # Build in the queue, then run the program here: it may read stdin, and it may run for
             # hours (a server), which mustn't hold a turn.
+            # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-tainted-env-args.dangerous-subprocess-use-tainted-env-args
             code = subprocess.call(queued + [tool, *build_first])
             if code != 0:
                 return code
@@ -361,9 +362,13 @@ def main() -> int:
                 sep = run_args.index("--") if "--" in run_args else len(run_args)
                 if "--no-build" not in run_args[:sep]:
                     run_args.insert(sep, "--no-build")
+            # Transparent PATH shim intentionally forwards caller argv to the real resolved tool.
+            # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
             os.execv(tool, [tool, *run_args])
         # `buildq run` runs it directly when this is already inside a build.
+        # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
         os.execv(sys.executable, queued + [tool, *args])
+    # nosemgrep: python.lang.security.audit.dangerous-os-exec-tainted-env-args.dangerous-os-exec-tainted-env-args
     os.execv(tool, [tool, *args])
     return 127
 

@@ -81,7 +81,7 @@ run cancelled with its job teaches the history nothing. If a new step keeps timi
 queue, run it once by hand through `buildq run` (the command alone teaches the queue nothing) so the
 history learns its real size. The history is kept per
 repository, lane and command (`<repository>|<lane>|<command words>`, where the repository is the
-name of its main checkout's folder, `filedrop` for a runner's `_work/filedrop/filedrop`), so run it
+name of its main checkout's folder, `myapp` for a runner's `_work/myapp/myapp`), so run it
 from a checkout whose folder has the same name, with the same `--lane` and the same command. The
 command words are the tool and what it runs: cargo's subcommand and packages, a JS tool's script, a
 script's name. A script listed in `script_labels` and run straight after its interpreter also gets

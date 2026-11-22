@@ -1384,7 +1384,7 @@ def export_machine(db: sqlite3.Connection, since: float | None, until: float | N
         notes.append("the analytics' minute rows don't say what the builds used: the replay has the built-in background")
         return None
     average = "builds_mem_avg" if "builds_mem_avg" in cols else "NULL"
-    query = (f"SELECT t, cores, mem_total, mem_available, builds_mem, {average}, cpu_busy, builds_cores "
+    query = (f"SELECT t, cores, mem_total, mem_available, builds_mem, {average}, cpu_busy, builds_cores "  # noqa: S608 (hardcoded column name)
              "FROM minute WHERE 1=1")
     params: list = []
     if since is not None:

@@ -1490,7 +1490,7 @@ def capacity_report(args) -> int:
                    {weighted("cpu_busy")}, {weighted("builds_cores")}, {weighted("ci_cores")},
                    {weighted("containers_cores")}, {weighted("apps_cores")},
                    MIN(mem_available_min), MAX(cores)
-            FROM {table} WHERE t >= ? GROUP BY period ORDER BY period""", (offset, offset, since)).fetchall()
+            FROM {table} WHERE t >= ? GROUP BY period ORDER BY period""", (offset, offset, since)).fetchall()  # noqa: S608
         builds = db.execute("SELECT waited_by, est_mem, mem_peak, past_peak_released, past_peak_attempts, past_peak_over, "
                             "past_peak_most_over, past_peak_freed, past_peak_unknown FROM build WHERE ended >= ?",
                             (since,)).fetchall()

@@ -904,7 +904,7 @@ class GitHubStatuses(DaemonCase):
         (said,) = [c for c in log.call_args_list if "can't run gh" in str(c)]
         self.assertIn("isn't on PATH, in ~/.local/bin or in ~/bin", str(said))
 
-    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "fedora-kinflow-1"}
+    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "ci-runner-1"}
 
     def test_a_pass_in_a_github_actions_job_posts_nothing(self):
         t = self.submit(("cargo", "test"), source=SOURCE, env=self.CI)
