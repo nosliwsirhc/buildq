@@ -229,8 +229,10 @@ buildq takes ideas, and no code, from these projects. Thank you to their authors
 
 ## Contributing
 
-Issues and pull requests are welcome. [Develop](#develop) has how to run the tests, and
-[docs/design.md](docs/design.md) how buildq works inside.
+Issues, discussions, and pull requests are welcome! Read [CONTRIBUTING.md](CONTRIBUTING.md) for how
+to set up locally, run tests, and submit changes, [docs/design.md](docs/design.md) for how buildq
+works inside, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community guidelines, and
+[SECURITY.md](SECURITY.md) for reporting security issues privately.
 
 ## Develop
 

@@ -1,0 +1,50 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for taking the time to report a bug! Fill in what you can — you don't need to know every detail.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: Commands or steps that trigger the issue.
+      placeholder: |
+        1. Run `...`
+        2. Observe `...`
+  - type: input
+    id: distro
+    attributes:
+      label: Linux distribution & init system
+      description: For example, Ubuntu 24.04 (systemd), Alpine 3.21 (OpenRC), Void (runit), WSL2, Docker container.
+      placeholder: Fedora 42 / systemd
+  - type: dropdown
+    id: runner
+    attributes:
+      label: Runner mode
+      description: Shown by `buildq daemon status` or `buildq ping`.
+      options:
+        - auto / not sure
+        - systemd
+        - cgroup
+        - direct
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`.
+      placeholder: Python 3.12.7
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output or logs
+      description: Paste output from `buildq daemon status`, `buildq status <ticket>`, or `buildq daemon logs --tail 50` (remove any secrets first).
+      render: shell
