@@ -691,6 +691,7 @@ fi
 
 # ---- Paths ---------------------------------------------------------------------------------------
 prefix=${PREFIX:-$HOME/.local}
+# shellcheck disable=SC2088
 case $prefix in
   '')   say "PREFIX must not be empty"; exit 1 ;;
   *'
@@ -722,6 +723,7 @@ shim_tools="cargo pnpm npm npx yarn make gmake ninja dotnet"
 # using `command -v gradle || ./gradlew` never trip over a shim for an absent tool.
 optional_shim_tools="cmake ctest zig gradle"
 state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
+# shellcheck disable=SC2088
 case $state_dir in
   '~')   state_dir=$HOME ;;
   '~/'*) state_dir=$HOME/${state_dir#'~/'} ;;
@@ -880,6 +882,7 @@ if [ "$do_uninstall" = yes ]; then
     fi
     # One final bounded socket probe (only when a socket path exists) followed by a final lock check.
     _cfg_sock=${BUILDQ_SOCKET:-}
+    # shellcheck disable=SC2088
     case $_cfg_sock in
       '~')   _cfg_sock=$HOME ;;
       '~/'*) _cfg_sock=$HOME/${_cfg_sock#'~/'} ;;
@@ -1241,6 +1244,7 @@ if [ -n "$rustc_guard_dirs" ]; then
       *)   _dir=$_rem; _rem='' ;;
     esac
     [ -n "$_dir" ] || continue
+    # shellcheck disable=SC2088
     case $_dir in
       '~')   _dir=$HOME ;;
       '~/'*) _dir=$HOME/${_dir#'~/'} ;;

@@ -1389,7 +1389,7 @@ class Order(DaemonCase):
 
 
 class CIFirst(DaemonCase):
-    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "filedrop-runner-2"}
+    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "ci-runner-2"}
 
     def setUp(self):
         super().setUp()
@@ -1647,7 +1647,7 @@ class CIFirst(DaemonCase):
 
 class MakeRoomForCI(DaemonCase):
     """make_room_for_ci: a CI job's build that has waited for memory our builds hold stops some."""
-    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "filedrop-runner-2"}
+    CI = {"GITHUB_ACTIONS": "true", "RUNNER_NAME": "ci-runner-2"}
 
     def setUp(self):
         super().setUp()

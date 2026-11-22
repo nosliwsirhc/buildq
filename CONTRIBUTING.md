@@ -60,6 +60,9 @@ sh -n install.sh bin/buildq-rustc-guard init/cgroup-setup.sh init/runit/buildqd/
 If you change scheduling behavior, you can also compare your branch against `main` using the replay
 simulator — see [docs/benchmark.md](docs/benchmark.md).
 
+CI also runs free automated security checks on every pull request (`shellcheck` + `dash -n`,
+`ruff`, `semgrep`, `gitleaks`, `actionlint`, `zizmor`, and GitHub CodeQL).
+
 ## Project conventions
 
 - **Zero third-party Python dependencies:** everything in `src/buildq/` and `bin/` uses the
