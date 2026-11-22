@@ -4,7 +4,8 @@ Logs, the memory watch, restarts, files, the analytics, `buildq top`, configurat
 
 ## Logs
 
-`journalctl --user -u buildq` has a line for each build queued, started, resized and
+`buildq daemon logs` (or `journalctl --user -u buildq` on systemd hosts; `~/.local/state/buildq/buildqd.log`,
+rotated at 4 MiB, on non-systemd hosts) has a line for each build queued, started, resized and
 finished, with its estimate, wait, cores, peak memory and time spent waiting on memory.
 
 ## When memory is tight
@@ -12,24 +13,31 @@ finished, with its estimate, wait, cores, peak memory and time spent waiting on 
 When less than twice `mem_floor` is available, or every task on the machine has
 stalled on memory at once 5% of the time while memory is scarce (less than the greater of twice
 `mem_floor` or a quarter of RAM), buildq records every 30 seconds what is available, swap
-and memory pressure, and the six cgroups holding the most memory, builds or not: Docker
-containers, CI runners, editors, agent sessions. It stops once more than 2.5 times `mem_floor` is
-free, with memory pressure under 1% or memory no longer scarce, for half a minute. The lines go to the journal at warning priority (`journalctl --user -u
-buildq -p warning`) and to `~/.local/state/buildq/memory.log`, which is synced to disk with each
+and memory pressure, and the six cgroups holding the most memory (or the six largest processes when
+per-service cgroups aren't present): Docker containers, CI runners, editors, agent sessions. It stops
+once more than 2.5 times `mem_floor` is free, with memory pressure under 1% or memory no longer scarce,
+for half a minute. The lines go to the daemon log (`journalctl --user -u buildq -p warning` on systemd,
+or `buildqd.log`) and to `~/.local/state/buildq/memory.log`, which is synced to disk with each
 entry: after a reset the journal can be missing its last minutes, and `memory.log` isn't.
 
 ## Restarts
 
-Restarts are safe. systemd holds the socket, so clients connecting during a restart wait
-rather than fail. Builds run in services of their own and carry on; queued tickets are on disk.
-The next daemon picks both up.
+Restarts are safe. On systemd hosts, `buildq.socket` holds the socket so clients connecting during a
+restart wait rather than fail. On non-systemd hosts, `buildq daemon restart` (or your init service's
+restart) stops and relaunches `buildqd` cleanly. In all runners, builds run under detached
+supervisors in their own services/cgroups/sessions and carry on across daemon restarts; queued
+tickets are on disk, and the next daemon picks both up.
 
 ## Files
 
 They are in `~/.local/state/buildq`: `tickets/<id>/` (the ticket, its output log, its
 result), `history.jsonl` (one line per finished build; delete it to forget every estimate),
 `memory.log` (the memory watch, kept to about 1 MiB plus one older file), `metrics.db` (the
-analytics, below), and `config.last-good.toml`. Everything is private to the user.
+analytics, below), `config.last-good.toml`, `buildqd.lock` (ensures only one daemon runs for this
+state directory), `cgroup-slice-baseline.json` (used by the `cgroup` runner to restore the original
+memory ceiling after a crash), and on non-systemd hosts `buildqd.pid`, `buildqd.log`, and
+`run/buildq.sock` (or `/tmp/buildq-<uid>/buildq.sock` if the home state path is too long for a
+Unix socket). Everything is private to the user.
 
 ## Analytics
 
@@ -131,7 +139,8 @@ one status request per refresh. Without a UTF-8 locale it draws in ASCII.
 
 ## A broken configuration
 
-A broken configuration is reported in the journal; the daemon keeps the last good one.
+A broken configuration is reported in the daemon log (`buildq daemon logs` / `journalctl --user -u buildq`);
+the daemon keeps the last good one.
 
 ## Before a reboot
 

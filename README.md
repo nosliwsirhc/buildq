@@ -5,7 +5,7 @@ runs it when the machine has room, sized to fit.
 
 [![tests](https://github.com/nosliwsirhc/buildq/actions/workflows/tests.yml/badge.svg)](https://github.com/nosliwsirhc/buildq/actions/workflows/tests.yml)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
-![Linux, cgroup v2, systemd](https://img.shields.io/badge/linux-cgroup%20v2%20%C2%B7%20systemd-informational)
+![Linux: systemd, cgroup v2, or direct](https://img.shields.io/badge/linux-systemd%20%C2%B7%20cgroup%20v2%20%C2%B7%20direct-informational)
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **Completely open source:** buildq is free software under the [MIT License](LICENSE), and all of it
@@ -38,17 +38,30 @@ flowchart TB
     M["The whole machine<br/>/proc · PSI · build cgroups"] -.-> D
     D("Fits now?<br/>memory · cores · pressure · disk · job count · workspace") -- "yes" --> S
     D -. "not yet" .-> Q
-    S["A systemd service of its own in buildq.slice<br/>capped by its lane and measured<br/>with a jobserver, its cores resized while it runs"]
+    S["Each build isolated &amp; measured<br/>(systemd service · cgroup v2 · direct /proc)<br/>with a jobserver, its cores resized while it runs"]
     S -. "memory low and falling:<br/>paused in place" .-> S
     S -. "memory critically low: stopped;<br/>queued again if it can safely start over" .-> Q
     S -- "peak memory, cores, time" --> H[("History, per command")]
     H -. "sizes and orders the next run" .-> Q
 ```
 
-With a systemd user session, every build runs as a systemd service of its own, so it can be capped
-and measured. What it used is recorded under its command (repository, lane, tool, subcommand,
-package), and the next run of that command is planned from it. The daemon re-plans every second and
-whenever a build arrives or ends.
+Every build runs under a lightweight supervisor so buildq can measure it, cap its resources, pause
+it if memory runs short, and clean up all of its child processes when it finishes. By default
+(`runner = "auto"`), buildq detects your Linux setup automatically:
+
+1. **With systemd (Ubuntu, Fedora, Arch, Debian, …):** runs each build as a private user service
+   inside `buildq.slice`, using systemd and the Linux kernel for memory caps, pausing, and cleanup.
+2. **Without systemd, out of the box (Alpine, Void, Gentoo, Artix, Devuan, WSL2, Docker/Podman):**
+   zero setup and no root needed — tracks each build's full process tree, limits its cores, pauses
+   it if RAM runs low, stops builds that pass their memory cap, and cleans up every child process.
+3. **Optional kernel caps without systemd (`cgroup`):** on non-systemd machines that have Linux
+   cgroup v2, running one boot-time script ([`init/cgroup-setup.sh`](init/cgroup-setup.sh)) gives
+   builds the same kernel-enforced memory limits and freezing as systemd. See
+   [`init/README.md`](init/README.md).
+
+What each build used is recorded under its command (repository, lane, tool, subcommand, package),
+and the next run of that command is planned from it. The daemon re-plans every second and whenever
+a build arrives or ends.
 
 ## What you get
 
@@ -59,43 +72,47 @@ whenever a build arrives or ends.
 | **Cores that follow the load** | Each build starts with the cores that are free and memory allows, between its lane's minimum and what its history says it can use. buildq passes the grant through each tool's environment (`CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `GRADLE_OPTS`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `GOMAXPROCS`) or CLI (`zig build -j`), and gives Cargo, `make -j` and Ninja builds a jobserver of their own that is resized live with the load. [Cores](docs/scheduling.md#cores) has the conditions. |
 | **Quick builds first** | Lanes have priorities; at the same priority, after fair shares, the build expected to finish soonest goes first. A build that has waited `starve_seconds` goes ahead of them all, so slow builds aren't passed for ever. A front-end lane can have turns of its own and never wait for CPU. [Order](docs/scheduling.md#order) |
 | **CI first, if you want** | With `ci_first`, a GitHub Actions step gets a head start and holds the room it needs from builds of its priority or lower, so a release is less likely to time out in the queue. A build that has waited three times `starve_seconds` or was stopped to free memory still goes ahead of it, unless the step has waited `ci_deadline`: then it goes first, the oldest such step first, except before a build that has queued twelve times `starve_seconds`. With `make_room_for_ci`, a step that has waited that long for memory stops the newest agent builds that can safely start over. [CI jobs](docs/ci.md) |
-| **Caps** | Lanes give their builds systemd limits (`MemoryHigh`, `MemoryMax`, CPU and IO weights). All builds share one slice, whose memory limit the daemon keeps in line with what the machine has free, so when other work grows, builds are slowed or stopped, not the machine. |
+| **Caps** | Lanes set per-build resource limits (`MemoryHigh`, `MemoryMax`, `CPUWeight`, `IOWeight`, `TasksMax`, `CPUQuota`, `Nice`). With `systemd` or `cgroup`, the Linux kernel enforces them directly and keeps all running builds under a safety ceiling that adjusts as other programs use RAM. In `direct` mode, a 1 s watchdog stops builds that exceed `MemoryMax` and `nice` lowers priority. |
 | **Memory given back** | When other work takes the memory anyway, buildq pauses its newest build in place while memory is low and falling, and stops one when it gets critically low, before the machine can stall. A compile or test run (cargo, dotnet, gradle/gradlew, cmake `--build`, ctest, zig, gcc/clang, pytest/unittest/mypy/pyright/uv, tsc, eslint, vitest, ninja) or a build submitted with `--restartable` (or run by a script the machine lists in `restartable_scripts`) is queued again at the front; anything else fails, saying why. [When memory runs short](docs/scheduling.md#when-memory-runs-short-anyway) |
 | **One build per source** | A repeat submission (the same command on the same source, in the same directory, lane, environment and settings) joins the build already queued or running, and a check that passed on it within `reuse_window` isn't run again. [The same source](docs/usage.md#the-same-source-the-same-build) |
 | **Fair shares** | At the same priority, the caller (a session, a CI runner) with fewer builds running goes first. |
 | **Tickets** | A build dropped off with `buildq submit` doesn't depend on whoever submitted it, its terminal or the daemon: agents submit, go on working, and check back. `buildq run` waits for it, streams its output and exits with its code; builds have no stdin or terminal. [Using buildq](docs/usage.md) |
 | **Visibility** | `buildq top` is a live view like btop. `buildq report --capacity` says what builds waited for, and SQLite analytics answer the rest. [Operating](docs/operations.md) |
-| **Small** | The Python 3.11 standard library, a POSIX shell script and three systemd user units. No root. |
+| **Small** | The Python 3.11 standard library, POSIX shell scripts, and optional systemd units or OpenRC/runit/s6/dinit/SysVinit service templates. No root required. |
 
 ## Quick start
 
-You need Linux with cgroup v2, Python 3.11 or newer, and a systemd user session. Without one,
-`install.sh` installs the programs, the config and the skill page, but no units; it doesn't set up the
-shims or the guard, or start the daemon.
-buildq is built on systemd, so a daemon started by hand (`buildqd`) queues builds but runs them
-without limits, unmeasured, and never pauses or stops them to free memory.
+You need Linux and Python 3.11 or newer — works with systemd **or** without it (Alpine/OpenRC,
+Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2, Docker/Podman containers). `install.sh`
+uses standard `/bin/sh` (no `bash` needed), checks compatibility and dependencies up front, and
+offers to install anything missing via your package manager (`apt`, `dnf`, `pacman`, `apk`,
+`xbps-install`, `zypper`, or `emerge`).
 
 ```sh
 git clone https://github.com/nosliwsirhc/buildq.git
 cd buildq
-./install.sh                       # the daemon and the client
+./install.sh                       # check system, install/upgrade, and start the daemon
+./install.sh --check               # optional: check compatibility & dependencies without installing
 ./install.sh --shims               # optional: heavy commands go through the queue by themselves
 ./install.sh --rustc-guard=~/src   # optional: cargo under ~/src refuses to compile Rust outside the queue
 ./install.sh --skill               # optional: a skill that teaches coding agents to use the queue
 ```
 
-`install.sh` does the following:
-- puts `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` in `~/.local/bin` and the `buildq` Python package in a versioned directory under `~/.local/lib/buildq/current` (`PREFIX` changes both), with the Python it checked written into the launchers (`PYTHON` chooses it; a virtualenv's is replaced by the Python it was made from), so a different `python3` on `PATH` later can't break them and an upgrade can't disturb already-running builds;
-- writes `~/.config/buildq/config.toml` if there isn't one;
-- installs `buildq.socket`, `buildq.service` and `buildq.slice` into `~/.config/systemd/user`, with a fixed memory backstop for all builds together (75%/85% of memory) and a drop-in that turns off per-slice `systemd-oomd` pressure kills on `buildq.slice` (leaving system oomd intact), both in `buildq.slice.d`;
-- starts the daemon.
+`install.sh` sets everything up automatically for your Linux machine:
+- checks that you're on Linux, detects your distro and init system, verifies Python 3.11+ and required utilities, and offers a `[y/N]` prompt (or `--install-deps`) to install any missing prerequisites;
+- installs `buildq`, `buildqd`, `buildq-shim` and `buildq-rustc-guard` into `~/.local/bin` (change with `PREFIX`), pinning them to the Python 3.11+ it verified (`PYTHON=...` to choose one) so switching virtualenvs or changing `python3` on `PATH` later won't break them, and keeping each release in its own versioned folder under `~/.local/lib/buildq/` so upgrades don't disturb already-running builds;
+- creates `~/.config/buildq/config.toml` with sensible defaults if you don't have one yet;
+- on **systemd** machines: installs and starts the user background service (`buildq.service`) with a 75%/85% memory safety cap for all builds together;
+- on **non-systemd** machines: starts `buildqd` directly in the background (logs in `~/.local/state/buildq/buildqd.log`), ready to use right away. Pass `--no-start` in Dockerfiles or packaging scripts. Want boot-time startup (OpenRC, runit, s6, dinit, SysVinit) or optional kernel memory limits without systemd? See [`init/README.md`](init/README.md).
 
-While the daemon runs, it lowers the slice's limit below that backstop to what builds hold plus
-what the machine has free. To upgrade, run `install.sh` again: running builds carry on,
-and queued ones keep their place.
+While running under `systemd` or `cgroup`, buildq automatically tightens the shared builds memory
+ceiling whenever other programs on the machine need RAM (`slice_guard`). To upgrade later, just run
+`install.sh` again — builds already running finish normally and queued builds keep their place.
 
-On a build server, keep the daemon running while you're logged out with `loginctl enable-linger "$USER"`.
-`./install.sh --uninstall` removes everything except your configuration and state (history, tickets, analytics).
+To keep the daemon running after you log out: run `loginctl enable-linger "$USER"` on systemd
+machines, or use a boot service from [`init/`](init/README.md) (or `@reboot ~/.local/bin/buildq daemon start`)
+on non-systemd machines. `./install.sh --uninstall` stops the daemon and removes everything except
+your config and build history.
 
 Then drop off a build. (This output is from a machine with a `heavy` lane and history for this command; a fresh install has one `default` lane.)
 
@@ -136,6 +153,7 @@ exit 0
 | `buildq top [--interval 2] [--once]` | a live view of the machine and each build, like btop |
 | `buildq query ["SQL"] [--json]` | a read-only query on the analytics (none: list the tables) |
 | `buildq help agents` | the page for coding agents |
+| `buildq daemon start\|stop\|restart\|reload\|status\|logs` | manage the daemon (delegates to systemd when installed; manages `buildqd` directly otherwise) |
 | `buildq ping` | check that the daemon answers |
 
 A ticket is a UUID; any unique prefix of four or more characters works in its place. The options
@@ -152,6 +170,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | [Coding agents](docs/agents.md) | shims, the Rust guard, the agents' skill, migrating from a slot script |
 | [CI jobs](docs/ci.md) | queueing a workflow step on a self-hosted runner, `ci_first`, a new step's first run |
 | [Operating buildq](docs/operations.md) | logs, the memory watch, restarts, files, analytics, `buildq top`, configuration errors, reboots, reports, GitHub statuses |
+| [Non-systemd Linux & init systems](init/README.md) | running on Alpine/OpenRC, Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2 and containers, plus optional cgroup v2 delegation |
 | [Benchmarking](docs/benchmark.md) | replaying builds against the scheduler: scenarios, comparing two versions or configurations, a trace from your machine |
 | [Design](docs/design.md) | the internals: code layout, the tool registry, the daemon, the protocol, the analytics schema |
 | [config.example.toml](config.example.toml) | every setting, with what it does |
@@ -162,8 +181,8 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | --- | --- |
 | **One machine and one user** | The socket is private to the user who runs the daemon. Several users each need their own daemon, and those daemons don't coordinate, though each sees the others' load in the machine-wide numbers. |
 | **The user is the trust boundary** | Every process of that user can submit, list, watch and cancel every build, and pause or resume the queue, CI jobs under the same user included, and can read a build's environment while it is queued or running. Where a CI runner runs code you don't trust, run it as a separate user (with its own daemon) rather than through this one. [Design, Security](docs/design.md#security) |
-| **Estimates, not guarantees** | A command that suddenly needs far more than before is planned by its history. Per-build `MemoryMax` and the slice backstop are what keep that from hurting the machine. |
-| **Sampling** | Memory is sampled once a second from the build's cgroup (anonymous memory, shared memory and unreclaimable kernel memory; page cache is left out because the kernel can take it back). A spike shorter than a second can be missed. |
+| **Estimates, not guarantees** | A command that suddenly needs far more than before is planned by its history. Per-build `MemoryMax` (plus the aggregate builds memory ceiling under `systemd` and `cgroup`) is what keeps that from hurting the machine. |
+| **Sampling** | Memory is measured once a second (excluding reclaimable file cache, from the build's cgroup under `systemd`/`cgroup` or from its running processes under `direct`). A very brief memory spike shorter than a second can be missed. |
 | **Work outside the build's cgroup** | Anything a build hands to a daemon runs in that daemon's cgroup: a test database in Docker, and above all `docker build`, whose compile runs in dockerd. It counts as machine load but not in the build's history, so give such commands a lane whose `min_mem` is what they really need, and route them there with a lane rule. (That is why the shims leave `docker` alone.) |
 | **Fair shares count builds, not their size** | A caller with one 16-core build running goes before one with two 1-core builds. Priorities still come first. |
 | **Reuse trusts the source, as git sees it** | A check that passed is taken as passing again on the same source, environment and settings. The fingerprint doesn't see what lies outside the repository (a path dependency in `../shared`, `~/.cargo/config.toml`, installed toolchains) or ignored files other than `.env*`, and a test can depend on other things (a database's contents, the network, the time). `--again` runs it; `reuse_window = "0"` turns reuse off. |
@@ -201,7 +220,7 @@ buildq takes ideas, and no code, from these projects. Thank you to their authors
   - [Fair-share](https://slurm.schedmd.com/classic_fair_share.html) priority, here between sessions rather than users.
   - [`sacct`](https://slurm.schedmd.com/sacct.html)-style accounting, which became `buildq report`.
 - **[pueue](https://github.com/Nukesor/pueue):** a paused queue starts no new tasks while the running ones carry on, as `buildq pause` and `buildq resume` do.
-- **[systemd](https://systemd.io/):** buildq is built on systemd's features:
+- **[systemd](https://systemd.io/):** on systemd machines, buildq builds on systemd's features (and mirrors the same model with Linux cgroup v2 or process tracking on non-systemd Linux):
   - transient services and slices;
   - socket activation;
   - `MemoryHigh` and `MemoryMax`;

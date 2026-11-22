@@ -115,7 +115,7 @@ outside it, your toolchain, or ignored files other than `.env*`. After changing 
 | `failed (exit 137)` without "killed for memory", or `stopped for memory (systemd-oomd or the kernel)` | The machine as a whole ran short, and something outside the build stopped it. | Run it again once: it queues until there is room. If it happens again, tell the owner. |
 | `waited on memory …s …; it went over its MemoryHigh` | It ran, but was slowed at its memory limit. | Nothing. Mention it to the owner if a command keeps doing it. |
 | `buildq: refusing to compile <crate> outside the build queue` | cargo ran outside a queued build, here where Rust compiles must be queued. | Run the same cargo command through the queue. |
-| `the queue daemon isn't answering …` | The daemon is down. A `run` waits for it. | Check `systemctl --user status buildq`. Tell the owner if it stays down. |
+| `the queue daemon isn't answering …` | The daemon is down. A `run` waits for it. | Check `buildq daemon status` (or `systemctl --user status buildq`). Tell the owner if it stays down. |
 | `the queue is paused (…)` | The owner paused it (a reboot, maintenance). Running builds carry on. | Wait, or drop the build off and check back later. Don't resume it yourself. |
 | `paused: the machine is short of memory` | Other work took the memory. Your build is frozen where it was. | Wait. It goes on by itself once memory is back; if memory stays short, it may be stopped (and queued again if it can safely start over). |
 | `stopped to free memory, and queued again at the front` | The machine ran very short. Your build was stopped, and starts over from the beginning once there is room. | Keep waiting on the same ticket. Don't submit it again. |

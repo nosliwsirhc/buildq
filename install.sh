@@ -1,8 +1,11 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # SPDX-License-Identifier: MIT
-# Install buildq for the current user. No root needed.
+# Install buildq for the current user. No root needed (unless you let it install missing system
+# prerequisites like Python 3.11+).
 #
-#   ./install.sh                 install or upgrade, then enable and (re)start the daemon
+#   ./install.sh                 check system, install or upgrade, and (re)start the daemon
+#   ./install.sh --check         check OS compatibility and dependencies without installing
+#   ./install.sh --install-deps  install missing prerequisites automatically (uses sudo/doas if needed)
 #   ./install.sh --shims         also put cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet
 #                                (plus cmake, ctest, zig and gradle when installed on PATH) shims in
 #                                ~/.local/share/buildq/shims, which send heavy commands through
@@ -19,27 +22,690 @@
 #                                machine's own notes from ~/.config/buildq/agents.md added at its end;
 #                                run it again after changing those notes. (The page itself is always
 #                                installed: `buildq help agents` prints it.)
+#   ./install.sh --no-start      install without starting/restarting the daemon (for images/packaging)
 #   ./install.sh --uninstall     stop and remove it all (keeps ~/.config/buildq and ~/.local/state/buildq)
 #
-# PREFIX (default ~/.local) sets where the programs go. PYTHON (default: python3 on PATH) sets the
-# interpreter they run with; it is written into them, so a different python3 on PATH later doesn't matter.
-set -euo pipefail
+# PREFIX (default ~/.local) sets where the programs go. PYTHON (default: auto-detected python3 >= 3.11
+# on PATH) sets the interpreter they run with; it is written into them, so a different python3 on
+# PATH later doesn't matter.
+set -eu
 
+say() { printf 'install.sh: %s\n' "$*"; }
+
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [OPTIONS]
+
+Options:
+  --check                     Check OS compatibility and dependencies only (no changes)
+  --install-deps              Automatically install missing dependencies via your package manager
+  --shims                     Install PATH shims for cargo, npm, pnpm, make, ninja, dotnet, etc.
+  --rustc-guard[=DIR[,DIR]]   Refuse Rust compiles outside buildq (globally or under given dirs)
+  --skill                     Link the buildq skill into detected coding agent directories
+  --no-start                  Install without starting or restarting the daemon
+  --uninstall                 Stop and remove buildq (keeps config and history)
+  -h, --help                  Show this help
+
+Environment:
+  PREFIX                      Install prefix (default: ~/.local)
+  PYTHON                      Python 3.11+ interpreter to use (default: auto-detected on PATH)
+EOF
+}
+
+# ---- Option parsing (before touching anything) ---------------------------------------------------
+do_uninstall=no
+do_check=no
+auto_install_deps=no
+no_start=no
+do_shims=no
+do_skill=no
+do_rustc_guard_global=no
+rustc_guard_dirs=""
+has_install_opts=no
+
+for _opt in "$@"; do
+  case $_opt in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --uninstall)
+      do_uninstall=yes
+      ;;
+    --check)
+      do_check=yes
+      ;;
+    --install-deps)
+      auto_install_deps=yes
+      ;;
+    --no-start)
+      no_start=yes
+      has_install_opts=yes
+      ;;
+    --shims)
+      do_shims=yes
+      has_install_opts=yes
+      ;;
+    --skill)
+      do_skill=yes
+      has_install_opts=yes
+      ;;
+    --rustc-guard)
+      do_rustc_guard_global=yes
+      has_install_opts=yes
+      ;;
+    --rustc-guard=*)
+      _val=${_opt#--rustc-guard=}
+      [ -n "$_val" ] || { say "--rustc-guard= requires at least one directory"; exit 2; }
+      rustc_guard_dirs=${rustc_guard_dirs:+$rustc_guard_dirs,}$_val
+      has_install_opts=yes
+      ;;
+    *)
+      say "unknown option $_opt (run ./install.sh --help for usage)"
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$do_uninstall" = yes ] && { [ "$do_check" = yes ] || [ "$auto_install_deps" = yes ] || [ "$has_install_opts" = yes ]; }; then
+  say "--uninstall cannot be combined with other options"
+  exit 2
+fi
+if [ "$do_check" = yes ] && { [ "$auto_install_deps" = yes ] || [ "$has_install_opts" = yes ]; }; then
+  say "--check cannot be combined with install options"
+  exit 2
+fi
+
+# ---- Helpers -------------------------------------------------------------------------------------
+have_realpath_m=no
+if command -v realpath >/dev/null 2>&1 && realpath -m -- / >/dev/null 2>&1; then
+  have_realpath_m=yes
+fi
+
+normpath() {
+  _np=$1
+  if [ "$have_realpath_m" = yes ]; then
+    realpath -m -- "$_np" 2>/dev/null || printf '%s' "$_np"
+    return
+  fi
+  if command -v realpath >/dev/null 2>&1 && { [ -e "$_np" ] || [ -L "$_np" ]; }; then
+    realpath "$_np" 2>/dev/null && return
+  fi
+  if [ -n "${python:-}" ] && [ -x "${python:-}" ]; then
+    "$python" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$_np" 2>/dev/null && return
+  fi
+  while [ "$_np" != / ]; do
+    case $_np in
+      */) _np=${_np%/} ;;
+      *)  break ;;
+    esac
+  done
+  printf '%s' "$_np"
+}
+
+have_systemd() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+# ---- System compatibility & dependency preflight -------------------------------------------------
+distro_name=""
+distro_id=""
+distro_like=""
+distro_version=""
+distro_codename=""
+env_tags=""
+pkg_mgr=""
+elevate_cmd=""
+
+detect_os_release() {
+  distro_name="Linux"
+  distro_id=""
+  distro_like=""
+  distro_version=""
+  distro_codename=""
+  if [ -r /etc/os-release ]; then
+    while IFS= read -r _line || [ -n "$_line" ]; do
+      case $_line in
+        PRETTY_NAME=*|ID=*|ID_LIKE=*|VERSION_ID=*|VERSION_CODENAME=*|UBUNTU_CODENAME=*)
+          _k=${_line%%=*}
+          _v=${_line#*=}
+          # Strip one pair of surrounding quotes without evaluating shell code.
+          case $_v in
+            \"*\") _v=${_v#\"}; _v=${_v%\"} ;;
+            \'*\') _v=${_v#\'}; _v=${_v%\'} ;;
+          esac
+          case $_k in
+            PRETTY_NAME)      distro_name=$_v ;;
+            ID)               distro_id=$_v ;;
+            ID_LIKE)          distro_like=$_v ;;
+            VERSION_ID)       distro_version=$_v ;;
+            VERSION_CODENAME) [ -n "$distro_codename" ] || distro_codename=$_v ;;
+            UBUNTU_CODENAME)  distro_codename=$_v ;;
+          esac
+          ;;
+      esac
+    done < /etc/os-release
+  fi
+  env_tags=""
+  if [ -d /run/WSL ] || { [ -r /proc/version ] && grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; }; then
+    env_tags="WSL2"
+  elif [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${container:-}" ]; then
+    env_tags="container"
+  fi
+}
+
+detect_runner_mode() {
+  if have_systemd; then
+    printf '%s' "systemd user session"
+    return
+  fi
+  if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    _user=${USER:-$(id -un 2>/dev/null || true)}
+    _cg=${BUILDQ_CGROUP_ROOT:-}
+    if [ -z "$_cg" ] && [ -n "$_user" ]; then
+      _cg="/sys/fs/cgroup/buildq-$_user/user"
+    fi
+    if [ -n "$_cg" ] && [ -d "$_cg/builds" ] && [ -w "$_cg/builds" ]; then
+      printf '%s' "non-systemd (direct runner; cgroup v2 available)"
+      return
+    fi
+  fi
+  printf '%s' "non-systemd (direct runner)"
+}
+
+check_os_compatible() {
+  _os=$(uname -s 2>/dev/null || printf unknown)
+  if [ "$_os" != "Linux" ]; then
+    case $_os in
+      Darwin)
+        say "buildq only runs on Linux (detected macOS)."
+        say "It relies on Linux's /proc and cgroups to measure and limit builds."
+        ;;
+      MINGW*|MSYS*|CYGWIN*)
+        say "buildq only runs on Linux (detected $_os)."
+        say "On Windows, install buildq inside a WSL2 Linux distribution instead."
+        ;;
+      *)
+        say "buildq only runs on Linux (detected $_os)."
+        ;;
+    esac
+    return 1
+  fi
+  if [ ! -r /proc/stat ] || [ ! -r /proc/meminfo ]; then
+    say "buildq needs Linux /proc mounted (/proc/stat and /proc/meminfo are not readable here)."
+    return 1
+  fi
+  detect_os_release
+  _mode=$(detect_runner_mode)
+  if [ -n "$env_tags" ]; then
+    say "detected $distro_name ($env_tags) — $_mode"
+  else
+    say "detected $distro_name — $_mode"
+  fi
+  return 0
+}
+
+python=""
+python_problem=""
+python_found_ver=""
+
+# Validate a candidate Python command (path or name on PATH) and set `python` to the resolved
+# real interpreter (unwrapping virtualenvs and pyenv/asdf shims, matching kernel #! limits).
+resolve_python_candidate() {
+  _cand_name=$1
+  _cand_path=$(command -v -- "$_cand_name" 2>/dev/null || true)
+  if [ -z "$_cand_path" ] || [ ! -x "$_cand_path" ]; then
+    python_problem="missing"
+    return 1
+  fi
+  _cand_path=$(CDPATH='' cd -- "$(dirname -- "$_cand_path")" >/dev/null && pwd)/$(basename -- "$_cand_path")
+  _ver=$("$_cand_path" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}")' 2>/dev/null || true)
+  _chosen=$("$_cand_path" - <<'EOF' 2>/dev/null || true
+import os, sys
+if sys.version_info < (3, 11):
+    sys.exit(1)
+if sys.prefix != sys.base_prefix:  # a virtualenv: the Python it was made from
+    found = sys._base_executable
+    stable = os.path.join(os.path.dirname(found), "python3")
+    if stable != found and os.path.realpath(stable) == os.path.realpath(found):
+        found = stable  # the same program, by the name that outlives a version upgrade
+    print(found)
+else:
+    print(sys.executable)  # itself, or what a shim ran
+EOF
+  )
+  if [ -z "$_chosen" ]; then
+    python_found_ver=$_ver
+    if [ -n "$_ver" ]; then
+      python_problem="old:$_cand_path:$_ver"
+    else
+      python_problem="broken:$_cand_path"
+    fi
+    return 1
+  fi
+  case $_chosen in
+    *[[:space:]]*)
+      python_problem="space:$_chosen"
+      return 1
+      ;;
+  esac
+  # "#!", the path and the newline must fit the 128-byte first-line buffer of kernels before 5.1.
+  if [ "$(printf '%s' "$_chosen" | LC_ALL=C wc -c)" -gt 125 ]; then
+    python_problem="long:$_chosen"
+    return 1
+  fi
+  if [ ! -x "$_chosen" ] || ! "$_chosen" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+    python_problem="badbase:$_cand_path:$_chosen"
+    return 1
+  fi
+  python=$_chosen
+  python_found_ver=$("$python" -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}")' 2>/dev/null || printf '3.11+')
+  python_problem=""
+  return 0
+}
+
+find_python() {
+  python=""
+  python_problem=""
+  python_found_ver=""
+  if [ -n "${PYTHON:-}" ]; then
+    resolve_python_candidate "$PYTHON"
+    return $?
+  fi
+  # Prefer python3, then fall back to versioned 3.11+ binaries (helpful on Ubuntu 22.04 / RHEL 9
+  # where `python3` may be 3.9/3.10 while `python3.11` or `python3.12` is installed beside it).
+  _first_problem=""
+  for _pycand in python3 python3.14 python3.13 python3.12 python3.11; do
+    if resolve_python_candidate "$_pycand"; then
+      return 0
+    fi
+    if [ -z "$_first_problem" ] || [ "$_first_problem" = "missing" ]; then
+      _first_problem=$python_problem
+    fi
+  done
+  python_problem=${_first_problem:-missing}
+  return 1
+}
+
+detect_pkg_mgr() {
+  pkg_mgr=""
+  # Prefer the package manager matching /etc/os-release ID / ID_LIKE before scanning the generic list.
+  _pref_pms=""
+  case " $distro_id $distro_like " in
+    *" alpine "*)                                        _pref_pms="apk" ;;
+    *" debian "*|*" ubuntu "*|*" devuan "*|*" mint "*)   _pref_pms="apt-get" ;;
+    *" fedora "*|*" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*) _pref_pms="dnf" ;;
+    *" arch "*|*" artix "*|*" manjaro "*)                _pref_pms="pacman" ;;
+    *" void "*)                                          _pref_pms="xbps-install" ;;
+    *" suse "*|*" opensuse "*|*" sles "*)                _pref_pms="zypper" ;;
+    *" gentoo "*)                                        _pref_pms="emerge" ;;
+  esac
+  for _pm in $_pref_pms apk apt-get dnf pacman xbps-install zypper emerge; do
+    if command -v "$_pm" >/dev/null 2>&1; then
+      pkg_mgr=$_pm
+      break
+    fi
+  done
+  elevate_cmd=""
+  if [ "$(id -u)" -eq 0 ]; then
+    elevate_cmd=""
+  elif command -v sudo >/dev/null 2>&1; then
+    elevate_cmd="sudo"
+  elif command -v doas >/dev/null 2>&1; then
+    elevate_cmd="doas"
+  else
+    elevate_cmd="NONE"
+  fi
+}
+
+# Pick the Python 3.11+ package name for distros whose default `python3` may be < 3.11 even on a
+# brand-new container image where no `python3` binary is installed yet (Ubuntu 22.04, RHEL 8/9,
+# openSUSE Leap 15, etc.).
+python_pkg_for() {
+  _pm=$1
+  case $_pm in
+    apk)          printf '%s' "python3" ;;
+    pacman)       printf '%s' "python" ;;
+    xbps-install) printf '%s' "python3" ;;
+    emerge)       printf '%s' "dev-lang/python" ;;
+    apt-get)
+      _need_versioned=no
+      if command -v python3 >/dev/null 2>&1; then
+        _need_versioned=yes
+      else
+        case "$distro_id:$distro_version:$distro_codename" in
+          ubuntu:20.*:*|ubuntu:22.*:*|debian:10*:*|debian:11*:*|devuan:4*:*|*:*:focal|*:*:jammy|*:*:bullseye|*:*:chimaera)
+            _need_versioned=yes
+            ;;
+        esac
+      fi
+      if [ "$_need_versioned" = yes ]; then
+        if command -v apt-cache >/dev/null 2>&1 && apt-cache show python3.12 >/dev/null 2>&1; then
+          printf '%s' "python3.12"
+        elif command -v apt-cache >/dev/null 2>&1 && apt-cache show python3.11 >/dev/null 2>&1; then
+          printf '%s' "python3.11"
+        else
+          printf '%s' "python3.11"
+        fi
+      else
+        printf '%s' "python3"
+      fi
+      ;;
+    dnf)
+      _need_versioned=no
+      if command -v python3 >/dev/null 2>&1; then
+        _need_versioned=yes
+      elif [ "$distro_id" != "fedora" ]; then
+        case $distro_version in
+          8|8.*|9|9.*) _need_versioned=yes ;;
+        esac
+      fi
+      if [ "$_need_versioned" = yes ]; then
+        printf '%s' "python3.11"
+      else
+        printf '%s' "python3"
+      fi
+      ;;
+    zypper)
+      _need_versioned=no
+      if command -v python3 >/dev/null 2>&1; then
+        _need_versioned=yes
+      else
+        case "$distro_id:$distro_version" in
+          opensuse-leap:15*|sles:15*|*:15.*) _need_versioned=yes ;;
+        esac
+      fi
+      if [ "$_need_versioned" = yes ]; then
+        printf '%s' "python311"
+      else
+        printf '%s' "python3"
+      fi
+      ;;
+  esac
+}
+
+# Build package list for the detected package manager from abstract dependency tokens.
+# Only emits hardcoded package names for known tokens.
+pkg_names_for() {
+  _pm=$1
+  shift
+  _out=""
+  for _dep in "$@"; do
+    _pkg=""
+    if [ "$_dep" = "python" ]; then
+      _pkg=$(python_pkg_for "$_pm")
+    else
+      case $_pm in
+        apk)
+          case $_dep in
+            flock)     _pkg="util-linux-misc" ;;
+            coreutils) _pkg="coreutils" ;;
+            awk)       _pkg="gawk" ;;
+            sed)       _pkg="sed" ;;
+            grep)      _pkg="grep" ;;
+            find)      _pkg="findutils" ;;
+          esac
+          ;;
+        apt-get|dnf|pacman|xbps-install|zypper)
+          case $_dep in
+            flock)     _pkg="util-linux" ;;
+            coreutils) _pkg="coreutils" ;;
+            awk)       _pkg="gawk" ;;
+            sed)       _pkg="sed" ;;
+            grep)      _pkg="grep" ;;
+            find)      _pkg="findutils" ;;
+          esac
+          ;;
+        emerge)
+          case $_dep in
+            flock)     _pkg="sys-apps/util-linux" ;;
+            coreutils) _pkg="sys-apps/coreutils" ;;
+            awk)       _pkg="sys-apps/gawk" ;;
+            sed)       _pkg="sys-apps/sed" ;;
+            grep)      _pkg="sys-apps/grep" ;;
+            find)      _pkg="sys-apps/findutils" ;;
+          esac
+          ;;
+      esac
+    fi
+    [ -n "$_pkg" ] || continue
+    case " $_out " in
+      *" $_pkg "*) ;;
+      *) _out=${_out:+$_out }$_pkg ;;
+    esac
+  done
+  printf '%s' "$_out"
+}
+
+format_install_command() {
+  _pm=$1
+  _pkgs=$2
+  _pref=""
+  case $elevate_cmd in
+    sudo|doas) _pref="$elevate_cmd " ;;
+  esac
+  case $_pm in
+    apk)          printf '%sapk add %s' "$_pref" "$_pkgs" ;;
+    apt-get)      printf '%sapt-get update && %sapt-get install -y %s' "$_pref" "$_pref" "$_pkgs" ;;
+    dnf)          printf '%sdnf install -y %s' "$_pref" "$_pkgs" ;;
+    pacman)       printf '%spacman -S --needed %s' "$_pref" "$_pkgs" ;;
+    xbps-install) printf '%sxbps-install -Sy %s' "$_pref" "$_pkgs" ;;
+    zypper)       printf '%szypper install -y %s' "$_pref" "$_pkgs" ;;
+    emerge)       printf '%semerge --noreplace %s' "$_pref" "$_pkgs" ;;
+  esac
+}
+
+run_pkg_install() {
+  _pm=$1
+  _pkgs=$2
+  # Word-splitting $_pkgs is intentional: pkg_names_for emits only safe hardcoded package names.
+  # shellcheck disable=SC2086
+  case $elevate_cmd in
+    "")
+      case $_pm in
+        apk)          apk add $_pkgs ;;
+        apt-get)      apt-get update && apt-get install -y $_pkgs ;;
+        dnf)          dnf install -y $_pkgs ;;
+        pacman)
+          if [ "$auto_install_deps" = yes ]; then
+            pacman -S --needed --noconfirm $_pkgs
+          else
+            pacman -S --needed $_pkgs
+          fi
+          ;;
+        xbps-install) xbps-install -Sy $_pkgs ;;
+        zypper)       zypper install -y $_pkgs ;;
+        emerge)       emerge --noreplace $_pkgs ;;
+      esac
+      ;;
+    sudo|doas)
+      case $_pm in
+        apk)          "$elevate_cmd" apk add $_pkgs ;;
+        apt-get)      "$elevate_cmd" apt-get update && "$elevate_cmd" apt-get install -y $_pkgs ;;
+        dnf)          "$elevate_cmd" dnf install -y $_pkgs ;;
+        pacman)
+          if [ "$auto_install_deps" = yes ]; then
+            "$elevate_cmd" pacman -S --needed --noconfirm $_pkgs
+          else
+            "$elevate_cmd" pacman -S --needed $_pkgs
+          fi
+          ;;
+        xbps-install) "$elevate_cmd" xbps-install -Sy $_pkgs ;;
+        zypper)       "$elevate_cmd" zypper install -y $_pkgs ;;
+        emerge)       "$elevate_cmd" emerge --noreplace $_pkgs ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+missing_deps=""
+missing_desc=""
+
+check_dependencies() {
+  missing_deps=""
+  missing_desc=""
+  if ! find_python; then
+    case $python_problem in
+      space:*)
+        say "the Python to use (${python_problem#space:}) has a space in its path, which a script's first line can't hold; PYTHON=... names another."
+        exit 1
+        ;;
+      long:*)
+        say "the Python to use (${python_problem#long:}) has too long a path for a script's first line; PYTHON=... names another."
+        exit 1
+        ;;
+      badbase:*)
+        _rest=${python_problem#badbase:}
+        say "buildq needs Python 3.11 or newer, and ${_rest%%:*} stands for ${_rest#*:}, which isn't; PYTHON=... names another."
+        exit 1
+        ;;
+    esac
+    if [ -n "${PYTHON:-}" ]; then
+      case $python_problem in
+        old:*)
+          _rest=${python_problem#old:}
+          say "buildq needs Python 3.11 or newer, and $PYTHON is ${_rest#*:}; set PYTHON=... to a newer interpreter."
+          ;;
+        *)
+          say "buildq needs Python 3.11 or newer, and $PYTHON isn't one that runs; set PYTHON=... to a valid interpreter."
+          ;;
+      esac
+      exit 1
+    fi
+    missing_deps="python"
+    case $python_problem in
+      old:*)
+        _rest=${python_problem#old:}
+        missing_desc="Python 3.11+ (found ${_rest#*:} at ${_rest%%:*})"
+        ;;
+      *)
+        missing_desc="Python 3.11+"
+        ;;
+    esac
+  fi
+
+  if ! command -v flock >/dev/null 2>&1; then
+    missing_deps=${missing_deps:+$missing_deps }flock
+    missing_desc=${missing_desc:+$missing_desc, }"flock (util-linux)"
+  fi
+  if ! command -v install >/dev/null 2>&1 || ! command -v mktemp >/dev/null 2>&1; then
+    missing_deps=${missing_deps:+$missing_deps }coreutils
+    missing_desc=${missing_desc:+$missing_desc, }"install/mktemp (coreutils)"
+  fi
+  for _u in awk sed grep find; do
+    if ! command -v "$_u" >/dev/null 2>&1; then
+      missing_deps=${missing_deps:+$missing_deps }$_u
+      missing_desc=${missing_desc:+$missing_desc, }$_u
+    fi
+  done
+  [ -z "$missing_deps" ]
+}
+
+ensure_dependencies() {
+  if check_dependencies; then
+    return 0
+  fi
+
+  say "missing required prerequisites: $missing_desc"
+  detect_pkg_mgr
+  _pkgs=""
+  if [ -n "$pkg_mgr" ]; then
+    # shellcheck disable=SC2086
+    _pkgs=$(pkg_names_for "$pkg_mgr" $missing_deps)
+  fi
+
+  if [ -z "$pkg_mgr" ] || [ -z "$_pkgs" ]; then
+    say "install Python 3.11+ and the missing tools above with your distribution's package manager, then re-run ./install.sh"
+    return 1
+  fi
+
+  _cmd_display=$(format_install_command "$pkg_mgr" "$_pkgs")
+
+  if [ "$do_check" = yes ]; then
+    if [ "$elevate_cmd" = "NONE" ]; then
+      say "install them as root with: $_cmd_display"
+    else
+      say "install them with: $_cmd_display"
+      say "or run: ./install.sh --install-deps"
+    fi
+    return 1
+  fi
+
+  if [ "$elevate_cmd" = "NONE" ]; then
+    say "no sudo or doas found; install missing prerequisites as root with:"
+    say "    su -c '$_cmd_display'"
+    return 1
+  fi
+
+  _proceed=no
+  if [ "$auto_install_deps" = yes ]; then
+    say "installing missing prerequisites: $_cmd_display"
+    _proceed=yes
+  elif [ -t 0 ] && [ -t 1 ]; then
+    printf 'install.sh: run `%s` now? [y/N] ' "$_cmd_display"
+    IFS= read -r _ans || _ans=""
+    case $_ans in
+      y|Y|yes|YES|Yes) _proceed=yes ;;
+    esac
+  else
+    say "install them with:"
+    say "    $_cmd_display"
+    say "(or re-run interactively, or with --install-deps)"
+    return 1
+  fi
+
+  if [ "$_proceed" != yes ]; then
+    say "skipped installing dependencies. Run:"
+    say "    $_cmd_display"
+    say "then run ./install.sh again."
+    return 1
+  fi
+
+  if ! run_pkg_install "$pkg_mgr" "$_pkgs"; then
+    say "package installation failed; install the prerequisites manually and re-run ./install.sh"
+    say "if your distribution's repositories don't include Python 3.11+ (e.g. Debian 11 or Ubuntu 20.04), install Python 3.11+ via pyenv or uv and run: PYTHON=/path/to/python3.11 ./install.sh"
+    return 1
+  fi
+
+  if ! check_dependencies; then
+    say "still missing required prerequisites after install: $missing_desc"
+    say "if your distribution's default python3 is older than 3.11, install Python 3.11+ (e.g. via pyenv, uv, or your distro's newer package) and run: PYTHON=/path/to/python3.11 ./install.sh"
+    return 1
+  fi
+  say "prerequisites installed (Python $python_found_ver at $python)"
+  return 0
+}
+
+# ---- Preflight compatibility & dependency checks (before resolving paths or touching disk) -------
+if [ "$do_uninstall" = no ]; then
+  check_os_compatible || exit 1
+  ensure_dependencies || exit 1
+  if [ "$do_check" = yes ]; then
+    say "all requirements met (Python $python_found_ver at $python, flock, core utilities) — ready to install!"
+    exit 0
+  fi
+fi
+
+# ---- Paths ---------------------------------------------------------------------------------------
 prefix=${PREFIX:-$HOME/.local}
 case $prefix in
-  '') printf 'install.sh: PREFIX must not be empty\n' >&2; exit 1 ;;
-  '~') prefix=$HOME ;;
+  '')   say "PREFIX must not be empty"; exit 1 ;;
+  *'
+'*)     say "PREFIX must not contain newlines"; exit 1 ;;
+  '~')  prefix=$HOME ;;
   '~/'*) prefix=$HOME/${prefix#'~/'} ;;
-  /*) ;;
-  *) prefix=$PWD/$prefix ;;
+  /*)   ;;
+  *)    prefix=$PWD/$prefix ;;
 esac
-if command -v realpath >/dev/null 2>&1; then
-  norm=$(realpath -m -- "$prefix")
-  [[ -n "$norm" && "$norm" == /* ]] || { printf 'install.sh: could not resolve PREFIX (%s)\n' "$prefix" >&2; exit 1; }
-  prefix=$norm
-else
-  while [[ $prefix != / && $prefix == */ ]]; do prefix=${prefix%/}; done
+norm=$(normpath "$prefix")
+if [ -z "$norm" ] || [ "${norm#/}" = "$norm" ]; then
+  say "could not resolve PREFIX ($prefix)"
+  exit 1
 fi
+prefix=$norm
 bindir=$prefix/bin
 libdir=$prefix/lib/buildq
 config_home=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -48,101 +714,42 @@ confdir=$config_home/buildq
 shimdir=${XDG_DATA_HOME:-$HOME/.local/share}/buildq/shims
 skilldir=${XDG_DATA_HOME:-$HOME/.local/share}/buildq/skill/buildq
 cargo_config=${CARGO_HOME:-$HOME/.cargo}/config.toml
-src=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+src=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 # docker isn't among them: an image build's work runs in dockerd, outside the build's cgroup, so the
 # queue can't measure it (see the README).
-shim_tools=(cargo pnpm npm npx yarn make gmake ninja dotnet)
+shim_tools="cargo pnpm npm npx yarn make gmake ninja dotnet"
 # Optional compiler shims are linked only when a real binary exists outside $shimdir, so scripts
 # using `command -v gradle || ./gradlew` never trip over a shim for an absent tool.
-optional_shim_tools=(cmake ctest zig gradle)
+optional_shim_tools="cmake ctest zig gradle"
+state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
+case $state_dir in
+  '~')   state_dir=$HOME ;;
+  '~/'*) state_dir=$HOME/${state_dir#'~/'} ;;
+esac
+guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
+skill_list=$confdir/skill-links    # every skill link made, for --uninstall
 
 has_real_tool() {
-  local name=$1 dir cand real_shimdir real_dir real_shim
-  real_shimdir=$(realpath -m -- "$shimdir" 2>/dev/null || printf '%s' "$shimdir")
-  real_shim=$(realpath -m -- "$bindir/buildq-shim" 2>/dev/null || printf '%s' "$bindir/buildq-shim")
-  local -a dirs
-  IFS=: read -r -a dirs <<< "$PATH"
-  for dir in "${dirs[@]}"; do
-    [[ -n "$dir" ]] || continue
-    real_dir=$(realpath -m -- "$dir" 2>/dev/null || printf '%s' "$dir")
-    [[ "$real_dir" == "$real_shimdir" ]] && continue
-    cand=$dir/$name
-    if [[ -f "$cand" && -x "$cand" ]]; then
-      [[ "$(realpath -m -- "$cand" 2>/dev/null || printf '%s' "$cand")" == "$real_shim" ]] && continue
+  _name=$1
+  _real_shimdir=$(normpath "$shimdir")
+  _real_shim=$(normpath "$bindir/buildq-shim")
+  _rest=${PATH:-}
+  while [ -n "$_rest" ]; do
+    case $_rest in
+      *:*) _dir=${_rest%%:*}; _rest=${_rest#*:} ;;
+      *)   _dir=$_rest; _rest='' ;;
+    esac
+    [ -n "$_dir" ] || continue
+    _real_dir=$(normpath "$_dir")
+    [ "$_real_dir" = "$_real_shimdir" ] && continue
+    _cand=$_dir/$_name
+    if [ -f "$_cand" ] && [ -x "$_cand" ]; then
+      [ "$(normpath "$_cand")" = "$_real_shim" ] && continue
       return 0
     fi
   done
   return 1
 }
-guard_list=$confdir/guard-configs  # every cargo config the guard was added to, for --uninstall
-skill_list=$confdir/skill-links    # every skill link made, for --uninstall
-# Where coding agents look for skills: each is used only if the agent's own directory exists.
-skill_homes=("${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" "$HOME/.agents")
-
-say() { printf 'install.sh: %s\n' "$*"; }
-
-# A link to buildq's skill: it points at the skill, or it is one this script made (listed with the
-# target it was given, which differs when XDG_DATA_HOME did).
-our_link() {
-  local link=$1 target
-  [[ -L "$link" ]] || return 1
-  target=$(readlink "$link")
-  [[ "$target" == "$skilldir" ]] && return 0
-  [[ -r "$skill_list" ]] && grep -qxF "$link"$'\t'"$target" "$skill_list"
-}
-
-# The skill for coding agents, with this machine's notes at its end (`buildq help agents` prints it).
-write_skill() {
-  mkdir -p "$skilldir"
-  temps+=("$skilldir/SKILL.md.new.$$")
-  {
-    cat "$src/skills/buildq/SKILL.md"
-    if [[ -r "$confdir/agents.md" ]]; then
-      printf '\n## On this machine\n\n'
-      cat "$confdir/agents.md"
-    fi
-  } >"$skilldir/SKILL.md.new.$$"
-  mv -f "$skilldir/SKILL.md.new.$$" "$skilldir/SKILL.md"
-}
-
-# ... and linked where agents look for skills.
-install_skill() {
-  local home link
-  write_skill
-  for home in "${skill_homes[@]}"; do
-    [[ -d "$home" ]] || continue
-    link=$home/skills/buildq
-    if [[ -e "$link" || -L "$link" ]] && ! our_link "$link"; then
-      say "$link already exists and isn't buildq's; leaving it"
-      continue
-    fi
-    mkdir -p "$home/skills"
-    ln -sfn "$skilldir" "$link"
-    if [[ -r "$skill_list" ]]; then  # one line per link, with its current target
-      temps+=("$skill_list.new.$$")
-      awk -F'\t' -v link="$link" '$1 != link' "$skill_list" >"$skill_list.new.$$"
-      mv -f "$skill_list.new.$$" "$skill_list"
-    fi
-    printf '%s\t%s\n' "$link" "$skilldir" >>"$skill_list"
-    say "agents reading $home/skills now have the buildq skill"
-  done
-  if [[ -r "$confdir/agents.md" ]]; then
-    say "the skill ends with this machine's notes from $confdir/agents.md"
-  fi
-}
-
-temps=()
-# Copies a file into place by renaming a temporary copy over it, so a program running from the
-# old file (a shell script reads its file as it goes) keeps the old one intact.
-put() {
-  local mode=$1 from=$2 to=$3 tmp
-  tmp="$to.new.$$"
-  temps+=("$tmp")
-  install -m "$mode" "$from" "$tmp"
-  mv -f "$tmp" "$to"
-}
-
-have_systemd() { command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; }
 
 # Serialize concurrent installs/uninstalls against the same physical prefix directory inode
 # (consistent across symlinked prefix spellings and regardless of XDG_RUNTIME_DIR).
@@ -193,36 +800,149 @@ os.replace(tmp, path)
 EOF
 }
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+mono_cs() {
+  if [ -r /proc/uptime ]; then
+    IFS='. ' read -r _us _ucs _ < /proc/uptime || return 1
+    _ucs=${_ucs#0}
+    printf '%s' "$(( _us * 100 + ${_ucs:-0} ))"
+    return 0
+  fi
+  return 1
+}
+
+daemon_lock_held() {
+  _lock=$state_dir/buildqd.lock
+  [ -f "$_lock" ] || return 1
+  if (exec 8<"$_lock" && flock -n 8) 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+# ---- Uninstall -----------------------------------------------------------------------------------
+if [ "$do_uninstall" = yes ]; then
   acquire_lock
+  find_python || true
   if have_systemd; then
-    systemctl --user disable --now buildq.service buildq.socket 2>/dev/null || true
+    _was_active=no
+    systemctl --user is-active --quiet buildq.service 2>/dev/null && _was_active=yes
+    if ! systemctl --user disable --now buildq.service buildq.socket 2>/dev/null; then
+      if [ "$_was_active" = yes ] && systemctl --user is-active --quiet buildq.service 2>/dev/null; then
+        say "couldn't stop buildq.service; stop it first (systemctl --user disable --now buildq.service buildq.socket) and re-run ./install.sh --uninstall"
+        exit 1
+      fi
+    fi
+  elif [ -x "$bindir/buildq" ]; then
+    # Always attempt `buildq daemon stop` (never skip when socket is starting or unresponsive).
+    if ! _stop_out=$("$bindir/buildq" daemon stop 2>&1); then
+      [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out" >&2
+      say "couldn't stop buildqd; stop it (or disable its init service) first, then re-run ./install.sh --uninstall"
+      exit 1
+    fi
+    [ -n "$_stop_out" ] && printf '%s\n' "$_stop_out"
+    # Unconditionally monitor buildqd.lock for a monotonic >=2.0 s window (fast non-blocking flock
+    # probes, never 2 s-retrying socket calls inside the loop) to catch a starting/unresponsive
+    # daemon or an init supervisor respawning buildqd between crashes.
+    _start_cs=$(mono_cs || printf '')
+    if [ -n "$_start_cs" ]; then
+      _end_cs=$(( _start_cs + 201 ))
+      _est_cs=$_start_cs
+      while :; do
+        if daemon_lock_held; then
+          say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
+          say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+          exit 1
+        fi
+        _now_cs=$(mono_cs || printf '%s' "$_est_cs")
+        [ "$_now_cs" -ge "$_end_cs" ] && break
+        if sleep 0.2 2>/dev/null || { [ -n "${python:-}" ] && "$python" -c 'import time; time.sleep(0.2)'; }; then
+          _est_cs=$(( _now_cs + 20 ))
+        else
+          sleep 1
+          _est_cs=$(( _now_cs + 100 ))
+        fi
+      done
+    else
+      _w=0
+      while [ "$_w" -lt 10 ]; do
+        if daemon_lock_held; then
+          say "buildqd is still running or restarted (holding $state_dir/buildqd.lock; it may be managed by an init service such as OpenRC, runit, s6, or dinit)."
+          say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+          exit 1
+        fi
+        if sleep 0.2 2>/dev/null || { [ -n "${python:-}" ] && "$python" -c 'import time; time.sleep(0.2)'; }; then
+          _w=$((_w + 1))
+        else
+          sleep 1
+          _w=$((_w + 5))
+        fi
+      done
+    fi
+    # One final bounded socket probe (only when a socket path exists) followed by a final lock check.
+    _cfg_sock=${BUILDQ_SOCKET:-}
+    case $_cfg_sock in
+      '~')   _cfg_sock=$HOME ;;
+      '~/'*) _cfg_sock=$HOME/${_cfg_sock#'~/'} ;;
+    esac
+    _sock_present=no
+    for _sp in "$_cfg_sock" "$state_dir/run/buildq.sock" "/tmp/buildq-$(id -u)/buildq.sock"; do
+      [ -n "$_sp" ] && [ -S "$_sp" ] && { _sock_present=yes; break; }
+    done
+    if [ "$_sock_present" = yes ] && "$bindir/buildq" ping >/dev/null 2>&1; then
+      say "buildqd restarted after stop (it is likely managed by an init service such as OpenRC, runit, s6, or dinit)."
+      say "Disable and stop that service first, then re-run ./install.sh --uninstall."
+      exit 1
+    fi
+    if daemon_lock_held; then
+      say "buildqd is still running or restarted (holding $state_dir/buildqd.lock); disable and stop its init service first, then re-run ./install.sh --uninstall."
+      exit 1
+    fi
+  elif daemon_lock_held; then
+    say "buildqd is still running (holding $state_dir/buildqd.lock); stop it first, then re-run ./install.sh --uninstall."
+    exit 1
   fi
   keep_guard=no
-  configs=("${CARGO_HOME:-$HOME/.cargo}/config.toml")
-  [[ -r "$guard_list" ]] && mapfile -t -O 1 configs < "$guard_list"
-  for cargo_config in "${configs[@]}"; do
-    [[ -e "$cargo_config" ]] || continue
+  _default_cargo=${CARGO_HOME:-$HOME/.cargo}/config.toml
+  if [ -e "$_default_cargo" ]; then
+    cargo_config=$_default_cargo
     if ! rustc_wrapper --remove; then
       say "couldn't take the guard out of $cargo_config; keeping $bindir/buildq-rustc-guard so cargo still works"
       keep_guard=yes
     fi
-  done
-  rm -f "$guard_list"
-  if [[ -r "$skill_list" ]]; then
-    while IFS=$'\t' read -r link target; do
-      target=${target:-$skilldir}
-      if [[ -L "$link" && "$(readlink "$link")" == "$target" ]]; then
-        rm -f "$link"
+  fi
+  if [ -r "$guard_list" ]; then
+    while IFS= read -r cargo_config || [ -n "$cargo_config" ]; do
+      [ -n "$cargo_config" ] || continue
+      [ "$cargo_config" = "$_default_cargo" ] && continue
+      [ -e "$cargo_config" ] || continue
+      if ! rustc_wrapper --remove; then
+        say "couldn't take the guard out of $cargo_config; keeping $bindir/buildq-rustc-guard so cargo still works"
+        keep_guard=yes
       fi
-      case $target in */buildq/skill/buildq) rm -rf "$(dirname "$target")" ;; esac
+    done < "$guard_list"
+  fi
+  rm -f "$guard_list"
+  if [ -r "$skill_list" ]; then
+    _tab=$(printf '\t')
+    while IFS= read -r _sline || [ -n "$_sline" ]; do
+      [ -n "$_sline" ] || continue
+      _link=${_sline%%"$_tab"*}
+      case $_sline in
+        *"$_tab"*) _target=${_sline#*"$_tab"} ;;
+        *)         _target=$skilldir ;;
+      esac
+      [ -n "$_target" ] || _target=$skilldir
+      if [ -L "$_link" ] && [ "$(readlink "$_link")" = "$_target" ]; then
+        rm -f "$_link"
+      fi
+      case $_target in */buildq/skill/buildq) rm -rf "$(dirname "$_target")" ;; esac
     done < "$skill_list"
   fi
   rm -f "$skill_list"
   rm -rf "$shimdir" "$(dirname "$skilldir")" "$libdir"
   rm -f "$bindir/buildq" "$bindir/buildqd" "$bindir/buildq-shim" \
         "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice"
-  [[ $keep_guard == no ]] && rm -f "$bindir/buildq-rustc-guard"
+  [ "$keep_guard" = no ] && rm -f "$bindir/buildq-rustc-guard"
   rm -f "$unitdir/buildq.slice.d/40-buildq-oomd.conf" "$unitdir/buildq.slice.d/60-buildq-oomd.conf" \
         "$unitdir/buildq.slice.d/50-buildq-memory.conf"
   have_systemd && systemctl --user daemon-reload
@@ -230,42 +950,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
-# The interpreter the installed programs run with, written into their first line, so a different
-# python3 first on PATH later (a project's virtualenv) can't break them. PYTHON=... chooses it (a
-# path, or a name looked up on PATH). What is written is the Python that really runs: a
-# virtualenv's is replaced by the Python it was made from, which outlives it, and a version
-# manager's shim (pyenv, asdf) by the Python it runs now. A plain path such as /usr/bin/python3 is
-# kept as found, not resolved to the python3.N it links to, so a distribution upgrade keeps it working.
-python=$(command -v -- "${PYTHON:-python3}" || true)
-[[ -n "$python" && -x "$python" ]] ||
-  { say "buildq needs Python 3.11 or newer (no ${PYTHON:-python3} found; PYTHON=... names one)."; exit 1; }
-python=$(CDPATH='' cd -- "$(dirname -- "$python")" >/dev/null && pwd)/$(basename -- "$python")
-chosen=$("$python" - <<'EOF'
-import os, sys
-if sys.version_info < (3, 11):
-    sys.exit(1)
-if sys.prefix != sys.base_prefix:  # a virtualenv: the Python it was made from
-    found = sys._base_executable
-    stable = os.path.join(os.path.dirname(found), "python3")
-    if stable != found and os.path.realpath(stable) == os.path.realpath(found):
-        found = stable  # the same program, by the name that outlives a version upgrade
-    print(found)
-else:
-    print(sys.executable)  # itself, or what a shim ran
-EOF
-) || { say "buildq needs Python 3.11 or newer, and $python isn't one that runs (too old, or its version manager couldn't run it); PYTHON=... names another."; exit 1; }
-case $chosen in
-  *[[:space:]]*) say "the Python to use ($chosen) has a space in its path, which a script's first line can't hold; PYTHON=... names another."; exit 1 ;;
-esac
-# (in bytes, as the kernel counts them: a non-ASCII path is longer than its characters. "#!", the
-# path and the newline must fit the 128-byte first-line buffer of kernels before 5.1, so 125)
-(( $(printf '%s' "$chosen" | LC_ALL=C wc -c) <= 125 )) ||
-  { say "the Python to use ($chosen) has too long a path for a script's first line; PYTHON=... names another."; exit 1; }
-[[ -x "$chosen" ]] && "$chosen" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' ||
-  { say "buildq needs Python 3.11 or newer, and $python stands for $chosen, which isn't; PYTHON=... names another."; exit 1; }
-python=$chosen
-[[ -r /proc/stat && -r /proc/meminfo ]] || { say "buildq needs Linux (/proc/stat, /proc/meminfo)."; exit 1; }
-
+# ---- Staged atomic install -----------------------------------------------------------------------
 acquire_lock
 mkdir -p "$bindir" "$libdir" "$unitdir" "$confdir"
 staged=""
@@ -273,39 +958,109 @@ release=""
 publishing=no
 prev_current=""
 had_current=no
+
+add_temp() {
+  [ -n "$staged" ] && printf '%s\n' "$1" >>"$staged/temps"
+}
+
+# Copies a file into place by renaming a temporary copy over it, so a program running from the
+# old file keeps the old one intact.
+put() {
+  _mode=$1 _from=$2 _to=$3
+  _tmp="$_to.new.$$"
+  add_temp "$_tmp"
+  install -m "$_mode" "$_from" "$_tmp"
+  mv -f "$_tmp" "$_to"
+}
+
+# A link to buildq's skill: it points at the skill, or it is one this script made (listed with the
+# target it was given, which differs when XDG_DATA_HOME did).
+our_link() {
+  _link=$1
+  [ -L "$_link" ] || return 1
+  _target=$(readlink "$_link")
+  [ "$_target" = "$skilldir" ] && return 0
+  _tab=$(printf '\t')
+  [ -r "$skill_list" ] && grep -qxF "${_link}${_tab}${_target}" "$skill_list"
+}
+
+# The skill for coding agents, with this machine's notes at its end (`buildq help agents` prints it).
+write_skill() {
+  mkdir -p "$skilldir"
+  add_temp "$skilldir/SKILL.md.new.$$"
+  {
+    cat "$src/skills/buildq/SKILL.md"
+    if [ -r "$confdir/agents.md" ]; then
+      printf '\n## On this machine\n\n'
+      cat "$confdir/agents.md"
+    fi
+  } >"$skilldir/SKILL.md.new.$$"
+  mv -f "$skilldir/SKILL.md.new.$$" "$skilldir/SKILL.md"
+}
+
+# ... and linked where agents look for skills.
+install_skill() {
+  write_skill
+  for _home in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${CODEX_HOME:-$HOME/.codex}" "$HOME/.agents"; do
+    [ -d "$_home" ] || continue
+    _link=$_home/skills/buildq
+    if { [ -e "$_link" ] || [ -L "$_link" ]; } && ! our_link "$_link"; then
+      say "$_link already exists and isn't buildq's; leaving it"
+      continue
+    fi
+    mkdir -p "$_home/skills"
+    ln -sfn "$skilldir" "$_link"
+    if [ -r "$skill_list" ]; then  # one line per link, with its current target
+      add_temp "$skill_list.new.$$"
+      awk -F'\t' -v link="$_link" '$1 != link' "$skill_list" >"$skill_list.new.$$"
+      mv -f "$skill_list.new.$$" "$skill_list"
+    fi
+    printf '%s\t%s\n' "$_link" "$skilldir" >>"$skill_list"
+    say "agents reading $_home/skills now have the buildq skill"
+  done
+  if [ -r "$confdir/agents.md" ]; then
+    say "the skill ends with this machine's notes from $confdir/agents.md"
+  fi
+}
+
 cleanup() {
-  if [[ $publishing == yes ]]; then
-    if [[ $had_current == yes ]]; then
+  if [ "$publishing" = yes ]; then
+    if [ "$had_current" = yes ]; then
       ln -sfn "$prev_current" "$libdir/current.rollback.$$" 2>/dev/null &&
         mv -Tf "$libdir/current.rollback.$$" "$libdir/current" 2>/dev/null ||
         rm -f "$libdir/current.rollback.$$" 2>/dev/null || true
     else
       rm -f "$libdir/current" 2>/dev/null || true
     fi
-    if [[ -n "$staged" && -d "$staged/prev-bin" ]]; then
-      for prog in buildq buildqd buildq-shim buildq-rustc-guard; do
-        if [[ -L "$staged/prev-bin/$prog" || -e "$staged/prev-bin/$prog" ]]; then
-          cp -a "$staged/prev-bin/$prog" "$bindir/$prog.rollback.$$" 2>/dev/null &&
-            mv -Tf "$bindir/$prog.rollback.$$" "$bindir/$prog" 2>/dev/null ||
-            rm -f "$bindir/$prog.rollback.$$" 2>/dev/null || true
+    if [ -n "$staged" ] && [ -d "$staged/prev-bin" ]; then
+      for _prog in buildq buildqd buildq-shim buildq-rustc-guard; do
+        if [ -L "$staged/prev-bin/$_prog" ] || [ -e "$staged/prev-bin/$_prog" ]; then
+          cp -a "$staged/prev-bin/$_prog" "$bindir/$_prog.rollback.$$" 2>/dev/null &&
+            mv -Tf "$bindir/$_prog.rollback.$$" "$bindir/$_prog" 2>/dev/null ||
+            rm -f "$bindir/$_prog.rollback.$$" 2>/dev/null || true
         else
-          rm -f "$bindir/$prog" 2>/dev/null || true
+          rm -f "$bindir/$_prog" 2>/dev/null || true
         fi
       done
     fi
   fi
-  if (( ${#temps[@]} )); then
-    rm -f "${temps[@]}"
+  if [ -n "$staged" ] && [ -r "$staged/temps" ]; then
+    while IFS= read -r _tf || [ -n "$_tf" ]; do
+      [ -n "$_tf" ] && rm -f -- "$_tf" 2>/dev/null || true
+    done < "$staged/temps"
   fi
-  if [[ -n "$release" && -e "$release" ]] && [[ ! "$release" -ef "$libdir/current" ]]; then
-    rm -rf "$release"
+  if [ -n "$release" ] && [ -e "$release" ]; then
+    if [ ! -e "$libdir/current" ] || [ "$(normpath "$release")" != "$(normpath "$libdir/current")" ]; then
+      rm -rf "$release" 2>/dev/null || true
+    fi
   fi
-  [[ -n "$staged" ]] && rm -rf "$staged"
+  [ -n "$staged" ] && rm -rf "$staged" 2>/dev/null || true
 }
 trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
 staged=$(mktemp -d "${TMPDIR:-/tmp}/buildq-install.XXXXXX")
 # Stage and validate the versioned package release, generated launchers, and helper scripts
 # (including destination-side temps) before the first live rename, so any error rolls back cleanly.
@@ -329,24 +1084,35 @@ EOF
 { printf '#!%s\n' "$python"; tail -n +2 "$src/bin/buildq-shim"; } >"$staged/buildq-shim"
 cp "$src/bin/buildq-rustc-guard" "$staged/buildq-rustc-guard"
 "$python" -B -I -m py_compile "$staged/buildq" "$staged/buildq-shim"
-bash -n "$staged/buildq-rustc-guard"
+/bin/sh -n "$staged/buildq-rustc-guard"
+# Validate the active configuration against the staged release BEFORE publishing `current` or any
+# launchers, so a broken config.toml never leaves a new release published on a failed install.
+if [ -e "$confdir/config.toml" ]; then
+  _cfg_to_check="$confdir/config.toml"
+else
+  _cfg_to_check="$src/config.example.toml"
+fi
+"$python" -B -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from buildq import daemon; sys.exit(daemon.main(["--check-config", "--config", sys.argv[2]]))' "$release" "$_cfg_to_check" >/dev/null ||
+  { say "$_cfg_to_check doesn't load; fix it and run install.sh again."; exit 1; }
 # Prepare every destination temp on the target filesystems before publishing anything.
-temps+=("$libdir/current.new.$$" "$bindir/buildq.new.$$" "$bindir/buildqd.new.$$"
-        "$bindir/buildq-shim.new.$$" "$bindir/buildq-rustc-guard.new.$$")
+for _tmp in "$libdir/current.new.$$" "$bindir/buildq.new.$$" "$bindir/buildqd.new.$$" \
+            "$bindir/buildq-shim.new.$$" "$bindir/buildq-rustc-guard.new.$$"; do
+  add_temp "$_tmp"
+done
 ln -sfn "$release" "$libdir/current.new.$$"
 install -m 755 "$staged/buildq" "$bindir/buildq.new.$$"
 ln -sfn buildq "$bindir/buildqd.new.$$"
 install -m 755 "$staged/buildq-shim" "$bindir/buildq-shim.new.$$"
 install -m 755 "$staged/buildq-rustc-guard" "$bindir/buildq-rustc-guard.new.$$"
 # Snapshot previous live targets for rollback if any live rename fails.
-if [[ -L "$libdir/current" ]]; then
+if [ -L "$libdir/current" ]; then
   had_current=yes
   prev_current=$(readlink "$libdir/current")
 fi
 mkdir -p "$staged/prev-bin"
-for prog in buildq buildqd buildq-shim buildq-rustc-guard; do
-  if [[ -L "$bindir/$prog" || -e "$bindir/$prog" ]]; then
-    cp -a "$bindir/$prog" "$staged/prev-bin/$prog"
+for _prog in buildq buildqd buildq-shim buildq-rustc-guard; do
+  if [ -L "$bindir/$_prog" ] || [ -e "$bindir/$_prog" ]; then
+    cp -a "$bindir/$_prog" "$staged/prev-bin/$_prog"
   fi
 done
 publishing=yes
@@ -356,110 +1122,140 @@ mv -Tf "$bindir/buildqd.new.$$" "$bindir/buildqd"
 mv -Tf "$bindir/buildq-shim.new.$$" "$bindir/buildq-shim"
 mv -Tf "$bindir/buildq-rustc-guard.new.$$" "$bindir/buildq-rustc-guard"
 publishing=no
-say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (package in $libdir/current, Python: $python)"
+say "installed buildq, buildqd, buildq-shim and buildq-rustc-guard in $bindir (Python $python_found_ver: $python)"
 
-if [[ ! -e "$confdir/config.toml" ]]; then
+if [ ! -e "$confdir/config.toml" ]; then
   put 644 "$src/config.example.toml" "$confdir/config.toml"
   say "wrote $confdir/config.toml (all defaults; edit it for your machine)"
 fi
-"$bindir/buildqd" --check-config --config "$confdir/config.toml" >/dev/null ||
-  { say "$confdir/config.toml doesn't load; fix it and run install.sh again."; exit 1; }
 
-
-for option in "$@"; do
-  case $option in --shims | --skill | --rustc-guard | --rustc-guard=*) ;; *) say "unknown option $option"; exit 2 ;; esac
-done
-skill_linked=no
-for option in "$@"; do
-  if [[ $option == --skill ]]; then install_skill; skill_linked=yes; fi
-done
-[[ $skill_linked == yes ]] || write_skill
-if ! have_systemd; then
-  # buildq is built on systemd: each build is a service of its own, which is what measures it, caps
-  # its memory and lets the queue pause it. Without a user session there is nothing to install the
-  # units into, and without a daemon that answers, the shims and the guard would only hold builds up
-  # (see below). Running install.sh again won't change that.
-  say "no systemd user session here, and buildq needs one: each build runs as a systemd service, which is what measures it, caps its memory and lets the queue pause it."
-  say "installed the programs in $bindir (and anything listed above), but nothing that needs systemd: no units, --shims and --rustc-guard weren't set up, and install.sh didn't start the daemon. buildqd can still be started by hand, but builds then run unmeasured and uncapped."
-  exit 0
+if [ "$do_skill" = yes ]; then
+  install_skill
+else
+  write_skill
 fi
 
-temps+=("$unitdir/buildq.service.new.$$")
-sed "s|@BINDIR@|$bindir|g" "$src/systemd/buildq.service" >"$unitdir/buildq.service.new.$$"
-mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
-put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
-put 644 "$src/systemd/buildq.slice" "$unitdir/buildq.slice"
-# A backstop for all builds together: if the estimates are wrong, the kernel slows and then
-# stops builds before they can take the machine's memory. Edit or remove it freely.
-# (The daemon also lowers these every few seconds to what the machine has free; see slice_guard.)
-if [[ ! -e "$unitdir/buildq.slice.d/50-buildq-memory.conf" ]]; then
-  mkdir -p "$unitdir/buildq.slice.d"
-  printf '[Slice]\nMemoryHigh=75%%\nMemoryMax=85%%\n' >"$unitdir/buildq.slice.d/50-buildq-memory.conf"
-  say "capped all builds together at 75%/85% of memory ($unitdir/buildq.slice.d/50-buildq-memory.conf)"
+if have_systemd; then
+  add_temp "$unitdir/buildq.service.new.$$"
+  # Render systemd unit safely via Python. Systemd applies C-unescaping and %-specifier expansion
+  # to the ExecStart executable path (argv[0]), NOT $VAR expansion — so never double `$`.
+  "$python" -B -I - "$src/systemd/buildq.service" "$unitdir/buildq.service.new.$$" "$bindir" <<'EOF'
+import sys
+src_u, dst_u, bindir = sys.argv[1:4]
+exe = bindir.rstrip("/") + "/buildqd"
+esc = exe.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+rendered = f'"{esc}"' if any(c.isspace() or c in "\"'\\;&%" for c in exe) else exe
+text = open(src_u).read().replace("@BINDIR@/buildqd", rendered).replace("@BINDIR@", bindir)
+with open(dst_u, "w") as f:
+    f.write(text)
+EOF
+  mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
+  put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
+  put 644 "$src/systemd/buildq.slice" "$unitdir/buildq.slice"
+  # A backstop for all builds together: if the estimates are wrong, the kernel slows and then
+  # stops builds before they can take the machine's memory. Edit or remove it freely.
+  # (The daemon also lowers these every few seconds to what the machine has free; see slice_guard.)
+  if [ ! -e "$unitdir/buildq.slice.d/50-buildq-memory.conf" ]; then
+    mkdir -p "$unitdir/buildq.slice.d"
+    printf '[Slice]\nMemoryHigh=75%%\nMemoryMax=85%%\n' >"$unitdir/buildq.slice.d/50-buildq-memory.conf"
+    say "capped all builds together at 75%/85% of memory ($unitdir/buildq.slice.d/50-buildq-memory.conf)"
+  fi
+  # Distros such as Fedora set ManagedOOMMemoryPressure=kill on every user slice, so a single build
+  # slowed at its own MemoryHigh can make systemd-oomd kill it even while plenty of RAM is free.
+  # buildq enforces per-build MemoryMax, slice_guard and shed_memory itself; this user-range drop-in
+  # disables pressure monitoring rooted at buildq.slice while leaving ancestor/system oomd intact.
+  if [ ! -e "$unitdir/buildq.slice.d/60-buildq-oomd.conf" ]; then
+    mkdir -p "$unitdir/buildq.slice.d"
+    printf '[Slice]\nManagedOOMMemoryPressure=auto\nManagedOOMMemoryPressureLimit=\n' >"$unitdir/buildq.slice.d/60-buildq-oomd.conf"
+    say "disabled per-slice systemd-oomd pressure kills on buildq.slice ($unitdir/buildq.slice.d/60-buildq-oomd.conf)"
+  fi
+  systemctl --user daemon-reload
+  if [ "$no_start" = no ]; then
+    systemctl --user enable --now buildq.socket >/dev/null
+    systemctl --user enable buildq.service >/dev/null
+    # A restart loads the new code. Running builds carry on, and the new daemon picks them up.
+    systemctl --user restart buildq.service
+    # A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
+    # file is gone, have systemd create it again.
+    if [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]; then
+      systemctl --user stop buildq.service
+      systemctl --user restart buildq.socket
+      systemctl --user start buildq.service
+    fi
+    _i=0
+    while [ "$_i" -lt 40 ]; do
+      "$bindir/buildq" ping >/dev/null 2>&1 && break
+      sleep 0.5 2>/dev/null || sleep 1
+      _i=$((_i + 1))
+    done
+    "$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
+  else
+    say "installed systemd user units (--no-start: skipped enabling/restarting buildq.service)"
+  fi
+else
+  if [ "$no_start" = no ]; then
+    say "no systemd user session here; starting buildqd as a user background daemon"
+    "$bindir/buildq" daemon restart || { say "couldn't start buildqd; not enabling shims or the guard."; exit 1; }
+    "$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
+    say "manage it with: buildq daemon status|restart|reload|stop|logs"
+    say "for boot-time supervision (OpenRC, runit, s6, dinit, sysvinit) or optional cgroup v2 limits, see $src/init/README.md"
+  else
+    say "no systemd user session here (--no-start: skipped starting buildqd; start it with \`buildq daemon start\`)"
+  fi
 fi
-# Distros such as Fedora set ManagedOOMMemoryPressure=kill on every user slice, so a single build
-# slowed at its own MemoryHigh can make systemd-oomd kill it even while plenty of RAM is free.
-# buildq enforces per-build MemoryMax, slice_guard and shed_memory itself; this user-range drop-in
-# disables pressure monitoring rooted at buildq.slice while leaving ancestor/system oomd intact.
-if [[ ! -e "$unitdir/buildq.slice.d/60-buildq-oomd.conf" ]]; then
-  mkdir -p "$unitdir/buildq.slice.d"
-  printf '[Slice]\nManagedOOMMemoryPressure=auto\nManagedOOMMemoryPressureLimit=\n' >"$unitdir/buildq.slice.d/60-buildq-oomd.conf"
-  say "disabled per-slice systemd-oomd pressure kills on buildq.slice ($unitdir/buildq.slice.d/60-buildq-oomd.conf)"
+
+# Shims and the guard only once the daemon answers (or explicitly with --no-start for image builds).
+if [ "$do_shims" = yes ]; then
+  mkdir -p "$shimdir"
+  installed_shims="$shim_tools"
+  for _tool in $shim_tools; do
+    ln -sfn "$bindir/buildq-shim" "$shimdir/$_tool"
+  done
+  for _tool in $optional_shim_tools; do
+    if has_real_tool "$_tool"; then
+      ln -sfn "$bindir/buildq-shim" "$shimdir/$_tool"
+      installed_shims="$installed_shims $_tool"
+    elif [ -L "$shimdir/$_tool" ]; then
+      rm -f "$shimdir/$_tool"
+    fi
+  done
+  say "shims for $installed_shims are in $shimdir. Put it first on PATH, at the end of ~/.bashrc:"
+  say "    export PATH=\"$shimdir:\$PATH\""
 fi
-systemctl --user daemon-reload
-systemctl --user enable --now buildq.socket >/dev/null
-systemctl --user enable buildq.service >/dev/null
-# A restart loads the new code. Running builds carry on, and the new daemon picks them up.
-systemctl --user restart buildq.service
-# A daemon older than this one (Python 3.13+) removed systemd's socket file when it stopped; if the
-# file is gone, have systemd create it again.
-if [[ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buildq.sock" ]]; then
-  systemctl --user stop buildq.service
-  systemctl --user restart buildq.socket
-  systemctl --user start buildq.service
+
+apply_rustc_guard() {
+  cargo_config=$1
+  rustc_wrapper "$bindir/buildq-rustc-guard" || exit 1
+  grep -qxF "$cargo_config" "$guard_list" 2>/dev/null || printf '%s\n' "$cargo_config" >>"$guard_list"
+  say "cargo under $(dirname "$(dirname "$cargo_config")") now compiles Rust only inside buildq builds"
+}
+
+if [ "$do_rustc_guard_global" = yes ]; then
+  apply_rustc_guard "${CARGO_HOME:-$HOME/.cargo}/config.toml"
 fi
-for _ in $(seq 1 40); do
-  "$bindir/buildq" ping >/dev/null 2>&1 && break
-  sleep 0.5
-done
-"$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
-# Shims and the guard only once the daemon answers: without it, they would hold builds up.
-for option in "$@"; do
-  case $option in
-    --shims)
-      mkdir -p "$shimdir"
-      installed_shims=("${shim_tools[@]}")
-      for tool in "${shim_tools[@]}"; do ln -sfn "$bindir/buildq-shim" "$shimdir/$tool"; done
-      for tool in "${optional_shim_tools[@]}"; do
-        if has_real_tool "$tool"; then
-          ln -sfn "$bindir/buildq-shim" "$shimdir/$tool"
-          installed_shims+=("$tool")
-        elif [[ -L "$shimdir/$tool" ]]; then
-          rm -f "$shimdir/$tool"
-        fi
-      done
-      say "shims for ${installed_shims[*]} are in $shimdir. Put it first on PATH, at the end of ~/.bashrc:"
-      say "    export PATH=\"$shimdir:\$PATH\""
-      ;;
-    --skill) ;;  # done above: it needs neither systemd nor the daemon
-    --rustc-guard | --rustc-guard=*)
-      targets=()
-      if [[ $option == --rustc-guard ]]; then
-        targets=("${CARGO_HOME:-$HOME/.cargo}/config.toml")
-      else
-        IFS=, read -r -a dirs <<<"${option#--rustc-guard=}"
-        for dir in "${dirs[@]}"; do targets+=("${dir/#\~/$HOME}/.cargo/config.toml"); done
-      fi
-      for cargo_config in "${targets[@]}"; do
-        rustc_wrapper "$bindir/buildq-rustc-guard" || exit 1
-        grep -qxF "$cargo_config" "$guard_list" 2>/dev/null || echo "$cargo_config" >>"$guard_list"
-        say "cargo under $(dirname "$(dirname "$cargo_config")") now compiles Rust only inside buildq builds"
-      done
-      ;;
-    *) say "unknown option $option"; exit 2 ;;
-  esac
-done
-case ":$PATH:" in
+if [ -n "$rustc_guard_dirs" ]; then
+  _rem=$rustc_guard_dirs
+  while [ -n "$_rem" ]; do
+    case $_rem in
+      *,*) _dir=${_rem%%,*}; _rem=${_rem#*,} ;;
+      *)   _dir=$_rem; _rem='' ;;
+    esac
+    [ -n "$_dir" ] || continue
+    case $_dir in
+      '~')   _dir=$HOME ;;
+      '~/'*) _dir=$HOME/${_dir#'~/'} ;;
+      /*)    ;;
+      *)     _dir=$PWD/$_dir ;;
+    esac
+    _dir=$(normpath "$_dir")
+    apply_rustc_guard "$_dir/.cargo/config.toml"
+  done
+fi
+
+case ":${PATH:-}:" in
   *":$bindir:"*) ;;
-  *) say "note: $bindir is not on your PATH." ;;
+  *) say "note: $bindir is not on your PATH. Add: export PATH=\"$bindir:\$PATH\"" ;;
 esac
+if [ "$no_start" = no ]; then
+  say "ready! Try: buildq status"
+fi

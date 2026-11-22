@@ -18,6 +18,7 @@ buildq report --capacity [--hourly] [--since 7d]  # what builds waited for, and 
 buildq top [--interval 2] [--once]                # a live view of the machine and each build, like btop
 buildq query ["SQL"] [--json]                     # a read-only query on the analytics (none: list the tables)
 buildq help agents                               # the page for coding agents
+buildq daemon start|stop|restart|reload|status|logs  # manage the daemon (systemd or standalone)
 buildq ping                                      # check that the daemon answers
 ```
 
@@ -177,10 +178,12 @@ the news without polling:
 
 | Variable | Effect |
 | -------- | ------ |
-| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock`) |
+| `BUILDQ_SOCKET` | the daemon's socket (default `$XDG_RUNTIME_DIR/buildq.sock` or `/run/user/$UID/buildq.sock` on systemd hosts, and `~/.local/state/buildq/run/buildq.sock` on non-systemd hosts — falling back to `/tmp/buildq-<uid>/buildq.sock` only if that path exceeds 100 bytes — so background services and terminal sessions always share the same daemon) |
+| `BUILDQ_RUNNER` | override `runner` from `config.toml` (`auto`, `systemd`, `cgroup`, or `direct`) |
+| `BUILDQ_CGROUP_ROOT` | override `cgroup_root` from `config.toml` (optional custom cgroup v2 folder for the `cgroup` runner) |
 | `BUILDQ_FALLBACK` | what `buildq run` does when the daemon can't be reached. Unset: wait for it. `fail`: exit 75. `run`: run the command unqueued. Anything else: a command prefix to run it through instead. |
 | `BUILDQ_AS` | the name of a wrapper in front of buildq. buildq's hints then name the wrapper's commands, so its users are told what they type (`wrapper --submit <command>`, not `buildq submit -- <command>`). The wrapper must take `--submit COMMAND...`, `--wait TICKET [--timeout D]`, `--status [TICKET]`, `--logs TICKET` and `--cancel TICKET` and pass them to buildq's commands of the same names; that is all the hints use. |
 | `BUILDQ_SOURCE` | `off` stops the client recording the source a build is of (no joining or reuse then) |
-| `BUILDQ_CALLER` | who is submitting, for fair shares; by default the agent session (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `T3CODE_THREAD_ID`, `ANTIGRAVITY_CONVERSATION_ID`), else the cgroup the client runs in (a CI runner's service, a terminal's scope) |
+| `BUILDQ_CALLER` | who is submitting, for fair shares; by default the agent session (`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID`, `T3CODE_THREAD_ID`, `ANTIGRAVITY_CONVERSATION_ID`), else the cgroup the client runs in (a CI runner's service, a terminal's scope), falling back on flat cgroups to terminal multiplexer/session identity (`TMUX_PANE`, `STY`, `TERM_SESSION_ID`, or process session id) |
 | `BUILDQ_JOB`, `BUILDQ_TICKET` | set inside every build to its ticket. A `buildq run` inside a build runs its command directly, because the build already holds a turn. buildq checks that the build really is running. |
 | `BUILDQ_CORES` | set inside every build: the cores it was given |

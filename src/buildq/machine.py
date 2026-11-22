@@ -3,14 +3,31 @@
 
 from __future__ import annotations
 
+import collections
+import ctypes
+import errno
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 
 from .common import DEVNULL, KIB, MIB, UID
+
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def set_child_subreaper() -> bool:
+    """Mark this process as a subreaper (Linux 3.4+) so orphaned grandchildren are reparented here
+    instead of PID 1, preserving process-tree membership and cumulative CPU accounting."""
+    try:
+        libc = ctypes.CDLL(None)
+        return libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (OSError, AttributeError):
+        return False
 
 def cpu_times() -> tuple[int, int]:
     """(all jiffies, idle + iowait jiffies) summed over every CPU, from /proc/stat."""
@@ -385,6 +402,465 @@ def proc_stat(pid, strict: bool = False):
         return None
 
 
+def proc_stat_full(pid: int):
+    """(start_ticks, state, ppid, pgrp, sid, utime, stime, cutime, cstime) from /proc/<pid>/stat."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            data = f.read()
+        fields = data.rsplit(")", 1)[1].split()
+        return (int(fields[19]), fields[0], int(fields[1]), int(fields[2]), int(fields[3]),
+                int(fields[11]), int(fields[12]), int(fields[13]), int(fields[14]))
+    except (OSError, ValueError, IndexError, TypeError, OverflowError):
+        return None
+
+
+def proc_memory(pid: int) -> tuple[int, int] | None:
+    """(unreclaimable anon+shmem bytes, swap bytes) of one process.
+
+    Reads /proc/<pid>/smaps_rollup (Pss_Anon + Pss_Shmem, SwapPss) so shared CoW pages aren't
+    double-counted across forked workers and file-backed page cache is excluded (matching cgroup
+    memory.stat). Falls back to /proc/<pid>/status (RssAnon + RssShmem, VmSwap) where smaps_rollup
+    isn't available. Returns None if neither file could be read."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            vals: dict[str, int] = {}
+            for line in f:
+                name, _, rest = line.partition(":")
+                if name in ("Pss_Anon", "Pss_Shmem", "SwapPss", "Swap", "Anonymous", "Pss"):
+                    parts = rest.split()
+                    if parts and parts[0].isdigit():
+                        vals[name] = int(parts[0]) * KIB
+        if "Pss_Anon" in vals or "Pss_Shmem" in vals:
+            mem = vals.get("Pss_Anon", 0) + vals.get("Pss_Shmem", 0)
+            swap = vals.get("SwapPss", vals.get("Swap", 0))
+            return mem, swap
+        if "Anonymous" in vals:
+            return vals["Anonymous"], vals.get("SwapPss", vals.get("Swap", 0))
+    except OSError:
+        pass
+    try:
+        vals = {}
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                name, _, rest = line.partition(":")
+                if name in ("RssAnon", "RssShmem", "VmRSS", "VmSwap"):
+                    parts = rest.split()
+                    if parts and parts[0].isdigit():
+                        vals[name] = int(parts[0]) * KIB
+        if "RssAnon" in vals or "RssShmem" in vals:
+            return vals.get("RssAnon", 0) + vals.get("RssShmem", 0), vals.get("VmSwap", 0)
+        if "VmRSS" in vals or "VmSwap" in vals:
+            return vals.get("VmRSS", 0), vals.get("VmSwap", 0)
+        return 0, 0
+    except OSError:
+        return None
+
+
+def proc_io(pid: int) -> tuple[int, int] | None:
+    """(read_bytes, write_bytes) from /proc/<pid>/io, or None."""
+    try:
+        rb = wb = 0
+        with open(f"/proc/{pid}/io") as f:
+            for line in f:
+                name, _, val = line.partition(":")
+                if name == "read_bytes":
+                    rb = int(val.strip())
+                elif name == "write_bytes":
+                    wb = int(val.strip())
+        return rb, wb
+    except (OSError, ValueError):
+        return None
+
+
+def _scan_own_stats():
+    """Single-pass scan of this user's /proc/<pid>/stat -> (stats, children_by_ppid, by_sid)."""
+    stats: dict[int, tuple] = {}
+    children: dict[int, list[int]] = collections.defaultdict(list)
+    by_sid: dict[int, list[int]] = collections.defaultdict(list)
+    for pid in own_pids():
+        s = proc_stat_full(pid)
+        if s is None:
+            continue
+        stats[pid] = s
+        children[s[2]].append(pid)
+        by_sid[s[4]].append(pid)
+    return stats, children, by_sid
+
+
+def _collect_tree(root_pid: int | None, root_start: int | None, job: str, stats: dict, children: dict,
+                  by_sid: dict) -> tuple[list[int], bool]:
+    """All PIDs in a build's process tree in strict parent-before-child topological order (rooted
+    at supervisor `root_pid`, plus session members, falling back to BUILDQ_JOB-tagged processes if
+    the supervisor is gone). Returns `(ordered_pids, sup_alive)`."""
+    members: set[int] = set()
+    sup_alive = False
+    if root_pid and root_pid in stats and stats[root_pid][0] == root_start and stats[root_pid][1] not in ("Z", "X"):
+        sup_alive = True
+        queue_pids = collections.deque([root_pid])
+        members.add(root_pid)
+        for spid in by_sid.get(root_pid, ()):
+            if spid not in members:
+                members.add(spid)
+                queue_pids.append(spid)
+        while queue_pids:
+            cur = queue_pids.popleft()
+            for ch in children.get(cur, ()):
+                if ch not in members:
+                    members.add(ch)
+                    queue_pids.append(ch)
+    else:
+        for pid in tagged_processes(job):
+            if pid not in members:
+                members.add(pid)
+                queue_pids = collections.deque([pid])
+                while queue_pids:
+                    cur = queue_pids.popleft()
+                    for ch in children.get(cur, ()):
+                        if ch not in members:
+                            members.add(ch)
+                            queue_pids.append(ch)
+    if not members:
+        return [], sup_alive
+    # Topologically sort `members` strictly parent-before-child so a parent's stat is always read
+    # before its children's (preventing child-exit reap double-counting).
+    roots = [p for p in members if (stats[p][2] not in members if p in stats else True)]
+    if root_pid in roots:
+        roots.remove(root_pid)
+        roots.insert(0, root_pid)
+    ordered: list[int] = []
+    visited: set[int] = set()
+    q = collections.deque(roots)
+    while q:
+        cur = q.popleft()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        ordered.append(cur)
+        for ch in children.get(cur, ()):
+            if ch in members and ch not in visited:
+                q.append(ch)
+    for leftover in members:
+        if leftover not in visited:
+            ordered.append(leftover)
+    return ordered, sup_alive
+
+
+def proc_tree_descendants(root_pid: int) -> list[tuple[int, int]]:
+    """All live descendant `(pid, start_time)` pairs of `root_pid` (excluding `root_pid`)."""
+    stats, children, _ = _scan_own_stats()
+    if root_pid not in stats:
+        return []
+    seen = {root_pid}
+    queue_pids = collections.deque([root_pid])
+    out: list[tuple[int, int]] = []
+    while queue_pids:
+        cur = queue_pids.popleft()
+        for ch in children.get(cur, ()):
+            if ch not in seen:
+                seen.add(ch)
+                queue_pids.append(ch)
+                s = stats.get(ch)
+                if s is not None and s[1] not in ("Z", "X"):
+                    out.append((ch, s[0]))
+    return out
+
+
+def proc_tree_info(root_pid: int | None, root_start: int | None, job: str) -> dict:
+    """Inspect one non-cgroup build's process tree for freezing, stopping, or status checks."""
+    stats, children, by_sid = _scan_own_stats()
+    tree, sup_alive = _collect_tree(root_pid, root_start, job, stats, children, by_sid)
+    live = [p for p in tree if p in stats and stats[p][1] not in ("Z", "X")]
+    descendants = [p for p in live if p != root_pid]
+    descendant_idents = {p: stats[p][0] for p in descendants}
+    pgids = sorted({stats[p][3] for p in descendants if stats[p][3] > 1 and stats[p][3] != root_pid})
+    sup_state = stats[root_pid][1] if sup_alive and root_pid in stats else None
+    own_stopped = (sup_state in ("T", "t")) if sup_state is not None else None
+    any_descendant_stopped = any(stats[p][1] in ("T", "t") for p in descendants)
+    all_stopped = (bool(own_stopped) and all(stats[p][1] in ("T", "t") for p in descendants)) if own_stopped is not None else None
+    return {
+        "sup_alive": sup_alive, "pids": live, "descendants": descendants,
+        "descendant_idents": descendant_idents, "pgids": pgids,
+        "own_stopped": own_stopped, "all_stopped": all_stopped,
+        "any_descendant_stopped": any_descendant_stopped,
+    }
+
+
+def proc_trees_snapshot(jobs: dict[str, tuple[int | None, int | None]]) -> dict[str, dict]:
+    """Single-pass /proc CPU, memory, swap, PID-list, and stop-state measurement for all active
+    non-cgroup builds at once. Reads stat in top-down parent-before-child BFS order so a child
+    reaped mid-scan is never double-counted in both its own utime and its parent's cutime."""
+    if not jobs:
+        return {}
+    stats, children, by_sid = _scan_own_stats()
+    clk = max(1, CLK_TCK)
+    out: dict[str, dict] = {}
+    for job_id, (root_pid, root_start) in jobs.items():
+        tree, sup_alive = _collect_tree(root_pid, root_start, job_id, stats, children, by_sid)
+        if not tree:
+            continue
+        ticks = 0
+        mem = swap = 0
+        mem_failed = 0
+        live: list[int] = []
+        descendants: list[int] = []
+        descendant_idents: dict[int, int] = {}
+        # Re-read stat strictly top-down (parent before child) so a concurrent child exit + reap
+        # cannot be counted in both the child's utime/stime and the parent's cutime/cstime.
+        fresh_states: dict[int, str] = {}
+        for pid in tree:
+            orig = stats.get(pid)
+            if orig is None:
+                continue
+            s = proc_stat_full(pid)
+            if s is None or s[0] != orig[0]:
+                continue
+            fresh_states[pid] = s[1]
+            ticks += s[5] + s[6] + s[7] + s[8]
+            if s[1] in ("Z", "X"):
+                continue
+            live.append(pid)
+            if pid != root_pid:
+                descendants.append(pid)
+                descendant_idents[pid] = s[0]
+                pm_ps = proc_memory(pid)
+                if pm_ps is None:
+                    # Process may have exited right between stat and smaps_rollup; only flag
+                    # sample invalid if the exact same process is still alive.
+                    after = proc_stat(pid)
+                    if after is not None and after[0] == s[0] and after[1] not in ("Z", "X"):
+                        mem_failed += 1
+                else:
+                    mem += pm_ps[0]
+                    swap += pm_ps[1]
+        sup_state = fresh_states.get(root_pid) if sup_alive and root_pid is not None else None
+        own_stopped = (sup_state in ("T", "t")) if sup_state is not None else None
+        all_stopped = (bool(own_stopped) and all(fresh_states.get(p) in ("T", "t") for p in descendants)) if own_stopped is not None else None
+        out[job_id] = {
+            "cpu_usec": int(ticks * 1_000_000 // clk),
+            "mem": mem,
+            "swap": swap,
+            "mem_ok": mem_failed == 0,
+            "pids": live,
+            "descendants": descendants,
+            "descendant_idents": descendant_idents,
+            "own_stopped": own_stopped,
+            "all_stopped": all_stopped,
+        }
+    return out
+
+
+def biggest_processes(count: int = 6, at_least: int = 256 * MIB, deadline: float | None = None):
+    """Fallback for the memory watch on machines without cgroup v2 sub-cgroups: top processes by
+    unreclaimable memory + swap from /proc/<pid>/status."""
+    found = []
+    complete = True
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return [], False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        if deadline is not None and time.monotonic() > deadline:
+            complete = False
+            break
+        try:
+            vals: dict[str, int] = {}
+            name = ""
+            with open(f"/proc/{entry}/status", errors="replace") as f:
+                for line in f:
+                    key, _, rest = line.partition(":")
+                    if key == "Name":
+                        name = rest.strip()
+                    elif key in ("RssAnon", "RssShmem", "VmRSS", "VmSwap"):
+                        parts = rest.split()
+                        if parts and parts[0].isdigit():
+                            vals[key] = int(parts[0]) * KIB
+            mem = (vals.get("RssAnon", 0) + vals.get("RssShmem", 0)) if ("RssAnon" in vals or "RssShmem" in vals) else vals.get("VmRSS", 0)
+            swap = vals.get("VmSwap", 0)
+            if mem + swap >= at_least:
+                found.append((mem, swap, f"pid {entry}", name))
+        except OSError:
+            continue
+    found.sort(key=lambda e: e[0] + e[1], reverse=True)
+    return found[:count], complete
+
+
+def is_cgroup_v2(root: str = "/sys/fs/cgroup") -> bool:
+    """Whether `root` is a mounted Linux cgroup v2 unified hierarchy."""
+    return os.path.isfile(os.path.join(root, "cgroup.controllers"))
+
+
+def cgroup_controllers(path: str) -> set[str]:
+    try:
+        with open(os.path.join(path, "cgroup.controllers")) as f:
+            return set(f.read().split())
+    except OSError:
+        return set()
+
+
+def cgroup_subtree_controllers(path: str) -> set[str]:
+    try:
+        with open(os.path.join(path, "cgroup.subtree_control")) as f:
+            return set(f.read().split())
+    except OSError:
+        return set()
+
+
+def cgroup_pids(path: str) -> list[int]:
+    try:
+        with open(os.path.join(path, "cgroup.procs")) as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def cgroup_all_pids(path: str) -> list[int]:
+    """All PIDs in `path` and every nested child cgroup beneath it (for legacy < 5.14 shutdown)."""
+    found: list[int] = []
+    seen: set[int] = set()
+    try:
+        for dirpath, _dirnames, _filenames in os.walk(path):
+            for pid in cgroup_pids(dirpath):
+                if pid not in seen:
+                    seen.add(pid)
+                    found.append(pid)
+    except OSError:
+        pass
+    return found
+
+
+def cgroup_memory_max(path: str) -> str | None:
+    try:
+        with open(os.path.join(path, "memory.max")) as f:
+            val = f.read().strip()
+        return val if val == "max" or val.isdigit() else None
+    except OSError:
+        return None
+
+
+def boot_id() -> str | None:
+    """Kernel boot UUID from /proc/sys/kernel/random/boot_id."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def pidfd_signal(pid: int, start: int | None, sig: int) -> bool:
+    """Send `sig` to `(pid, start)` pinned via Linux pidfd_open + pidfd_send_signal (immune to PID
+    reuse). Falls back to re-verified os.kill if the kernel lacks pidfd support."""
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send = getattr(signal, "pidfd_send_signal", None)
+    if pidfd_open is not None and pidfd_send is not None:
+        fd = -1
+        try:
+            fd = pidfd_open(pid, 0)
+            if start is not None:
+                st = proc_stat(pid)
+                if st is None or st[0] != start:
+                    return False
+            pidfd_send(fd, sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError as e:
+            if getattr(e, "errno", None) not in (errno.ENOSYS, errno.EPERM):
+                return False
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    if start is not None:
+        st = proc_stat(pid)
+        if st is None or st[0] != start:
+            return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def proc_ppid_comm(pid: int) -> tuple[int | None, str | None]:
+    """(ppid, parent_comm) for `pid`, or (None, None)."""
+    s = proc_stat_full(pid)
+    if s is None or s[2] <= 0:
+        return None, None
+    ppid = s[2]
+    try:
+        with open(f"/proc/{ppid}/comm", errors="replace") as f:
+            return ppid, f.read().strip()
+    except OSError:
+        return ppid, None
+
+
+def is_descendant_of(pid: int, ancestor_pid: int, ancestor_start: int | None = None) -> bool:
+    """Whether `pid` descends from `(ancestor_pid, ancestor_start)` via /proc/<p>/stat PPID chain."""
+    if not isinstance(pid, int) or not isinstance(ancestor_pid, int) or ancestor_pid <= 1:
+        return False
+    cur = pid
+    seen: set[int] = set()
+    for _ in range(64):
+        if cur <= 1 or cur in seen:
+            return False
+        seen.add(cur)
+        s = proc_stat_full(cur)
+        if s is None:
+            return False
+        if cur == ancestor_pid:
+            return ancestor_start is None or s[0] == ancestor_start
+        cur = s[2]
+    return False
+
+
+def _cmdline_is_buildqd(cmd: list[str]) -> bool:
+    if not cmd or "--supervise" in cmd:
+        return False
+    base0 = os.path.basename(cmd[0])
+    if base0 == "buildqd":
+        return True
+    if not re.fullmatch(r"python(\d+(\.\d+)*)?", base0):
+        return False
+    i = 1
+    while i < len(cmd):
+        arg = cmd[i]
+        if arg == "-m":
+            return i + 1 < len(cmd) and cmd[i + 1] == "buildq.daemon"
+        if arg in ("-c", "-W", "-X"):
+            if arg == "-c":
+                return False
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return os.path.basename(arg) == "buildqd"
+    return False
+
+
+def pid_is_buildqd(pid: int, start: int | None = None) -> bool:
+    """Whether `pid` (optionally pinned to `start`) is a running buildqd daemon owned by UID."""
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != UID:
+            return False
+    except OSError:
+        return False
+    stat_info = proc_stat(pid)
+    if stat_info is None or stat_info[1] in ("Z", "X"):
+        return False
+    if start is not None and stat_info[0] != start:
+        return False
+    return _cmdline_is_buildqd(proc_cmdline(pid))
+
+
 def proc_identity(pid):
     """(start time in clock ticks since boot, state letter) of a process, or None if it's gone."""
     stat = proc_stat(pid)
@@ -598,15 +1074,9 @@ def holds_flock(pid: int, path: str, inode: int) -> bool:
     return False
 
 
-def fifo_in_use(cgroup: str, path: str | None) -> bool:
-    """Whether a process of the build (other than its supervisor's own copy) has its jobserver
-    FIFO open: a tool that opened it speaks the protocol, even before it takes a token."""
-    if not path:
-        return False
-    try:
-        with open(os.path.join(cgroup, "cgroup.procs")) as f:
-            pids = [int(x) for x in f.read().split()]
-    except (OSError, ValueError):
+def fifo_in_use_pids(pids, path: str | None) -> bool:
+    """Whether more than one process in `pids` has the jobserver FIFO open (beyond the supervisor)."""
+    if not path or not pids:
         return False
     users = 0
     for pid in pids:
@@ -615,12 +1085,22 @@ def fifo_in_use(cgroup: str, path: str | None) -> bool:
                 try:
                     if os.readlink(f"/proc/{pid}/fd/{fd}") == path:
                         users += 1
+                        if users > 1:
+                            return True
                         break
                 except OSError:
                     continue
         except OSError:
             continue
     return users > 1  # the supervisor holds it open for the whole build
+
+
+def fifo_in_use(cgroup: str, path: str | None) -> bool:
+    """Whether a process of the build (other than its supervisor's own copy) has its jobserver
+    FIFO open: a tool that opened it speaks the protocol, even before it takes a token."""
+    if not path:
+        return False
+    return fifo_in_use_pids(cgroup_pids(cgroup), path)
 
 
 

@@ -46,6 +46,7 @@ DEFAULTS = {
     "max_log": "64M",
     "slice": "buildq.slice",
     "slice_guard": True,
+    "cgroup_root": "",
     "runner": "auto",
     "default_lane": "default",
     "keep_finished": "7d",
@@ -59,7 +60,7 @@ DEFAULTS = {
     "release_after_peak": "shadow",
     "scale_mem_with_cores": "always",
     "env": {},
-    "lanes": {"default": {"cores": 4, "mem": "4G", "properties": {"MemoryHigh": "40%", "MemoryMax": "50%"}}},
+    "lanes": {"default": {"cores": 4, "properties": {"MemoryHigh": "40%", "MemoryMax": "50%"}}},
     "lane_rules": [],
     "flock_slots": [],
 }
@@ -87,7 +88,10 @@ class Lane:
         self.cores = min(max(self.cores, self.min_cores), self.max_cores)
         if self.min_cores > self.max_cores:
             raise ValueError(f"lanes.{name}: min_cores is more than max_cores")
-        self.mem = common.parse_size(raw.get("mem", "4G"), mem_total)
+        if "mem" in raw:
+            self.mem = common.parse_size(raw["mem"], mem_total)
+        else:
+            self.mem = min(4 * common.GIB, max(1, mem_total // 4))
         self.min_mem = common.parse_size(raw.get("min_mem", 0), mem_total)
         if not 0 < self.mem <= mem_total:
             raise ValueError(f"lanes.{name}.mem must be more than 0 and at most the machine's memory")
@@ -222,9 +226,16 @@ class Config:
         if not re.fullmatch(r"[A-Za-z0-9_.\-]+\.slice", self.slice):
             raise ValueError(f"slice must be a systemd slice name ending in .slice: {self.slice!r}")
         self.slice_guard = common.boolean(d["slice_guard"], "slice_guard")
+        cg_root = str(d["cgroup_root"] or "").strip()
+        if cg_root:
+            cg_norm = os.path.normpath(cg_root)
+            if not os.path.isabs(cg_root) or not (cg_norm == "/sys/fs/cgroup" or cg_norm.startswith("/sys/fs/cgroup/")):
+                raise ValueError(f"cgroup_root must be a directory under /sys/fs/cgroup: {cg_root!r}")
+            cg_root = cg_norm
+        self.cgroup_root = cg_root
         self.runner = str(d["runner"])
-        if self.runner not in ("auto", "systemd", "direct"):
-            raise ValueError("runner must be auto, systemd or direct")
+        if self.runner not in ("auto", "systemd", "cgroup", "direct"):
+            raise ValueError("runner must be auto, systemd, cgroup or direct")
         self.keep_finished = common.parse_duration(d["keep_finished"])
         self.max_finished = common.number(d["max_finished"], "max_finished", 0, 1_000_000, integer=True)
         self.on_finish = str(d["on_finish"] or "")
@@ -318,6 +329,7 @@ class Config:
             "restartable_scripts": sorted(self.restartable_scripts),
             "slice": self.slice,
             "slice_guard": self.slice_guard,
+            "cgroup_root": self.cgroup_root,
             "runner": self.runner, "default_lane": self.default_lane, "keep_finished": self.keep_finished,
             "max_log": self.max_log, "shed_memory": self.shed_memory, "reuse_window": self.reuse_window,
             "github_status": self.github_status, "gh": self.gh, "metrics": self.metrics,

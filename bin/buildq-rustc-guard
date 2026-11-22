@@ -36,10 +36,33 @@ shift
 pass() { exec "$rustc" "$@"; }
 
 # Inside a buildq build: the common case, so it is checked first and costs one read.
+# Matches systemd (`.../buildq.slice/buildq-<uuid>[-r<digits>].service`) and direct cgroup v2
+# (`.../builds/buildq-<uuid>[-r<digits>]`) build cgroups specifically, never unrelated cgroups.
 cgroup=$(cat /proc/self/cgroup 2>/dev/null)
-case $cgroup in
-  */buildq.slice/*) pass "$@" ;;
-esac
+uuid_pat='[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+is_valid_retry() {
+  case $1 in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+matches_build_cgroup() {
+  cg_line=$1
+  slice_name=$2
+  case $cg_line in
+    */"$slice_name"/buildq-${uuid_pat}.service) return 0 ;;
+    */"$slice_name"/buildq-${uuid_pat}-r*.service)
+      unit=${cg_line##*/}
+      rest=${unit#buildq-${uuid_pat}-r}
+      is_valid_retry "${rest%.service}" && return 0 ;;
+    */builds/buildq-${uuid_pat}|*/builds/buildq-${uuid_pat}/*) return 0 ;;
+    */builds/buildq-${uuid_pat}-r*)
+      rest=${cg_line#*/builds/buildq-${uuid_pat}-r}
+      is_valid_retry "${rest%%/*}" && return 0 ;;
+  esac
+  return 1
+}
+matches_build_cgroup "$cgroup" "buildq.slice" && pass "$@"
 
 # Not a compile: version and target queries.
 compiling=no
@@ -76,19 +99,39 @@ if [ -r "$config" ]; then
   done < "$config"
 fi
 if [ -n "$slice" ]; then
-  case $cgroup in
-    */"$slice"/*) pass "$@" ;;
-  esac
+  matches_build_cgroup "$cgroup" "$slice" && pass "$@"
 fi
 
-# A build of the direct runner has no cgroup to show it; its ticket says it is running.
+# A build of the direct runner (no build cgroup): verify that BUILDQ_JOB names a live direct
+# ticket AND that this process actually descends from that ticket's exact (pid, start) supervisor.
+# (cgroup and systemd builds must match /proc/self/cgroup above and cannot be spoofed by env.)
 if [ -n "${BUILDQ_JOB:-}" ]; then
   state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
   case $BUILDQ_JOB in
     */*|.*) ;;
     *) ticket=$state_dir/tickets/$BUILDQ_JOB/ticket.json
-       if grep -q '"state":"running"' "$ticket" 2>/dev/null && grep -q '"runner":"direct"' "$ticket" 2>/dev/null; then
-         pass "$@"
+       sup_json=$state_dir/tickets/$BUILDQ_JOB/supervisor.json
+       if grep -Eq '"state"[[:space:]]*:[[:space:]]*"(starting|running)"' "$ticket" 2>/dev/null \
+          && grep -Eq '"runner"[[:space:]]*:[[:space:]]*"direct"' "$ticket" 2>/dev/null; then
+         sup_pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$sup_json" 2>/dev/null | head -n 1)
+         sup_start=$(sed -n 's/.*"start"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$sup_json" 2>/dev/null | head -n 1)
+         if [ -z "$sup_pid" ] || [ -z "$sup_start" ]; then
+           sup_pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$ticket" 2>/dev/null | head -n 1)
+           sup_start=$(sed -n 's/.*"pid_start"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$ticket" 2>/dev/null | head -n 1)
+         fi
+         if [ -n "$sup_pid" ] && [ -n "$sup_start" ] && [ "$sup_pid" -gt 1 ] 2>/dev/null; then
+           walk=$PPID
+           wdepth=0
+           while [ "${walk:-0}" -gt 1 ] 2>/dev/null && [ "$wdepth" -lt 64 ]; do
+             if [ "$walk" -eq "$sup_pid" ] 2>/dev/null; then
+               act_start=$(awk '{s = s (NR > 1 ? " " : "") $0} END {if (sub(/.*\) /, "", s)) {split(s, f); print f[20]}}' "/proc/$walk/stat" 2>/dev/null)
+               [ "$act_start" = "$sup_start" ] && pass "$@"
+               break
+             fi
+             walk=$(awk '{s = s (NR > 1 ? " " : "") $0} END {if (sub(/.*\) /, "", s)) {split(s, f); print f[2]}}' "/proc/$walk/stat" 2>/dev/null)
+             wdepth=$((wdepth + 1))
+           done
+         fi
        fi ;;
   esac
 fi
