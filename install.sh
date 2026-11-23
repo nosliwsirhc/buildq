@@ -22,6 +22,8 @@
 #                                machine's own notes from ~/.config/buildq/agents.md added at its end;
 #                                run it again after changing those notes. (The page itself is always
 #                                installed: `buildq help agents` prints it.)
+#   ./install.sh --auto-update   enable the systemd user timer (buildq-update.timer) to periodically
+#                                pull and install updates automatically
 #   ./install.sh --no-start      install without starting/restarting the daemon (for images/packaging)
 #   ./install.sh --uninstall     stop and remove it all (keeps ~/.config/buildq and ~/.local/state/buildq)
 #
@@ -42,6 +44,7 @@ Options:
   --shims                     Install PATH shims for cargo, npm, pnpm, make, ninja, dotnet, etc.
   --rustc-guard[=DIR[,DIR]]   Refuse Rust compiles outside buildq (globally or under given dirs)
   --skill                     Link the buildq skill into detected coding agent directories
+  --auto-update               Enable the systemd user timer to check for and install updates
   --no-start                  Install without starting or restarting the daemon
   --uninstall                 Stop and remove buildq (keeps config and history)
   -h, --help                  Show this help
@@ -59,6 +62,7 @@ auto_install_deps=no
 no_start=no
 do_shims=no
 do_skill=no
+do_auto_update=no
 do_rustc_guard_global=no
 rustc_guard_dirs=""
 has_install_opts=no
@@ -88,6 +92,10 @@ for _opt in "$@"; do
       ;;
     --skill)
       do_skill=yes
+      has_install_opts=yes
+      ;;
+    --auto-update)
+      do_auto_update=yes
       has_install_opts=yes
       ;;
     --rustc-guard)
@@ -826,6 +834,7 @@ if [ "$do_uninstall" = yes ]; then
   acquire_lock
   find_python || true
   if have_systemd; then
+    systemctl --user disable --now buildq-update.timer buildq-update.service 2>/dev/null || true
     _was_active=no
     systemctl --user is-active --quiet buildq.service 2>/dev/null && _was_active=yes
     if ! systemctl --user disable --now buildq.service buildq.socket 2>/dev/null; then
@@ -944,7 +953,10 @@ if [ "$do_uninstall" = yes ]; then
   rm -f "$skill_list"
   rm -rf "$shimdir" "$(dirname "$skilldir")" "$libdir"
   rm -f "$bindir/buildq" "$bindir/buildqd" "$bindir/buildq-shim" \
-        "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice"
+        "$unitdir/buildq.service" "$unitdir/buildq.socket" "$unitdir/buildq.slice" \
+        "$unitdir/buildq-update.service" "$unitdir/buildq-update.timer" \
+        "$state_dir/install.json"
+  rm -rf "$unitdir/buildq-update.timer.d"
   [ "$keep_guard" = no ] && rm -f "$bindir/buildq-rustc-guard"
   rm -f "$unitdir/buildq.slice.d/40-buildq-oomd.conf" "$unitdir/buildq.slice.d/60-buildq-oomd.conf" \
         "$unitdir/buildq.slice.d/50-buildq-memory.conf"
@@ -1155,6 +1167,21 @@ EOF
   mv -f "$unitdir/buildq.service.new.$$" "$unitdir/buildq.service"
   put 644 "$src/systemd/buildq.socket" "$unitdir/buildq.socket"
   put 644 "$src/systemd/buildq.slice" "$unitdir/buildq.slice"
+  if [ -r "$src/systemd/buildq-update.service" ] && [ -r "$src/systemd/buildq-update.timer" ]; then
+    add_temp "$unitdir/buildq-update.service.new.$$"
+    "$python" -B -I - "$src/systemd/buildq-update.service" "$unitdir/buildq-update.service.new.$$" "$bindir" <<'EOF'
+import sys
+src_u, dst_u, bindir = sys.argv[1:4]
+exe = bindir.rstrip("/") + "/buildq"
+esc = exe.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+rendered = f'"{esc}"' if any(c.isspace() or c in "\"'\\;&%" for c in exe) else exe
+text = open(src_u).read().replace("@BINDIR@/buildq", rendered).replace("@BINDIR@", bindir)
+with open(dst_u, "w") as f:
+    f.write(text)
+EOF
+    mv -f "$unitdir/buildq-update.service.new.$$" "$unitdir/buildq-update.service"
+    put 644 "$src/systemd/buildq-update.timer" "$unitdir/buildq-update.timer"
+  fi
   # A backstop for all builds together: if the estimates are wrong, the kernel slows and then
   # stops builds before they can take the machine's memory. Edit or remove it freely.
   # (The daemon also lowers these every few seconds to what the machine has free; see slice_guard.)
@@ -1192,10 +1219,17 @@ EOF
       _i=$((_i + 1))
     done
     "$bindir/buildq" ping || { say "the daemon isn't answering; not enabling shims or the guard."; exit 1; }
+    if [ "$do_auto_update" = yes ]; then
+      systemctl --user enable --now buildq-update.timer >/dev/null
+      say "enabled automatic updates (buildq-update.timer); check with \`buildq update --status\`"
+    fi
   else
     say "installed systemd user units (--no-start: skipped enabling/restarting buildq.service)"
   fi
 else
+  if [ "$do_auto_update" = yes ]; then
+    say "note: --auto-update requires a systemd user session; run \`buildq update --auto\` from cron instead"
+  fi
   if [ "$no_start" = no ]; then
     say "no systemd user session here; starting buildqd as a user background daemon"
     "$bindir/buildq" daemon restart || { say "couldn't start buildqd; not enabling shims or the guard."; exit 1; }
@@ -1255,6 +1289,81 @@ if [ -n "$rustc_guard_dirs" ]; then
     apply_rustc_guard "$_dir/.cargo/config.toml"
   done
 fi
+
+# Record install metadata so `buildq update` knows the prefix, python, source checkout, and options.
+mkdir -p "$state_dir"
+_meta_commit=${BUILDQ_INSTALL_COMMIT:-}
+_meta_source_dir=""
+_meta_repo=${BUILDQ_INSTALL_REPO:-}
+_meta_branch=${BUILDQ_INSTALL_BRANCH:-main}
+if [ -d "$src/.git" ] && command -v git >/dev/null 2>&1; then
+  _meta_source_dir=$(normpath "$src")
+  if [ -z "$_meta_commit" ]; then
+    _meta_commit=$(git -C "$src" rev-parse HEAD 2>/dev/null || true)
+  fi
+  if [ -z "$_meta_repo" ]; then
+    _meta_origin=$(git -C "$src" remote get-url origin 2>/dev/null || true)
+    _meta_repo=$("$python" -B -I - "$_meta_origin" <<'EOF'
+import re, sys
+url = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+for pat in (
+    r"^https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+    r"^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+    r"^ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+):
+    m = re.match(pat, url)
+    if m:
+        print(m.group(1))
+        break
+EOF
+)
+  fi
+elif [ -n "${BUILDQ_PRESERVE_SOURCE_DIR:-}" ] && [ -d "${BUILDQ_PRESERVE_SOURCE_DIR}/.git" ]; then
+  _meta_source_dir=$(normpath "$BUILDQ_PRESERVE_SOURCE_DIR")
+fi
+_meta_shims=no
+if [ "$do_shims" = yes ]; then
+  _meta_shims=yes
+elif [ -d "$shimdir" ]; then
+  for _se in "$shimdir"/*; do
+    if [ -e "$_se" ] || [ -L "$_se" ]; then
+      _meta_shims=yes
+      break
+    fi
+  done
+fi
+_meta_skill=no
+if [ "$do_skill" = yes ] || [ -s "$skill_list" ]; then
+  _meta_skill=yes
+fi
+_meta_auto=no
+if [ "$do_auto_update" = yes ]; then
+  _meta_auto=yes
+elif have_systemd && systemctl --user is-enabled --quiet buildq-update.timer 2>/dev/null; then
+  _meta_auto=yes
+fi
+"$python" -B -I - "$state_dir/install.json" "$prefix" "$python" "$_meta_source_dir" "$_meta_commit" \
+  "${_meta_repo:-nosliwsirhc/buildq}" "$_meta_branch" "$_meta_shims" "$_meta_skill" "$_meta_auto" <<'EOF'
+import datetime, json, os, sys
+dst, prefix, py, source_dir, commit, repo, branch, shims, skill, auto = sys.argv[1:11]
+data = {
+    "prefix": prefix,
+    "python": py,
+    "source_dir": source_dir or None,
+    "commit": commit or None,
+    "repo": repo,
+    "branch": branch,
+    "shims": shims == "yes",
+    "skill": skill == "yes",
+    "auto_update": auto == "yes",
+    "installed_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+tmp = f"{dst}.new.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, dst)
+EOF
 
 case ":${PATH:-}:" in
   *":$bindir:"*) ;;

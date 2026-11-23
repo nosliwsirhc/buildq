@@ -28,6 +28,23 @@ restart) stops and relaunches `buildqd` cleanly. In all runners, builds run unde
 supervisors in their own services/cgroups/sessions and carry on across daemon restarts; queued
 tickets are on disk, and the next daemon picks both up.
 
+## Updates and auto-update
+
+`buildq update` checks for a newer commit on `main`, pulls it, and re-runs `install.sh` (preserving
+your prefix, Python interpreter, shims, and skill links).
+
+- **Source:** if `install.sh` was run from a git checkout, `buildq update` fast-forwards `origin/main`
+  there (refusing if the tree is dirty, diverged, or on another branch). Otherwise (or with
+  `--source github`), it fetches the latest commit tarball from GitHub over HTTPS into a temporary
+  directory and installs from there.
+- **Flags:** `--check` checks without installing, `--when-idle` skips if builds are currently
+  running, `--force` reinstalls even when already on the latest commit, and `--json` emits
+  machine-readable output.
+- **Automatic updates:** enable the opt-in systemd user timer (`buildq-update.timer`, default every
+  6 hours with 15 minutes of jitter) with `./install.sh --auto-update` or `buildq update --enable`
+  (optionally `--interval 1h` / `1d`). Check status with `buildq update --status` and disable with
+  `buildq update --disable`. On non-systemd hosts, schedule `buildq update --auto` via cron.
+
 ## Files
 
 They are in `~/.local/state/buildq`: `tickets/<id>/` (the ticket, its output log, its

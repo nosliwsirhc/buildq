@@ -70,6 +70,7 @@ cd buildq
 ./install.sh --shims               # optional: heavy commands go through the queue automatically
 ./install.sh --rustc-guard=~/src   # optional: refuse to compile Rust under ~/src outside the queue
 ./install.sh --skill               # optional: install a skill teaching coding agents to use buildq
+./install.sh --auto-update         # optional: enable the systemd user timer for automatic updates
 ```
 
 Drop off a build (example from a workstation with a `heavy` lane and past history; a fresh install starts with one `default` lane):
@@ -104,7 +105,7 @@ exit 0
 - On **systemd** machines: installs and starts the user background service (`buildq.service`) with a 75%/85% aggregate memory safety cap (`buildq.slice`) that tightens automatically whenever other programs need RAM (`slice_guard`).
 - On **non-systemd** machines: starts `buildqd` directly in the background (logs in `~/.local/state/buildq/buildqd.log`), ready to use right away. Pass `--no-start` in Dockerfiles or packaging scripts. For boot-time startup (OpenRC, runit, s6, dinit, SysVinit) or optional kernel memory limits without systemd, see [`init/README.md`](init/README.md).
 - To keep the daemon running after you log out: run `loginctl enable-linger "$USER"` on systemd machines, or use a boot service from [`init/`](init/README.md) (or `@reboot ~/.local/bin/buildq daemon start`) on non-systemd machines.
-- To upgrade later, run `./install.sh` again: running builds finish normally and queued builds keep their place. `./install.sh --uninstall` stops the daemon and removes everything except your config and build history.
+- To upgrade later, run `buildq update` (or `./install.sh` again): running builds finish normally and queued builds keep their place. Pass `--auto-update` (or run `buildq update --enable`) to enable a periodic systemd user timer (`buildq-update.timer`). `./install.sh --uninstall` stops the daemon and removes everything except your config and build history.
 
 </details>
 
@@ -325,6 +326,7 @@ See [Benchmarking](docs/benchmark.md) for the simulation model, caveats, and how
 | `buildq query ["SQL"] [--json]` | a read-only query on the analytics (none: list the tables) |
 | `buildq help agents` | the page for coding agents |
 | `buildq daemon start\|stop\|restart\|reload\|status\|logs` | manage the daemon (delegates to systemd when installed; manages `buildqd` directly otherwise) |
+| `buildq update [--check] [--when-idle] [--enable\|--disable\|--status]` | check for and install updates (git fast-forward or GitHub archive), or manage the auto-update timer |
 | `buildq ping` | check that the daemon answers |
 
 A ticket is a UUID; any unique prefix of four or more characters works in its place. The options
@@ -340,7 +342,7 @@ A ticket is a UUID; any unique prefix of four or more characters works in its pl
 | [How buildq decides](docs/scheduling.md) | when a build starts, the order, memory shedding, past the peak, estimates, cores, lanes |
 | [Coding agents](docs/agents.md) | shims, the Rust guard, the agents' skill, migrating from a slot script |
 | [CI jobs](docs/ci.md) | queueing a workflow step on a self-hosted runner, `ci_first`, a new step's first run |
-| [Operating buildq](docs/operations.md) | logs, the memory watch, restarts, files, analytics, `buildq top`, configuration errors, reboots, reports, GitHub statuses |
+| [Operating buildq](docs/operations.md) | logs, the memory watch, restarts, updates and auto-update, files, analytics, `buildq top`, configuration errors, reboots, reports, GitHub statuses |
 | [Non-systemd Linux & init systems](init/README.md) | running on Alpine/OpenRC, Void/runit, Gentoo, Artix/s6/dinit, Devuan/SysVinit, WSL2 and containers, plus optional cgroup v2 delegation |
 | [Benchmarking](docs/benchmark.md) | replaying builds against the scheduler: comparing buildq against no queue and fixed slots, two versions or configurations, or a trace from your machine |
 | [Design](docs/design.md) | the internals: code layout, the tool registry, the daemon, the protocol, the analytics schema |

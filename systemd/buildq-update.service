@@ -1,0 +1,8 @@
+[Unit]
+Description=Check for and install buildq updates
+Documentation=https://github.com/nosliwsirhc/buildq
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/buildq update --auto

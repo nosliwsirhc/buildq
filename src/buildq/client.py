@@ -36,6 +36,11 @@ def _cmd_top(args) -> int:
     return top.cmd_top(args)
 
 
+def _cmd_update(args) -> int:
+    from . import update
+    return update.cmd_update(args)
+
+
 def note(text: str) -> None:
     print(f"buildq: {text}", file=sys.stderr, flush=True)
 
@@ -2033,13 +2038,28 @@ def _main(argv=None) -> int:
     daemon_p.add_argument("--tail", "-n", type=int, help="with logs: show the last N lines")
     daemon_p.add_argument("--follow", "-f", action="store_true", help="with logs: follow new log lines")
     sub.add_parser("ping", help="check that the daemon answers")
+    upd = sub.add_parser("update", help="check for and install buildq updates, or manage the auto-update timer")
+    upd.add_argument("--check", action="store_true", help="check whether an update is available without installing")
+    upd.add_argument("--force", action="store_true", help="reinstall even if already at the latest commit")
+    upd.add_argument("--when-idle", action="store_true", help="skip updating if any builds are currently running")
+    upd.add_argument("--auto", action="store_true", help="non-interactive mode for scheduled timers (skips cleanly if offline or dirty)")
+    upd.add_argument("--source", choices=("auto", "git", "github"), default="auto",
+                     help="update source: recorded git checkout if present, else GitHub archive (default: auto)")
+    upd.add_argument("--repo", help="GitHub repository in owner/name form (default: recorded or nosliwsirhc/buildq)")
+    upd.add_argument("--branch", help="branch to track (default: recorded or main)")
+    upd.add_argument("--json", action="store_true", help="print result as JSON")
+    timer_grp = upd.add_mutually_exclusive_group()
+    timer_grp.add_argument("--enable", action="store_true", help="enable the systemd user auto-update timer")
+    timer_grp.add_argument("--disable", action="store_true", help="disable the systemd user auto-update timer")
+    timer_grp.add_argument("--status", action="store_true", help="show installed commit, update source, and timer status")
+    upd.add_argument("--interval", help="with --enable: timer interval (e.g. 1h, 6h, 1d)")
     source = sub.add_parser("source", help=argparse.SUPPRESS)
     source.add_argument("directory")
     args = parser.parse_args(argv)
     handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
                 "report": cmd_report, "help": cmd_help, "daemon": cmd_daemon, "ping": cmd_ping,
-                "source": cmd_source, "query": cmd_query, "top": _cmd_top}
+                "update": _cmd_update, "source": cmd_source, "query": cmd_query, "top": _cmd_top}
     return handlers[args.cmd](args)
 
 
