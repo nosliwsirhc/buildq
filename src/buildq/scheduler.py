@@ -585,7 +585,7 @@ class SchedulerMixin:
     def add_wait(self, t: Ticket, now: float) -> None:
         """Count the time since the last pass as waited for the reason the ticket had then."""
         if t.wait_mark is not None and now > t.wait_mark:
-            reason = t.reason_cat or "new"
+            reason = t.wait_key or t.reason_cat or "new"
             t.waited_by[reason] = round(t.waited_by.get(reason, 0.0) + (now - t.wait_mark), 1)
         t.wait_mark = now
 
@@ -797,6 +797,7 @@ class SchedulerMixin:
             t.short_by = 0.0
             t.held_for = None
             t.behind = 0
+            t.wait_key = ""
             reason, holds = None, True
             if not os.path.isdir(t.cwd):
                 self.finalize(t, now, None, error=f"its working directory {t.cwd} is gone")
@@ -822,6 +823,12 @@ class SchedulerMixin:
                 what = ("is running" if holder.state != "queued" else
                         "is a CI job's, which goes first, and is held" if not self.waited_out(holder, now)
                         else "has waited longest and is held")
+                if holder.state == "queued":
+                    t.wait_key = "workspace-held"
+                elif t.caller and holder.caller and t.caller == holder.caller:
+                    t.wait_key = "workspace-self"
+                else:
+                    t.wait_key = "workspace"
                 reason, holds = ("workspace", f"another build in the same workspace {what} ({holder.label[:60]}, "
                                               f"{(holder.group_lane or holder.lane) if holder.state != 'queued' else self.lane(holder.lane).name} "
                                               f"lane, {holder.id[:8]}); they would "
@@ -937,7 +944,7 @@ class SchedulerMixin:
         t.wait_total += max(0.0, now - (t.queued_at or t.submitted))
         t.runner = self.runner.name
         t.oom_base = 0
-        t.reason = t.reason_cat = ""
+        t.reason = t.reason_cat = t.wait_key = ""
         t.yields_to = t.yield_until = None  # running again: a later stop for memory isn't one for that CI job's build
         t.granted = t.max_granted = granted
         t.growth_now = t.est_mem  # (all of its plan, until the queue next works out what it uses)

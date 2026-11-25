@@ -130,43 +130,79 @@ PYTHON_VALUE_OPTIONS = {"-m", "-c", "-W", "-X"}  # python's options that take th
 SAFE_WORD = re.compile(r"^@?[A-Za-z0-9_.,+:%/-]{1,64}$")  # "@scope/pkg" is an npm package, not an address
 
 
-def env_command(args: list[str]) -> list[str] | None:
-    """What `env ARGS` runs, read as GNU env reads it: its options first (up to `--` or the first
-    word that isn't one), then assignments (any word with "="), then the command. Only options whose
-    reading is exact are read: -i, -0, -v (grouped too), --ignore-environment, --null, --debug, a lone
-    `-`, and -u/-C with their value apart or attached (-uX, --unset=, --chdir=). None for any other
-    (grouped with a value, abbreviated, -a, -S/--split-string, even with "=" in it): the command can't
-    be told for certain."""
+def env_parse(args: list[str]) -> tuple[list[str], bool, set[str], dict[str, str], str | None] | None:
+    """Parse `env ARGS` as GNU env reads it, returning `(rest, clear_env, unsets, assigns, chdir)`
+    or None if an unrecognized option prevents telling the command for certain."""
     rest = list(args)
+    clear_env = False
+    unsets: set[str] = set()
+    assigns: dict[str, str] = {}
+    chdir: str | None = None
     while rest and rest[0].startswith("-") and rest[0] != "-":
         option = rest.pop(0)
         if option == "--":
             break
         if option in ("--ignore-environment", "--null", "--debug") or re.fullmatch(r"-[i0v]+", option):
+            if option == "--ignore-environment" or (option.startswith("-") and not option.startswith("--") and "i" in option[1:]):
+                clear_env = True
             continue
-        if option in ("-u", "--unset", "-C", "--chdir") and rest:
-            rest.pop(0)  # its value, written apart
+        if option in ("-u", "--unset") and rest:
+            unsets.add(rest.pop(0))
             continue
-        if re.fullmatch(r"(-u|-C).+|(--unset|--chdir)=.*", option):
-            continue  # its value, written with it (an empty one fails, or a later -C wins: the command is the same)
+        if option in ("-C", "--chdir") and rest:
+            chdir = rest.pop(0)
+            continue
+        if option.startswith("-u") and len(option) > 2:
+            unsets.add(option[2:])
+            continue
+        if option.startswith("--unset="):
+            unsets.add(option[len("--unset="):])
+            continue
+        if option.startswith("-C") and len(option) > 2:
+            chdir = option[2:]
+            continue
+        if option.startswith("--chdir="):
+            chdir = option[len("--chdir="):]
+            continue
         return None
     if rest[:1] == ["-"]:  # (env - …: the same as -i)
+        clear_env = True
         rest = rest[1:]
     while rest and "=" in rest[0]:  # GNU env takes any word with "=" for an assignment
-        rest = rest[1:]
-    return rest
+        k, v = rest.pop(0).split("=", 1)
+        assigns[k] = v
+    return rest, clear_env, unsets, assigns, chdir
 
 
-def strip_wrappers(argv: list[str]) -> list[str]:
+def env_command(args: list[str]) -> list[str] | None:
+    """What `env ARGS` runs, read as GNU env reads it."""
+    parsed = env_parse(args)
+    return parsed[0] if parsed is not None else None
+
+
+def effective_context(argv: list[str], cwd: str = "", env: dict | None = None) -> tuple[list[str], str, dict[str, str]]:
+    """Strip wrappers like `strip_wrappers()` while applying leading `NAME=VALUE` assignments,
+    `env` modifications (`-i`, `-u`, `-C`, `NAME=VALUE`), and returning `(stripped, cwd, env)`."""
     t = list(argv)
+    eff_cwd = cwd
+    eff_env = dict(env) if env else {}
     while t:
         head = os.path.basename(t[0])
         if ASSIGNMENT.match(t[0]):
-            t = t[1:]
+            k, v = t.pop(0).split("=", 1)
+            eff_env[k] = v
         elif head == "env":
-            rest = env_command(t[1:])
-            if rest is None:
-                return t  # env's command can't be told for certain: leave env as the command, unread
+            parsed = env_parse(t[1:])
+            if parsed is None:
+                return t, eff_cwd, eff_env
+            rest, clear_env, unsets, assigns, chdir = parsed
+            if clear_env:
+                eff_env.clear()
+            for k in unsets:
+                eff_env.pop(k, None)
+            eff_env.update(assigns)
+            if chdir:
+                eff_cwd = os.path.join(eff_cwd, chdir) if eff_cwd else chdir
             t = rest
         elif head == "timeout":
             t = t[1:]
@@ -186,7 +222,11 @@ def strip_wrappers(argv: list[str]) -> list[str]:
                     t.pop(0)
         else:
             break
-    return t
+    return t, eff_cwd, eff_env
+
+
+def strip_wrappers(argv: list[str]) -> list[str]:
+    return effective_context(argv)[0]
 
 
 def git_toplevel(cwd: str) -> str | None:
@@ -832,19 +872,87 @@ def sane_caller(raw) -> str | None:
 
 
 
-def command_key(argv: list[str], cwd: str, lane: str, labels: "frozenset[str] | tuple" = ()) -> str:
-    return f"{repo_name(cwd)}|{lane}|{' '.join(command_words(argv, labels))}"
+# Executables known never to lock or write a Rust Cargo target directory: an inherited
+# CARGO_TARGET_DIR in the caller's shell must not force them onto Cargo's workspace lock.
+NON_CARGO_TOOLS = frozenset({
+    "docker", "podman", "tsc", "vue-tsc", "eslint", "vite", "vitest", "jest", "playwright",
+    "storybook", "dotnet", "gradle", "gradlew", "zig", "cmake", "ctest",
+    "gcc", "g++", "clang", "clang++", "cc", "c++", "pytest", "mypy", "pyright", "semgrep",
+})
+SECRET_ENV_NAME = re.compile(r"(?:key|token|secret|passw|pass|auth|cred)", re.I)
 
 
-def workspace_of(cwd: str, env: dict) -> str:
+def command_key(argv: list[str], cwd: str, lane: str, labels: "frozenset[str] | tuple" = (),
+                env: dict | None = None, key_env: "tuple[str, ...] | frozenset[str] | list[str]" = ()) -> str:
+    base = f"{repo_name(cwd)}|{lane}|{' '.join(command_words(argv, labels))}"
+    if not key_env:
+        return base
+    _, _, eff_env = effective_context(argv, cwd, env)
+    extras = []
+    for var in sorted(set(key_env)):
+        val = eff_env.get(var)
+        if val is None or val == "":
+            continue
+        if (not SECRET_ENV_NAME.search(var) and SAFE_WORD.match(val)
+                and not TOKEN_LIKE.match(val) and not tools.CREDENTIAL_OR_ASSIGN.search(val)):
+            extras.append(f"{var}={val}")
+        else:
+            digest = hashlib.sha256(val.encode()).hexdigest()[:8]
+            extras.append(f"{var}=h{digest}")
+    return f"{base}|{' '.join(extras)}" if extras else base
+
+
+def status_context(argv: list[str], cwd: str, repo: str | None = None, name: str | None = None,
+                   labels: "frozenset[str] | tuple" = ()) -> str:
+    """GitHub commit-status context for a verified check or named build.
+
+    Named builds use `buildq/<name>`. Unnamed checks use `buildq/<command words>`, adding a short
+    stable digest when arguments beyond those key words, inline env assignments, or a subdirectory
+    under the repository distinguish the check (preventing e.g. two filtered test runs from
+    overwriting each other's status without exposing raw arguments)."""
+    if name:
+        return ("buildq/" + name)[:100]
+    words = command_words(argv, labels)
+    base = "buildq/" + " ".join(words)
+    stripped, eff_cwd, inline_env = effective_context(argv, cwd, {})
+    rel_cwd = ""
+    if repo and eff_cwd:
+        try:
+            rel = os.path.relpath(os.path.realpath(eff_cwd), os.path.realpath(repo))
+            if rel not in (".", "") and not rel.startswith("..") and not os.path.isabs(rel):
+                rel_cwd = rel
+        except ValueError:
+            pass
+    canon = [os.path.basename(stripped[0]), *stripped[1:]] if stripped else []
+    word_tokens = [part for w in words for part in w.split(" ")]
+    if not rel_cwd and not inline_env and canon == word_tokens:
+        return base[:100]
+    payload = json.dumps([rel_cwd, sorted(inline_env.items()), canon], separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:8]
+    suffix = f" [{digest}]"
+    return f"{base[:100 - len(suffix)]}{suffix}"
+
+
+def workspace_of(cwd: str, env: dict, argv: list[str] | None = None) -> str:
     """What a build writes to, so two builds that would fight over it run one at a time: its
-    CARGO_TARGET_DIR if it has one, else its git worktree, else its directory."""
-    target = env.get("CARGO_TARGET_DIR")
-    if target:
-        return "target:" + os.path.realpath(os.path.join(cwd, target))
-    top = git_toplevel(cwd)
+    Cargo target directory (for Cargo and scripts that may invoke Cargo, never for explicitly
+    non-Cargo tools like docker or tsc), else its git worktree, else its directory."""
+    eff_cwd, eff_env, tool, args = cwd, env, "", []
+    if argv:
+        stripped, eff_cwd, eff_env = effective_context(argv, cwd, env)
+        if stripped:
+            tool, args = os.path.basename(stripped[0]), stripped[1:]
+    if tool == "cargo":
+        target = tools._cargo_target_dir(args, eff_cwd, eff_env, require_explicit=True)
+        if target:
+            return "target:" + os.path.realpath(target)
+    elif tool not in NON_CARGO_TOOLS:
+        target = eff_env.get("CARGO_TARGET_DIR")
+        if target:
+            return "target:" + os.path.realpath(os.path.join(eff_cwd, target))
+    top = git_toplevel(eff_cwd)
     if top in (None, "/", os.path.expanduser("~")):  # a dotfiles repo isn't a workspace
-        top = cwd
+        top = eff_cwd
     return "tree:" + os.path.realpath(top)
 
 
@@ -860,15 +968,15 @@ def write_dirs_of(cwd: str, env: dict, argv: list[str]) -> list[str]:
     """Where a build fills the disk, for `buildq top`: its CARGO_TARGET_DIR, tool-specific build
     output folders (e.g. target/ beside Cargo.lock), and its TMPDIR, in the environment it runs with.
     Only folders inside the user's home count, and none inside another."""
+    stripped, eff_cwd, eff_env = effective_context(argv, cwd, env)
     found = []
-    target = env.get("CARGO_TARGET_DIR")
+    target = eff_env.get("CARGO_TARGET_DIR")
     if target:
-        found.append(os.path.join(cwd, target))
-    stripped = strip_wrappers(argv)
+        found.append(os.path.join(eff_cwd, target))
     if stripped:
-        found.extend(tools.write_dirs_for(os.path.basename(stripped[0]), stripped[1:], cwd, env))
-    if env.get("TMPDIR"):
-        found.append(os.path.join(cwd, env["TMPDIR"]))
+        found.extend(tools.write_dirs_for(os.path.basename(stripped[0]), stripped[1:], eff_cwd, eff_env))
+    if eff_env.get("TMPDIR"):
+        found.append(os.path.join(eff_cwd, eff_env["TMPDIR"]))
     kept: list[str] = []
     for real in sorted({r for r in map(within_home, found) if r}, key=len):
         if not any(real == k or real.startswith(k + os.sep) for k in kept):
@@ -876,14 +984,18 @@ def write_dirs_of(cwd: str, env: dict, argv: list[str]) -> list[str]:
     return kept
 
 
-def disk_paths_of(cwd: str, env: dict) -> list[str]:
+def disk_paths_of(cwd: str, env: dict, argv: list[str] | None = None) -> list[str]:
     """Where a build writes: its directory, its CARGO_TARGET_DIR and its TMPDIR, as far as they
     exist (or their nearest existing parent), each filesystem once."""
+    if argv:
+        _, eff_cwd, eff_env = effective_context(argv, cwd, env)
+    else:
+        eff_cwd, eff_env = cwd, env
     paths, devices = [], set()
-    for raw in (cwd, env.get("CARGO_TARGET_DIR"), env.get("TMPDIR")):
+    for raw in (eff_cwd, eff_env.get("CARGO_TARGET_DIR"), eff_env.get("TMPDIR")):
         if not raw:
             continue
-        path = os.path.abspath(os.path.join(cwd, raw))
+        path = os.path.abspath(os.path.join(eff_cwd, raw))
         while not os.path.exists(path) and os.path.dirname(path) != path:
             path = os.path.dirname(path)
         try:
@@ -898,18 +1010,18 @@ def disk_paths_of(cwd: str, env: dict) -> list[str]:
 
 def is_cold(argv: list[str], cwd: str, env: dict) -> bool:
     """Whether a build looks cold (no existing output for its profile yet)."""
-    stripped = strip_wrappers(argv)
+    stripped, eff_cwd, eff_env = effective_context(argv, cwd, env)
     if not stripped:
         return False
-    return tools.is_cold_for(os.path.basename(stripped[0]), stripped[1:], cwd, env)
+    return tools.is_cold_for(os.path.basename(stripped[0]), stripped[1:], eff_cwd, eff_env)
 
 
 def cargo_cold(argv: list[str], cwd: str, env: dict) -> bool:
     """Cargo-only wrapper over `is_cold` (kept for callers expecting Cargo-only semantics)."""
-    stripped = strip_wrappers(argv)
+    stripped, eff_cwd, eff_env = effective_context(argv, cwd, env)
     if not stripped or os.path.basename(stripped[0]) != "cargo":
         return False
-    return tools.is_cold_for("cargo", stripped[1:], cwd, env)
+    return tools.is_cold_for("cargo", stripped[1:], eff_cwd, eff_env)
 
 
 SECRET_IN_URL = re.compile(r"(://[^/\s:@]+:)[^@\s/]+@")

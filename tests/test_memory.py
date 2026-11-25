@@ -713,6 +713,16 @@ class Outgrowing(DaemonCase):
         again = history.History(self.daemon.history.path)  # and it survives a restart
         e = again.estimate(t.key, self.daemon.cfg.lanes["heavy"], self.daemon.cfg, 32, True, False, self.now)
         self.assertGreater(e.mem, 18 * GIB)
+        self.assertIn("last 30d", e.source)
+
+    def test_unmeasured_fast_runs_do_not_hide_measured_memory_peaks(self):
+        t = self.submit()
+        self.daemon.history.add({"key": t.key, "t": self.now - 10, "peak_mem": 6 * GIB, "mem_measured": True,
+                                 "peak_cores": 4, "granted": 4})
+        self.daemon.history.add({"key": t.key, "t": self.now, "peak_mem": 0, "mem_measured": False,
+                                 "peak_cores": 1, "granted": 4})
+        e = self.daemon.history.estimate(t.key, self.daemon.cfg.lanes["heavy"], self.daemon.cfg, 32, True, False, self.now)
+        self.assertGreater(e.mem, 6 * GIB)
 
     def test_a_kill_from_outside_doesnt_teach_the_cap(self):
         self.assertFalse(supervisor.oom_of({"oom_kills": 1, "hit_own_cap": False}))

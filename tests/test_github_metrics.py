@@ -729,7 +729,8 @@ class GitHubStatuses(DaemonCase):
         failed = self.submit(("cargo", "clippy"), source=SOURCE)  # a failure with no pass before
         self.finish(failed, 1)
         self.settle()
-        self.drain(self.now + 60)
+        for _ in range(3):
+            self.drain(self.now + 60)
         calls = self.calls()
         self.assertEqual(len(calls), 1, calls)
         self.assertIn(f"repos/owner/project/statuses/{'a' * 40}", calls[0])
@@ -1110,6 +1111,62 @@ class GitHubStatuses(DaemonCase):
         self.assertIn(post, self.daemon.status_posts)
         self.daemon.status_procs.clear()
 
+    def test_unnamed_checks_with_different_args_or_subdirs_get_distinct_contexts(self):
+        repo = self.workdir("repo")
+        sub = os.path.join(repo, "api")
+        os.makedirs(sub)
+        src = {**SOURCE, "repo": repo}
+        self.seen_source = dict(src)
+        self.source_file()
+        a = self.submit(("dotnet", "test", "App.csproj", "--filter", "Auth"), cwd=repo, source=src)
+        self.finish(a, 0)
+        b = self.submit(("dotnet", "test", "App.csproj", "--filter", "Billing"), cwd=repo, source=src)
+        self.finish(b, 0)
+        root_check = self.submit(("cargo", "test"), cwd=repo, source=src)
+        self.finish(root_check, 0)
+        sub_check = self.submit(("cargo", "test"), cwd=sub, source=src)
+        self.finish(sub_check, 0)
+        self.settle()
+        for _ in range(3):
+            self.drain(self.now + 60)
+        calls = self.calls()
+        self.assertEqual(len(calls), 4, calls)
+        full_contexts = [c.split("context=", 1)[1].split(" -f ", 1)[0] for c in calls]
+        self.assertEqual(len(set(full_contexts)), 4, full_contexts)
+        self.assertIn("buildq/cargo test", full_contexts)
+        for ctx in full_contexts:
+            self.assertNotIn("Auth", ctx)
+            self.assertNotIn("Billing", ctx)
+
+    def test_github_status_expiry_stats_and_revival_on_retry(self):
+        self.daemon.gh = [sys.executable, "-c",
+                          "import sys; sys.stderr.write('No commit found for SHA: aaaa\\n'); sys.exit(1)"]
+        t = self.submit(("cargo", "test"), source=SOURCE)
+        self.finish(t, 0)
+        self.settle()
+        self.drain(self.now + 60)
+        # Expire after 6h missing-commit window.
+        expire_at = self.now + 60 + daemon.Daemon.STATUS_MISSING_MAX_AGE + 10
+        self.daemon.send_status_posts(expire_at)
+        self.assertEqual(self.daemon.status_posts, [])
+        summary = self.daemon.overview(expire_at)["github_status"]
+        self.assertEqual((summary["expired"], summary["revivable"]), (1, 1))
+        # Now the commit is pushed and `retry_statuses` revives & delivers it.
+        self.daemon.gh = [sys.executable, "-c",
+                          f"import sys; open({self.calls_file!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')"]
+        counts = self.daemon.retry_statuses(expire_at + 10)
+        self.assertEqual(counts["revived"], 1)
+        self.drain(expire_at + 15)
+        self.assertEqual(len(self.calls()), 1)
+        after = self.daemon.overview(expire_at + 20)["github_status"]
+        self.assertEqual((after["delivered"], after["pending"], after["revivable"]), (1, 0, 0))
+
+    def test_overview_records_tick_duration_metrics(self):
+        self.daemon.tick(self.now + 1)
+        tick_info = self.daemon.overview(self.now + 1).get("tick")
+        self.assertIsNotNone(tick_info)
+        self.assertGreaterEqual(tick_info["last_ms"], 0.0)
+        self.assertGreaterEqual(tick_info["max_ms"], tick_info["last_ms"])
 
 
 if __name__ == "__main__":

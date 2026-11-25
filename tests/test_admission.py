@@ -401,6 +401,41 @@ class Admission(DaemonCase):
         second = self.submit(env={"CARGO_TARGET_DIR": target})  # another worktree, same target dir
         self.assertEqual(second.reason_cat, "workspace")
 
+    def test_non_cargo_tools_ignore_inherited_cargo_target_dir_while_inline_env_locks(self):
+        target = os.path.join(self.tmp.name, "shared-target")
+        first = self.submit(("cargo", "build"), env={"CARGO_TARGET_DIR": target})
+        # Inherited CARGO_TARGET_DIR must not force non-Cargo tools (docker, tsc) onto Cargo's lock.
+        scan = self.submit(("docker", "run", "--rm", "semgrep"), env={"CARGO_TARGET_DIR": target})
+        tsc = self.submit(("tsc", "--noEmit"), env={"CARGO_TARGET_DIR": target})
+        self.assertEqual((first.state, scan.state, tsc.state), ("running", "running", "running"))
+        # Inline `env CARGO_TARGET_DIR=...` DOES take the Cargo target lock.
+        inline = self.submit(("env", f"CARGO_TARGET_DIR={target}", "cargo", "test"))
+        self.assertEqual((inline.state, inline.reason_cat), ("queued", "workspace"))
+
+    def test_workspace_waits_distinguish_self_other_and_held_in_waited_by(self):
+        tree = self.workdir("ws-split")
+        running = self.submit(("cargo", "build"), cwd=tree, caller="agent-a")
+        same = self.submit(("cargo", "test"), cwd=tree, caller="agent-a")
+        other = self.submit(("cargo", "check"), cwd=tree, caller="agent-b")
+        self.assertEqual((same.reason_cat, other.reason_cat), ("workspace", "workspace"))
+        self.daemon.schedule(self.now + 20)
+        self.assertIn("workspace-self", same.waited_by)
+        self.assertIn("workspace", other.waited_by)
+        # Starving queued build holding a workspace causes a second queued build to wait as `workspace-held`.
+        self.finish(running, 0, after=25)
+        self.daemon.cfg.max_jobs = 1
+        busy = self.submit(("cargo", "build"), cwd=self.workdir("other-ws"), cores=1)
+        tree2 = self.workdir("ws-held")
+        holder = self.submit(("cargo", "build"), cwd=tree2, caller="agent-c")
+        holder.submitted -= self.daemon.cfg.starve_seconds + 10
+        holder.queued_at = holder.submitted
+        waiter = self.submit(("cargo", "test"), cwd=tree2, caller="agent-d")
+        self.daemon.schedule(self.now + 30)
+        self.assertEqual(waiter.reason_cat, "workspace")
+        self.daemon.schedule(self.now + 50)
+        self.assertIn("workspace-held", waiter.waited_by)
+        self.finish(busy, 0, after=60)
+
     def test_a_build_whose_directory_is_gone_fails_without_a_turn(self):
         self.daemon.cfg.max_jobs = 1
         self.submit(cores=1)

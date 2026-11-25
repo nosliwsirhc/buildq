@@ -20,6 +20,20 @@ CARGO_VALUE_OPTIONS = frozenset({
 JS_VALUE_OPTIONS = frozenset({"-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "--cwd"})
 VERIFY_CARGO = frozenset({"check", "c", "clippy", "test", "t", "nextest"})
 RESTART_CARGO = frozenset({"build", "b", "check", "c", "clippy", "test", "t", "doc", "d", "nextest", "bench"})
+CARGO_BUILTIN_SUBCOMMANDS = frozenset({
+    "build", "b", "check", "c", "test", "t", "run", "r", "clippy", "doc", "d", "bench",
+    "publish", "package", "install", "uninstall", "clean", "fmt", "fix", "rustc", "rustdoc",
+    "fetch", "update", "add", "remove", "rm", "metadata", "tree", "vendor", "verify-project",
+    "generate-lockfile", "locate-project", "pkgid", "read-manifest", "new", "init", "search",
+    "owner", "login", "logout", "yank", "config", "report", "help", "version",
+})
+CARGO_NON_COLD_SUBCOMMANDS = frozenset({
+    "clean", "fmt", "metadata", "tree", "version", "help", "search", "login", "logout",
+    "owner", "yank", "locate-project", "pkgid", "read-manifest", "verify-project", "new",
+    "init", "add", "remove", "rm", "update", "fetch", "generate-lockfile", "vendor",
+    "config", "report", "uninstall", "install",
+})
+CARGO_INFO_FLAGS = frozenset({"-h", "--help", "-V", "--version"})
 
 
 def redact_args(args: list[str]) -> list[str]:
@@ -148,11 +162,34 @@ def build_registry(specs: Collection[ToolSpec]) -> Mapping[str, ToolSpec]:
 # ---- Per-tool implementations ---------------------------------------------------------------
 
 
+def _cargo_manifest_label(path: str) -> str:
+    """Stable, idempotent folder label for Cargo's `--manifest-path` option (empty for root Cargo.toml)."""
+    cleaned = path.strip()
+    if not cleaned or cleaned == "…":
+        return ""
+    norm = os.path.normpath(cleaned)
+    if os.path.basename(norm) == "Cargo.toml":
+        norm = os.path.dirname(norm)
+    if not norm or norm in (".", "/"):
+        return ""
+    if os.path.isabs(norm) or norm.startswith(".."):
+        leaf = os.path.basename(norm)
+        return leaf if leaf and leaf not in (".", "..") else ""
+    return norm
+
+
 def _cargo_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]:
     words = [tool]
     if rest and rest[0].startswith("+"):
         rest = rest[1:]
-    words += positionals(rest, CARGO_VALUE_OPTIONS)[:1]
+    pos = positionals(rest, CARGO_VALUE_OPTIONS)
+    if pos:
+        words.append(pos[0])
+        if pos[0] not in CARGO_BUILTIN_SUBCOMMANDS and len(pos) >= 2 and SCRIPT_WORD.fullmatch(pos[1]):
+            words.append(pos[1])
+    manifests = [m for p in option_values(rest, {"--manifest-path"}) if (m := _cargo_manifest_label(p))]
+    if manifests:
+        words.append(f"--manifest-path {manifests[-1]}")
     words += [f"-p {p}" for p in sorted(set(option_values(rest, {"-p", "--package"})))]
     words += [f"--profile {p}" for p in option_values(rest, {"--profile"})]
     words += [f for f in ("--release", "--workspace", "--all-targets", "--no-run", "--lib", "--doc")
@@ -190,45 +227,70 @@ def _cargo_global_env(granted: int, want: int, jobserver: str | None, test_threa
     return values
 
 
-def _cargo_write_dirs(_tool: str, _args: list[str], cwd: str, env: dict) -> list[str]:
-    if env.get("CARGO_TARGET_DIR"):
-        return []  # already tracked globally in commands.write_dirs_of
-    here = os.path.abspath(cwd)
-    for _ in range(12):
-        if os.path.exists(os.path.join(here, "Cargo.lock")):
-            return [os.path.join(here, "target")]
-        if os.path.dirname(here) == here:
+def _cargo_target_dir(args: list[str], cwd: str, env: dict, *, require_explicit: bool = False) -> str | None:
+    """Resolve Cargo's target directory: `--target-dir` beats `CARGO_TARGET_DIR`, which beats
+    the workspace/crate `target/` walked up from `--manifest-path` (if given) or `cwd`."""
+    before = args[:args.index("--")] if "--" in args else args
+    target_dirs = option_values(before, {"--target-dir"})
+    if target_dirs:
+        return os.path.join(cwd, target_dirs[-1])
+    target = env.get("CARGO_TARGET_DIR")
+    if target:
+        return os.path.join(cwd, target)
+    manifests = option_values(before, {"--manifest-path"})
+    if require_explicit and not manifests:
+        return None
+    if manifests:
+        mpath = os.path.abspath(os.path.join(cwd, manifests[-1]))
+        start = os.path.dirname(mpath) if os.path.basename(mpath) == "Cargo.toml" or not os.path.isdir(mpath) else mpath
+    else:
+        start = os.path.abspath(cwd)
+    d = start
+    root = None
+    while True:
+        if os.path.exists(os.path.join(d, "Cargo.lock")):
+            root = d
             break
-        here = os.path.dirname(here)
-    return []
+        if os.path.exists(os.path.join(d, "Cargo.toml")):
+            root = root or d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    if root is None:
+        return os.path.join(start, "target") if manifests else None
+    return os.path.join(root, "target")
+
+
+def _cargo_write_dirs(_tool: str, args: list[str], cwd: str, env: dict) -> list[str]:
+    target = _cargo_target_dir(args, cwd, env)
+    return [target] if target else []
 
 
 def _cargo_is_cold(_tool: str, args: list[str], cwd: str, env: dict) -> bool:
     """Whether a cargo command will build from scratch: its target directory has no build of that
     profile yet. History of warm builds says little about a cold one."""
-    target = env.get("CARGO_TARGET_DIR")
-    if target:
-        target = os.path.join(cwd, target)
-    else:
-        d = os.path.abspath(cwd)
-        root = None
-        while True:
-            if os.path.exists(os.path.join(d, "Cargo.lock")):
-                root = d
-                break
-            if os.path.exists(os.path.join(d, "Cargo.toml")):
-                root = root or d
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        if root is None:
+    before = args[:args.index("--")] if "--" in args else args
+    if any(a in CARGO_INFO_FLAGS for a in before):
+        return False
+    sub = _cargo_subcommand(before)
+    if not sub or sub in CARGO_NON_COLD_SUBCOMMANDS:
+        return False
+    if sub == "sqlx":
+        rest = before[1:] if before and before[0].startswith("+") else before
+        pos = positionals(rest, CARGO_VALUE_OPTIONS)
+        if len(pos) < 2 or pos[1] != "prepare":
             return False
-        target = os.path.join(root, "target")
-    profile = "release" if "--release" in args else "debug"
-    profiles = option_values(args, {"--profile"})
+    target = _cargo_target_dir(before, cwd, env)
+    if not target:
+        return False
+    profile = "release" if "--release" in before else "debug"
+    profiles = option_values(before, {"--profile"})
     if profiles:
-        profile = {"dev": "debug", "test": "debug", "bench": "release"}.get(profiles[0], profiles[0])
+        profile = {"dev": "debug", "test": "debug", "bench": "release"}.get(profiles[-1], profiles[-1])
+    triples = option_values(before, {"--target"})
+    if triples:
+        return not os.path.isdir(os.path.join(target, triples[-1], profile))
     return not os.path.isdir(os.path.join(target, profile))
 
 

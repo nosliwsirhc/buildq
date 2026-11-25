@@ -36,6 +36,7 @@ DEFAULTS = {
     "make_room_behind_agents": True,
     "make_room_spare_after": "0",
     "script_labels": [],
+    "key_env": [],
     "restartable_scripts": [],
     "unwatched_seconds": 30,
     "abandoned_seconds": 600,
@@ -204,6 +205,10 @@ class Config:
             raise ValueError("script_labels must be a list of script file names or package scripts, such as "
                              "[\"build.sh\", \"verify:push\"]")
         self.script_labels = frozenset(labels)
+        key_env = d["key_env"]
+        if not isinstance(key_env, list) or not all(isinstance(x, str) and ENV_NAME.fullmatch(x) for x in key_env):
+            raise ValueError("key_env must be a list of environment variable names, such as [\"TEST_SUITE\"]")
+        self.key_env = tuple(sorted(set(key_env)))
         scripts = d["restartable_scripts"]
         if not isinstance(scripts, list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.+-]+", x)
                                                      for x in scripts):
@@ -326,6 +331,7 @@ class Config:
             "ci_deadline": self.ci_deadline,
             "scale_mem_with_cores": self.scale_mem_with_cores,
             "make_room_spare_after": self.make_room_spare_after, "script_labels": sorted(self.script_labels),
+            "key_env": list(self.key_env),
             "restartable_scripts": sorted(self.restartable_scripts),
             "slice": self.slice,
             "slice_guard": self.slice_guard,

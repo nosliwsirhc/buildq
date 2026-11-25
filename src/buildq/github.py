@@ -40,7 +40,7 @@ class GitHubMixin:
         if t.state == "failed" and not (isinstance(t.exit, int) and 1 <= t.exit <= 127 and not t.oom
                                         and not t.timed_out and not t.shed_error):
             return
-        context = ("buildq/" + (t.name or " ".join(commands.command_words(t.argv))))[:100]
+        context = commands.status_context(t.argv, t.cwd, src.get("repo"), t.name, self.cfg.script_labels)
         where = f"{src['remote']}@{src['commit']}@{context}"
         order = [t.ended or now, t.submitted, t.id]  # ties go to the one submitted later
         pending = [p for p in self.status_posts if p.get("where") == where]
@@ -83,13 +83,68 @@ class GitHubMixin:
     def save_status_posts(self) -> None:
         if len(self.status_posted) > 2000:  # (insertion order: the oldest go)
             self.status_posted = dict(list(self.status_posted.items())[-1000:])
+        if len(self.status_expired) > 100:
+            self.status_expired = self.status_expired[-100:]
         try:
             if len(self.status_seen) > 2000:
                 self.status_seen = dict(list(self.status_seen.items())[-1000:])
             common.write_json(os.path.join(self.state_dir, "github-statuses.json"),
-                       {"queue": self.status_posts, "posted": self.status_posted, "seen": self.status_seen})
+                       {"queue": self.status_posts, "posted": self.status_posted, "seen": self.status_seen,
+                        "expired": self.status_expired, "stats": self.status_stats})
         except OSError as e:
             common.log(f"can't save the GitHub statuses to send: {e}")
+
+    STATUS_EXPIRED_KEEP = 86400.0  # keep expired missing-commit posts this long so a later push can revive them
+
+    def retry_statuses(self, now: float, repo: str | None = None, *, include_expired: bool = True) -> dict:
+        """Schedule pending GitHub statuses for immediate retry (optionally limited to `repo`),
+        and revive recently expired missing-commit statuses whose verdicts are still current."""
+        nudged = 0
+        for post in self.status_posts:
+            if repo is not None and post.get("repo") != repo:
+                continue
+            if repo is None or post.get("missing"):
+                post["next"] = now
+                post["tries"] = 0
+                nudged += 1
+        revived = 0
+        if include_expired and self.status_expired:
+            queued_wheres = {p.get("where") for p in self.status_posts}
+            kept = []
+            for post in self.status_expired:
+                expired_at = post.get("expired_at") or post.get("first") or 0
+                if now - expired_at > self.STATUS_EXPIRED_KEEP:
+                    continue
+                if repo is not None and post.get("repo") != repo:
+                    kept.append(post)
+                    continue
+                where = post.get("where") or f"{post['repo']}@{post['sha']}@{post['context']}"
+                order = post.get("order") or [0, ""]
+                seen = self.status_seen.get(where) or [0, ""]
+                if where in queued_wheres or order < seen:
+                    continue
+                revived_post = {k: v for k, v in post.items() if k not in ("expired_at", "tries", "logged")}
+                revived_post["first"] = now
+                revived_post["next"] = now
+                self.status_posts.append(revived_post)
+                queued_wheres.add(where)
+                revived += 1
+            self.status_expired = kept
+        if nudged or revived:
+            self.save_status_posts()
+        return {"nudged": nudged, "revived": revived, "pending": len(self.status_posts)}
+
+    def github_status_summary(self) -> dict:
+        return {
+            "pending": len(self.status_posts),
+            "missing": sum(1 for p in self.status_posts if p.get("missing")),
+            "revivable": len(self.status_expired),
+            "delivered": int(self.status_stats.get("delivered") or 0),
+            "expired": int(self.status_stats.get("expired") or 0),
+            "failed": int(self.status_stats.get("failed") or 0),
+            "last_error": self.status_stats.get("last_error"),
+            "last_posted": self.status_stats.get("last_posted"),
+        }
 
     STATUS_RETRY_BASE = 600.0        # first retry wait (10m); doubles each failure up to STATUS_RETRY_MAX
 
@@ -136,6 +191,8 @@ class GitHubMixin:
                 if (post.get("order") or [0, ""]) >= (self.status_posted.get(where, {}).get("order") or [0, ""]):
                     self.status_posted.pop(where, None)
                     self.status_posted[where] = {"state": post["state"], "order": post.get("order") or [0, ""]}
+                self.status_stats["delivered"] = int(self.status_stats.get("delivered") or 0) + 1
+                self.status_stats["last_posted"] = round(now)
                 if newer:
                     # The commit is now on GitHub: give any queued replacement a fresh delivery
                     # window instead of expiring or backing off under the old missing-commit state.
@@ -147,9 +204,12 @@ class GitHubMixin:
                             p["next"] = min(p.get("next", now), now)
             else:
                 kind = self._status_failure(error)
+                err_msg = error[:200] or f"gh exited {proc.returncode}"
                 if not newer and kind == "permanent":
                     if post in self.status_posts:
                         self.status_posts.remove(post)
+                    self.status_stats["failed"] = int(self.status_stats.get("failed") or 0) + 1
+                    self.status_stats["last_error"] = f"{post['repo']}@{post['sha'][:8]}: {err_msg}"
                     common.log(f"GitHub refused the status for {post['repo']}@{post['sha'][:8]} (not retrying): "
                         f"{error[:300] or f'gh exited {proc.returncode}'}", level=4)
                 elif kind != "permanent":
@@ -166,6 +226,7 @@ class GitHubMixin:
                             target["missing"] = True
                         else:
                             target.pop("missing", None)
+                            self.status_stats["last_error"] = f"{target['repo']}@{target['sha'][:8]}: {err_msg}"
                         delay = min(self.STATUS_RETRY_MAX, self.STATUS_RETRY_BASE * (2 ** min(tries - 1, 10)))
                         target["next"] = max(target.get("next", 0), now + delay)
                         if not target.get("logged"):
@@ -183,6 +244,10 @@ class GitHubMixin:
                 span = "6 hours" if post.get("missing") else "a day"
                 common.log(f"gave up telling GitHub about {post['repo']}@{post['sha'][:8]}: {why} for {span}")
                 self.status_posts.remove(post)
+                self.status_stats["expired"] = int(self.status_stats.get("expired") or 0) + 1
+                if post.get("missing"):
+                    expired = dict(post, expired_at=now)
+                    self.status_expired.append(expired)
                 changed = True
         sending = {p.get("where") for _, p, _ in self.status_procs}
         for post in self.status_posts if self.cfg.github_status else ():

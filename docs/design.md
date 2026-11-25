@@ -537,7 +537,8 @@ edit made and undone between the two checks isn't seen.
 
 With `github_status` on, a verified ticket that succeeds with a clean source and a GitHub remote,
 and is a check or has a `--name`, queues a post to `repos/OWNER/REPO/statuses/SHA` (state
-`success`, context `buildq/<name or command>`). A ticket submitted from a GitHub Actions job (its
+`success`, context `buildq/<name or command>`, adding a short stable digest for unnamed checks
+whose extra arguments, inline env overrides, or repository subdirectory distinguish them). A ticket submitted from a GitHub Actions job (its
 environment has `GITHUB_ACTIONS` and `RUNNER_NAME`, the shim's test) never posts `success`: the job
 reports its own result, and on a pull request its checkout is usually a merge commit the pull request
 doesn't show. Its failure may still correct a `success` on the same commit, as below. A later
@@ -548,12 +549,13 @@ build ended (then when it was submitted), not when its check came back: one olde
 verdict seen (queued, posted, or not posted because there was nothing to correct) is dropped, a newer one replaces older ones not yet sent, one is sent at a
 time per commit and context, and after a restart only the newest queued result per commit and
 context is kept. The daemon sends at most two at once with `gh api`, in processes it doesn't wait on, and
-keeps the queue and what it has posted in
+keeps the queue, delivery counters, recent missing-commit expiries, and what it has posted in
 `github-statuses.json` (entries that don't parse are dropped when it loads). A post that fails
 permanently (HTTP 400, 401, 403 other than rate limiting, 404, or a 422 other than a missing commit) is
 logged and dropped at once. Otherwise it is logged with `gh`'s message the first time and retried
-with exponential backoff (10 minutes up to 2 hours), at once for missing-commit posts after a
-`git push` run through buildq from the same repository succeeds, and dropped after 6 hours for a
+with exponential backoff (10 minutes up to 2 hours), at once (along with revivable missing-commit
+expiries from the last 24 hours) after a `git push` run through buildq from the same repository
+succeeds or on `buildq status --retry-statuses`, and expired after 6 hours for a
 missing commit (HTTP 422 "No commit found") or a day for transient errors. With `github_status` off, nothing queued is sent.
 
 ## Fair shares and pausing
