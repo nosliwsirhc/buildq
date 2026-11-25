@@ -104,6 +104,8 @@ def _https_get(url: str, *, headers: dict[str, str] | None = None,
         path = parsed.path or "/"
         if parsed.query:
             path = f"{path}?{parsed.query}"
+        # Python 3.11+ with explicit ssl.create_default_context() certificate & hostname verification.
+        # nosemgrep: python.lang.security.audit.httpsconnection-detected.httpsconnection-detected
         conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=timeout, context=ctx)
         try:
             conn.request("GET", path, headers=req_headers)
