@@ -114,6 +114,10 @@ class Daemon(GitHubMixin, SchedulerMixin):
         self.source_wanted: collections.deque = collections.deque()  # (ticket, phase, attempt) waiting a turn
         self.status_posted: dict[str, dict] = {}  # "repo@sha@context" -> {state, order} last posted
         self.status_seen: dict[str, list] = {}  # "repo@sha@context" -> order of the newest verdict seen
+        self.status_expired: list[dict] = []  # recently expired missing-commit posts (revivable after push)
+        self.status_stats: dict = {"delivered": 0, "expired": 0, "failed": 0, "last_error": None, "last_posted": None}
+        self.tick_ms: collections.deque = collections.deque(maxlen=300)
+        self.tick_max_ms: float = 0.0
         statuses = common.read_json(os.path.join(state_dir, "github-statuses.json"))
         if isinstance(statuses, list):
             self.status_posts = statuses
@@ -130,6 +134,19 @@ class Daemon(GitHubMixin, SchedulerMixin):
                     value = {"state": value, "order": [0, ""]}
                 if isinstance(value, dict) and isinstance(value.get("state"), str):
                     self.status_posted[str(where)] = {"state": value["state"], "order": list(value.get("order") or [0, ""])}
+            expired = statuses.get("expired")
+            if isinstance(expired, list):
+                self.status_expired = [p for p in expired if commands.valid_post(p)][-100:]
+            stats = statuses.get("stats")
+            if isinstance(stats, dict):
+                for key in ("delivered", "expired", "failed"):
+                    val = common.sane_count(stats.get(key))
+                    if val is not None:
+                        self.status_stats[key] = int(val)
+                if isinstance(stats.get("last_error"), str):
+                    self.status_stats["last_error"] = stats["last_error"][:300]
+                if isinstance(stats.get("last_posted"), (int, float)) and not isinstance(stats.get("last_posted"), bool):
+                    self.status_stats["last_posted"] = stats["last_posted"]
         newest: dict[str, dict] = {}
         for post in (p for p in self.status_posts if commands.valid_post(p)):  # what was in flight is just queued now
             where = post.get("where") or f"{post['repo']}@{post['sha']}@{post['context']}"
@@ -391,8 +408,9 @@ class Daemon(GitHubMixin, SchedulerMixin):
                 self.submit_outcome = {how: True} if how in ("joined", "reused") else {}
                 return earlier, None
         tid = str(uuid.uuid4())
-        t = Ticket(tid, argv, cwd, lane_name, commands.command_key(argv, cwd, lane_name, self.cfg.script_labels), now,
-                   os.path.join(self.tickets_dir, tid))
+        t = Ticket(tid, argv, cwd, lane_name,
+                   commands.command_key(argv, cwd, lane_name, self.cfg.script_labels, env=env, key_env=self.cfg.key_env),
+                   now, os.path.join(self.tickets_dir, tid))
         try:
             t.priority = common.number(msg.get("priority") or 0, "priority", -1000, 1000, integer=True)
             if msg.get("timeout") is not None:
@@ -449,7 +467,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
                     earlier.wanted_at = now
                 self.save(earlier)
                 return earlier, None
-        t.workspace = commands.workspace_of(cwd, env)
+        t.workspace = commands.workspace_of(cwd, env, argv)
         if isinstance(submission, str) and len(submission) <= 100:
             t.submission = submission
             self.submissions[submission] = tid
@@ -466,7 +484,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
             job_env.setdefault(key, value.replace("{id}", tid))
         job_env["BUILDQ_JOB"] = tid
         job_env["BUILDQ_TICKET"] = tid
-        t.disk_paths = commands.disk_paths_of(cwd, job_env)  # (configured defaults included: a TMPDIR elsewhere counts)
+        t.disk_paths = commands.disk_paths_of(cwd, job_env, argv)  # (configured defaults included: a TMPDIR elsewhere counts)
         t.write_dirs = commands.write_dirs_of(cwd, job_env, argv)
         try:
             os.makedirs(t.dir)
@@ -1015,15 +1033,16 @@ class Daemon(GitHubMixin, SchedulerMixin):
         t.frozen_total += t.frozen_attempt
         t.frozen_attempt = 0.0
         used = t.cpu_usec - (t.cpu_usec_base or 0)
-        if not t.cg and isinstance(result, dict):
+        if isinstance(result, dict):
             res_cpu = result.get("cpu_s")
             if isinstance(res_cpu, (int, float)) and not isinstance(res_cpu, bool) and res_cpu >= 0:
                 res_usec = int(float(res_cpu) * 1_000_000)
                 if res_usec > used:
                     used = res_usec
                     # Keep t.cpu_usec in sync so outcomes.jsonl and metrics.db see the exact same
-                    # authoritative terminal CPU, without setting t.measured on CPU-only runs (so
-                    # an unsampled memory peak is never mistaken for an observed 0 bytes).
+                    # authoritative terminal CPU, even on fast cgroup builds that ended before the
+                    # 1 Hz sampler ran, without setting t.measured on CPU-only runs (so an unsampled
+                    # memory peak is never mistaken for an observed 0 bytes).
                     t.cpu_usec = (t.cpu_usec_base or 0) + used
         t.avg_cores = used / 1e6 / wall if wall > 0 and (t.measured or used > 0) else 0.0
         t.peak_cores = max(t.peak_cores, t.avg_cores)
@@ -1050,7 +1069,8 @@ class Daemon(GitHubMixin, SchedulerMixin):
             try:
                 self.history.add({
                     "key": t.key, "lane": t.lane, "t": round(time.time()), "wall": round(wall, 1), "exit": exit_code,
-                    "peak_mem": t.mem_peak, "peak_cores": round(t.peak_cores, 2), "avg_cores": round(t.avg_cores, 2),
+                    "peak_mem": t.mem_peak, "mem_measured": bool(t.measured or own_oom),
+                    "peak_cores": round(t.peak_cores, 2), "avg_cores": round(t.avg_cores, 2),
                     "granted": given, "mem_cores": t.peak_mem_cores or t.max_granted, "elastic": t.elastic,
                     "cold": t.cold, "oom": own_oom, "mem_wait_some": round(t.mem_wait_some, 1),
                     "mem_wait_full": round(t.mem_wait_full, 1), "mem_high": t.mem_high,
@@ -1081,14 +1101,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         except Exception as e:  # the analytics must never cost a build its ending
             self.metrics.trouble(f"can't record {t.id} for the analytics: {e!r}")
         if t.state == "succeeded" and commands.command_words(t.argv)[:2] == ["git", "push"] and t.source:
-            nudged = False
-            for post in self.status_posts:  # a push may have brought commits that were waiting
-                if post.get("repo") == t.source.get("remote") and post.get("missing"):
-                    post["next"] = now
-                    post["tries"] = 0
-                    nudged = True
-            if nudged:
-                self.save_status_posts()
+            self.retry_statuses(now, repo=t.source.get("remote"))
         waits = ""
         if t.mem_wait_some >= 1 or t.mem_high:
             waits = (f"; waited on memory {t.mem_wait_some:.0f}s ({t.mem_wait_full:.0f}s with all of it waiting)"
@@ -1379,7 +1392,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         queue = self.queue()
         running = sorted(self.active(), key=lambda t: t.started or 0)
         recent = sorted((t for t in self.tickets.values() if t.state in FINISHED), key=lambda t: t.ended or 0)[-10:]
-        return {
+        out = {
             "version": VERSION, "now": now, "runner": self.runner.name,
             "builds_cg": self._runner_builds_cgroup(self.runner),
             "machine": self.machine.summary(),
@@ -1388,6 +1401,16 @@ class Daemon(GitHubMixin, SchedulerMixin):
             "queued": [t.row(now, i) for i, t in enumerate(queue)],
             "recent": [t.row(now) for t in reversed(recent)],
         }
+        if self.cfg.github_status:
+            out["github_status"] = self.github_status_summary()
+        if self.tick_ms:
+            samples = sorted(self.tick_ms)
+            out["tick"] = {
+                "last_ms": round(self.tick_ms[-1], 1),
+                "p95_ms": round(samples[min(len(samples) - 1, int(len(samples) * 0.95))], 1),
+                "max_ms": round(self.tick_max_ms, 1),
+            }
+        return out
 
     def listing(self, now: float, everything: bool) -> list[dict]:
         queue = self.queue()
@@ -1401,7 +1424,8 @@ class Daemon(GitHubMixin, SchedulerMixin):
     # ---- the loop
 
     def tick(self, now: float) -> None:
-        self.machine.sample(time.monotonic())
+        t0 = time.monotonic()
+        self.machine.sample(t0)
         self.check(now)
         self.shed_memory(now)
         self.drop_unwatched(now)
@@ -1430,6 +1454,12 @@ class Daemon(GitHubMixin, SchedulerMixin):
         if tick - self.last_prune >= 600:
             self.last_prune = tick
             self.prune(now)
+        dur_ms = (time.monotonic() - t0) * 1000.0
+        self.tick_ms.append(dur_ms)
+        if dur_ms > self.tick_max_ms:
+            self.tick_max_ms = dur_ms
+        if dur_ms >= 500.0:
+            common.log(f"slow daemon tick: {dur_ms:.0f}ms (max {self.tick_max_ms:.0f}ms)", level=4)
 
     def vacate(self, t: Ticket, now: float) -> None:
         """A queued `buildq run` build whose client went (a harness's tool timeout, by SIGKILL, or
@@ -1650,6 +1680,13 @@ class Daemon(GitHubMixin, SchedulerMixin):
         elif op == "resume":
             self.resume(now)
             conn.send({"type": "paused", "paused": None})
+        elif op == "retry_statuses":
+            repo = msg.get("repo")
+            repo = str(repo) if isinstance(repo, str) and repo else None
+            counts = self.retry_statuses(now, repo=repo)
+            if self.status_posts:
+                self.send_status_posts(now)
+            conn.send({"type": "statuses", **counts})
         elif op == "ping":
             conn.send({"type": "pong", "version": VERSION, "runner": self.runner.name})
         else:

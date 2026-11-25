@@ -67,7 +67,10 @@ class History:
         self.by_key[key] = records  # most recently used last
         day = int(record["t"] // 86400)
         peaks = self.peaks.setdefault(key, {})
-        if day not in peaks or record["peak_mem"] > peaks[day]["peak_mem"]:
+        measured = record.get("mem_measured", True) is not False
+        prev = peaks.get(day)
+        if prev is None or (measured and (prev.get("mem_measured", True) is False or record["peak_mem"] > prev["peak_mem"])) \
+                or (not measured and prev.get("mem_measured", True) is False and record["peak_mem"] > prev["peak_mem"]):
             peaks[day] = record
         for old in [d for d in peaks if d < day - self.PEAK_DAYS]:
             del peaks[old]
@@ -159,8 +162,10 @@ class History:
             mem_cores = lane.cores
         else:
             # Memory: the biggest run within history_days, however many smaller ones came since.
+            # Prefer runs whose memory was actually observed over fast (<2s) unmeasured ones.
             window = [r for r in self._retained(key) if r["t"] >= cutoff] or recent
-            top = max(window, key=lambda r: r["peak_mem"])
+            mem_window = [r for r in window if r.get("mem_measured", True) is not False] or window
+            top = max(mem_window, key=lambda r: r["peak_mem"])
             mem_cores = int(top.get("mem_cores") or top.get("granted") or lane.cores) or lane.cores
             peak = top["peak_mem"]
             if any(r.get("oom") for r in window):
@@ -178,7 +183,12 @@ class History:
                 else:
                     wants.append(used * 1.2)
             want = max(wants)
-            source = f"largest of the last {len(recent)} run{'s' if len(recent) > 1 else ''}"
+            recent_ids = {id(r) for r in recent}
+            if id(top) in recent_ids:
+                source = f"largest of the last {len(recent)} run{'s' if len(recent) > 1 else ''}"
+            else:
+                days = int(cfg.history_days) if float(cfg.history_days).is_integer() else cfg.history_days
+                source = f"largest peak in the last {days}d (last {len(recent)} run{'s' if len(recent) > 1 else ''})"
         if cold:
             if lane.mem > mem:
                 mem, mem_cores = lane.mem, lane.cores

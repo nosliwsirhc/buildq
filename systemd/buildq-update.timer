@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically check for and install buildq updates
+Documentation=https://github.com/nosliwsirhc/buildq
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

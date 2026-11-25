@@ -238,6 +238,7 @@ class Ticket:
         self.flock = None  # (lock path, holder pid) for a build found holding a flock slot
         self.reason = ""
         self.reason_cat = ""
+        self.wait_key = ""  # finer wait attribution for waited_by (e.g. workspace-self, workspace-held)
         self.held = False
         self.sent_cat = None
         self.sent_at = 0.0

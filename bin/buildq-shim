@@ -176,9 +176,14 @@ def heavy(tool: str, args: list[str]) -> bool:
     if args and all(a in INFO for a in args):
         return False
     if tool == "cargo":
+        before = args[: args.index("--")] if "--" in args else args
+        if any(a in ("-h", "--help", "-V", "--version") for a in before):
+            return False  # cargo <subcommand> --help / --version asks for info, never compiles
         sub = cargo_subcommand(args)
         if not sub:
             return False  # cargo -V, cargo --list, ...
+        if sub[0] == "sqlx" and sub[1:] and sub[1] in ("migrate", "database", "db"):
+            return False  # sqlx-cli database/migration commands don't compile Rust
         if watching(args) or (sub[0] not in ("build", "b", "check", "c", "test", "t", "run", "r", "clippy")
                               and sub[1:] and sub[1] in ("watch", "dev", "serve")):
             return False  # cargo leptos watch, cargo tauri dev, ...: runs until stopped

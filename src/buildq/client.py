@@ -36,6 +36,11 @@ def _cmd_top(args) -> int:
     return top.cmd_top(args)
 
 
+def _cmd_update(args) -> int:
+    from . import update
+    return update.cmd_update(args)
+
+
 def note(text: str) -> None:
     print(f"buildq: {text}", file=sys.stderr, flush=True)
 
@@ -303,6 +308,16 @@ def print_overview(s: dict) -> None:
         p = s["paused"]
         print(f"PAUSED for {fmt_age(s['now'] - (p.get('since') or s['now']))}"
               f"{': ' + p['reason'] if p.get('reason') else ''}. Nothing new starts until `buildq resume`.")
+    gh = s.get("github_status") or {}
+    if gh.get("pending") or gh.get("expired") or gh.get("failed"):
+        parts = [f"{gh.get('pending', 0)} pending" + (f" ({gh['missing']} awaiting push)" if gh.get("missing") else "")]
+        if gh.get("delivered"):
+            parts.append(f"{gh['delivered']} delivered")
+        if gh.get("expired"):
+            parts.append(f"{gh['expired']} expired" + (f" ({gh['revivable']} revivable)" if gh.get("revivable") else ""))
+        if gh.get("failed"):
+            parts.append(f"{gh['failed']} failed")
+        print(f"GitHub statuses: {', '.join(parts)}" + (f"; last error: {gh['last_error']}" if gh.get("last_error") else ""))
     print()
     running, queued, recent = s["running"], s["queued"], s.get("recent") or []
     print(f"running {len(running)} of at most {c['max_jobs']}")
@@ -1278,6 +1293,16 @@ def cmd_cancel(args) -> int:
 
 
 def cmd_status(args) -> int:
+    if getattr(args, "retry_statuses", False):
+        reply = request({"op": "retry_statuses"})
+        if reply is None or reply.get("type") != "statuses":
+            return unreachable()
+        if args.json:
+            print(json.dumps({k: v for k, v in reply.items() if k != "type"}, indent=2))
+        else:
+            print(f"GitHub statuses: retried {reply.get('nudged', 0)} pending, "
+                  f"revived {reply.get('revived', 0)} expired ({reply.get('pending', 0)} queued)")
+        return 0
     if args.tickets:
         reply = request({"op": "status", "tickets": args.tickets})
         if reply is None:
@@ -1379,6 +1404,13 @@ def cmd_report(args) -> int:
                 pass
         return out
 
+    def slowed_by_high(r: dict) -> bool:
+        if not r.get("mem_high_all", r.get("mem_high")):
+            return False
+        wait = float(r.get("mem_wait_some") or 0)
+        wall = float(r.get("wall") or 0)
+        return wait >= 30.0 or (wall > 0 and wait >= 5.0 and wait / wall >= 0.05)
+
     rows = []
     for name, runs in groups.items():
         walls = num(runs, "wall")
@@ -1386,7 +1418,7 @@ def cmd_report(args) -> int:
             "name": name, "runs": len(runs), "failed": sum(1 for r in runs if r.get("state") != "succeeded"),
             "killed_for_memory": sum(1 for r in runs if r.get("oom") or r.get("stopped_for_memory")),
             "requeues": int(sum(num(runs, "requeues"))), "ci_stops": int(sum(num(runs, "ci_stops"))),
-            "over_memory_high": sum(1 for r in runs if r.get("mem_high_all", r.get("mem_high"))),
+            "over_memory_high": sum(1 for r in runs if slowed_by_high(r)),
             "median_seconds": median(walls), "total_seconds": sum(walls),
             "median_wait_seconds": median(num(runs, "waited")), "peak_memory": max(num(runs, "peak_mem"), default=0),
             "memory_wait_seconds": sum(num(runs, "mem_wait_some")),
@@ -1407,10 +1439,10 @@ def cmd_report(args) -> int:
         print(f"{r['runs']:>5} {r['failed']:>6} {fmt_age(r['median_seconds']):>7} {waited:>7} "
               f"{fmt_size(r['peak_memory']):>6} {r['over_memory_high']:>5} {fmt_age(r['memory_wait_seconds']):>8} "
               f"{r['killed_for_memory']:>6} {r['requeues']:>5}  {r['name']}")
-    print("FAILED: didn't succeed (failed, cancelled, timed out or lost). HIGH: went over its MemoryHigh, where the "
-          "kernel slows it. MEMWAIT: time spent waiting on memory in all. KILLED: killed for memory, or stopped to "
-          "free it. AGAIN: times stopped and started over, for memory or (make_room_for_ci) to make room for a CI "
-          "job's build.")
+    print("FAILED: didn't succeed (failed, cancelled, timed out or lost). HIGH: slowed materially by MemoryHigh "
+          "(>=30s or >=5% of wall waiting on memory). MEMWAIT: time spent waiting on memory in all. KILLED: killed "
+          "for memory, or stopped to free it. AGAIN: times stopped and started over, for memory or "
+          "(make_room_for_ci) to make room for a CI job's build.")
     return 0
 
 
@@ -1993,6 +2025,8 @@ def _main(argv=None) -> int:
     status = sub.add_parser("status", help="a ticket in detail, or the queue and the machine")
     status.add_argument("tickets", nargs="*")
     status.add_argument("--json", action="store_true")
+    status.add_argument("--retry-statuses", action="store_true",
+                        help="retry pending and recently expired GitHub commit statuses now")
     listing = sub.add_parser("list", help="every ticket")
     listing.add_argument("--all", action="store_true", help="include builds that finished more than a day ago")
     listing.add_argument("--json", action="store_true")
@@ -2033,13 +2067,28 @@ def _main(argv=None) -> int:
     daemon_p.add_argument("--tail", "-n", type=int, help="with logs: show the last N lines")
     daemon_p.add_argument("--follow", "-f", action="store_true", help="with logs: follow new log lines")
     sub.add_parser("ping", help="check that the daemon answers")
+    upd = sub.add_parser("update", help="check for and install buildq updates, or manage the auto-update timer")
+    upd.add_argument("--check", action="store_true", help="check whether an update is available without installing")
+    upd.add_argument("--force", action="store_true", help="reinstall even if already at the latest commit")
+    upd.add_argument("--when-idle", action="store_true", help="skip updating if any builds are currently running")
+    upd.add_argument("--auto", action="store_true", help="non-interactive mode for scheduled timers (skips cleanly if offline or dirty)")
+    upd.add_argument("--source", choices=("auto", "git", "github"), default="auto",
+                     help="update source: recorded git checkout if present, else GitHub archive (default: auto)")
+    upd.add_argument("--repo", help="GitHub repository in owner/name form (default: recorded or nosliwsirhc/buildq)")
+    upd.add_argument("--branch", help="branch to track (default: recorded or main)")
+    upd.add_argument("--json", action="store_true", help="print result as JSON")
+    timer_grp = upd.add_mutually_exclusive_group()
+    timer_grp.add_argument("--enable", action="store_true", help="enable the systemd user auto-update timer")
+    timer_grp.add_argument("--disable", action="store_true", help="disable the systemd user auto-update timer")
+    timer_grp.add_argument("--status", action="store_true", help="show installed commit, update source, and timer status")
+    upd.add_argument("--interval", help="with --enable: timer interval (e.g. 1h, 6h, 1d)")
     source = sub.add_parser("source", help=argparse.SUPPRESS)
     source.add_argument("directory")
     args = parser.parse_args(argv)
     handlers = {"submit": cmd_submit, "run": cmd_run, "status": cmd_status, "list": cmd_list, "wait": cmd_wait,
                 "logs": cmd_logs, "cancel": cmd_cancel, "pause": cmd_pause, "resume": cmd_resume,
                 "report": cmd_report, "help": cmd_help, "daemon": cmd_daemon, "ping": cmd_ping,
-                "source": cmd_source, "query": cmd_query, "top": _cmd_top}
+                "update": _cmd_update, "source": cmd_source, "query": cmd_query, "top": _cmd_top}
     return handlers[args.cmd](args)
 
 

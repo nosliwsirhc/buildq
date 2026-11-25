@@ -105,6 +105,11 @@ make_room_spare_after = "0"
 # the lane's default.
 # script_labels = ["persistent-cargo-target.sh"]
 
+# Environment variables whose value changes what a command builds or tests, so they join its
+# history key (for example, splitting a shared test script's unit vs. integration runs). Values
+# that look like credentials or come from secret-named variables are hashed before entering keys.
+# key_env = ["RUN_INTEGRATION_TESTS"]
+
 # Scripts (file names) that only build and run tests, so starting one over is safe: stopped for
 # memory, or to make room for a CI job's build, it is queued again instead of failed, as a plain
 # `cargo test` is, without each caller passing --restartable. Only when the script is run directly
@@ -289,11 +294,11 @@ properties = { MemoryHigh = "40%", MemoryMax = "50%" }
 # lane = "heavy"
 #
 # [[lane_rules]]
-# match = "^(pnpm|npm|npx|yarn|bun|bunx|vite|vitest|tsc|eslint|node|playwright) "
+# match = "^(pnpm|npm|npx|yarn|bun|bunx|vite|vitest|tsc|eslint|node|playwright)( |$)"
 # lane = "web"
 #
 # [[lane_rules]]
-# match = "^dotnet "
+# match = "^dotnet( |$)"
 # lane = "dotnet"
 #
 # Image builds compile inside dockerd, outside the build's cgroup, so buildq can't measure them:

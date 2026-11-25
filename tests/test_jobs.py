@@ -1,5 +1,7 @@
 """Unit tests for cores, jobservers, recovery, history, command keys, config, supervisor, shim, and client helpers."""
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import re
@@ -10,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 from unittest import mock
@@ -515,6 +518,39 @@ class Turns(DaemonCase):
         self.assertEqual((record["caller"], record["requeues"]), ("agent.scope", 0))
         self.assertGreaterEqual(record["waited"], 0)
 
+    def test_fast_unmeasured_cgroup_build_uses_terminal_cpu_and_marks_mem_unmeasured(self):
+        t = self.submit(("cargo", "check"))
+        t.cg = "/sys/fs/cgroup/fake-build"
+        t.measured = False
+        self.finish(t, 0, after=0.5, cpu_s=1.25)
+        self.assertFalse(t.measured)
+        self.assertAlmostEqual(t.cpu_usec, 1_250_000, delta=5)
+        self.assertGreater(t.avg_cores, 0.0)
+        self.assertGreater(t.peak_cores, 0.0)
+        recs = list(self.daemon.history.by_key.get(t.key, ()))
+        self.assertEqual(len(recs), 1)
+        self.assertIs(recs[0].get("mem_measured"), False)
+        self.assertGreater(recs[0]["avg_cores"], 0.0)
+
+    def test_report_high_column_only_counts_material_memory_high_stalls(self):
+        outcomes = os.path.join(self.state, "outcomes.jsonl")
+        now = time.time()
+        rows = [
+            {"t": now, "key": "repo|heavy|big", "lane": "heavy", "caller": "a", "state": "succeeded",
+             "wall": 3000.0, "waited": 0.0, "peak_mem": 10 * GIB, "mem_high_all": 120000, "mem_wait_some": 2.0},
+            {"t": now, "key": "repo|heavy|big", "lane": "heavy", "caller": "a", "state": "succeeded",
+             "wall": 600.0, "waited": 0.0, "peak_mem": 10 * GIB, "mem_high_all": 1000, "mem_wait_some": 45.0},
+        ]
+        with open(outcomes, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        buf = io.StringIO()
+        ns = types.SimpleNamespace(capacity=False, since=86400, by="command", top=25, json=True)
+        with mock.patch.object(client, "state_dir", return_value=self.state), redirect_stdout(buf):
+            self.assertEqual(client.cmd_report(ns), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data[0]["over_memory_high"], 1)
+
     def test_bad_memory_waits_are_ignored(self):
         t = self.submit()
         self.finish(t, 0, mem_wait_some="lots", mem_wait_full=None, mem_high=10 ** 400)
@@ -735,6 +771,66 @@ class Keys(unittest.TestCase):
         self.assertEqual(self.words("cargo", "+nightly", "build", "--release", "--package=api"),
                          "cargo build -p api --release")
         self.assertEqual(self.words("cargo", "test", "-p", "api", "--test", "a", "--test", "b"), "cargo test -p api")
+        # External cargo subcommands keep their sub-verb and --manifest-path keeps its folder (#audit).
+        self.assertEqual(self.words("cargo", "sqlx", "prepare", "--workspace"), "cargo sqlx prepare --workspace")
+        self.assertEqual(self.words("cargo", "sqlx", "migrate", "run", "--source", "api/migrations"),
+                         "cargo sqlx migrate")
+        self.assertEqual(self.words("cargo", "nextest", "run", "-p", "api"), "cargo nextest run -p api")
+        self.assertEqual(self.words("cargo", "nextest", "list"), "cargo nextest list")
+        self.assertEqual(self.words("cargo", "test", "--manifest-path", "aws/tools/architecture/Cargo.toml"),
+                         "cargo test --manifest-path aws/tools/architecture")
+        # Idempotent when re-keyed from stored key words, and root ./Cargo.toml is omitted.
+        self.assertEqual(self.words("cargo", "test", "--manifest-path", "aws/tools/architecture"),
+                         "cargo test --manifest-path aws/tools/architecture")
+        self.assertEqual(self.words("cargo", "test", "--manifest-path", "./Cargo.toml"), "cargo test")
+
+    def test_key_env_splits_history_keys_and_redacts_secrets(self):
+        cfg = config.Config({"key_env": ["SUITE", "API_TOKEN"]}, 64 * GIB, 16)
+        self.assertEqual(cfg.key_env, ("API_TOKEN", "SUITE"))
+        with self.assertRaises(ValueError):
+            config.Config({"key_env": ["BAD-VAR"]}, 64 * GIB, 16)
+        with tempfile.TemporaryDirectory() as cwd:
+            unit = commands.command_key(["bash", "run.sh"], cwd, "heavy", env={"SUITE": "unit"}, key_env=cfg.key_env)
+            integ = commands.command_key(["bash", "run.sh"], cwd, "heavy", env={"SUITE": "integration"},
+                                         key_env=cfg.key_env)
+            inline = commands.command_key(["env", "SUITE=integration", "bash", "run.sh"], cwd, "heavy",
+                                          env={}, key_env=cfg.key_env)
+            secret = commands.command_key(["bash", "run.sh"], cwd, "heavy",
+                                          env={"API_TOKEN": "supersecretvalue"}, key_env=cfg.key_env)
+            self.assertNotEqual(unit, integ)
+            self.assertEqual(integ, inline)
+            self.assertIn("SUITE=integration", integ)
+            self.assertNotIn("supersecretvalue", secret)
+            self.assertIn("API_TOKEN=h", secret)
+
+    def test_inline_env_manifest_path_target_dir_and_non_compile_cold_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "Cargo.toml"), "w").close()
+            ext_target = os.path.join(tmp, "ext-target")
+            os.makedirs(os.path.join(ext_target, "release"))
+            # Inline `env CARGO_TARGET_DIR=...` sees the warm release dir instead of missing `<cwd>/target/release`.
+            self.assertFalse(commands.is_cold(["env", f"CARGO_TARGET_DIR={ext_target}", "cargo", "build", "--release"],
+                                              tmp, {}))
+            self.assertTrue(commands.is_cold(["env", f"CARGO_TARGET_DIR={ext_target}", "cargo", "build"], tmp, {}))
+            # `--manifest-path` checks that crate's target directory, not the parent repo's.
+            sub = os.path.join(tmp, "tools", "arch")
+            os.makedirs(os.path.join(sub, "target", "release"))
+            open(os.path.join(sub, "Cargo.toml"), "w").close()
+            self.assertFalse(commands.is_cold(
+                ["cargo", "build", "--release", "--manifest-path", "tools/arch/Cargo.toml"], tmp, {}))
+            # `--target-dir` and `--target <triple>` are honored.
+            custom = os.path.join(tmp, "custom-t")
+            os.makedirs(os.path.join(custom, "x86_64-unknown-linux-gnu", "release"))
+            self.assertFalse(commands.is_cold(
+                ["cargo", "build", "--release", "--target-dir", custom, "--target", "x86_64-unknown-linux-gnu"],
+                tmp, {}))
+            self.assertTrue(commands.is_cold(
+                ["cargo", "build", "--release", "--target-dir", custom, "--target", "aarch64-unknown-linux-gnu"],
+                tmp, {}))
+            # Non-compiling / info Cargo commands are never marked cold.
+            for argv in (["cargo", "sqlx", "--version"], ["cargo", "sqlx", "migrate", "run"],
+                         ["cargo", "install", "cargo-deny"], ["cargo", "build", "--help"]):
+                self.assertFalse(commands.is_cold(argv, tmp, {}), argv)
 
     def test_wrappers_and_assignments_are_ignored(self):
         self.assertEqual(self.words("env", "SQLX_OFFLINE=true", "nice", "-n", "10", "cargo", "check"), "cargo check")
@@ -836,6 +932,13 @@ class Keys(unittest.TestCase):
         label = commands.redacted_label(["env", "TOKEN=abc", "sh", "-c", "X=1 make", "postgres://u:hunter2@db/x"])
         self.assertNotIn("abc", label)
         self.assertNotIn("hunter2", label)
+
+        # `example` config lane rules match bare tool names (tsc --noEmit -> key words "tsc") as well as args.
+        example_cfg = config.load_config_file(os.path.join(ROOT, "config.example.toml"), 64 * GIB, 16)
+        self.assertIsNotNone(example_cfg)
+        web_rule = re.compile(r"^(pnpm|npm|npx|yarn|bun|bunx|vite|vitest|tsc|eslint|node|playwright)( |$)")
+        for cmd in (["tsc", "--noEmit"], ["eslint"], ["vitest"], ["pnpm", "build"]):
+            self.assertRegex(" ".join(commands.command_words(cmd)), web_rule, cmd)
 
     def test_repo_name_is_shared_by_worktrees(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1155,6 +1258,13 @@ class ShimRules(unittest.TestCase):
         # Shimmed `cargo clean` must also queue so it waits for any build using the same target directory (#76).
         self.assertTrue(self.shim.heavy("cargo", ["clean"]))
         self.assertTrue(self.shim.heavy("cargo", ["clean", "-p", "api"]))
+        # Cargo subcommand --help/--version (before `--`) and non-compiling sqlx subcommands bypass the queue.
+        for args in (["sqlx", "--version"], ["build", "--help"], ["xtask", "-h"],
+                     ["sqlx", "migrate", "run"], ["sqlx", "database", "reset"]):
+            self.assertFalse(self.shim.heavy("cargo", args), args)
+        # Flags after `--` belong to the compiled binary, and `cargo sqlx prepare` compiles Rust.
+        self.assertTrue(self.shim.heavy("cargo", ["test", "--", "--help"]))
+        self.assertTrue(self.shim.heavy("cargo", ["sqlx", "prepare", "--workspace"]))
 
     def test_duplicate_option_values_do_not_confuse_tool_or_subcommand_position(self):
         self.assertTrue(self.shim.heavy("pnpm", ["--filter", "vite", "vite", "build"]))

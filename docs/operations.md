@@ -28,6 +28,23 @@ restart) stops and relaunches `buildqd` cleanly. In all runners, builds run unde
 supervisors in their own services/cgroups/sessions and carry on across daemon restarts; queued
 tickets are on disk, and the next daemon picks both up.
 
+## Updates and auto-update
+
+`buildq update` checks for a newer commit on `main`, pulls it, and re-runs `install.sh` (preserving
+your prefix, Python interpreter, shims, and skill links).
+
+- **Source:** if `install.sh` was run from a git checkout, `buildq update` fast-forwards `origin/main`
+  there (refusing if the tree is dirty, diverged, or on another branch). Otherwise (or with
+  `--source github`), it fetches the latest commit tarball from GitHub over HTTPS into a temporary
+  directory and installs from there.
+- **Flags:** `--check` checks without installing, `--when-idle` skips if builds are currently
+  running, `--force` reinstalls even when already on the latest commit, and `--json` emits
+  machine-readable output.
+- **Automatic updates:** enable the opt-in systemd user timer (`buildq-update.timer`, default every
+  6 hours with 15 minutes of jitter) with `./install.sh --auto-update` or `buildq update --enable`
+  (optionally `--interval 1h` / `1d`). Check status with `buildq update --status` and disable with
+  `buildq update --disable`. On non-systemd hosts, schedule `buildq update --auto` via cron.
+
 ## Files
 
 They are in `~/.local/state/buildq`: `tickets/<id>/` (the ticket, its output log, its
@@ -151,7 +168,8 @@ builds wait with that reason.
 ## `buildq report`
 
 `buildq report` sums up the history per command (or `--by lane`, `--by caller`): runs,
-failures, median time and queue wait, peak memory, runs that went over their `MemoryHigh`, time
+failures, median time and queue wait, peak memory, runs slowed materially by `MemoryHigh`
+(`>=30s` or `>=5%` of wall waiting on memory), time
 spent waiting on memory, and kills. That is the evidence for a lane's caps: a command whose runs
 keep going over `MemoryHigh` with long memory waits is held back by it. The history keeps each
 command's last 100 runs and its biggest run of each day, so older numbers are a sample.
@@ -160,15 +178,16 @@ command's last 100 runs and its biggest run of each day, so older numbers are a 
 
 With `github_status = true`, a check (see [usage](usage.md#the-same-source-the-same-build)) or a build given a `--name` that
 passes on a commit with no changes on top, its tree the same when it started and ended, posts a
-`success` status on that commit (context `buildq/<name or command>`, so a name is visible on the
-repository) through `gh`, so its pull request shows it was verified here. A later failure of the
+`success` status on that commit (context `buildq/<name or command>`, with a short digest suffix
+when unnamed checks differ by extra arguments or subdirectory) through `gh`, so its pull request shows it was verified here. A later failure of the
 same check on the same commit (its own verdict, an exit of 1 to 127; not a kill, a timeout or a
 stop to free memory) posts `failure`; other failures aren't posted. Results are ordered by when
 their builds ended, so an older one never replaces a newer one. A commit GitHub
 doesn't have yet is tried again after the next `git push` run through buildq from that
-repository, and with exponential backoff (10 minutes up to 2 hours), for up to 6 hours (or a day
+repository (including reviving missing-commit statuses that expired within the last 24 hours),
+or on demand with `buildq status --retry-statuses`, and with exponential backoff (10 minutes up to 2 hours), for up to 6 hours (or a day
 for transient errors; permanent 4xx refusals are dropped at once); the first refusal is logged with
-`gh`'s message.
+`gh`'s message, and `buildq status` surfaces pending, expired, and failed counts.
 Statuses go to the `origin` remote's repository (in a fork, the fork). A build from a GitHub
 Actions job never posts `success`, since the job reports its own result. Its failure can still
 turn red a `success` posted on the same commit. The daemon runs the `gh` the `gh` setting names
