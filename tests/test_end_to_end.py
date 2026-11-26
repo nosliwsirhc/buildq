@@ -526,7 +526,7 @@ class Enforcement(Harness):
         shims = os.path.join(self.tmp.name, "shims")
         os.makedirs(real)
         os.makedirs(shims)
-        for tool in ("make", "cargo", "dotnet", "cmake", "ctest", "zig", "gradle"):
+        for tool in ("make", "cargo", "dotnet", "cmake", "ctest", "zig", "gradle", "bun", "bunx"):
             with open(os.path.join(real, tool), "w") as f:
                 f.write(f"#!/bin/sh\necho \"{tool} $* job=${{BUILDQ_JOB:-none}}\"\n")
             os.chmod(os.path.join(real, tool), 0o755)
@@ -579,6 +579,12 @@ class Enforcement(Harness):
             (["zig", "fmt", "."], False),
             (["gradle", "test"], True),
             (["gradle", "--stop"], False),
+            (["bun", "run", "build"], True),
+            (["bun", "test"], True),
+            (["bun", "run", "dev"], False),
+            (["bun", "test", "--watch"], False),
+            (["bunx", "tsc", "--noEmit"], True),
+            (["bunx", "vitest", "--watch"], False),
         ):
             res = subprocess.run(cmd, env=env, cwd=self.work, capture_output=True, text=True, timeout=60)
             self.assertEqual(res.returncode, 0, (cmd, res.stderr))

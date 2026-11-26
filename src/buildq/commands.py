@@ -338,9 +338,9 @@ def _tool_and_args(argv: list[str]) -> tuple[str, list[str]]:
 
 def reusable_check(argv: list[str]) -> bool:
     """A command whose only result is a verdict on the source: cargo check, clippy, test or nextest
-    run, dotnet test, `tsc --noEmit`, eslint, `vitest run`, `zig test`/`ast-check`,
-    `gcc`/`clang -fsyntax-only`, `pytest`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `mypy`,
-    `pyright`, `uv run --no-sync <check>`, with nothing that writes (--fix, -u,
+    run, dotnet test, `go vet`, `zig test` or `zig ast-check`, `gcc`/`clang -fsyntax-only`,
+    `pytest`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `mypy`, `pyright`, `uv run --no-sync
+    <check>`, `tsc --noEmit`, eslint, `vitest run`, with nothing that writes (--fix, -u,
     --update-snapshots, watch modes, --no-run, which keeps the test binaries for later) or asks for
     help/version. A second pass on the same source tells nothing the first didn't, so the first
     answers it. Commands that produce files (builds, docs, bundles) and package scripts, which might
@@ -763,6 +763,14 @@ def paths_inside(argv: list[str], cwd: str, top: str, env: dict | None = None) -
         if any(effective_env.get(k) for k in ("UV_WORKING_DIR", "UV_PROJECT", "UV_ENV_FILE")):
             return False  # env redirects uv to another directory or external .env file
     sure_tool, sure_args = sure_tool_and_args(argv)
+    if tool == "go" or sure_tool == "go":
+        if effective_env.get("GOFLAGS"):
+            return False  # GOFLAGS can inject -toolexec, -vettool, -C, -overlay, etc.
+        gowork = str(effective_env.get("GOWORK") or "").strip()
+        if gowork and gowork not in ("off", "auto"):
+            path = os.path.realpath(os.path.join(cwd, os.path.expanduser(gowork)))
+            if path != root and not path.startswith(root + os.sep):
+                return False
     if effective_env.get("PYTEST_ADDOPTS") and (
         _uses_pytest(tool, stripped[1:]) or _uses_pytest(sure_tool, sure_args)
     ):

@@ -118,6 +118,7 @@ class Daemon(GitHubMixin, SchedulerMixin):
         self.status_stats: dict = {"delivered": 0, "expired": 0, "failed": 0, "last_error": None, "last_posted": None}
         self.tick_ms: collections.deque = collections.deque(maxlen=300)
         self.tick_max_ms: float = 0.0
+        self.tick_last_slow: dict | None = None
         statuses = common.read_json(os.path.join(state_dir, "github-statuses.json"))
         if isinstance(statuses, list):
             self.status_posts = statuses
@@ -1405,11 +1406,14 @@ class Daemon(GitHubMixin, SchedulerMixin):
             out["github_status"] = self.github_status_summary()
         if self.tick_ms:
             samples = sorted(self.tick_ms)
-            out["tick"] = {
+            tick_info: dict = {
                 "last_ms": round(self.tick_ms[-1], 1),
                 "p95_ms": round(samples[min(len(samples) - 1, int(len(samples) * 0.95))], 1),
                 "max_ms": round(self.tick_max_ms, 1),
             }
+            if self.tick_last_slow is not None:
+                tick_info["last_slow"] = dict(self.tick_last_slow)
+            out["tick"] = tick_info
         return out
 
     def listing(self, now: float, everything: bool) -> list[dict]:
@@ -1425,41 +1429,77 @@ class Daemon(GitHubMixin, SchedulerMixin):
 
     def tick(self, now: float) -> None:
         t0 = time.monotonic()
+        prev = t0
+        phases: list[tuple[str, float]] = []
+
+        def mark(name: str) -> float:
+            nonlocal prev
+            t = time.monotonic()
+            phases.append((name, (t - prev) * 1000.0))
+            prev = t
+            return t
+
         self.machine.sample(t0)
+        mark("sample")
         self.check(now)
+        mark("check")
         self.shed_memory(now)
+        mark("shed")
         self.drop_unwatched(now)
+        mark("unwatched")
         self.drop_abandoned(now)
+        mark("abandoned")
         self.scan_flock_slots(now)
+        mark("flock")
         self.schedule(now)
+        mark("schedule")
         self.make_room_for_ci(now)
+        mark("ci_room")
         try:
             self.observe_metrics(now)
         except Exception as e:  # nor the loop its tick
             self.metrics.trouble(f"can't add up this tick for the analytics: {e!r}")
-        tick = time.monotonic()
+        tick = mark("metrics")
         if tick - self.last_rebalance >= self.REBALANCE_SECONDS:
             self.last_rebalance = tick
             self.rebalance(now)
+            mark("rebalance")
             self.guard_slice()
+            mark("guard_slice")
         elif self.memory_moving():
             self.guard_slice()  # every tick while memory is short or falling fast (#5)
+            mark("guard_slice")
         self.watch_memory(tick)
+        mark("watch_memory")
         if self.source_checks or self.source_wanted:
             self.collect_source_checks(now)
+            mark("source_checks")
         if self.status_posts or self.status_procs:
             self.send_status_posts(now)
+            mark("status_posts")
         self.send_waits(now)
+        mark("send_waits")
         self.reap_helpers(now)
+        mark("reap_helpers")
         if tick - self.last_prune >= 600:
             self.last_prune = tick
             self.prune(now)
-        dur_ms = (time.monotonic() - t0) * 1000.0
+            mark("prune")
+        dur_ms = (prev - t0) * 1000.0
         self.tick_ms.append(dur_ms)
         if dur_ms > self.tick_max_ms:
             self.tick_max_ms = dur_ms
         if dur_ms >= 500.0:
-            common.log(f"slow daemon tick: {dur_ms:.0f}ms (max {self.tick_max_ms:.0f}ms)", level=4)
+            top = sorted(phases, key=lambda p: p[1], reverse=True)[:3]
+            shown = [(name, ms) for name, ms in top if ms >= 1.0]
+            self.tick_last_slow = {
+                "ms": round(dur_ms, 1),
+                "at": round(now, 1),
+                "phases": {name: round(ms, 1) for name, ms in shown},
+            }
+            detail = ", ".join(f"{name} {ms:.0f}ms" for name, ms in shown)
+            suffix = f" ({detail})" if detail else ""
+            common.log(f"slow daemon tick: {dur_ms:.0f}ms (max {self.tick_max_ms:.0f}ms){suffix}", level=4)
 
     def vacate(self, t: Ticket, now: float) -> None:
         """A queued `buildq run` build whose client went (a harness's tool timeout, by SIGKILL, or

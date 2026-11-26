@@ -9,7 +9,7 @@ How buildq works inside. The [README](../README.md) covers installing it, and [U
 | `buildq` | The client: submits builds, follows them, shows status. It never runs a build itself (except in a fallback). |
 | `buildqd` | The daemon: holds the queue, measures the machine and the builds, decides who starts and with how many cores, starts builds, resizes their jobservers, keeps history. |
 | `buildqd --supervise DIR` | The supervisor: one per build, inside its service/cgroup/session. Sets `PR_SET_CHILD_SUBREAPER` under `cgroup`/`direct` (requiring it for `direct`), joins the build cgroup (under `cgroup`), probes GNU Make < 4.4 inside confinement, runs the command, reaps orphaned descendants, and writes output and exit status. |
-| `buildq-shim` | Optional: standalone zero-import wrapper on `PATH` for `cargo`, `pnpm`, `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet` (plus `cmake`, `ctest`, `zig` and `gradle` when installed) that sends heavy invocations through `buildq run`. |
+| `buildq-shim` | Optional: standalone zero-import wrapper on `PATH` for `cargo`, `pnpm`, `npm`, `npx`, `yarn`, `make`, `gmake`, `ninja`, `dotnet` (plus `cmake`, `ctest`, `zig`, `gradle`, `bun` and `bunx` when installed) that sends heavy invocations through `buildq run`. |
 | `buildq-rustc-guard` | Optional: cargo's rustc wrapper; refuses compiles outside a buildq build. |
 | `skills/buildq/SKILL.md` | The page for coding agents on using the queue, with the machine's own notes (`~/.config/buildq/agents.md`) added at its end: always installed (`buildq help agents` prints it), and linked into the agents' skill directories with `install.sh --skill`. |
 | `buildq.socket`, `buildq.service`, `buildq.slice` | Systemd user units: socket activation (`$XDG_RUNTIME_DIR/buildq.sock`, mode 0600), `KillMode=process`, and the `buildq.slice` aggregate memory/CPU/IO backstop. |
@@ -55,7 +55,7 @@ such as `gcc-14`, `clang-18`, `python3.12`) and any of these hooks:
 - **`command_words`**: extracts the history/lane-rule key words while redacting credentials and assignments.
 - **`honors_grant` / `honors_grant_args`**: whether this tool (or specific invocation, e.g. `cmake --build` without `-j` or `zig build` without `-j`) respects buildq's core grant.
 - **`jobserver` / `makeflags_jobserver`**: GNU make FIFO jobserver support (`cargo`, `make`/`gmake`, `ninja`).
-- **`global_env` / `direct_env` / `merge_env_vars`**: parallelism and cgroup-containment environment variables. `global_env` runs for every build (so wrapper scripts inherit limits like `CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `GOMAXPROCS`, and merged `GRADLE_OPTS`); `direct_env` supersedes it for direct invocations. Variables listed in `merge_env_vars` (currently `GRADLE_OPTS`) explicitly merge into caller values and bypass the scheduler's "skip if caller set" filter only for the callback that emitted them.
+- **`global_env` / `direct_env` / `merge_env_vars`**: parallelism and cgroup-containment environment variables. `global_env` runs for every build (so wrapper scripts inherit limits like `CMAKE_BUILD_PARALLEL_LEVEL`, `CTEST_PARALLEL_LEVEL`, `DOTNET_PROCESSOR_COUNT`, `UV_CONCURRENT_BUILDS`, `PYTEST_XDIST_AUTO_NUM_WORKERS`, `GOMAXPROCS`, and merged `GRADLE_OPTS`); `direct_env` supersedes it for direct invocations. Variables listed in `merge_env_vars` (currently `GRADLE_OPTS`) explicitly merge into caller values and bypass the scheduler's "skip if caller set" filter only for the callback that emitted them.
 - **`rewrite_argv`**: optional command-line rewrite for direct invocations (stripping `-j` for jobserver `make`/`ninja`, injecting `-j<cores>` for direct `zig build`).
 - **`restart_safe` / `reusable_check`**: whether a stopped build can safely start over, and whether a passing run can answer a repeat submission on the same source.
 - **`write_dirs` / `is_cold` / `container_storage` / `not_script`**: extra output/cache folders for `buildq top`, cold-build detection (`cargo`, `zig build`), container storage disk checks, and `restartable_scripts` refusal.
@@ -405,7 +405,8 @@ stops one build even when a stop takes a few seconds to land.
    its service is empty, `requeue()`:
    - if it was cancelled meanwhile, finalizes it as cancelled;
    - if it isn't safe to start over (`restart_safe()`: a cargo build, check, test, clippy, doc,
-     nextest or bench; a dotnet build or test; gradle/gradlew build or test tasks; `cmake --build`
+     nextest or bench; a dotnet build or test; `go build`, `test` or `vet` without exec/output/
+     fuzz/profile flags; gradle/gradlew build or test tasks; `cmake --build`
      with an explicit build dir and standard safe targets; ordinary `ctest` runs; `zig` build,
      test, compile or `ast-check`; `gcc`/`clang` without `-wrapper` or `@file`; `pytest`, `mypy`,
      `pyright`/`basedpyright`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv build` or
@@ -516,7 +517,7 @@ unknown id, changes nothing), and the build carries on. A cancel that names no s
 (`buildq cancel`) is refused while more than one waits, unless it says `--all`. A build being
 stopped to be queued again can be joined too. Failing that, a ticket that succeeded within `reuse_window` answers it if
 the command is a check (`reusable_check()`: cargo check, clippy, test or `nextest run`, dotnet
-test, `zig test` or `zig ast-check`, `gcc`/`clang -fsyntax-only`, `pytest`, `mypy`,
+test, `go vet`, `zig test` or `zig ast-check`, `gcc`/`clang -fsyntax-only`, `pytest`, `mypy`,
 `pyright`/`basedpyright`, `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv run --no-sync <check>`,
 `tsc --noEmit`, eslint, `vitest run`; none with `--fix`, vitest's `-u`, `--update*`, `--watch*`,
 `--allow-dirty`, `--no-run`, dry-run/info flags, or `@file` response files; Gradle and CTest are

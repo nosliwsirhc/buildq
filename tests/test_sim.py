@@ -411,10 +411,18 @@ class Export(SimCase):
                      ["gradlew", ":secretmod:testDebugUnitTest"], ["gradlew", ":secretmod:publishRelease"],
                      ["ctest"], ["ctest", "-T"], ["ctest", "--build-and-test"],
                      ["uv", "run", "-m", "unittest"], ["uv", "run", "python3", "-m", "pytest"],
-                     ["uv", "run", "--frozen", "pytest", "tests/secret.py"], ["uv", "run", "--no-sync", "pytest"]):
+                     ["uv", "run", "--frozen", "pytest", "tests/secret.py"], ["uv", "run", "--no-sync", "pytest"],
+                     ["dotnet", "test", "--project", "Secret.Tests.csproj", "-c", "Release", "--no-build"],
+                     ["dotnet", "publish", "Secret.csproj"],
+                     ["go", "build", "./cmd/secret"], ["go", "test", "-race", "-tags", "secrettag", "./..."],
+                     ["go", "test", "-fuzz", "FuzzSecret", "./..."], ["go", "build", "-o", "secretbin", "./..."],
+                     ["go", "vet", "./..."], ["go", "generate", "./..."]):
             anon = sim.anonymous_argv(argv)
             self.assertNotIn("secretmod", json.dumps(anon))
             self.assertNotIn("secret.py", json.dumps(anon))
+            self.assertNotIn("Secret", json.dumps(anon))
+            self.assertNotIn("secrettag", json.dumps(anon))
+            self.assertNotIn("secretbin", json.dumps(anon))
             self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(argv), (argv, anon))
         self.assertEqual(sim.anonymous_argv(["cmake", "--workflow", "--preset", "ci"])[:3],
                          ["cmake", "--workflow", "--preset"])
@@ -426,16 +434,33 @@ class Export(SimCase):
                     ["ctest", "-T", "Submit"],
                     ["ctest", "--add-notes", "n.txt"],
                     ["gradle", "assembleRelease"],
-                    ["gradle", "--max-workers=8", "test"]):
+                    ["gradle", "--max-workers=8", "test"],
+                    ["dotnet", "test", "--project", "src/Secret.Tests/Secret.Tests.csproj",
+                     "--configuration", "Release", "--no-build", "-v", "n"],
+                    ["dotnet", "build", "--no-restore", "-c", "Debug", "Secret.sln"],
+                    ["dotnet", "publish", "Secret.csproj", "-c", "Release"],
+                    ["go", "build", "./cmd/secret"],
+                    ["go", "test", "-race", "-tags", "b,a", "-p", "4", "./cmd/secret"],
+                    ["go", "vet", "./..."],
+                    ["go", "generate", "./..."],
+                    ["go", "run", "./cmd/secret"]):
             key_words = bq_commands.command_words(raw)
             exported = " ".join(key_words).split()  # as metrics.db stores and sim.export_builds splits it
             self.assertEqual(bq_commands.command_words(exported), key_words, raw)
             anon = sim.anonymous_argv(exported)
+            self.assertNotIn("Secret", json.dumps(anon))
+            self.assertNotIn("secret", json.dumps(anon))
             self.assertEqual(bq_commands.restart_safe(anon), bq_commands.restart_safe(raw), (raw, exported, anon))
             self.assertEqual(bq_tools.honors_grant_for(anon[0], anon[1:]),
                              bq_tools.honors_grant_for(raw[0], raw[1:]), (raw, exported, anon))
         key = lambda argv: bq_commands.command_words(sim.anonymous_argv(argv))  # noqa: E731
         self.assertNotEqual(key(["cargo", "test", "--doc"]), key(["cargo", "test"]))  # two histories, as in the database
+        self.assertNotEqual(key(["dotnet", "test", "--project", "App.Tests", "-c", "Debug"]),
+                            key(["dotnet", "test", "--project", "App.Tests", "-c", "Release"]))
+        self.assertNotEqual(key(["dotnet", "test", "--project", "App.Tests", "--no-build"]),
+                            key(["dotnet", "test", "--project", "App.Tests"]))
+        self.assertNotEqual(key(["go", "test", "-race", "./..."]), key(["go", "test", "./..."]))
+        self.assertNotEqual(key(["go", "test", "-tags", "integration", "./..."]), key(["go", "test", "./..."]))
 
     def test_an_option_like_value_doesn_t_survive_from_the_database_to_the_trace(self):
         # pnpm --filter=--internal-client test, as its history key keeps it (#46 round 4)

@@ -56,7 +56,7 @@ build starts: CI jobs, containers, a session. With `shed_memory` on (the default
   of those whose memory covers the shortfall, else the largest, and never one holding less than
   512 MiB (if what holds the memory isn't buildq's, stopping small builds frees nothing). Memory
   held by builds still being stopped counts as freed, so one shortfall stops one build. A
-  compile or test run (cargo, dotnet, gradle/gradlew, cmake --build, ctest, zig, gcc/clang,
+  compile or test run (cargo, dotnet, go, gradle/gradlew, cmake --build, ctest, zig, gcc/clang,
   pytest/unittest/mypy/pyright/uv, tsc, eslint, vitest, ninja), a build submitted with
   `--restartable`, or one run by a script listed in `restartable_scripts` is queued again at the
   front and starts from the beginning once there is room. The compile, test run or listed script
@@ -157,7 +157,8 @@ says it can use. A run that used nearly all the cores it was given wants half as
 time; one that left cores idle wants a little more than it used; a build with no history wants the
 lane's `cores` (its `max_cores` if it is a cold cargo or zig build). The number goes into its
 environment, unless the caller set these: `BUILDQ_CORES`, `CMAKE_BUILD_PARALLEL_LEVEL`,
-`CTEST_PARALLEL_LEVEL`, `GOMAXPROCS`, `UV_CONCURRENT_BUILDS`, `DOTNET_PROCESSOR_COUNT` (with
+`CTEST_PARALLEL_LEVEL`, `GOMAXPROCS`, `UV_CONCURRENT_BUILDS`, `PYTEST_XDIST_AUTO_NUM_WORKERS`,
+`DOTNET_PROCESSOR_COUNT` (with
 MSBuild's node reuse and shared compiler off, so .NET compiles inside the build where it is
 measured), `GRADLE_OPTS` (merging `-Dorg.gradle.daemon=false` and
 `-Dorg.gradle.workers.max=<cores>` into any caller `GRADLE_OPTS` unless the caller already set

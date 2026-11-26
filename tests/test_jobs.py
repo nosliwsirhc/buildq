@@ -1533,6 +1533,7 @@ class ToolsRegistry(unittest.TestCase):
         self.assertEqual(env_cargo["CMAKE_BUILD_PARALLEL_LEVEL"], "4")
         self.assertEqual(env_cargo["CTEST_PARALLEL_LEVEL"], "4")
         self.assertEqual(env_cargo["UV_CONCURRENT_BUILDS"], "4")
+        self.assertEqual(env_cargo["PYTEST_XDIST_AUTO_NUM_WORKERS"], "4")
         self.assertEqual(env_cargo["GRADLE_OPTS"], "-Dorg.gradle.daemon=false -Dorg.gradle.workers.max=4")
         self.assertEqual(env_cargo["GOMAXPROCS"], "4")
 
@@ -2029,6 +2030,120 @@ class SystemCompilers(DaemonCase):
         self.assertIsNone(t_cfg.dedupe)
         self.finish(t_cfg)
         self.daemon.cfg.env = {}
+
+
+class DotnetGoAndPytestXdist(DaemonCase):
+    """Per-project/config dotnet keys, pytest-xdist auto worker cap, and Go classification."""
+
+    def test_dotnet_command_words_and_property_guards(self):
+        words = commands.command_words
+        self.assertEqual(words(["dotnet"]), ["dotnet"])
+        self.assertEqual(words(["dotnet", "test"]), ["dotnet", "test"])
+        self.assertEqual(words(["dotnet", "test", "--project", "src/Foo.Tests/Foo.Tests.csproj"]),
+                         ["dotnet", "test", "Foo.Tests.csproj"])
+        self.assertEqual(words(["dotnet", "test", "src/Foo.Tests/Foo.Tests.csproj"]),
+                         ["dotnet", "test", "Foo.Tests.csproj"])
+        self.assertEqual(words(["dotnet", "build", "--project", "src/App/App.csproj"]),
+                         words(["dotnet", "build", "src/App/App.csproj"]))
+        self.assertEqual(words(["dotnet", "test", "--solution", "dir/MyApp.sln", "--configuration", "Release"]),
+                         ["dotnet", "test", "MyApp.sln", "-c Release"])
+        self.assertEqual(words(["dotnet", "test", "--project", "Foo.Tests", "-c", "Debug"]),
+                         ["dotnet", "test", "Foo.Tests", "-c Debug"])
+        self.assertEqual(words(["dotnet", "test", "-c:release", "--no-build", "--project=Foo.Tests"]),
+                         ["dotnet", "test", "Foo.Tests", "-c Release", "--no-build"])
+        self.assertEqual(words(["dotnet", "build", "--no-restore", "-c=Release", "App.csproj"]),
+                         ["dotnet", "build", "App.csproj", "-c Release", "--no-restore"])
+        # Order independence & idempotency of exported key tokens.
+        a = words(["dotnet", "test", "--project", "Foo.Tests", "-c", "Release", "--no-build", "-v", "n",
+                   "--logger", "trx", "--filter", "Category=Unit"])
+        b = words(["dotnet", "test", "--no-build", "-v", "n", "-c", "Release", "--project", "Foo.Tests"])
+        self.assertEqual(a, ["dotnet", "test", "Foo.Tests", "-c Release", "--no-build"])
+        self.assertEqual(a, b)
+        self.assertEqual(words(" ".join(a).split()), a)
+        # MSBuild -p:Prop=Val and -p Prop=Val must never be misread as a project target; -p:Configuration=X extracts -c.
+        self.assertEqual(words(["dotnet", "build", "-p:UseRazorSourceGenerator=false", "src/App.csproj"]),
+                         ["dotnet", "build", "App.csproj"])
+        self.assertEqual(words(["dotnet", "build", "-p:UseRazorSourceGenerator=false;Configuration=Release", "src/App.csproj"]),
+                         ["dotnet", "build", "App.csproj", "-c Release"])
+        self.assertEqual(words(["dotnet", "build", "-p", "UseRazorSourceGenerator=false", "src/App.csproj"]),
+                         ["dotnet", "build", "App.csproj"])
+        self.assertEqual(words(["dotnet", "build", "-p", "src/App.csproj"]),
+                         ["dotnet", "build", "App.csproj"])
+        self.assertEqual(words(["dotnet", "test", "/p:Configuration=Release", "Foo.Tests.csproj"]),
+                         ["dotnet", "test", "Foo.Tests.csproj"])
+        self.assertEqual(words(["dotnet", "test", "/v:q", "Foo.Tests.csproj"]),
+                         ["dotnet", "test", "Foo.Tests.csproj"])
+        # Non-build dotnet subcommands still retain their second positional word.
+        self.assertEqual(words(["dotnet", "ef", "migrations", "add", "Init"]), ["dotnet", "ef", "migrations"])
+        # Leading global options don't break restart_safe or reusable_check.
+        self.assertTrue(commands.restart_safe(["dotnet", "--diagnostics", "build", "App.csproj"]))
+        self.assertTrue(commands.reusable_check(["dotnet", "--diagnostics", "test", "App.Tests.csproj"]))
+
+    def test_pytest_xdist_auto_workers_exported_and_defers_to_caller(self):
+        t_default = self.submit(("pytest", "-n", "auto", "tests/"))
+        with open(os.path.join(t_default.dir, "parallel.json")) as f:
+            par_default = json.load(f)
+        self.assertEqual(par_default["PYTEST_XDIST_AUTO_NUM_WORKERS"], str(t_default.granted))
+        self.finish(t_default)
+
+        t_caller = self.submit(("pytest", "-n", "auto", "tests/"), env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "2"})
+        with open(os.path.join(t_caller.dir, "parallel.json")) as f:
+            par_caller = json.load(f)
+        self.assertNotIn("PYTEST_XDIST_AUTO_NUM_WORKERS", par_caller)
+        self.finish(t_caller)
+
+    def test_go_words_restart_reusable_and_write_dirs(self):
+        words = commands.command_words
+        self.assertEqual(words(["go"]), ["go"])
+        self.assertEqual(words(["go", "build", "./..."]), ["go", "build", "./..."])
+        self.assertEqual(words(["go", "test", "./cmd/api"]), ["go", "test", "cmd/api"])
+        self.assertEqual(words(["go", "test", "-C", "sub", "./cmd/api"]), ["go", "test", "cmd/api"])
+        self.assertEqual(words(["go", "-C", "sub", "test", "./cmd/api"]), ["go", "test", "cmd/api"])
+        self.assertEqual(words(["go", "test", "-v", "-timeout", "10m", "-run", "TestFoo", "-race",
+                                "-tags", "linux integration", "-p", "4", "./cmd/api", "-args", "-flag"]),
+                         ["go", "test", "cmd/api", "-race", "-tags integration,linux", "-p"])
+        self.assertEqual(words(["go", "test", "--tags=integration,linux", "--race=true", "-p=2", "./cmd/api"]),
+                         ["go", "test", "cmd/api", "-race", "-tags integration,linux", "-p"])
+        self.assertEqual(words(["go", "test", "-race=false", "./..."]), ["go", "test", "./..."])
+        # Idempotency of exported key tokens (including bare -p marker at end).
+        exported = " ".join(["go", "test", "cmd/api", "-race", "-tags integration,linux", "-p"]).split()
+        self.assertEqual(words(exported), ["go", "test", "cmd/api", "-race", "-tags integration,linux", "-p"])
+        self.assertEqual(words(["go", "test", "-p"]), ["go", "test", "-p"])
+        # Restart safety: build/test/vet safe unless exec/toolexec/vettool/output/fuzz/profile flags appear.
+        for argv in (("go", "build", "./..."), ("go", "test", "-race", "./..."), ("go", "vet", "./..."),
+                     ("go", "test", "-count", "1", "./cmd/api")):
+            self.assertTrue(commands.restart_safe(list(argv)), argv)
+        for argv in (("go", "generate", "./..."), ("go", "run", "./cmd/api"), ("go", "install", "./..."),
+                     ("go", "mod", "tidy"), ("go", "build", "-o", "bin/app", "./cmd/api"),
+                     ("go", "build", "-o=bin/app", "./cmd/api"), ("go", "build", "-toolexec", "wrap", "./..."),
+                     ("go", "test", "-exec", "runner", "./..."), ("go", "test", "-fuzz", "FuzzParse", "./..."),
+                     ("go", "test", "-fuzz=FuzzParse", "./..."), ("go", "test", "-fuzztime=30s", "./..."),
+                     ("go", "test", "-coverprofile=cov.out", "./..."), ("go", "test", "-cpuprofile", "cpu.pprof", "./..."),
+                     ("go", "test", "-memprofile=mem.pprof", "./..."), ("go", "test", "-blockprofile=b.pprof", "./..."),
+                     ("go", "test", "-mutexprofile=m.pprof", "./..."), ("go", "test", "-trace=t.out", "./..."),
+                     ("go", "test", "-outputdir", "out", "./..."), ("go", "vet", "-vettool=/bin/v", "./..."),
+                     ("go", "test", "--fuzz=FuzzParse", "./...")):
+            self.assertFalse(commands.restart_safe(list(argv)), argv)
+        # Reusable checks: go vet only, and never with unsafe/info/dry-run flags or GOFLAGS/external GOWORK.
+        self.assertTrue(commands.reusable_check(["go", "vet", "./..."]))
+        self.assertTrue(commands.reusable_check(["go", "vet", "-tags", "integration", "./cmd/api"]))
+        for argv in (("go", "build", "./..."), ("go", "test", "./..."), ("go", "generate", "./..."),
+                     ("go", "vet", "-vettool=./tool", "./..."), ("go", "vet", "-toolexec=./wrap", "./..."),
+                     ("go", "vet", "-help"), ("go", "vet", "-n", "./...")):
+            self.assertFalse(commands.reusable_check(list(argv)), argv)
+        self.assertTrue(commands.paths_inside(["go", "vet", "./..."], "/r", "/r"))
+        self.assertTrue(commands.paths_inside(["go", "vet", "./..."], "/r", "/r", env={"GOWORK": "off"}))
+        self.assertTrue(commands.paths_inside(["go", "vet", "./..."], "/r", "/r", env={"GOWORK": "auto"}))
+        self.assertFalse(commands.paths_inside(["go", "vet", "./..."], "/r", "/r", env={"GOFLAGS": "-mod=readonly"}))
+        self.assertFalse(commands.paths_inside(["env", "GOFLAGS=-vettool=/x", "go", "vet", "./..."], "/r", "/r"))
+        self.assertFalse(commands.paths_inside(["go", "vet", "./..."], "/r", "/r", env={"GOWORK": "/other/go.work"}))
+        self.assertFalse(commands.paths_inside(["go", "vet", "-C", "sub", "./..."], "/r", "/r"))
+        # Write dirs: explicit GOCACHE / GOMODCACHE only; default shared caches stay unwatched; GOCACHE=off ignored.
+        self.assertEqual(tools.write_dirs_for("go", ["build", "./..."], "/repo", {}), [])
+        self.assertEqual(tools.write_dirs_for("go", ["build", "./..."], "/repo", {"GOCACHE": "off"}), [])
+        self.assertEqual(tools.write_dirs_for("go", ["build", "./..."], "/repo",
+                                              {"GOCACHE": ".gocache", "GOMODCACHE": "/tmp/gomod"}),
+                         ["/repo/.gocache", "/tmp/gomod"])
 
 
 if __name__ == "__main__":
