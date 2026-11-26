@@ -3,7 +3,7 @@
 """buildq-shim: send heavy commands through buildq without anyone having to remember to.
 
 Install it as links named after the tools (cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet,
-cmake, ctest, zig, gradle) in a directory that comes first on PATH (`./install.sh --shims`). Each
+cmake, ctest, zig, gradle, bun, bunx) in a directory that comes first on PATH (`./install.sh --shims`). Each
 link runs this program, which finds the real tool further down PATH and then:
 
   - runs a heavy invocation as `buildq run -- <the real tool> ARGS...`: it waits its turn, its

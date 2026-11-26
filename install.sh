@@ -7,7 +7,7 @@
 #   ./install.sh --check         check OS compatibility and dependencies without installing
 #   ./install.sh --install-deps  install missing prerequisites automatically (uses sudo/doas if needed)
 #   ./install.sh --shims         also put cargo, pnpm, npm, npx, yarn, make, gmake, ninja, dotnet
-#                                (plus cmake, ctest, zig and gradle when installed on PATH) shims in
+#                                (plus cmake, ctest, zig, gradle, bun and bunx when installed on PATH) shims in
 #                                ~/.local/share/buildq/shims, which send heavy commands through
 #                                the queue; put that directory first on PATH (it says how)
 #   ./install.sh --rustc-guard=DIR[,DIR...]
@@ -729,7 +729,7 @@ src=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 shim_tools="cargo pnpm npm npx yarn make gmake ninja dotnet"
 # Optional compiler shims are linked only when a real binary exists outside $shimdir, so scripts
 # using `command -v gradle || ./gradlew` never trip over a shim for an absent tool.
-optional_shim_tools="cmake ctest zig gradle"
+optional_shim_tools="cmake ctest zig gradle bun bunx"
 state_dir=${BUILDQ_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/buildq}
 # shellcheck disable=SC2088
 case $state_dir in

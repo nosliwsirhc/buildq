@@ -1089,7 +1089,10 @@ class InstallScriptTests(unittest.TestCase):
             # Isolated PATH without systemctl so it exercises the non-systemd branch safely.
             bindir = self._stub_bin(
                 tmp,
-                {"python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n"},
+                {
+                    "python3": f"#!/bin/sh\nexec '{sys.executable}' \"$@\"\n",
+                    "bun": "#!/bin/sh\nexit 0\n",
+                },
                 copy_host=("uname", "grep", "id", "flock", "install", "mktemp", "awk", "sed", "find",
                            "dirname", "basename", "wc", "cp", "rm", "mv", "ln", "mkdir", "cat", "tail", "readlink", "realpath", "sleep", "date"),
             )
@@ -1110,6 +1113,8 @@ class InstallScriptTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(prefix, "bin", "buildq")))
             self.assertTrue(os.path.islink(os.path.join(prefix, "bin", "buildqd")))
             self.assertTrue(os.path.islink(os.path.join(tmp, "data", "buildq", "shims", "cargo")))
+            self.assertTrue(os.path.islink(os.path.join(tmp, "data", "buildq", "shims", "bun")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "data", "buildq", "shims", "bunx")))
             self.assertTrue(os.path.islink(os.path.join(claude, "skills", "buildq")))
             guard_cfg = os.path.join(work, ".cargo", "config.toml")
             self.assertTrue(os.path.isfile(guard_cfg))

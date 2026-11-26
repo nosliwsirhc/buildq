@@ -1167,6 +1167,41 @@ class GitHubStatuses(DaemonCase):
         self.assertIsNotNone(tick_info)
         self.assertGreaterEqual(tick_info["last_ms"], 0.0)
         self.assertGreaterEqual(tick_info["max_ms"], tick_info["last_ms"])
+        self.assertNotIn("last_slow", tick_info)
+
+    def test_slow_tick_logs_top_phases_and_exposes_last_slow_in_overview(self):
+        clock = [1000.0]
+
+        def fake_monotonic():
+            return clock[0]
+
+        orig_check = self.daemon.check
+        orig_schedule = self.daemon.schedule
+
+        def slow_check(now):
+            clock[0] += 0.620
+            return orig_check(now)
+
+        def slow_schedule(now):
+            clock[0] += 0.280
+            return orig_schedule(now)
+
+        logged: list[str] = []
+        with mock.patch.object(daemon.time, "monotonic", side_effect=fake_monotonic), \
+             mock.patch.object(self.daemon, "check", side_effect=slow_check), \
+             mock.patch.object(self.daemon, "schedule", side_effect=slow_schedule), \
+             mock.patch.object(daemon.common, "log", side_effect=lambda msg, level=6: logged.append(msg)):
+            self.daemon.tick(self.now + 5)
+
+        slow_logs = [m for m in logged if m.startswith("slow daemon tick:")]
+        self.assertEqual(len(slow_logs), 1, logged)
+        self.assertIn("check 620ms", slow_logs[0])
+        self.assertIn("schedule 280ms", slow_logs[0])
+        tick_info = self.daemon.overview(self.now + 5)["tick"]
+        self.assertAlmostEqual(tick_info["last_ms"], 900.0, places=1)
+        self.assertIn("last_slow", tick_info)
+        self.assertAlmostEqual(tick_info["last_slow"]["ms"], 900.0, places=1)
+        self.assertEqual(tick_info["last_slow"]["phases"], {"check": 620.0, "schedule": 280.0})
 
 
 if __name__ == "__main__":

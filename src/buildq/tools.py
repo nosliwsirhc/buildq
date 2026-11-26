@@ -326,14 +326,165 @@ def _ninja_restart_safe(_tool: str, args: list[str]) -> bool:
     return set(positionals(args, {"-C", "-f", "-j", "-k", "-l", "-d", "-t", "-w"})) <= {"all", "test", "check"}
 
 
+DOTNET_GLOBAL_VALUE_OPTIONS = frozenset({
+    "--roll-forward", "--fx-version", "--additionalprobingpath", "--depsfile", "--runtimeconfig",
+})
+DOTNET_BUILD_SUBCOMMANDS = frozenset({"build", "test", "publish", "pack", "restore", "clean", "run", "msbuild"})
+DOTNET_VALUE_OPTIONS = frozenset({
+    "-f", "--framework", "-r", "--runtime", "-a", "--arch", "--os", "-o", "--output",
+    "--artifacts-path", "-v", "--verbosity", "-l", "--logger", "--filter", "-d", "--diag",
+    "-s", "--settings", "--results-directory", "--collect", "--test-adapter-path",
+    "--blame-hang-timeout", "--blame-crash-dump-type", "--blame-hang-dump-type",
+    "--source", "--configfile", "--packages", "--version-suffix", "--launch-profile",
+    "-e", "--environment", "--tl", "--terminalLogger",
+})
+DOTNET_MSBUILD_SWITCH = re.compile(r"^/[A-Za-z]+:")
+
+
+def _dotnet_subcommand_index(args: list[str]) -> int | None:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in DOTNET_GLOBAL_VALUE_OPTIONS:
+            i += 2
+        elif arg.startswith("-"):
+            i += 1
+        else:
+            return i
+    return None
+
+
+def _dotnet_norm_config(val: str) -> str:
+    return {"debug": "Debug", "release": "Release"}.get(val.lower(), val)
+
+
+def _dotnet_config_from_props(raw: str) -> str | None:
+    cfg: str | None = None
+    for part in raw.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            val = v.strip()
+            if k.strip().lower() == "configuration" and val and val != "…":
+                cfg = _dotnet_norm_config(val)
+    return cfg
+
+
+def _dotnet_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]:
+    sub_idx = _dotnet_subcommand_index(rest)
+    if sub_idx is None:
+        return [tool]
+    sub = os.path.basename(rest[sub_idx].rstrip("/")) or rest[sub_idx]
+    sub_args = rest[sub_idx + 1:]
+    if sub not in DOTNET_BUILD_SUBCOMMANDS:
+        extra = [os.path.basename(p.rstrip("/")) or p for p in positionals(sub_args) if p != "…"][:1]
+        return [tool, sub] + extra
+    explicit_target: str | None = None
+    pos_target: str | None = None
+    config: str | None = None
+    no_build = False
+    no_restore = False
+    i = 0
+    while i < len(sub_args):
+        arg = sub_args[i]
+        if arg in ("--project", "--solution"):
+            val = sub_args[i + 1] if i + 1 < len(sub_args) else ""
+            if val and val != "…":
+                explicit_target = os.path.basename(val.rstrip("/")) or val
+            i += 2 if i + 1 < len(sub_args) else 1
+            continue
+        if arg.startswith(("--project=", "--project:", "--solution=", "--solution:")):
+            val = re.split(r"[=:]", arg, maxsplit=1)[1]
+            if val and val != "…":
+                explicit_target = os.path.basename(val.rstrip("/")) or val
+            i += 1
+            continue
+        if arg == "-p":
+            val = sub_args[i + 1] if i + 1 < len(sub_args) else ""
+            if "=" in val:
+                found = _dotnet_config_from_props(val)
+                if found:
+                    config = found
+            elif val and val != "…":
+                explicit_target = os.path.basename(val.rstrip("/")) or val
+            i += 2 if i + 1 < len(sub_args) else 1
+            continue
+        if arg.startswith("-p="):
+            val = arg[3:]
+            if "=" in val:
+                found = _dotnet_config_from_props(val)
+                if found:
+                    config = found
+            elif val and val != "…":
+                explicit_target = os.path.basename(val.rstrip("/")) or val
+            i += 1
+            continue
+        if arg.startswith(("-p:", "--property:", "-property:", "--property=", "-property=")):
+            val = re.split(r"[=:]", arg, maxsplit=1)[1]
+            found = _dotnet_config_from_props(val)
+            if found:
+                config = found
+            i += 1
+            continue
+        if arg in ("--property", "-property"):
+            val = sub_args[i + 1] if i + 1 < len(sub_args) else ""
+            if "=" in val:
+                found = _dotnet_config_from_props(val)
+                if found:
+                    config = found
+            i += 2 if i + 1 < len(sub_args) else 1
+            continue
+        if arg in ("-c", "--configuration"):
+            val = sub_args[i + 1] if i + 1 < len(sub_args) else ""
+            if val and val != "…":
+                config = _dotnet_norm_config(val)
+            i += 2 if i + 1 < len(sub_args) else 1
+            continue
+        if arg.startswith(("-c=", "-c:", "--configuration=", "--configuration:")):
+            val = re.split(r"[=:]", arg, maxsplit=1)[1]
+            if val and val != "…":
+                config = _dotnet_norm_config(val)
+            i += 1
+            continue
+        if arg == "--no-build":
+            no_build = True
+            i += 1
+            continue
+        if arg == "--no-restore":
+            no_restore = True
+            i += 1
+            continue
+        if arg in DOTNET_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith("-") or DOTNET_MSBUILD_SWITCH.match(arg):
+            i += 1
+            continue
+        if arg != "…" and pos_target is None:
+            pos_target = os.path.basename(arg.rstrip("/")) or arg
+        i += 1
+    words = [tool, sub]
+    target = explicit_target or pos_target
+    if target:
+        words.append(target)
+    if config:
+        words.append(f"-c {config}")
+    if no_build:
+        words.append("--no-build")
+    if no_restore:
+        words.append("--no-restore")
+    return words
+
+
 def _dotnet_restart_safe(_tool: str, args: list[str]) -> bool:
-    return positionals(args)[:1] in (["build"], ["test"])
+    idx = _dotnet_subcommand_index(args)
+    return idx is not None and args[idx] in ("build", "test")
 
 
 def _dotnet_reusable_check(_tool: str, args: list[str]) -> bool:
     if any(re.match(r"-[ld](:|$)", a) or re.search(r"CollectCoverage", a) for a in args):
         return False  # dotnet test's short --logger and --diag, and coverage through MSBuild
-    return positionals(args)[:1] == ["test"]
+    idx = _dotnet_subcommand_index(args)
+    return idx is not None and args[idx] == "test"
 
 
 def _dotnet_global_env(granted: int, _want: int, _jobserver: str | None, _test_threads: bool,
@@ -1288,6 +1439,154 @@ def _uv_reusable_check(_tool: str, args: list[str]) -> bool:
     return is_reusable_check(inner_tool, inner[1:])
 
 
+# ---- Go -------------------------------------------------------------------------------------
+
+GO_VALUE_OPTIONS = frozenset({
+    "-C", "-o", "-p", "-asmflags", "-buildmode", "-buildvcs", "-compiler", "-gccgoflags",
+    "-gcflags", "-installsuffix", "-ldflags", "-mod", "-modfile", "-overlay", "-pgo", "-pkgdir",
+    "-tags", "-toolexec", "-covermode", "-coverpkg", "-bench", "-benchtime", "-blockprofile",
+    "-blockprofilerate", "-count", "-coverprofile", "-cpu", "-cpuprofile", "-exec", "-fuzz",
+    "-fuzzminimizetime", "-fuzztime", "-list", "-memprofile", "-memprofilerate", "-mutexprofile",
+    "-mutexprofilefraction", "-outputdir", "-parallel", "-run", "-shuffle", "-skip", "-timeout",
+    "-trace", "-vet", "-vettool",
+})
+GO_UNSAFE_RESTART_OPTIONS = frozenset({
+    "-exec", "-toolexec", "-vettool", "-o", "-fuzz", "-fuzztime", "-fuzzminimizetime",
+    "-coverprofile", "-cpuprofile", "-memprofile", "-blockprofile", "-mutexprofile",
+    "-trace", "-outputdir",
+})
+GO_NON_REUSABLE_OPTIONS = GO_UNSAFE_RESTART_OPTIONS | frozenset({"-c", "-n", "-h", "-help", "-V"})
+
+
+def _go_norm_flag(arg: str) -> str:
+    return "-" + arg[2:] if arg.startswith("--") and len(arg) > 2 else arg
+
+
+def _go_subcommand_and_args(args: list[str]) -> tuple[str, list[str]]:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        norm = _go_norm_flag(arg)
+        if norm == "-C":
+            i += 2
+            continue
+        if norm.startswith("-C="):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            return "", []
+        return arg, args[i + 1:]
+    return "", []
+
+
+def _go_words(tool: str, rest: list[str], _labels: Collection[str]) -> list[str]:
+    sub, sub_args = _go_subcommand_and_args(rest)
+    if not sub:
+        return [tool]
+    pkg: str | None = None
+    has_race = False
+    has_p = False
+    tags: list[str] = []
+    i = 0
+    while i < len(sub_args):
+        arg = sub_args[i]
+        norm = _go_norm_flag(arg)
+        if norm == "-args":
+            break
+        if norm == "-race":
+            has_race = True
+            i += 1
+            continue
+        if norm.startswith("-race="):
+            if norm.split("=", 1)[1].lower() not in ("false", "0"):
+                has_race = True
+            i += 1
+            continue
+        if norm == "-p":
+            has_p = True
+            i += 2 if i + 1 < len(sub_args) and not sub_args[i + 1].startswith("-") else 1
+            continue
+        if norm.startswith("-p="):
+            has_p = True
+            i += 1
+            continue
+        if norm == "-tags":
+            if i + 1 < len(sub_args):
+                val = sub_args[i + 1]
+                if val and val != "…":
+                    tags.extend(t for t in re.split(r"[\s,]+", val) if t)
+                i += 2
+            else:
+                i += 1
+            continue
+        if norm.startswith("-tags="):
+            val = norm.split("=", 1)[1]
+            if val and val != "…":
+                tags.extend(t for t in re.split(r"[\s,]+", val) if t)
+            i += 1
+            continue
+        if norm in GO_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        if pkg is None and arg != "…":
+            if arg == "./...":
+                pkg = "./..."
+            elif arg.startswith("/"):
+                pkg = os.path.basename(arg.rstrip("/")) or "/"
+            else:
+                cleaned = arg.rstrip("/")
+                if cleaned.startswith("./"):
+                    cleaned = cleaned[2:]
+                pkg = cleaned or "."
+        i += 1
+    words = [tool, sub]
+    if pkg:
+        words.append(pkg)
+    if has_race:
+        words.append("-race")
+    if tags:
+        words.append(f"-tags {','.join(sorted(set(tags)))}")
+    if has_p:
+        words.append("-p")
+    return words
+
+
+def _go_restart_safe(_tool: str, args: list[str]) -> bool:
+    sub, sub_args = _go_subcommand_and_args(args)
+    if sub not in ("build", "test", "vet"):
+        return False
+    for arg in sub_args:
+        norm = _go_norm_flag(arg)
+        if norm == "-args":
+            break
+        if norm.split("=", 1)[0] in GO_UNSAFE_RESTART_OPTIONS:
+            return False
+    return True
+
+
+def _go_reusable_check(_tool: str, args: list[str]) -> bool:
+    sub, sub_args = _go_subcommand_and_args(args)
+    if sub != "vet":
+        return False
+    for arg in sub_args:
+        norm = _go_norm_flag(arg)
+        if norm.split("=", 1)[0] in GO_NON_REUSABLE_OPTIONS:
+            return False
+    return True
+
+
+def _go_write_dirs(_tool: str, _args: list[str], cwd: str, env: dict) -> list[str]:
+    dirs: list[str] = []
+    for var in ("GOCACHE", "GOMODCACHE"):
+        val = env.get(var)
+        if val and val != "off":
+            dirs.append(os.path.join(cwd, val))
+    return dirs
+
+
 # ---- Built-in registrations -----------------------------------------------------------------
 
 JS_TOOLS = frozenset({"npm", "pnpm", "yarn", "npx", "pnpx", "bunx"})
@@ -1326,6 +1625,7 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         names=("dotnet",),
         honors_grant=True,
+        command_words=_dotnet_words,
         restart_safe=_dotnet_restart_safe,
         reusable_check=_dotnet_reusable_check,
         global_env=_dotnet_global_env,
@@ -1393,6 +1693,7 @@ SPECS: tuple[ToolSpec, ...] = (
         command_words=_pytest_words,
         restart_safe=_pytest_restart_safe,
         reusable_check=_pytest_reusable_check,
+        global_env=lambda g, _w, _js, _tt, _env: {"PYTEST_XDIST_AUTO_NUM_WORKERS": str(g)},
     ),
     ToolSpec(
         names=("mypy",),
@@ -1416,7 +1717,11 @@ SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         names=("go",),
         honors_grant=True,
+        command_words=_go_words,
+        restart_safe=_go_restart_safe,
+        reusable_check=_go_reusable_check,
         global_env=lambda g, _w, _js, _tt, _env: {"GOMAXPROCS": str(g)},
+        write_dirs=_go_write_dirs,
     ),
     ToolSpec(
         names=tuple(sorted(JS_TOOLS)),

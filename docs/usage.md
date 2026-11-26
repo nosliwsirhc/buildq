@@ -77,7 +77,7 @@ arguments name no path outside the tree:
   others wait for. A resent submission gets the same answer it got the first time. A
   joiner's `--notify` runs when it ends;
 - is answered by an earlier pass within `reuse_window` (2 hours) if the command is a check: cargo
-  check, clippy, test or `nextest run`, dotnet test, `zig test` or `zig ast-check`, `gcc`/`g++`/
+  check, clippy, test or `nextest run`, dotnet test, `go vet`, `zig test` or `zig ast-check`, `gcc`/`g++`/
   `clang`/`clang++`/`cc`/`c++` with `-fsyntax-only`, `pytest`, `mypy`, `pyright`/`basedpyright`,
   `python -m unittest`/`pytest`/`mypy`/`pyright`, `uv run --no-sync <check>` (explicit `--no-sync`
   is required so reuse never skips `.venv` syncing), `tsc --noEmit`, eslint, `vitest run`, with none
@@ -94,7 +94,7 @@ arguments name no path outside the tree:
   `UV_WORKING_DIR`/`UV_PROJECT`/`UV_ENV_FILE`) or names a path
   outside the tree whose source was recorded, anywhere in a word (`--manifest-path
   ../other/Cargo.toml`, `RUSTC_WRAPPER=/x/w.sh`, `RUSTFLAGS=-L/x`, `CFLAGS=-isystem/x`, or C/C++
-  include env vars like `CPATH` and `PYTEST_ADDOPTS` flags)
+  include env vars like `CPATH`, `PYTEST_ADDOPTS` flags, and Go's `GOFLAGS` / external `GOWORK`)
   is never answered from an earlier pass; nor is one with a word buildq can't read for certain
   (quotes, escapes, brackets, `$` or a URL in it, as a `--config` TOML value has): that costs a run,
   never a wrong answer. An output folder (`--target-dir`, `CARGO_TARGET_DIR`, eslint's
