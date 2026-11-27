@@ -1,8 +1,8 @@
 # buildq
 
-A local build queue for Linux that keeps parallel builds, coding agents, and CI runners from crashing the machine out of memory without leaving CPUs idle.
+A load-aware local build queue for Linux that keeps parallel coding agents, local builds, and self-hosted CI runners from OOM-freezing the machine without leaving CPUs idle.
 
-Drop off a build, get a ticket; `buildq` starts it when the machine has the RAM and CPU for it, resizes `cargo`, `make`, and `ninja` jobs live as load changes, and pauses or restarts builds if memory runs tight anyway.
+Drop off a build and get a ticket: `buildq` admits jobs using live RAM, CPU, and learned per-command peaks, resizes `cargo`, `make`, and `ninja` jobserver pools while they run, and pauses or restarts builds before memory runs out.
 
 [![tests](https://github.com/nosliwsirhc/buildq/actions/workflows/tests.yml/badge.svg)](https://github.com/nosliwsirhc/buildq/actions/workflows/tests.yml)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -10,6 +10,16 @@ Drop off a build, get a ticket; `buildq` starts it when the machine has the RAM 
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Open source under the [MIT License](LICENSE); everything is in this repository.
+
+### Live monitoring with `buildq top`
+
+`buildq top` renders a live `btop`-style terminal view of machine CPU and memory headroom, queued and running tickets, per-build jobserver core grants, and disk I/O.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/buildq-top-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/buildq-top-light.svg">
+  <img alt="buildq top terminal monitor showing live CPU graph, single-bar memory ledger, running builds, and queue state" src="docs/images/buildq-top-light.svg">
+</picture>
 
 ## The problem
 
@@ -42,6 +52,8 @@ Across five shared-workstation replay workloads (132 builds on a 32-core, 125 GB
 | **6 fixed slots** | 127 / 132 (96%) | 1 | 4 | 35.8 min | 0.1 GB |
 | **buildq** | **132 / 132 (100%)** | **0** | **0** | **0 s** | **23.4 GB** |
 
+> **In daily use (13 days on a 32-core, 126 GB Linux workstation):** Across 8,486 builds (~630/day, including 1,618 self-hosted CI jobs, 1,151 builds peaking at ≥ 8 GB RAM, and 232 peaking at 16–25 GB), overlapping bursts would have reached 17 concurrent builds and 160 GB of RAM across 9 out-of-memory episodes without a queue. With `buildq`, there were 0 OOM kills, available RAM stayed above 26 GB (0 minutes below the 16 GB floor), 479 builds serialized cleanly on shared Cargo/workspace directories, and 33 agent builds were preempted and restarted so CI releases finished on time.
+>
 > **Real Linux hardware check:** on a Linux 6.12 KVM machine (4 vCPUs, 2 GB RAM, no swap) compiling C code with `gcc -O2` and `make -j4`, running without a queue caused 3 kernel OOM kills (7/10 finished). `buildq` finished 10/10 with 0 OOM kills, 3.3× faster CI turnaround than 2 safe fixed slots (`8.8 s` vs. `28.8 s`), and >1 GB RAM free throughout.
 >
 > Reproduce the full replay benchmark locally in a few seconds (no root, no extra packages): `python3 bench/sim.py baselines`. [See all per-scenario numbers and trade-offs below.](#benchmarks-the-full-numbers)
